@@ -5,9 +5,9 @@
 //                             x += Mlp(LayerNorm(x))         768 -> 3072 -> 768, GELU
 //             -> LayerNorm -> h @ wteᵀ                      logits; the head is tied to wte
 //
-// Pre-LayerNorm, no dropout, GPT-2's init. The names match Hugging Face's
-// GPT2LMHeadModel (wte, h.0.attn.c_attn, ...). Only autograd and the kernels
-// come from LibTorch; the model itself is here.
+// Pre-LayerNorm, no dropout, GPT-2's init, fp32 throughout. The names match
+// Hugging Face's GPT2LMHeadModel (wte, h.0.attn.c_attn, ...). Only autograd
+// and the kernels come from LibTorch; the model itself is here.
 using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
@@ -33,11 +33,11 @@ public sealed class CausalSelfAttention : Module<Tensor, Tensor>
     {
         long B = x.shape[0], T = x.shape[1], C = x.shape[2];
         // (B,T,3C) -> (3, B, heads, T, head_size): q, k, v with the heads split out
-        var qkv = Amp.Linear(x, c_attn).view(B, T, 3, nHead, C / nHead).permute(2, 0, 3, 1, 4);
-        // Fused causal attention: the flash kernel in bf16/fp16, never builds the TxT matrix.
+        var qkv = c_attn.forward(x).view(B, T, 3, nHead, C / nHead).permute(2, 0, 3, 1, 4);
+        // Fused causal attention (memory-efficient kernel): never builds the TxT matrix.
         var y = F.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2], is_casual: true);
         y = y.transpose(1, 2).contiguous().view(B, T, C);   // heads back side by side
-        return Amp.Linear(y, c_proj);
+        return c_proj.forward(y);
     }
 }
 
@@ -53,7 +53,7 @@ public sealed class Mlp : Module<Tensor, Tensor>
     }
 
     public override Tensor forward(Tensor x) =>
-        Amp.Linear(F.gelu(Amp.Linear(x, c_fc), TorchSharp.Modules.GELU.Approximate.tanh), c_proj);   // GPT-2's tanh GELU
+        c_proj.forward(F.gelu(c_fc.forward(x), TorchSharp.Modules.GELU.Approximate.tanh));   // GPT-2's tanh GELU
 }
 
 public sealed class Block : Module<Tensor, Tensor>
@@ -71,11 +71,10 @@ public sealed class Block : Module<Tensor, Tensor>
         RegisterComponents();
     }
 
-    // x is the fp32 residual stream; each branch runs in the compute dtype.
     public override Tensor forward(Tensor x)
     {
-        x = x + attn.forward(ln_1.forward(x)).to(ScalarType.Float32);
-        return x + mlp.forward(ln_2.forward(x)).to(ScalarType.Float32);
+        x = x + attn.forward(ln_1.forward(x));
+        return x + mlp.forward(ln_2.forward(x));
     }
 }
 
@@ -112,7 +111,7 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
         }
     }
 
-    /// ids (B,T) -> final hidden states (B,T,C), fp32.
+    /// ids (B,T) -> final hidden states (B,T,C).
     public override Tensor forward(Tensor ids)
     {
         long T = ids.shape[1];
@@ -123,9 +122,8 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
         return ln_f.forward(x);
     }
 
-    /// Hidden states -> logits over the padded vocabulary, fp32. The head is wte itself.
-    public Tensor Logits(Tensor hidden) =>
-        F.linear(Amp.Cast(hidden), Amp.Cast(wte.weight!)).to(ScalarType.Float32);
+    /// Hidden states -> logits over the padded vocabulary. The head is wte itself.
+    public Tensor Logits(Tensor hidden) => F.linear(hidden, wte.weight!);
 
     /// Mean next-token loss of a (B,T) batch: position t predicts token t+1.
     public Tensor Loss(Tensor ids)
@@ -155,6 +153,7 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
             var pick = values.softmax(0).multinomial(1);
             tokens.Add(indices[pick].item<long>());
         }
+        train();
         return tokens.ToArray();
     }
 }

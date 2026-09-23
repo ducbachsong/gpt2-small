@@ -16,9 +16,9 @@ modules in common/, unchanged:
 
 The two sides share only files and the trainer's console, as in lab06: no
 sockets, no bindings. The first shard is held back as heldout.bin and never
-trained on: its first EVAL_ROWS rows give val_loss. Checkpoints are saved
-every SAVE_EVERY steps, at the end, and on Ctrl+C. Everything goes to
-OUTPUT_DIR. Needs .NET 8 (colab_setup.sh installs it), a GPU to finish in
+trained on: its first EVAL_ROWS rows give val_loss. The model trains in
+fp32 and is not saved: at the end it continues PROMPTS into samples.txt, and
+the run is over. Everything goes to OUTPUT_DIR. Needs .NET 8 (colab_setup.sh installs it), a GPU to finish in
 reasonable time, and the network.
 """
 import os
@@ -74,19 +74,14 @@ MAX_STEPS = 3000                # ~98M tokens; ~305,000 steps is the whole 10B
 EVAL_ROWS = 80                  # held-out rows (x 1024 tokens) for val_loss
 EVAL_EVERY = 250
 PRINT_EVERY = 25                # the trainer reads the GPU once per this many steps
-SAVE_EVERY = 500
 OUTPUT_DIR = "runs"
 RUN_NAME = "fineweb-edu-gpt2cs-{time}"  # {time} is when this run started
-RESUME = ""                     # a checkpoint folder to continue from, e.g.
-                                # "runs/<run>/checkpoints/step-1500"
 MONITOR = False                 # True opens the live csvexplorer page; not on Colab
 PROMPTS = ["The theory of evolution explains",
            "In mathematics, a prime number is",
            "Photosynthesis is the process"]
 
 # ── the machine ─────────────────────────────────────────────────────────────
-PRECISION = "auto"              # auto: bf16 on compute capability 8+ (A100, L4, ...),
-                                # fp16 on older GPUs (T4), fp32 without a GPU
 SEED = 0
 DOTNET = "dotnet"               # found on PATH, else in ~/.dotnet
 CSHARP_PROJECT = os.path.join(HERE, "csharp", "Gpt2Trainer")
@@ -108,14 +103,6 @@ def gpu_info():
         return None
     capability, memory_mb = output.splitlines()[0].split(",")
     return float(capability), float(memory_mb) / 1024
-
-
-def pick_precision(gpu):
-    if PRECISION != "auto":
-        return PRECISION
-    if gpu is None:
-        return "fp32"
-    return "bf16" if gpu[0] >= 8 else "fp16"
 
 
 def pick_micro_batch(gpu):
@@ -219,18 +206,19 @@ def parse_line(line):
     return match.group(1), fields
 
 
-def trainer_arguments(run_folder, pool_dir, gpu):
+def trainer_arguments(pool_dir, gpu, tokenizer):
     micro_batch = pick_micro_batch(gpu)
     grad_accum = max(1, TOKENS_PER_STEP // (micro_batch * SEQUENCE_LENGTH))
+    prompts = ";".join(",".join(str(i) for i in tokenizer.encode(prompt)) for prompt in PROMPTS)
     settings = {
-        "data": pool_dir, "out": run_folder, "resume": full_path(RESUME) if RESUME else "",
+        "data": pool_dir,
         "n-layer": N_LAYER, "n-head": N_HEAD, "n-embd": N_EMBD,
         "sequence-length": SEQUENCE_LENGTH, "micro-batch": micro_batch,
         "grad-accum-steps": grad_accum, "learning-rate": LEARNING_RATE,
         "min-learning-rate": MIN_LEARNING_RATE, "warmup-steps": WARMUP_STEPS,
         "weight-decay": WEIGHT_DECAY, "grad-clip": GRAD_CLIP, "max-steps": MAX_STEPS,
         "eval-rows": EVAL_ROWS, "eval-every": EVAL_EVERY, "print-every": PRINT_EVERY,
-        "save-every": SAVE_EVERY, "precision": pick_precision(gpu),
+        "prompts": prompts, "max-new-tokens": 60, "temperature": 0.8, "top-k": 50,
         "device": "cpu" if gpu is None else "cuda", "seed": SEED,
     }
     arguments = []
@@ -244,8 +232,10 @@ def trainer_arguments(run_folder, pool_dir, gpu):
 def train(run_folder, dotnet, trainer_dll, gpu):
     """Runs the feeder thread and the C# trainer until the trainer is done.
 
-    Out: (steps taken, final val_loss, log path, final checkpoint folder)
+    Out: (steps taken, final val_loss, log path, samples as text)
     """
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
     pool_dir = os.path.join(run_folder, "pool")
     shutil.rmtree(pool_dir, ignore_errors=True)
     os.makedirs(pool_dir)
@@ -260,12 +250,12 @@ def train(run_folder, dotnet, trainer_dll, gpu):
                               name="feed-trainer", daemon=True)
     log_path = os.path.join(run_folder, "log.csv")
     log = trainer = None
-    step, val_loss, final = 0, float("nan"), None
+    step, val_loss, samples = 0, float("nan"), []
     tokens_per_step = TOKENS_PER_STEP       # replaced by what the trainer reports
     try:
         feeder.start()
         trainer = subprocess.Popen(
-            [dotnet, trainer_dll, "train", *trainer_arguments(run_folder, pool_dir, gpu)],
+            [dotnet, trainer_dll, *trainer_arguments(pool_dir, gpu, tokenizer)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             encoding="utf-8", errors="replace")
         while True:
@@ -297,17 +287,18 @@ def train(run_folder, dotnet, trainer_dll, gpu):
                                 open_dashboard(log_path, wait=False)
                         else:
                             log.write(row)
-                    elif kind == "Done":
-                        final = fields["checkpoint"]
+                    elif kind == "Sample":
+                        ids = [int(i) for i in fields["ids"].split(",")]
+                        samples.append(tokenizer.decode(ids))
                 break
             except KeyboardInterrupt:
-                # The trainer got the Ctrl+C too: it finishes its step and saves.
-                print("\nCtrl+C: waiting for the trainer to save", flush=True)
+                # The trainer got the Ctrl+C too: it finishes its step, then samples.
+                print("\nCtrl+C: waiting for the trainer to finish", flush=True)
         if trainer.wait() != 0:
             raise RuntimeError(f"the C# trainer failed (exit code {trainer.returncode})")
         if errors:
             raise RuntimeError("feeding the trainer failed") from errors[0]
-        return step, val_loss, log_path, final
+        return step, val_loss, log_path, samples
     finally:
         if trainer is not None and trainer.poll() is None:
             trainer.kill()
@@ -335,27 +326,11 @@ def save_loss_chart(log_path, run_folder):
         print(f"no loss chart ({error!r}); pip install vl-convert-python")
 
 
-def save_samples(checkpoint, run_folder, dotnet, trainer_dll, gpu):
-    """The trained model continues each prompt, into samples.txt.
-
-    The tokenizer turns text into ids and back; the C# trainer does the rest.
-    """
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
-    device = "cpu" if gpu is None else "cuda"
-    lines = []
-    for prompt in PROMPTS:
-        ids = ",".join(str(i) for i in tokenizer.encode(prompt))
-        output = subprocess.run(
-            [dotnet, trainer_dll, "generate", "--checkpoint", checkpoint, "--prompt", ids,
-             "--max-new-tokens", "60", "--temperature", "0.8", "--top-k", "50",
-             "--device", device, "--precision", pick_precision(gpu)],
-            capture_output=True, text=True, check=True).stdout
-        generated = re.search(r"\[Generated\] ids=([\d,]+)", output).group(1)
-        lines.append(tokenizer.decode([int(i) for i in generated.split(",")]))
-    text = "\n\n".join(lines)
-    with open(os.path.join(run_folder, "samples.txt"), "w", encoding="utf-8") as samples:
-        samples.write(text + "\n")
+def save_samples(samples, run_folder):
+    """The trained model's continuation of each prompt, into samples.txt."""
+    text = "\n\n".join(samples)
+    with open(os.path.join(run_folder, "samples.txt"), "w", encoding="utf-8") as samples_file:
+        samples_file.write(text + "\n")
     print(f"\n── samples ──\n{text}\n")
 
 
@@ -367,14 +342,12 @@ def main():
     dotnet = find_dotnet()
     trainer_dll = build_trainer(dotnet, gpu)
     started = time.perf_counter()
-    steps, val_loss, log_path, checkpoint = train(run_folder, dotnet, trainer_dll, gpu)
+    steps, val_loss, log_path, samples = train(run_folder, dotnet, trainer_dll, gpu)
     print(f"\n{steps} steps in {(time.perf_counter() - started) / 3600:.2f} h, "
           f"final val_loss {val_loss:.4f}")
-    print(f"log:        {log_path}")
-    print(f"checkpoint: {checkpoint}")
+    print(f"log: {log_path}")
     save_loss_chart(log_path, run_folder)
-    if checkpoint:
-        save_samples(checkpoint, run_folder, dotnet, trainer_dll, gpu)
+    save_samples(samples, run_folder)
 
 
 if __name__ == "__main__":

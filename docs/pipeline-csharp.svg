@@ -71,27 +71,27 @@
 
   <rect x="560" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
   <text x="576" y="386" class="t">GPT-2 small · 124M</text>
-  <text x="576" y="404" class="f">Model.cs · Amp.cs</text>
+  <text x="576" y="404" class="f">Model.cs</text>
   <text x="576" y="430" class="s">12 pre-LN blocks, tied head</text>
-  <text x="576" y="450" class="s">fused causal attention (flash)</text>
-  <text x="576" y="470" class="s">bf16 / fp16 matmuls by hand</text>
+  <text x="576" y="450" class="s">fused causal attention (SDPA)</text>
+  <text x="576" y="470" class="s">fp32 (TF32 on A100 / L4)</text>
   <text x="576" y="490" class="s">vocab padded to 50,304</text>
 
   <rect x="300" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
   <text x="316" y="386" class="t">AdamW + loop</text>
   <text x="316" y="404" class="f">AdamW.cs · Trainer.cs</text>
   <text x="316" y="430" class="s">AdamW written from scratch</text>
-  <text x="316" y="450" class="s">clip + loss scale on the GPU</text>
+  <text x="316" y="450" class="s">grad clipping on the GPU</text>
   <text x="316" y="470" class="s">warmup + cosine LR</text>
   <text x="316" y="490" class="s">1 GPU sync per 25 steps</text>
 
   <rect x="40" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
-  <text x="56" y="386" class="t">Checkpoints</text>
-  <text x="56" y="404" class="f">Checkpoint.cs</text>
-  <text x="56" y="430" class="s">weights + AdamW m, v + step</text>
-  <text x="56" y="450" class="s">every 500 steps, end, Ctrl+C</text>
-  <text x="56" y="470" class="s">atomic: tmp folder, rename</text>
-  <text x="56" y="490" class="s">RESUME continues exactly</text>
+  <text x="56" y="386" class="t">Eval + samples</text>
+  <text x="56" y="404" class="f">Trainer.cs · Model.cs</text>
+  <text x="56" y="430" class="s">val_loss on held-out rows</text>
+  <text x="56" y="450" class="s">every 250 steps and at the end</text>
+  <text x="56" y="470" class="s">then continues each prompt</text>
+  <text x="56" y="490" class="s">nothing is saved to disk</text>
 
   <path class="l" d="M930,276 L930,356" marker-end="url(#a)"/>
   <path class="l" d="M820,432 L782,432" marker-end="url(#a)"/>
@@ -100,13 +100,13 @@
   <text x="938" y="322" class="e">files</text>
   <text x="784" y="424" class="e">ids</text>
   <text x="524" y="424" class="e">grads</text>
-  <text x="264" y="424" class="e">save</text>
+  <text x="264" y="424" class="e">model</text>
 
   <!-- row 3: python logging -->
   <rect x="560" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
   <text x="576" y="618" class="t">Console → CsvWriter</text>
   <text x="576" y="636" class="f">csvwriter.py</text>
-  <text x="576" y="662" class="s">[Step] [Eval] [Checkpoint]</text>
+  <text x="576" y="662" class="s">[Step] [Eval] [Sample] [Done]</text>
   <text x="576" y="682" class="s">lines parsed into rows</text>
   <text x="576" y="702" class="s">→ log.csv</text>
 
@@ -118,14 +118,14 @@
 
   <rect x="40" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
   <text x="56" y="618" class="t">Samples</text>
-  <text x="56" y="636" class="f">Gpt2Trainer generate</text>
-  <text x="56" y="662" class="s">Python tokenizes the prompt</text>
-  <text x="56" y="682" class="s">C# samples token ids</text>
+  <text x="56" y="636" class="f">traingpt2cs.py</text>
+  <text x="56" y="662" class="s">Python tokenizes the prompts</text>
+  <text x="56" y="682" class="s">C# prints [Sample] ids</text>
   <text x="56" y="702" class="s">Python decodes → samples.txt</text>
 
   <path class="l" d="M430,506 C430,550 660,546 668,588" marker-end="url(#a)"/>
   <path class="l" d="M560,665 L522,665" marker-end="url(#a)"/>
   <path class="l" d="M150,506 L150,588" marker-end="url(#a)"/>
   <text x="560" y="548" class="e">stdout</text>
-  <text x="158" y="552" class="e">final checkpoint</text>
+  <text x="158" y="552" class="e">[Sample] ids</text>
 </svg>

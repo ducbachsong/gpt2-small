@@ -14,7 +14,7 @@ public sealed class AdamW
     readonly Tensor[] parameters, m, v;
     readonly bool[] decay;
     readonly Config config;
-    public long T { get; set; }            // steps taken, for the bias correction
+    long t;                                // steps taken, for the bias correction
 
     /// Weight decay on the matrices and embeddings only (dim >= 2), not on
     /// biases or LayerNorm, as in traingpt2.py.
@@ -28,9 +28,6 @@ public sealed class AdamW
         decay = this.parameters.Select(p => p.dim() >= 2).ToArray();
     }
 
-    public IReadOnlyList<Tensor> Parameters => parameters;
-    public IReadOnlyList<Tensor> Moments => m.Concat(v).ToArray();
-
     public void ZeroGrad()
     {
         foreach (var p in parameters) p.grad?.zero_();
@@ -43,9 +40,9 @@ public sealed class AdamW
     {
         using var _ = no_grad();
         using var scope = NewDisposeScope();
-        T++;
-        double correction1 = 1 - Math.Pow(config.Beta1, T);
-        double sqrtCorrection2 = Math.Sqrt(1 - Math.Pow(config.Beta2, T));
+        t++;
+        double correction1 = 1 - Math.Pow(config.Beta1, t);
+        double sqrtCorrection2 = Math.Sqrt(1 - Math.Pow(config.Beta2, t));
         for (int i = 0; i < parameters.Length; i++)
         {
             var g = parameters[i].grad;
@@ -58,15 +55,12 @@ public sealed class AdamW
         }
     }
 
-    /// Divides the gradients by `unscale` (the fp16 loss scale, else 1), then
-    /// scales them down so their global L2 norm is at most maxNorm.
+    /// Scales the gradients down so their global L2 norm is at most maxNorm.
     /// Out: the norm before clipping, as a 0-d tensor still on the GPU.
-    public Tensor UnscaleAndClip(double unscale, double maxNorm)
+    public Tensor ClipGradNorm(double maxNorm)
     {
         using var _ = no_grad();
         var grads = parameters.Select(p => p.grad).Where(g => g is not null).Select(g => g!).ToArray();
-        if (unscale != 1)
-            foreach (var g in grads) g.mul_(1 / unscale);
         var norm = stack(grads.Select(g => g.norm()).ToArray()).norm();
         var coefficient = (norm + 1e-6).reciprocal().mul_(maxNorm).clamp_max_(1.0);
         foreach (var g in grads) g.mul_(coefficient);

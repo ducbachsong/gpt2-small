@@ -5,13 +5,15 @@
 // buffers on the GPU; every PrintEvery steps the buffers come back to the CPU
 // in one go and each step is printed as a line. So the CPU waits for the GPU
 // once per PrintEvery steps, not once per step, and keeps queueing work ahead.
+// At the end the model continues each prompt, and the run is over: nothing is
+// saved.
 //
 // The console is the only thing the Python side reads (as in lab06):
-//     [Config] params=124.4M device=cuda precision=bf16 ...
+//     [Config] params=124.4M device=cuda ...
 //     [Step] step=25 tokens=819200 loss=7.0123 lr=5.2e-05 grad_norm=1.23 [tokens_per_second=... left=...]
 //     [Eval] step=250 val_loss=5.4321
-//     [Checkpoint] step=500 path=...
-//     [Done] step=3000 val_loss=3.21 checkpoint=...
+//     [Sample] ids=464,3290,...
+//     [Done] step=3000 val_loss=3.21
 using System.Diagnostics;
 using TorchSharp;
 using static TorchSharp.torch;
@@ -33,7 +35,7 @@ public sealed class Trainer
             if (stopRequested) return;          // a second Ctrl+C kills it
             e.Cancel = true;
             stopRequested = true;
-            Console.WriteLine("[Stop] Ctrl+C: finishing this step, then saving");
+            Log("[Stop] Ctrl+C: finishing this step");
         };
     }
 
@@ -41,22 +43,14 @@ public sealed class Trainer
     {
         var model = new Gpt2(config).to(device);
         var optimizer = new AdamW(model.parameters(), config);
-        var scaler = new LossScaler(config.Precision == "fp16");
         using var reader = new ShardReader(config, device);
-        int step = 0;
-        if (config.Resume != "")
-        {
-            var state = Checkpoint.LoadTraining(config.Resume, model, optimizer);
-            step = state.Step;
-            scaler.Scale = state.LossScale;
-            Log($"[Resume] step={step} from={config.Resume}");
-        }
 
         long parameterCount = model.parameters().Sum(p => p.numel());
         Log($"[Config] params={parameterCount / 1e6:F1}M device={device.type.ToString().ToLowerInvariant()} " +
-            $"precision={config.Precision} micro_batch={config.MicroBatch} grad_accum={config.GradAccumSteps} " +
+            $"micro_batch={config.MicroBatch} grad_accum={config.GradAccumSteps} " +
             $"tokens_per_step={config.TokensPerStep} max_steps={config.MaxSteps}");
 
+        int step = 0;
         using var heldOut = reader.HeldOut();
         double valLoss = Evaluate(model, heldOut);
         Log($"[Eval] step={step} val_loss={valLoss:F4}");
@@ -68,7 +62,6 @@ public sealed class Trainer
         int logged = 0;
         var runClock = Stopwatch.StartNew();
         var windowClock = Stopwatch.StartNew();
-        int firstStep = step;
         bool ranOut = false;
 
         void Flush()
@@ -84,8 +77,7 @@ public sealed class Trainer
                               $"lr={lrLog[i]:0.00e+00} grad_norm={norms[i]:F3}";
                 if (i == logged - 1)
                     line += $" tokens_per_second={logged * config.TokensPerStep / seconds:F0} " +
-                            $"left={TimeLeft(step - firstStep, config.MaxSteps - step, runClock.Elapsed.TotalSeconds)}" +
-                            (scaler.Enabled ? $" loss_scale={scaler.Scale}" : "");
+                            $"left={TimeLeft(step, config.MaxSteps - step, runClock.Elapsed.TotalSeconds)}";
                 Log(line);
             }
             logged = 0;
@@ -104,15 +96,13 @@ public sealed class Trainer
                 var ids = reader.Next();
                 if (ids is null) { ranOut = true; break; }
                 var loss = model.Loss(ids) / config.GradAccumSteps;
-                (scaler.Enabled ? loss * scaler.Scale : loss).backward();
+                loss.backward();
                 stepLoss.add_(loss.detach());
             }
             if (ranOut) { optimizer.ZeroGrad(); break; }
 
-            var norm = optimizer.UnscaleAndClip(scaler.Scale, config.GradClip);
-            // fp16 only: one wait per step to learn whether the gradients overflowed.
-            bool finite = !scaler.Enabled || norm.isfinite().item<bool>();
-            if (scaler.Update(finite)) optimizer.Step(lr);
+            var norm = optimizer.ClipGradNorm(config.GradClip);
+            optimizer.Step(lr);
             optimizer.ZeroGrad();
             step++;
 
@@ -131,8 +121,6 @@ public sealed class Trainer
                 evaluatedAt = step;
                 Log($"[Eval] step={step} val_loss={valLoss:F4}");
             }
-            if (step % config.SaveEvery == 0)
-                Save(Path.Combine(config.Out, "checkpoints", $"step-{step}"), model, optimizer, scaler, step);
         }
         Flush();
 
@@ -142,10 +130,14 @@ public sealed class Trainer
             valLoss = Evaluate(model, heldOut);
             Log($"[Eval] step={step} val_loss={valLoss:F4}");
         }
-        string final = Path.Combine(config.Out, "checkpoints", "final");
-        Save(final, model, optimizer, scaler, step);
         reader.Stop();
-        Log($"[Done] step={step} val_loss={valLoss:F4} checkpoint={final}");
+        foreach (var prompt in config.Prompts.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            long[] ids = prompt.Split(',').Select(long.Parse).ToArray();
+            var sample = model.Generate(ids, config.MaxNewTokens, config.Temperature, config.TopK, device);
+            Log($"[Sample] ids={string.Join(",", sample)}");
+        }
+        Log($"[Done] step={step} val_loss={valLoss:F4}");
     }
 
     /// Mean loss over the held-out rows.
@@ -163,13 +155,6 @@ public sealed class Trainer
         }
         model.train();
         return total.item<float>() / rows;
-    }
-
-    void Save(string folder, Gpt2 model, AdamW optimizer, LossScaler scaler, int step)
-    {
-        Checkpoint.Save(folder, model, optimizer,
-                        new TrainingState(step, step * config.TokensPerStep, optimizer.T, scaler.Scale));
-        Log($"[Checkpoint] step={step} path={folder}");
     }
 
     static string TimeLeft(int stepsDone, int stepsLeft, double seconds)

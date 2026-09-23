@@ -4,8 +4,6 @@
 // "--name value" arguments, so the Python file stays the one place to change a
 // run. Anything not passed keeps the default below.
 using System.Globalization;
-using System.Reflection;
-using System.Text.Json;
 
 namespace Gpt2Trainer;
 
@@ -36,17 +34,19 @@ public sealed class Config
     public int EvalRows { get; set; } = 80;              // held-out rows for val_loss
     public int EvalEvery { get; set; } = 250;
     public int PrintEvery { get; set; } = 25;            // also: how often the CPU waits for the GPU
-    public int SaveEvery { get; set; } = 500;
+
+    // ── samples at the end: prompts as token ids, "464,3290;818,19473" ──────
+    public string Prompts { get; set; } = "";
+    public int MaxNewTokens { get; set; } = 60;
+    public double Temperature { get; set; } = 0.8;
+    public int TopK { get; set; } = 50;
 
     // ── the machine ─────────────────────────────────────────────────────────
     public string Device { get; set; } = "auto";         // auto | cuda | cpu
-    public string Precision { get; set; } = "fp32";      // bf16 | fp16 | fp32
     public int Seed { get; set; } = 0;
 
-    // ── where things are ────────────────────────────────────────────────────
+    // ── where the data is ───────────────────────────────────────────────────
     public string Data { get; set; } = "pool";           // shard folder the Python side fills
-    public string Out { get; set; } = "run";             // checkpoints go to Out/checkpoints
-    public string Resume { get; set; } = "";             // a checkpoint folder to continue from
 
     public long TokensPerStep => (long)MicroBatch * SequenceLength * GradAccumSteps;
 
@@ -71,10 +71,6 @@ public sealed class Config
         }
         return config;
     }
-
-    public string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-
-    public static Config FromJson(string json) => JsonSerializer.Deserialize<Config>(json)!;
 
     static string Kebab(string name) =>
         string.Concat(name.Select((c, i) => char.IsUpper(c) && i > 0 ? "-" + char.ToLowerInvariant(c)
