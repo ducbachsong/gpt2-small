@@ -1,122 +1,161 @@
-# GPT-2 Small on FineWeb-Edu 10B
+# GPT-2 Small on FineWeb-Edu 10B — C# trainer
 
 Pre-train a **GPT-2 small (124M parameters)** from scratch on the
 [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) `sample/10BT`
-split (~10 billion tokens of high-quality educational web text), with a data
-pipeline and training loop tuned to keep the GPU busy and train as fast as possible
-on a single GPU — from a free Colab T4 up to an A100.
+split (~10 billion tokens of educational web text), as fast as a single GPU allows.
 
-## Why this project
+> **This is the `csharp-trainer` branch.** No Python model library is used:
+> the GPT-2 model, the AdamW optimizer, mixed precision and the training loop are
+> written by hand in **C#** on [TorchSharp](https://github.com/dotnet/TorchSharp)
+> (the .NET bindings of LibTorch). The Python data pipeline, logging and charts
+> from `main` are reused unchanged. The Hugging Face `transformers` version of the
+> trainer is on [`main`](https://github.com/ducbachsong/gpt2-small/tree/main)
+> (`traingpt2.py`, still here too).
 
-Training a small language model is usually bottlenecked not by the model but by
-everything around it: downloading tens of GB of data, tokenizing it, feeding the GPU,
-and logging without stalling. This project focuses on making that whole path fast
-and memory-efficient:
+![Training pipeline](docs/pipeline-csharp.svg)
 
-- **Streaming data straight into RAM** – parquet shards are downloaded in the
-  background into memory (no disk round-trip), with a RAM cap so it fits Colab's 12.7 GB.
-- **Parallel background tokenization** – worker threads tokenize the next shards
-  while the GPU trains on the current batches, so the GPU never waits on data.
-- **Mixed precision** – `bfloat16` autocast on Ampere+ GPUs (A100, L4, …),
-  `float16` with a `GradScaler` on older GPUs (T4).
-- **Fused AdamW** and weight decay on weight matrices only.
-- **No per-step GPU sync** – the loss stays on the GPU; the CPU reads it only when
-  printing or flushing logs, so the CPU keeps queueing work ahead of the GPU.
-- **Pinned memory + non-blocking host→device copies.**
-- **`torch.compile`** switch for extra speed on A100-class GPUs.
-- **`expandable_segments`** CUDA allocator to reduce memory fragmentation.
-- **Gradient accumulation** to reach large effective batch sizes on small GPUs.
-- **Cosine LR schedule** with linear warmup, gradient clipping.
+## How the two sides work together
+
+Python and C# run as two processes and share only **files** and the trainer's
+**console**: no sockets, no language bindings.
+
+| Direction | Channel | What |
+|---|---|---|
+| Python → C# | `<run>/pool/heldout.bin` | first batch, held out for `val_loss`, never trained on |
+| Python → C# | `<run>/pool/shard_NNNNNN.bin` | one token batch per file: `[u32 'GPT2'][u32 rows][u32 seq_len][u16 ids…]`, written to `.tmp` then renamed |
+| C# → Python | `<run>/pool/consumed.txt` | highest shard already on the GPU; Python deletes those files and writes more (16 kept ready) |
+| either | `<run>/pool/STOP` | Python: dataset ran out · C#: training finished |
+| C# → Python | stdout | `[Config]`, `[Step]`, `[Eval]`, `[Checkpoint]`, `[Done]` lines, parsed into `log.csv` |
+
+## What makes it fast
+
+**Data (Python, from `main`)**
+- Parquet files are downloaded **straight into RAM** in the background, with a RAM cap.
+- **Tokenizer threads** fill a buffer of ready batches while the GPU trains.
+- Each **shard is copied to the GPU whole** when it is read. Micro-batches are views of it,
+  so the training loop never waits on a file or a host→device copy.
+
+**Model and training (C#)**
+- **Fused causal attention** (`scaled_dot_product_attention`), which uses the flash kernel in bf16/fp16.
+- **Hand-written mixed precision** (TorchSharp has no `autocast`). The weights are fp32, and each
+  matmul runs in **bf16** (Ampere+: A100, L4, …) or **fp16** (T4). fp16 uses a dynamic
+  loss scaler. LayerNorm, the residual stream and the loss stay fp32. TF32 is on for the rest.
+- **Few CPU↔GPU syncs**: the loss and grad norm of each step go into GPU buffers that are read
+  once every `PRINT_EVERY` steps. Gradient clipping is written to stay on the GPU
+  (TorchSharp's `clip_grad_norm_` returns a `double`, which would sync every step).
+- **Vocabulary padded to 50,304** (a multiple of 64) for faster matmuls. Padding ids are never sampled.
+- **Loss on T−1 positions only**: the last hidden state is dropped *before* the 50k-wide head matmul.
+- AdamW with decoupled weight decay on matrices only, β = (0.9, 0.95), linear warmup + cosine LR,
+  gradient clipping at 1.0, and GPT-2's scaled init for residual projections.
 
 ## Project layout
 
 ```
 gpt2-small/
-├── traingpt2.py          # the training run: config + training loop
-├── requirements.txt
-└── common/               # reusable building blocks
-    ├── parquetpool.py    # downloads Hugging Face parquet shards into RAM, thread-safe
-    ├── tokenpool.py      # tokenizes shards in background threads into ready batches
-    ├── csvwriter.py      # low-overhead CSV logger (buffers rows, reads GPU once per flush)
-    ├── csvexplorer.py    # DuckDB + Altair charts / live Streamlit dashboard for the logs
-    └── test/             # tests for the modules
+├── traingpt2cs.py            # the run: settings, feeds shards, runs the C# trainer, logs
+├── colab_setup.sh            # installs .NET 8 + Python packages (Colab / Linux)
+├── csharp/Gpt2Trainer/       # the C# trainer (TorchSharp)
+│   ├── Model.cs              # GPT-2: attention, MLP, blocks, tied head, generation
+│   ├── Amp.cs                # mixed precision by hand + fp16 loss scaler
+│   ├── AdamW.cs              # AdamW from scratch, LR schedule, on-GPU grad clipping
+│   ├── Trainer.cs            # training loop, eval, console protocol
+│   ├── Shards.cs             # reads the token shards Python writes
+│   ├── Checkpoint.cs         # atomic save/load of weights + optimizer + state
+│   ├── Config.cs             # every setting, overridable as --kebab-case flags
+│   └── Program.cs            # `train` and `generate` modes
+├── common/                   # reused Python modules (unchanged from main)
+│   ├── parquetpool.py        # parquet files from the HF Hub into RAM, thread-safe
+│   ├── tokenpool.py          # background tokenization into ready batches
+│   ├── csvwriter.py          # low-overhead CSV logger
+│   └── csvexplorer.py        # DuckDB + Altair charts / live dashboard
+├── traingpt2.py              # the transformers-based trainer from main, for comparison
+└── docs/                     # diagrams
 ```
-
-### Data pipeline
-
-![Training pipeline](docs/pipeline.svg)
 
 ## Quick start
 
-```bash
-git clone https://github.com/ducbachsong/gpt2-small.git
-cd gpt2-small
-pip install -r requirements.txt
-python traingpt2.py
-```
-
-On Google Colab:
+### Google Colab (GPU)
 
 ```python
-!git clone https://github.com/ducbachsong/gpt2-small.git
+!git clone -b csharp-trainer https://github.com/ducbachsong/gpt2-small.git
 %cd gpt2-small
-!pip install -r requirements.txt
-!python traingpt2.py
+!bash colab_setup.sh          # .NET 8 into ~/.dotnet + pip install -r requirements.txt
+!python traingpt2cs.py
 ```
 
-A GPU and a network connection are required.
+The first run builds the C# project, and NuGet downloads LibTorch 2.10 with CUDA 12.8 (~2 GB).
+
+### Locally
+
+Requirements: Python 3.10+, the [.NET 8 SDK](https://dotnet.microsoft.com/download), and an
+NVIDIA GPU (the CPU works for testing only).
+
+```bash
+git clone -b csharp-trainer https://github.com/ducbachsong/gpt2-small.git
+cd gpt2-small
+pip install -r requirements.txt
+python traingpt2cs.py
+```
+
+`traingpt2cs.py` detects the GPU with `nvidia-smi` and then picks:
+- the LibTorch build: `cpu`, `cuda-linux` or `cuda-windows`
+- the precision: bf16, fp16 or fp32
+- the micro-batch size, based on GPU memory
+
+### Running the C# trainer by itself
+
+```bash
+cd csharp/Gpt2Trainer
+dotnet build -c Release -p:TorchBackend=cuda-linux      # or cpu / cuda-windows
+dotnet bin/Release/net8.0/Gpt2Trainer.dll train --data <pool dir> --out <run dir> \
+    --precision bf16 --micro-batch 8 --grad-accum-steps 4 --max-steps 3000
+dotnet bin/Release/net8.0/Gpt2Trainer.dll generate --checkpoint <run>/checkpoints/final \
+    --prompt 464,3290,286 --max-new-tokens 60
+```
+
+Every property in `Config.cs` is a `--kebab-case` flag.
 
 ## Configuration
 
-All settings are constants at the top of `traingpt2.py`:
+All settings are at the top of `traingpt2cs.py`, which passes them to the C# trainer:
 
 | Setting | Default | Notes |
 |---|---|---|
-| `DATASET` / `ALLOW_PATTERNS` | `HuggingFaceFW/fineweb-edu` / `sample/10BT/*.parquet` | 14 shards, ~2 GB each |
+| `DATASET` / `ALLOW_PATTERNS` | `HuggingFaceFW/fineweb-edu` / `sample/10BT/*.parquet` | 14 files, ~2 GB each |
 | `SEQUENCE_LENGTH` | 1024 | context length |
-| `BATCH_SIZE` | 4 | fits a 15 GB T4; use 8+ on an A100 |
-| `GRAD_ACCUM_STEPS` | 8 | 4 × 1024 × 8 = 32,768 tokens per step |
+| `SHARD_ROWS` / `SHARDS_AHEAD` | 256 / 16 | rows per shard file, files kept ready |
 | `N_LAYER` / `N_HEAD` / `N_EMBD` | 12 / 12 / 768 | GPT-2 small |
-| `LEARNING_RATE` → `MIN_LEARNING_RATE` | 6e-4 → 6e-5 | cosine decay after `WARMUP_STEPS = 300` |
+| `TOKENS_PER_STEP` | 32,768 | micro-batch × 1024 × gradient accumulation |
+| `MICRO_BATCH` | `None` = auto | 4 on 16 GB (T4), 8 on 40 GB (A100), 16 on 80 GB |
+| `LEARNING_RATE` → `MIN_LEARNING_RATE` | 6e-4 → 6e-5 | cosine after `WARMUP_STEPS = 300` |
 | `WEIGHT_DECAY` / `GRAD_CLIP` | 0.1 / 1.0 | |
-| `MAX_STEPS` | 3000 | ~98M tokens; raise it to train on the full 10B |
-| `COMPILE` | `False` | set `True` on A100-class GPUs |
-| `MODEL_NAME` | `""` | `"gpt2"` fine-tunes OpenAI's weights instead of training from scratch |
-| `PARQUET_RAM_LIMIT` / `TOKEN_RAM_LIMIT` | 3 GB / 1 GB | sized for Colab's 12.7 GB RAM |
+| `MAX_STEPS` | 3000 | ~98M tokens; ~305,000 steps for the full 10B |
+| `PRECISION` | `auto` | bf16 on compute capability ≥ 8, fp16 below, fp32 without a GPU |
+| `PRINT_EVERY` | 25 | also how often the trainer waits for the GPU |
+| `RESUME` | `""` | a checkpoint folder to continue from |
 | `MONITOR` | `False` | `True` opens a live loss dashboard (not on Colab) |
-
-To use the full ~10B tokens: `MAX_STEPS ≈ 10e9 / TOKENS_PER_STEP` (≈ 305,000 steps at
-32,768 tokens/step, or ≈ 19,000 steps at the GPT-2 paper's ~524k tokens/step).
 
 ## Outputs
 
-Everything goes to `runs/fineweb-edu-gpt2-<time>/`:
+Everything goes to `runs/fineweb-edu-gpt2cs-<time>/`:
 
-- `log.csv` – step, tokens, loss, val_loss, lr, grad_norm, tokens/second
-- `checkpoints/step-N/` and `checkpoints/final/` – Hugging Face `save_pretrained`
-  format (load with `GPT2LMHeadModel.from_pretrained`), plus `training.json`
-- `loss.png` – training and validation loss curve
-- `samples.txt` – text generated by the final model from a few prompts
+- `log.csv`: step, tokens, loss, val_loss, lr, grad_norm, tokens/second
+- `checkpoints/step-N/` and `checkpoints/final/`, each holding:
+  - `model.bin`: the weights (TorchSharp format)
+  - `optimizer.bin`: AdamW's moments
+  - `config.json` and `state.json`
+- `loss.png`: the training and validation loss curves
+- `samples.txt`: text generated by the final model from a few prompts
 
-Training can be stopped at any time with **Ctrl+C**; the current model is evaluated
-and saved.
-
-## Using the trained model
-
-```python
-from transformers import AutoTokenizer, GPT2LMHeadModel
-
-path = "runs/<run>/checkpoints/final"
-tokenizer = AutoTokenizer.from_pretrained(path)
-model = GPT2LMHeadModel.from_pretrained(path)
-ids = tokenizer("Photosynthesis is the process", return_tensors="pt")
-print(tokenizer.decode(model.generate(**ids, max_new_tokens=60, do_sample=True)[0]))
-```
+Press **Ctrl+C** to stop at any time. The trainer finishes its step, evaluates and saves.
+Set `RESUME` to a checkpoint folder to continue with the exact optimizer state.
+The data stream starts again from the beginning of the dataset.
 
 ## Acknowledgements
 
 - [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) by Hugging Face
-- GPT-2 by OpenAI; model implementation from 🤗 Transformers
+- GPT-2 by OpenAI
+- [TorchSharp](https://github.com/dotnet/TorchSharp) by the .NET Foundation
 
 ## License
 

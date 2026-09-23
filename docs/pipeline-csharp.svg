@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="790" viewBox="0 0 1080 790" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .t{font-size:17px;font-weight:700;fill:#0f172a}
+      .f{font-size:11.5px;font-family:Consolas,Menlo,monospace;fill:#64748b}
+      .s{font-size:12.5px;fill:#334155}
+      .k{font-size:11px;font-weight:700;letter-spacing:1.2px;fill:#64748b}
+      .e{font-size:11px;fill:#64748b}
+      .l{stroke:#475569;stroke-width:2;fill:none}
+    </style>
+  </defs>
+  <rect width="1080" height="790" rx="16" fill="#ffffff"/>
+  <text x="40" y="44" font-size="22" font-weight="800" fill="#0f172a">GPT-2 small on FineWeb-Edu 10B — Python data, C# model and training</text>
+  <text x="40" y="68" class="s">Python feeds token shards and reads the trainer's console; the model, AdamW and the loop are hand-written C# on TorchSharp (LibTorch).</text>
+
+  <!-- lanes -->
+  <rect x="24" y="92" width="1032" height="200" rx="12" fill="#eff6ff" stroke="#bfdbfe" stroke-dasharray="6 5"/>
+  <text x="40" y="114" class="k">PYTHON · DATA IN BACKGROUND THREADS · traingpt2cs.py + common/</text>
+  <rect x="24" y="322" width="1032" height="200" rx="12" fill="#fff7ed" stroke="#fed7aa" stroke-dasharray="6 5"/>
+  <text x="40" y="344" class="k">C# · GPU · csharp/Gpt2Trainer (TorchSharp, no Python model library)</text>
+  <rect x="24" y="552" width="1032" height="214" rx="12" fill="#f5f3ff" stroke="#ddd6fe" stroke-dasharray="6 5"/>
+  <text x="40" y="574" class="k">PYTHON · LOGGING AND RESULTS · runs/fineweb-edu-gpt2cs-&lt;time&gt;/</text>
+
+  <!-- row 1: python data -->
+  <rect x="40" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="56" y="156" class="t">🤗 Hugging Face Hub</text>
+  <text x="56" y="182" class="s">HuggingFaceFW/fineweb-edu</text>
+  <text x="56" y="202" class="s">sample/10BT/*.parquet</text>
+  <text x="56" y="222" class="s">14 shards × ~2 GB</text>
+  <text x="56" y="242" class="s">≈ 10B tokens</text>
+
+  <rect x="300" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="316" y="156" class="t">ParquetPool</text>
+  <text x="316" y="174" class="f">parquetpool.py</text>
+  <text x="316" y="200" class="s">downloads the next file while</text>
+  <text x="316" y="220" class="s">the current one is used</text>
+  <text x="316" y="240" class="s">straight into RAM, 3 GB cap</text>
+
+  <rect x="560" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="576" y="156" class="t">TokenPool</text>
+  <text x="576" y="174" class="f">tokenpool.py</text>
+  <text x="576" y="200" class="s">2 GPT-2 BPE tokenizer threads</text>
+  <text x="576" y="220" class="s">rows of 1024 tokens</text>
+  <text x="576" y="240" class="s">batches of 256 rows</text>
+
+  <rect x="820" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="836" y="156" class="t">Shard files</text>
+  <text x="836" y="174" class="f">&lt;run&gt;/pool/shard_N.bin</text>
+  <text x="836" y="200" class="s">one batch per file, u16 ids</text>
+  <text x="836" y="220" class="s">16 kept ready, then deleted</text>
+  <text x="836" y="240" class="s">heldout.bin written first</text>
+  <text x="836" y="260" class="s">consumed.txt · STOP</text>
+
+  <path class="l" d="M260,202 L298,202" marker-end="url(#a)"/>
+  <path class="l" d="M520,202 L558,202" marker-end="url(#a)"/>
+  <path class="l" d="M780,202 L818,202" marker-end="url(#a)"/>
+  <text x="264" y="194" class="e">bytes</text>
+  <text x="524" y="194" class="e">file</text>
+  <text x="782" y="194" class="e">batch</text>
+
+  <!-- row 2: c# -->
+  <rect x="820" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
+  <text x="836" y="386" class="t">ShardReader</text>
+  <text x="836" y="404" class="f">Shards.cs</text>
+  <text x="836" y="430" class="s">whole shard copied to the GPU</text>
+  <text x="836" y="450" class="s">micro-batches are views of it</text>
+  <text x="836" y="470" class="s">writes consumed.txt</text>
+
+  <rect x="560" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
+  <text x="576" y="386" class="t">GPT-2 small · 124M</text>
+  <text x="576" y="404" class="f">Model.cs · Amp.cs</text>
+  <text x="576" y="430" class="s">12 pre-LN blocks, tied head</text>
+  <text x="576" y="450" class="s">fused causal attention (flash)</text>
+  <text x="576" y="470" class="s">bf16 / fp16 matmuls by hand</text>
+  <text x="576" y="490" class="s">vocab padded to 50,304</text>
+
+  <rect x="300" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
+  <text x="316" y="386" class="t">AdamW + loop</text>
+  <text x="316" y="404" class="f">AdamW.cs · Trainer.cs</text>
+  <text x="316" y="430" class="s">AdamW written from scratch</text>
+  <text x="316" y="450" class="s">clip + loss scale on the GPU</text>
+  <text x="316" y="470" class="s">warmup + cosine LR</text>
+  <text x="316" y="490" class="s">1 GPU sync per 25 steps</text>
+
+  <rect x="40" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="56" y="386" class="t">Checkpoints</text>
+  <text x="56" y="404" class="f">Checkpoint.cs</text>
+  <text x="56" y="430" class="s">weights + AdamW m, v + step</text>
+  <text x="56" y="450" class="s">every 500 steps, end, Ctrl+C</text>
+  <text x="56" y="470" class="s">atomic: tmp folder, rename</text>
+  <text x="56" y="490" class="s">RESUME continues exactly</text>
+
+  <path class="l" d="M930,276 L930,356" marker-end="url(#a)"/>
+  <path class="l" d="M820,432 L782,432" marker-end="url(#a)"/>
+  <path class="l" d="M560,432 L522,432" marker-end="url(#a)"/>
+  <path class="l" d="M300,432 L262,432" marker-end="url(#a)"/>
+  <text x="938" y="322" class="e">files</text>
+  <text x="784" y="424" class="e">ids</text>
+  <text x="524" y="424" class="e">grads</text>
+  <text x="264" y="424" class="e">save</text>
+
+  <!-- row 3: python logging -->
+  <rect x="560" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="576" y="618" class="t">Console → CsvWriter</text>
+  <text x="576" y="636" class="f">csvwriter.py</text>
+  <text x="576" y="662" class="s">[Step] [Eval] [Checkpoint]</text>
+  <text x="576" y="682" class="s">lines parsed into rows</text>
+  <text x="576" y="702" class="s">→ log.csv</text>
+
+  <rect x="300" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="316" y="618" class="t">csvexplorer</text>
+  <text x="316" y="636" class="f">csvexplorer.py</text>
+  <text x="316" y="662" class="s">loss / val_loss → loss.png</text>
+  <text x="316" y="682" class="s">live dashboard (MONITOR)</text>
+
+  <rect x="40" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="56" y="618" class="t">Samples</text>
+  <text x="56" y="636" class="f">Gpt2Trainer generate</text>
+  <text x="56" y="662" class="s">Python tokenizes the prompt</text>
+  <text x="56" y="682" class="s">C# samples token ids</text>
+  <text x="56" y="702" class="s">Python decodes → samples.txt</text>
+
+  <path class="l" d="M430,506 C430,550 660,546 668,588" marker-end="url(#a)"/>
+  <path class="l" d="M560,665 L522,665" marker-end="url(#a)"/>
+  <path class="l" d="M150,506 L150,588" marker-end="url(#a)"/>
+  <text x="560" y="548" class="e">stdout</text>
+  <text x="158" y="552" class="e">final checkpoint</text>
+</svg>

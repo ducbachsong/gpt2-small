@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The LibTorch build comes from TorchBackend:
+         dotnet build -c Release                            CPU (any OS, for testing)
+         dotnet build -c Release -p:TorchBackend=cuda-linux     Colab / Linux GPU
+         dotnet build -c Release -p:TorchBackend=cuda-windows   Windows GPU
+       traingpt2cs.py picks it for you. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TorchBackend Condition="'$(TorchBackend)' == ''">cpu</TorchBackend>
+    <TorchSharpVersion>0.107.0</TorchSharpVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="TorchSharp-cpu" Version="$(TorchSharpVersion)" Condition="'$(TorchBackend)' == 'cpu'" />
+    <PackageReference Include="TorchSharp-cuda-linux" Version="$(TorchSharpVersion)" Condition="'$(TorchBackend)' == 'cuda-linux'" />
+    <PackageReference Include="TorchSharp-cuda-windows" Version="$(TorchSharpVersion)" Condition="'$(TorchBackend)' == 'cuda-windows'" />
+  </ItemGroup>
+
+</Project>
