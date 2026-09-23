@@ -22,12 +22,9 @@ public static class Program
             var config = Config.FromArgs(args);
             manual_seed(config.Seed);
             bool cuda = config.Device == "cuda" || (config.Device == "auto" && torch.cuda.is_available());
-            if (cuda)
-            {
-                // fp32 matmuls on TF32 tensor cores (Ampere and newer); no effect on a T4.
-                torch.backends.cuda.matmul.allow_tf32 = true;
-                torch.backends.cudnn.allow_tf32 = true;
-            }
+            // Pure fp32: no TF32 anywhere. LibTorch allows it in cuDNN by default, so both are set.
+            torch.backends.cuda.matmul.allow_tf32 = false;
+            torch.backends.cudnn.allow_tf32 = false;
             new Trainer(config, cuda ? CUDA : CPU).Train();
             return 0;
         }

@@ -1,9 +1,4 @@
 // AdamW.cs — the optimiser, the learning-rate schedule and gradient clipping, by hand.
-//
-// Nothing here makes the CPU wait for the GPU: the learning rate and the bias
-// corrections are plain doubles, and clipping keeps the norm on the GPU
-// (torch.nn.utils.clip_grad_norm_ in TorchSharp returns a double, which would
-// stop the CPU once per step).
 using TorchSharp;
 using static TorchSharp.torch;
 

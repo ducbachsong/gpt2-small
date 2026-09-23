@@ -74,7 +74,7 @@
   <text x="576" y="404" class="f">Model.cs</text>
   <text x="576" y="430" class="s">12 pre-LN blocks, tied head</text>
   <text x="576" y="450" class="s">fused causal attention (SDPA)</text>
-  <text x="576" y="470" class="s">fp32 (TF32 on A100 / L4)</text>
+  <text x="576" y="470" class="s">pure fp32, no TF32</text>
   <text x="576" y="490" class="s">vocab padded to 50,304</text>
 
   <rect x="300" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>

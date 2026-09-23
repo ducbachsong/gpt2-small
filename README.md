@@ -38,8 +38,7 @@ Python and C# run as two processes and share only **files** and the trainer's
 
 **Model and training (C#)**
 - **Fused causal attention** (`scaled_dot_product_attention`), which never builds the T×T matrix.
-- **Plain fp32** everywhere, like lab06. On Ampere and newer GPUs (A100, L4) the matmuls use TF32
-  tensor cores. That's one switch, not mixed precision; on a T4 it has no effect.
+- **Pure fp32** everywhere, like lab06: no mixed precision and no TF32.
 - **Few CPU↔GPU syncs**: the loss and grad norm of each step go into GPU buffers that are read
   once every `PRINT_EVERY` steps. Gradient clipping is written to stay on the GPU
   (TorchSharp's `clip_grad_norm_` returns a `double`, which would sync every step).
@@ -60,7 +59,7 @@ gpt2-small/
 │   ├── Trainer.cs            # training loop, eval, samples, console protocol
 │   ├── Shards.cs             # reads the token shards Python writes
 │   ├── Config.cs             # every setting, overridable as --kebab-case flags
-│   └── Program.cs            # entry point: device, seed, TF32
+│   └── Program.cs            # entry point: device, seed, pure fp32
 ├── common/                   # reused Python modules (unchanged from main)
 │   ├── parquetpool.py        # parquet files from the HF Hub into RAM, thread-safe
 │   ├── tokenpool.py          # background tokenization into ready batches
