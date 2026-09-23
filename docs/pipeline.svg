@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="560" viewBox="0 0 1080 560" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .t{font-size:17px;font-weight:700;fill:#0f172a}
+      .s{font-size:12.5px;fill:#334155}
+      .k{font-size:11px;font-weight:700;letter-spacing:1.2px;fill:#64748b}
+      .l{stroke:#475569;stroke-width:2;fill:none}
+    </style>
+  </defs>
+  <rect width="1080" height="560" rx="16" fill="#ffffff"/>
+  <text x="40" y="44" font-size="22" font-weight="800" fill="#0f172a">GPT-2 small on FineWeb-Edu 10B — training pipeline</text>
+  <text x="40" y="68" class="s">Data is downloaded and tokenized in background threads while the GPU trains, so the GPU never waits on data.</text>
+
+  <!-- lanes -->
+  <rect x="24" y="92" width="770" height="200" rx="12" fill="#eff6ff" stroke="#bfdbfe" stroke-dasharray="6 5"/>
+  <text x="40" y="114" class="k">CPU · BACKGROUND THREADS · RAM ONLY, NO DISK</text>
+  <rect x="808" y="92" width="248" height="200" rx="12" fill="#fff7ed" stroke="#fed7aa" stroke-dasharray="6 5"/>
+  <text x="824" y="114" class="k">GPU</text>
+  <rect x="24" y="330" width="1032" height="200" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-dasharray="6 5"/>
+  <text x="40" y="352" class="k">OUTPUTS · runs/fineweb-edu-gpt2-&lt;time&gt;/</text>
+
+  <!-- row 1 -->
+  <rect x="40" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="56" y="156" class="t">🤗 Hugging Face Hub</text>
+  <text x="56" y="182" class="s">HuggingFaceFW/fineweb-edu</text>
+  <text x="56" y="202" class="s">sample/10BT/*.parquet</text>
+  <text x="56" y="222" class="s">14 shards × ~2 GB</text>
+  <text x="56" y="242" class="s">≈ 10B tokens</text>
+
+  <rect x="300" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="316" y="156" class="t">ParquetPool</text>
+  <text x="316" y="182" class="s">downloads next shard while</text>
+  <text x="316" y="202" class="s">the current one is used</text>
+  <text x="316" y="222" class="s">straight into RAM, 3 GB cap</text>
+  <text x="316" y="242" class="s">retries failed downloads</text>
+
+  <rect x="560" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="576" y="156" class="t">TokenPool</text>
+  <text x="576" y="182" class="s">2 tokenizer threads (GPT-2 BPE)</text>
+  <text x="576" y="202" class="s">packs rows of 1024 tokens</text>
+  <text x="576" y="222" class="s">int32 batches (4 × 1024)</text>
+  <text x="576" y="242" class="s">1 GB of ready batches</text>
+
+  <rect x="824" y="128" width="216" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
+  <text x="840" y="156" class="t">GPT-2 small · 124M</text>
+  <text x="840" y="182" class="s">pinned, non-blocking copy</text>
+  <text x="840" y="202" class="s">bf16 / fp16 autocast</text>
+  <text x="840" y="222" class="s">fused AdamW · grad accum ×8</text>
+  <text x="840" y="242" class="s">cosine LR · clip 1.0</text>
+  <text x="840" y="262" class="s">32,768 tokens / step</text>
+
+  <path class="l" d="M260,202 L298,202" marker-end="url(#a)"/>
+  <path class="l" d="M520,202 L558,202" marker-end="url(#a)"/>
+  <path class="l" d="M780,202 L822,202" marker-end="url(#a)"/>
+  <text x="264" y="194" font-size="11" fill="#64748b">bytes</text>
+  <text x="524" y="194" font-size="11" fill="#64748b">shard</text>
+  <text x="782" y="194" font-size="11" fill="#64748b">batch</text>
+
+  <!-- row 2 -->
+  <rect x="824" y="366" width="216" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="840" y="394" class="t">Checkpoints</text>
+  <text x="840" y="420" class="s">checkpoints/step-N/</text>
+  <text x="840" y="440" class="s">checkpoints/final/</text>
+  <text x="840" y="460" class="s">every 500 steps, end, Ctrl+C</text>
+  <text x="840" y="480" class="s">samples.txt (generated text)</text>
+
+  <rect x="560" y="366" width="220" height="148" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="576" y="394" class="t">CsvWriter</text>
+  <text x="576" y="420" class="s">loss stays on the GPU</text>
+  <text x="576" y="440" class="s">rows buffered in RAM</text>
+  <text x="576" y="460" class="s">GPU synced once per flush</text>
+  <text x="576" y="480" class="s">→ log.csv</text>
+
+  <rect x="300" y="366" width="220" height="148" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="316" y="394" class="t">csvexplorer</text>
+  <text x="316" y="420" class="s">DuckDB + Altair</text>
+  <text x="316" y="440" class="s">loss / val_loss chart → loss.png</text>
+  <text x="316" y="460" class="s">live Streamlit dashboard</text>
+  <text x="316" y="480" class="s">(MONITOR = True)</text>
+
+  <rect x="40" y="366" width="220" height="148" rx="10" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="56" y="394" class="t">Validation</text>
+  <text x="56" y="420" class="s">first 20 batches held out</text>
+  <text x="56" y="440" class="s">never trained on</text>
+  <text x="56" y="460" class="s">val_loss every 250 steps</text>
+
+  <path class="l" d="M932,276 L932,364" marker-end="url(#a)"/>
+  <path class="l" d="M880,276 C880,330 700,320 690,364" marker-end="url(#a)"/>
+  <path class="l" d="M560,440 L522,440" marker-end="url(#a)"/>
+  <path class="l" d="M670,278 C660,286 640,310 600,310 L170,310 C160,310 150,316 150,326 L150,364" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="940" y="324" font-size="11" fill="#64748b">weights</text>
+  <text x="742" y="330" font-size="11" fill="#64748b">metrics</text>
+  <text x="176" y="303" font-size="11" fill="#64748b">held-out batches from TokenPool</text>
+</svg>

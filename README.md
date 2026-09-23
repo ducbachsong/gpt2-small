@@ -44,11 +44,7 @@ gpt2-small/
 
 ### Data pipeline
 
-```
-Hugging Face Hub ──► ParquetPool ──► TokenPool ──► GPT-2 ──► CsvWriter ──► csvexplorer
- (fineweb-edu)       (RAM, bg DL)   (bg threads,   (train)   (log.csv)     (loss chart /
-                                     int32 batches)                         dashboard)
-```
+![Training pipeline](docs/pipeline.svg)
 
 ## Quick start
 
