@@ -14,13 +14,13 @@
   </defs>
   <rect width="1080" height="790" rx="16" fill="#ffffff"/>
   <text x="40" y="44" font-size="22" font-weight="800" fill="#0f172a">GPT-2 small on FineWeb-Edu 10B — Python data, C# model and training</text>
-  <text x="40" y="68" class="s">Python feeds token shards and reads the trainer's console; the model, AdamW and the loop are hand-written C# on TorchSharp (LibTorch).</text>
+  <text x="40" y="68" class="s">One process: C# takes each batch straight from TokenPool (pythonnet); the model, AdamW and the loop are hand-written C# on TorchSharp.</text>
 
   <!-- lanes -->
   <rect x="24" y="92" width="1032" height="200" rx="12" fill="#eff6ff" stroke="#bfdbfe" stroke-dasharray="6 5"/>
   <text x="40" y="114" class="k">PYTHON · DATA IN BACKGROUND THREADS · traingpt2cs.py + common/</text>
   <rect x="24" y="322" width="1032" height="200" rx="12" fill="#fff7ed" stroke="#fed7aa" stroke-dasharray="6 5"/>
-  <text x="40" y="344" class="k">C# · GPU · csharp/Gpt2Trainer (TorchSharp, no Python model library)</text>
+  <text x="40" y="344" class="k">C# · GPU · src/ (TorchSharp, no Python model library)</text>
   <rect x="24" y="552" width="1032" height="214" rx="12" fill="#f5f3ff" stroke="#ddd6fe" stroke-dasharray="6 5"/>
   <text x="40" y="574" class="k">PYTHON · LOGGING AND RESULTS · runs/fineweb-edu-gpt2cs-&lt;time&gt;/</text>
 
@@ -29,7 +29,7 @@
   <text x="56" y="156" class="t">🤗 Hugging Face Hub</text>
   <text x="56" y="182" class="s">HuggingFaceFW/fineweb-edu</text>
   <text x="56" y="202" class="s">sample/10BT/*.parquet</text>
-  <text x="56" y="222" class="s">14 shards × ~2 GB</text>
+  <text x="56" y="222" class="s">14 files × ~2 GB</text>
   <text x="56" y="242" class="s">≈ 10B tokens</text>
 
   <rect x="300" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
@@ -47,27 +47,27 @@
   <text x="576" y="240" class="s">batches of 256 rows</text>
 
   <rect x="820" y="128" width="220" height="148" rx="10" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
-  <text x="836" y="156" class="t">Shard files</text>
-  <text x="836" y="174" class="f">&lt;run&gt;/pool/shard_N.bin</text>
-  <text x="836" y="200" class="s">one batch per file, u16 ids</text>
-  <text x="836" y="220" class="s">16 kept ready, then deleted</text>
-  <text x="836" y="240" class="s">heldout.bin written first</text>
-  <text x="836" y="260" class="s">consumed.txt · STOP</text>
+  <text x="836" y="156" class="t">next_batch()</text>
+  <text x="836" y="174" class="f">traingpt2cs.py</text>
+  <text x="836" y="200" class="s">called by C# via pythonnet</text>
+  <text x="836" y="220" class="s">get_token_batch() → int32</text>
+  <text x="836" y="240" class="s">array address, no copy</text>
+  <text x="836" y="260" class="s">0 when the data runs out</text>
 
   <path class="l" d="M260,202 L298,202" marker-end="url(#a)"/>
   <path class="l" d="M520,202 L558,202" marker-end="url(#a)"/>
   <path class="l" d="M780,202 L818,202" marker-end="url(#a)"/>
   <text x="264" y="194" class="e">bytes</text>
-  <text x="524" y="194" class="e">file</text>
+  <text x="524" y="194" class="e">batch</text>
   <text x="782" y="194" class="e">batch</text>
 
   <!-- row 2: c# -->
   <rect x="820" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
-  <text x="836" y="386" class="t">ShardReader</text>
-  <text x="836" y="404" class="f">Shards.cs</text>
-  <text x="836" y="430" class="s">whole shard copied to the GPU</text>
+  <text x="836" y="386" class="t">TokenFeed</text>
+  <text x="836" y="404" class="f">TokenFeed.cs</text>
+  <text x="836" y="430" class="s">whole batch copied to the GPU</text>
   <text x="836" y="450" class="s">micro-batches are views of it</text>
-  <text x="836" y="470" class="s">writes consumed.txt</text>
+  <text x="836" y="470" class="s">first batch held out</text>
 
   <rect x="560" y="358" width="220" height="148" rx="10" fill="#fff" stroke="#f97316" stroke-width="2"/>
   <text x="576" y="386" class="t">GPT-2 small · 124M</text>
@@ -97,14 +97,14 @@
   <path class="l" d="M820,432 L782,432" marker-end="url(#a)"/>
   <path class="l" d="M560,432 L522,432" marker-end="url(#a)"/>
   <path class="l" d="M300,432 L262,432" marker-end="url(#a)"/>
-  <text x="938" y="322" class="e">files</text>
+  <text x="938" y="322" class="e">in RAM</text>
   <text x="784" y="424" class="e">ids</text>
   <text x="524" y="424" class="e">grads</text>
   <text x="264" y="424" class="e">model</text>
 
   <!-- row 3: python logging -->
   <rect x="560" y="590" width="220" height="150" rx="10" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
-  <text x="576" y="618" class="t">Console → CsvWriter</text>
+  <text x="576" y="618" class="t">report → CsvWriter</text>
   <text x="576" y="636" class="f">csvwriter.py</text>
   <text x="576" y="662" class="s">[Step] [Eval] [Sample] [Done]</text>
   <text x="576" y="682" class="s">lines parsed into rows</text>

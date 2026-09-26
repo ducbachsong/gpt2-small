@@ -84,8 +84,14 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
     readonly ModuleList<Block> h;
     readonly TorchSharp.Modules.LayerNorm ln_f;
     public Config Config { get; }
+    /// Every parameter and gradient of the model in two flat buffers; what AdamW works on.
+    public FlatParameters Flat { get; }
 
-    public Gpt2(Config config) : base(nameof(Gpt2))
+    /// Builds the layers, initialises them (on the CPU, so the values are the
+    /// same whatever the device), moves them to `device` (the CPU if null), and
+    /// only then moves every parameter into the flat buffers. The model is on its
+    /// final device from here on: do not call .to() on it afterwards.
+    public Gpt2(Config config, Device? device = null) : base(nameof(Gpt2))
     {
         Config = config;
         wte = Embedding(config.PaddedVocabSize, config.NEmbd);
@@ -93,13 +99,15 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
         h = new ModuleList<Block>(Enumerable.Range(0, config.NLayer).Select(_ => new Block(config)).ToArray());
         ln_f = LayerNorm(config.NEmbd);
         RegisterComponents();
-        InitWeights();
+        InitParameters();
+        if (device is not null) this.to(device);
+        Flat = new FlatParameters(parameters());
     }
 
     /// GPT-2's init: weights ~ N(0, 0.02), biases 0, LayerNorm 1 and 0. The
     /// projections back into the residual stream get 0.02 / sqrt(2 x layers),
     /// so the stream's variance doesn't grow with depth.
-    void InitWeights()
+    void InitParameters()
     {
         using var _ = no_grad();
         double residualStd = 0.02 / Math.Sqrt(2.0 * Config.NLayer);
@@ -111,13 +119,13 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
         }
     }
 
-    /// ids (B,T) -> final hidden states (B,T,C).
-    public override Tensor forward(Tensor ids)
+    /// tokenIds (B,T) -> final hidden states (B,T,C).
+    public override Tensor forward(Tensor tokenIds)
     {
-        long T = ids.shape[1];
+        long T = tokenIds.shape[1];
         if (T > Config.SequenceLength)
             throw new ArgumentException($"a sequence of {T} is longer than the {Config.SequenceLength} positions");
-        var x = wte.forward(ids) + wpe.forward(arange(T, dtype: ScalarType.Int64, device: ids.device));
+        var x = wte.forward(tokenIds) + wpe.forward(arange(T, dtype: ScalarType.Int64, device: tokenIds.device));
         foreach (var block in h) x = block.forward(x);
         return ln_f.forward(x);
     }
@@ -126,13 +134,13 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
     public Tensor Logits(Tensor hidden) => F.linear(hidden, wte.weight!);
 
     /// Mean next-token loss of a (B,T) batch: position t predicts token t+1.
-    public Tensor Loss(Tensor ids)
+    public Tensor Loss(Tensor tokenIds)
     {
-        long T = ids.shape[1];
-        var hidden = forward(ids);
+        long T = tokenIds.shape[1];
+        var hidden = forward(tokenIds);
         // Only T-1 positions have a next token: drop the last before the big matmul.
         var logits = Logits(hidden.narrow(1, 0, T - 1));
-        var targets = ids.narrow(1, 1, T - 1);
+        var targets = tokenIds.narrow(1, 1, T - 1);
         return F.cross_entropy(logits.reshape(-1, Config.PaddedVocabSize), targets.reshape(-1));
     }
 
@@ -150,8 +158,8 @@ public sealed class Gpt2 : Module<Tensor, Tensor>
             var logits = Logits(hidden.narrow(1, context.Length - 1, 1)).reshape(-1)
                 .narrow(0, 0, Config.VocabSize) / temperature;       // padding ids are never sampled
             var (values, indices) = logits.topk(Math.Min(topK, Config.VocabSize));
-            var pick = values.softmax(0).multinomial(1);
-            tokens.Add(indices[pick].item<long>());
+            var choice = values.softmax(0).multinomial(1);
+            tokens.Add(indices[choice].item<long>());
         }
         train();
         return tokens.ToArray();

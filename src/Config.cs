@@ -1,7 +1,7 @@
-// Config.cs — every setting of the C# trainer, with the defaults of traingpt2.py.
+// Config.cs — every setting of the C# trainer, with the defaults of main's traingpt2.py.
 //
-// traingpt2cs.py keeps the settings you edit and passes them here as
-// "--name value" arguments, so the Python file stays the one place to change a
+// traingpt2cs.py keeps the settings you edit and passes them to Trainer.Start as
+// "--name value" pairs, so the Python file stays the one place to change a
 // run. Anything not passed keeps the default below.
 using System.Globalization;
 
@@ -45,8 +45,8 @@ public sealed class Config
     public string Device { get; set; } = "auto";         // auto | cuda | cpu
     public int Seed { get; set; } = 0;
 
-    // ── where the data is ───────────────────────────────────────────────────
-    public string Data { get; set; } = "pool";           // shard folder the Python side fills
+    // ── the data: TokenPool batches of BatchRows x SequenceLength ids ───────
+    public int BatchRows { get; set; } = 256;            // rows per batch Python hands over
 
     public long TokensPerStep => (long)MicroBatch * SequenceLength * GradAccumSteps;
 

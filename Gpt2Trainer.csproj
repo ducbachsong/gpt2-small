@@ -6,7 +6,9 @@
          dotnet build -c Release -p:TorchBackend=cuda-windows   Windows GPU
        traingpt2cs.py picks it for you. -->
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <!-- A library that traingpt2cs.py loads into Python (pythonnet): this also
+         writes the runtimeconfig.json .NET needs and copies TorchSharp next to it. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -14,6 +16,14 @@
     <TorchBackend Condition="'$(TorchBackend)' == ''">cpu</TorchBackend>
     <TorchSharpVersion>0.107.0</TorchSharpVersion>
   </PropertyGroup>
+
+  <!-- The code is in src/; the tests there (src/test) are a project of their own. -->
+  <PropertyGroup>
+    <EnableDefaultItems>false</EnableDefaultItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="src/*.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="TorchSharp-cpu" Version="$(TorchSharpVersion)" Condition="'$(TorchBackend)' == 'cpu'" />
