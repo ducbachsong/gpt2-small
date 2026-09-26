@@ -4,7 +4,7 @@
 
 Compare with BenchmarkOursAgainstTheBuiltInAdamW (AdamWTests.cs), run on the same GPU:
 
-    dotnet test Gpt2Trainer.sln -p:TorchBackend=cuda-linux --filter Category=Benchmark --logger "console;verbosity=detailed"
+    dotnet test Gpt2Trainer.sln -p:TorchBackend=cuda-linux --filter Category=AdamW-Benchmark --logger "console;verbosity=detailed"
 
 TorchSharp's built-in AdamW (what the C# benchmark compares against) only loops over the
 parameters. Python PyTorch has two faster modes, and this times all three:

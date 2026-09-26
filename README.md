@@ -165,8 +165,8 @@ once, where ours runs about 10 separate operations over whole buffers. TorchShar
 that kernel.
 
 ```bash
-dotnet test Gpt2Trainer.sln --filter Category=Benchmark --logger "console;verbosity=detailed"
-dotnet test Gpt2Trainer.sln --filter Category!=Benchmark   # everything else
+dotnet test Gpt2Trainer.sln --filter Category=AdamW-Benchmark --logger "console;verbosity=detailed"
+dotnet test Gpt2Trainer.sln --filter Category!=AdamW-Benchmark   # everything else
 ```
 
 ## Configuration

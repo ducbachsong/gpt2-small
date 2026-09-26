@@ -653,8 +653,8 @@ public class AdamWTests
     ///
     /// Prints the timings and does not fail on them (timings vary from machine to
     /// machine and run to run). To see the output, or to leave it out:
-    ///     dotnet test Gpt2Trainer.sln --filter Category=Benchmark --logger "console;verbosity=detailed"
-    ///     dotnet test Gpt2Trainer.sln --filter Category!=Benchmark
+    ///     dotnet test Gpt2Trainer.sln --filter Category=AdamW-Benchmark --logger "console;verbosity=detailed"
+    ///     dotnet test Gpt2Trainer.sln --filter Category!=AdamW-Benchmark
     [Fact]
     [Trait("Category", "AdamW-Benchmark")]
     public void BenchmarkOursAgainstTheBuiltInAdamW()
