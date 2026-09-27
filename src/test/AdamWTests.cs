@@ -17,6 +17,7 @@ using static TorchSharp.torch;
 
 namespace Gpt2Trainer.Tests;
 
+[Collection("GPU")]      // never at the same time as FusedAdamWTests: the two benchmarks share the GPU
 public class AdamWTests
 {
     const double Tolerance = 1e-5;
@@ -38,7 +39,8 @@ public class AdamWTests
     /// backward() adds into that view, so g lands in the buffer AdamW reads.
     /// A new tensor assigned to p.grad would not. Like any backward(), it adds:
     /// the gradients must be 0 before (they are at the start, and after each Step).
-    static void SimulateGradients(params (Tensor parameter, float[] gradient)[] pairs)
+    /// FusedAdamWTests uses it too.
+    internal static void SimulateGradients(params (Tensor parameter, float[] gradient)[] pairs)
     {
         var loss = pairs.Select(pair =>
             (pair.parameter * tensor(pair.gradient, pair.parameter.shape, device: pair.parameter.device)).sum())

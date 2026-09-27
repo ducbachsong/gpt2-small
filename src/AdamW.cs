@@ -13,12 +13,24 @@
 // A step is ClipGradientNorm (optional), then Step. ClipGradientNorm only
 // works out the scale; Step applies it, updates, and leaves the gradients at
 // 0, ready for the next backward. So no ZeroGradients is needed between steps.
+//
+// This is the readable one, and runs on any device. FusedAdamW.cs does the
+// same step, with the same results, as one CUDA kernel.
 using TorchSharp;
 using static TorchSharp.torch;
 
 namespace Gpt2Trainer;
 
-public sealed class AdamW
+/// What the training loop needs from an optimiser. AdamW (below, tensor
+/// operations) and FusedAdamW (one CUDA kernel) are the same AdamW, two ways.
+public interface IOptimizer
+{
+    void ZeroGradients();
+    Tensor ClipGradientNorm(double maxNorm);
+    void Step(double learningRate);
+}
+
+public sealed class AdamW : IOptimizer
 {
     readonly FlatParameters flat;
     readonly Tensor firstMoment, secondMoment;
@@ -72,8 +84,9 @@ public sealed class AdamW
     //   g  = 0
     //
     // Each line below is one of these, in this order and with the same
-    // it bit for bit, not only up to rounding (AdamWTests checks this).
-    // sqrt(v̂) is computed as sqrt(v) / sqrt(1-b2ᵗ), and lr m̂ as (lr / (1-b1ᵗ)) m,
+    // operations as torch.optim.AdamW: sqrt(v̂) is computed as
+    // sqrt(v) / sqrt(1-b2ᵗ), and lr m̂ as (lr / (1-b1ᵗ)) m, as it does. So ours
+    // matches it bit for bit, not only up to rounding (AdamWTests checks this).
     public void Step(double learningRate)
     {
         using var _ = no_grad();

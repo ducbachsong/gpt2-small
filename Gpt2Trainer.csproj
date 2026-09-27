@@ -17,12 +17,17 @@
     <TorchSharpVersion>0.107.0</TorchSharpVersion>
   </PropertyGroup>
 
-  <!-- The code is in src/; the tests there (src/test) are a project of their own. -->
+  <!-- The code is in src/, and our CUDA kernels in src/cuda/; the tests there
+       (src/test) are a project of their own. -->
   <PropertyGroup>
     <EnableDefaultItems>false</EnableDefaultItems>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>   <!-- CudaKernel.cs: pointers for cuLaunchKernel -->
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="src/*.cs" />
+    <Compile Include="src/*.cs;src/cuda/*.cs" />
+    <!-- The kernels' CUDA source goes inside the dll, as adamw.cu etc.;
+         CudaKernel compiles it for the GPU it runs on. -->
+    <EmbeddedResource Include="src/cuda/*.cu" LogicalName="%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

@@ -92,11 +92,12 @@ public sealed class Trainer
     void Train()
     {
         var model = new Gpt2(config, device);              // on the device, parameters already flat
-        var optimizer = new AdamW(model.Flat, config);
+        var optimizer = NewOptimizer(model.Flat);
         using var feed = new TokenFeed(nextBatch, config, device, Log);
 
         long parameterCount = model.parameters().Sum(p => p.numel());
         Log($"[Config] params={parameterCount / 1e6:F1}M device={device.type.ToString().ToLowerInvariant()} " +
+            $"optimizer={optimizer.GetType().Name} " +
             $"micro_batch={config.MicroBatch} grad_accum={config.GradAccumSteps} " +
             $"tokens_per_step={config.TokensPerStep} max_steps={config.MaxSteps}");
 
@@ -186,6 +187,25 @@ public sealed class Trainer
             Log($"[Sample] ids={string.Join(",", sample)}");
         }
         Log($"[Done] step={step} val_loss={valLoss:F4}");
+    }
+
+    /// FusedAdamW on a GPU, unless FusedOptimizer is off; AdamW otherwise. Both
+    /// give the same results. If the kernel cannot be compiled here (no NVRTC,
+    /// say), training goes on with AdamW, and the log says why.
+    IOptimizer NewOptimizer(FlatParameters flat)
+    {
+        if (config.FusedOptimizer && device.type == DeviceType.CUDA)
+        {
+            try
+            {
+                return new FusedAdamW(flat, config);
+            }
+            catch (Exception error)
+            {
+                Log($"[Warn] no fused AdamW, using AdamW: {error.Message}");
+            }
+        }
+        return new AdamW(flat, config);
     }
 
     /// Mean loss over the held-out rows.

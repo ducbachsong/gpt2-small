@@ -77,6 +77,7 @@ WARMUP_STEPS = 300
 WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
 MAX_STEPS = 3000                # ~98M tokens; ~305,000 steps is the whole 10B
+FUSED_OPTIMIZER = True          # on a GPU, AdamW's step as one CUDA kernel (src/cuda/adamw.cu)
 
 # ── watching and saving ─────────────────────────────────────────────────────
 EVAL_ROWS = 80                  # held-out rows (x 1024 tokens) for val_loss
@@ -226,6 +227,7 @@ def trainer_arguments(gpu, tokenizer):
         "grad-accum-steps": grad_accum, "learning-rate": LEARNING_RATE,
         "min-learning-rate": MIN_LEARNING_RATE, "warmup-steps": WARMUP_STEPS,
         "weight-decay": WEIGHT_DECAY, "grad-clip": GRAD_CLIP, "max-steps": MAX_STEPS,
+        "fused-optimizer": FUSED_OPTIMIZER,
         "eval-rows": EVAL_ROWS, "eval-every": EVAL_EVERY, "print-every": PRINT_EVERY,
         "prompts": prompts, "max-new-tokens": 60, "temperature": 0.8, "top-k": 50,
         "device": "cpu" if gpu is None else "cuda", "seed": SEED,

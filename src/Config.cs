@@ -29,6 +29,7 @@ public sealed class Config
     public double Eps { get; set; } = 1e-8;
     public double GradClip { get; set; } = 1.0;
     public int MaxSteps { get; set; } = 3000;
+    public bool FusedOptimizer { get; set; } = true;     // on a GPU: AdamW's step as one CUDA kernel
 
     // ── watching and saving ─────────────────────────────────────────────────
     public int EvalRows { get; set; } = 80;              // held-out rows for val_loss

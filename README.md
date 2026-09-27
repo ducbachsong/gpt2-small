@@ -57,6 +57,12 @@ TorchSharp brings its own LibTorch, so **PyTorch must not load into the same pro
   becomes a view into one flat buffer (`FlatParameters.cs`). The layers use their own tensors as
   usual; AdamW works on the two big buffers, so a step is 11 tensor operations over the whole
   model, with no per-parameter loop, and matches `torch.optim.AdamW` bit for bit.
+- **AdamW in one CUDA kernel** (`FusedAdamW.cs`, `src/cuda/adamw.cu`): on a GPU, the whole step
+  (clip factor, weight decay, both moments, bias correction, update, gradients back to 0) is one
+  kernel. It reads each value's parameter, gradient and two moments once and writes them once:
+  8 memory accesses per value instead of the 26 of the 11 operations, and a step is limited by
+  memory traffic. NVRTC compiles it when the trainer starts, for the GPU it runs on, so the build
+  needs no CUDA toolkit. Same results as `AdamW`, bit for bit.
 
 ## Project layout
 
@@ -69,12 +75,18 @@ gpt2-small/
 ├── src/                      # the code: C# model and training, Python data pipeline
 │   ├── Model.cs              # GPT-2: attention, MLP, blocks, tied head, sampling
 │   ├── FlatParameters.cs     # the model's parameters and gradients in two flat buffers
-│   ├── AdamW.cs              # AdamW over those buffers, LR schedule, clipping
+│   ├── AdamW.cs              # AdamW over those buffers as tensor operations, LR schedule, clipping
+│   ├── FusedAdamW.cs         # the same AdamW step as one CUDA kernel (GPU only)
 │   ├── Trainer.cs            # what Python calls: training loop on its own thread, eval, samples
 │   ├── TokenFeed.cs          # batches from Python's next_batch() onto the GPU
 │   ├── Config.cs             # every setting, overridable as --kebab-case flags
+│   ├── cuda/                 # our own CUDA kernels, compiled when the trainer starts
+│   │   ├── adamw.cu          # AdamW's whole step: one thread per 4 values
+│   │   └── CudaKernel.cs     # compiles a .cu for this GPU (NVRTC), launches it (CUDA driver API)
 │   ├── test/                 # xUnit tests for the trainer
 │   │   ├── AdamWTests.cs     # AdamW vs torch.optim.AdamW
+│   │   ├── FusedAdamWTests.cs  # the kernel vs torch.optim.AdamW and AdamW, on the GPU
+│   │   ├── CudaFact.cs       # [CudaFact]: a GPU test, skipped without a GPU
 │   │   ├── TokenFeedTests.cs # the feed reads the exact ids it is handed
 │   │   └── adamw-benchmark-torch.py  # Python PyTorch's AdamW timed, to compare
 │   └── common/               # Python: data, logging, charts (unchanged from main)
@@ -135,9 +147,15 @@ PyTorch's AdamW on the same data pipeline. Its defaults match `traingpt2cs.py` (
 
 ```bash
 dotnet test Gpt2Trainer.sln   # the C# tests, on the CPU build of LibTorch
+dotnet test Gpt2Trainer.sln -p:TorchBackend=cuda-linux   # on a GPU (Colab): the FusedAdamW tests too
 
 python src/common/test/tokenpool-test.py   # each Python module has a test script
 ```
+
+`src/test/FusedAdamWTests.cs` checks the CUDA kernel the same way, on the GPU: against
+`torch.optim.AdamW` bit for bit, and against our `AdamW` on a whole (tiny) GPT-2 with clipping,
+where every parameter and the padding between them must match. On the CPU build, or without
+a GPU, these tests show as skipped (`[CudaFact]`).
 
 `src/test/AdamWTests.cs` checks the hand-written AdamW against TorchSharp's built-in
 `torch.optim.AdamW` (PyTorch's own): a copy of each parameter is trained with it on the same
@@ -162,12 +180,16 @@ The flat buffers remove the per-parameter loop: ours is 4.3x faster than TorchSh
 is the one C# can use, and a little faster than PyTorch's `foreach`. PyTorch's fused kernel is still
 1.9x faster: a step here is limited by memory traffic, and one kernel reads and writes each buffer
 once, where ours runs about 10 separate operations over whole buffers. TorchSharp does not expose
-that kernel.
+that kernel, so `FusedAdamW` writes its own: `BenchmarkFusedAgainstTheFlatAdamW` times it against
+ours, the step alone and clip + step, on the same parameters.
 
 ```bash
 dotnet test Gpt2Trainer.sln --filter Category=AdamW-Benchmark --logger "console;verbosity=detailed"
 dotnet test Gpt2Trainer.sln --filter Category!=AdamW-Benchmark   # everything else
 ```
+
+Add `-p:TorchBackend=cuda-linux` (or `cuda-windows`) to run them on the GPU; the fused benchmark
+runs only there.
 
 ## Configuration
 
@@ -184,6 +206,7 @@ All settings are at the top of `traingpt2cs.py`, which passes them to the C# tra
 | `LEARNING_RATE` → `MIN_LEARNING_RATE` | 6e-4 → 6e-5 | cosine after `WARMUP_STEPS = 300` |
 | `WEIGHT_DECAY` / `GRAD_CLIP` | 0.1 / 1.0 | |
 | `MAX_STEPS` | 3000 | ~98M tokens; ~305,000 steps for the full 10B |
+| `FUSED_OPTIMIZER` | `True` | on a GPU, AdamW's step as one CUDA kernel; `False`: the 11-operation step |
 | `PRINT_EVERY` | 25 | also how often the trainer waits for the GPU |
 | `PROMPTS` | 3 prompts | continued by the model at the end, into `samples.txt` |
 | `MONITOR` | `False` | `True` opens a live loss dashboard (not on Colab) |
