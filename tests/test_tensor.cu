@@ -3,7 +3,7 @@
 // and actual value, and ok; the first FAIL stops the program.
 //
 //     nvcc -O3 -std=c++17 tests/test_tensor.cu -o test_tensor && ./test_tensor     # on a GPU (Colab)
-#include "check.h"                // ASSERT_EQ, ASSERT_NEAR, sample_data
+#include "test_helpers.h"         // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "../llmc/tensor.cuh"
 
 // ── making tensors ────────────────────────────────────────────────────────────
@@ -56,11 +56,11 @@ static void value_i_j_sits_at_i_times_stride_0_plus_j(void) {
     // Expect: in a 2x4 holding 0..7, [i][j] is data[i * 4 + j], so its value is i * 4 + j: [1][2] is 6.
     Tensor t = Tensor::zeros({2, 4});
     t.copy_from_cpu(sample_data(8).data());
-    std::vector<float> values = t.tolist();
+    std::vector<float> values_on_cpu = t.tolist();
     for (size_t i = 0; i < 2; i++) {
-        for (size_t j = 0; j < 4; j++) ASSERT_EQ(values[i * t.stride(0) + j * t.stride(1)], (float)(i * 4 + j));
+        for (size_t j = 0; j < 4; j++) ASSERT_EQ(values_on_cpu[i * t.stride(0) + j * t.stride(1)], (float)(i * 4 + j));
     }
-    ASSERT_EQ(values[1 * t.stride(0) + 2 * t.stride(1)], 6.0f);
+    ASSERT_EQ(values_on_cpu[1 * t.stride(0) + 2 * t.stride(1)], 6.0f);
 }
 
 // ── view: the same values, another shape ──────────────────────────────────────
@@ -70,31 +70,31 @@ static void view_changes_the_shape_not_the_values(void) {
     // the same values 0..7; viewed as {8} it has shape {8}.
     Tensor t = Tensor::zeros({2, 4});
     t.copy_from_cpu(sample_data(8).data());
-    Tensor v = t.view({4, 2});
-    ASSERT_EQ(v.shape(), Shape({4, 2}));
-    ASSERT_EQ(v.stride(), Shape({2, 1}));
-    ASSERT_EQ(v.data(), t.data());                         // not a copy
-    ASSERT_EQ(v.tolist(), sample_data(8));
+    Tensor view = t.view({4, 2});
+    ASSERT_EQ(view.shape(), Shape({4, 2}));
+    ASSERT_EQ(view.stride(), Shape({2, 1}));
+    ASSERT_EQ(view.data(), t.data());                         // not a copy
+    ASSERT_EQ(view.tolist(), sample_data(8));
     ASSERT_EQ(t.view({8}).shape(), Shape({8}));
 }
 
 static void a_view_shares_the_values(void) {
     // Expect: 0..7 written through the view {8} shows up in t: both use one piece of GPU memory.
     Tensor t = Tensor::zeros({2, 4});
-    Tensor v = t.view({8});
-    v.copy_from_cpu(sample_data(8).data());
+    Tensor view = t.view({8});
+    view.copy_from_cpu(sample_data(8).data());
     ASSERT_EQ(t.tolist(), sample_data(8));
 }
 
 static void a_view_keeps_the_memory_alive(void) {
     // Expect: v still reads 0..7 after t is gone: v shares t's memory, so the memory stays.
-    Tensor v;
+    Tensor view;
     {
         Tensor t = Tensor::zeros({2, 4});
         t.copy_from_cpu(sample_data(8).data());
-        v = t.view({8});
+        view = t.view({8});
     }
-    ASSERT_EQ(v.tolist(), sample_data(8));
+    ASSERT_EQ(view.tolist(), sample_data(8));
 }
 
 // ── narrow: some rows ─────────────────────────────────────────────────────────
@@ -113,11 +113,11 @@ static void narrow_takes_rows(void) {
 static void narrow_then_view(void) {
     // Expect: values 8..19 of a flat 20, seen as 3x4, start 8 floats in and hold 8..19.
     // (How TensorBuffer makes its tensors.)
-    Tensor all = Tensor::zeros({20});
-    all.copy_from_cpu(sample_data(20).data());
-    Tensor piece = all.narrow(0, 8, 12).view({3, 4});
+    Tensor whole = Tensor::zeros({20});
+    whole.copy_from_cpu(sample_data(20).data());
+    Tensor piece = whole.narrow(0, 8, 12).view({3, 4});
     ASSERT_EQ(piece.shape(), Shape({3, 4}));
-    ASSERT_EQ(piece.data(), all.data() + 8);
+    ASSERT_EQ(piece.data(), whole.data() + 8);
     ASSERT_EQ(piece.tolist(), std::vector<float>({8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}));
 }
 
@@ -142,9 +142,9 @@ static void from_blob_uses_the_memory_and_does_not_free_it(void) {
         ASSERT_EQ(t.tolist(), sample_data(8));
     }
     // t is gone; the memory must still be ours: copying from it must work.
-    std::vector<float> after(8);
-    cudaCheck(cudaMemcpy(after.data(), gpu, 8 * sizeof(float), cudaMemcpyDeviceToHost));
-    ASSERT_EQ(after, sample_data(8));
+    std::vector<float> values_after(8);
+    cudaCheck(cudaMemcpy(values_after.data(), gpu, 8 * sizeof(float), cudaMemcpyDeviceToHost));
+    ASSERT_EQ(values_after, sample_data(8));
     cudaCheck(cudaFree(gpu));
 }
 
@@ -168,14 +168,14 @@ static void zeros_like_and_empty_like_copy_shape_and_dtype(void) {
     // Expect: zeros_like and empty_like of a 2x5 int tensor are 2x5 int tensors in memory of their
     // own; zeros_like holds ten 0s.
     Tensor t = Tensor::ones({2, 5}, DType::Int32);
-    Tensor z = Tensor::zeros_like(t);
-    Tensor e = Tensor::empty_like(t);
-    ASSERT_EQ(z.shape(), Shape({2, 5}));
-    ASSERT_EQ(z.dtype() == DType::Int32, true);
-    ASSERT_EQ(e.shape(), Shape({2, 5}));
-    ASSERT_EQ(e.dtype() == DType::Int32, true);
-    ASSERT_EQ(z.data_ptr<int>() != t.data_ptr<int>(), true);
-    ASSERT_EQ(z.tolist<int>(), std::vector<int>(10, 0));
+    Tensor zeros_like_t = Tensor::zeros_like(t);
+    Tensor empty_like_t = Tensor::empty_like(t);
+    ASSERT_EQ(zeros_like_t.shape(), Shape({2, 5}));
+    ASSERT_EQ(zeros_like_t.dtype() == DType::Int32, true);
+    ASSERT_EQ(empty_like_t.shape(), Shape({2, 5}));
+    ASSERT_EQ(empty_like_t.dtype() == DType::Int32, true);
+    ASSERT_EQ(zeros_like_t.data_ptr<int>() != t.data_ptr<int>(), true);
+    ASSERT_EQ(zeros_like_t.tolist<int>(), std::vector<int>(10, 0));
 }
 
 // ── int tensors ───────────────────────────────────────────────────────────────
@@ -221,13 +221,13 @@ static void fill_on_a_narrow_fills_only_those_rows(void) {
 static void the_same_seed_gives_the_same_numbers(void) {
     // Expect: randn({1000}) after manual_seed(7) twice gives the same 1000 numbers; after seed 8, others.
     Tensor::manual_seed(7);
-    std::vector<float> first = Tensor::randn({1000}).tolist();
+    std::vector<float> seed_7_numbers = Tensor::randn({1000}).tolist();
     Tensor::manual_seed(7);
-    std::vector<float> again = Tensor::randn({1000}).tolist();
+    std::vector<float> seed_7_again = Tensor::randn({1000}).tolist();
     Tensor::manual_seed(8);
-    std::vector<float> other = Tensor::randn({1000}).tolist();
-    ASSERT_EQ(again, first);
-    ASSERT_EQ(other != first, true);
+    std::vector<float> seed_8_numbers = Tensor::randn({1000}).tolist();
+    ASSERT_EQ(seed_7_again, seed_7_numbers);
+    ASSERT_EQ(seed_8_numbers != seed_7_numbers, true);
 }
 
 static void normal_has_the_mean_and_std_asked_for(void) {
@@ -236,12 +236,12 @@ static void normal_has_the_mean_and_std_asked_for(void) {
     Tensor::manual_seed(1);
     Tensor t = Tensor::zeros({100000});
     t.normal_(0.0f, 0.02f);
-    std::vector<float> values = t.tolist();
+    std::vector<float> values_on_cpu = t.tolist();
     double sum = 0.0, sum_squares = 0.0;
-    for (float value : values) sum += value;
-    double mean = sum / values.size();
-    for (float value : values) sum_squares += (value - mean) * (value - mean);
-    double deviation = sqrt(sum_squares / values.size());
+    for (float value : values_on_cpu) sum += value;
+    double mean = sum / values_on_cpu.size();
+    for (float value : values_on_cpu) sum_squares += (value - mean) * (value - mean);
+    double deviation = sqrt(sum_squares / values_on_cpu.size());
     ASSERT_NEAR(mean, 0.0, 0.0005);
     ASSERT_NEAR(deviation, 0.02, 0.02 * 0.02);                 // 2% of 0.02
 }
@@ -327,6 +327,6 @@ int main(void) {
     item_reads_the_one_value();
     indexing_picks_rows_and_values();
 
-    printf("all tests passed\n");
+    printf("\nall tests passed\n");
     return 0;
 }

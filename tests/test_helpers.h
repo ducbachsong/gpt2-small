@@ -1,10 +1,14 @@
-// check.h — what every test file here uses: ASSERT_EQ and ASSERT_NEAR, which print
-// every check and stop the program on the first FAIL, and sample_data.
+// test_helpers.h — what every test file here uses: ASSERT_EQ, ASSERT_NEAR and ASSERT_FAR,
+// which print every check and stop the program on the first FAIL, and sample_data.
 //
 //     normal_has_the_mean_and_std_asked_for                            ← the test case
 //         input: mean      expected: 0 +/- 0.0005   actual: 6.1e-05   ok  (line 293)
-#ifndef TESTS_CHECK_H
-#define TESTS_CHECK_H
+//
+// Two lists print both, then how far apart they are:
+//
+//         input: weight.tolist()   expected: {0.79, ...}   actual: {0.79, ...}   difference: 2.6e-08 (at most 1e-05)   ok
+#ifndef TESTS_TEST_HELPERS_H
+#define TESTS_TEST_HELPERS_H
 
 #undef NDEBUG                     // asserts on, whatever the build flags
 #include <cassert>
@@ -40,7 +44,7 @@ static void print_value(const std::vector<T>& values) {
     printf("}");
 }
 
-// ── ASSERT_EQ, ASSERT_NEAR: print every check, stop on a FAIL ─────────────────
+// ── ASSERT_EQ, ASSERT_NEAR, ASSERT_FAR: print every check, stop on a FAIL ─────
 
 /// The test case's name, once, before its first check.
 static void print_test_name(const char* test) {
@@ -74,10 +78,49 @@ static void check_near(const char* test, const char* input, double actual, doubl
     assert(near && "the values are printed above");
 }
 
+/// The largest difference between two lists of values, as a fraction of the largest
+/// expected value: 1e-5 means they agree to about 5 digits. NaN if `actual` has a NaN.
+static double relative_difference(const std::vector<float>& actual, const std::vector<float>& expected) {
+    double largest_difference = 0.0, largest_value = 0.0;
+    for (size_t i = 0; i < expected.size(); i++) {
+        double difference = fabs((double)actual[i] - expected[i]);
+        if (std::isnan(difference) || difference > largest_difference) largest_difference = difference;
+        largest_value = fmax(largest_value, fabs((double)expected[i]));
+    }
+    return largest_value > 0 ? largest_difference / largest_value : largest_difference;
+}
+
+/// Two lists, both printed, then their relative_difference. close: it must be at most
+/// `limit` (the same values, up to rounding); not close: more than `limit` (far apart).
+static void check_lists(const char* test, const char* input, const std::vector<float>& actual,
+                        const std::vector<float>& expected, double limit, bool close, int line) {
+    print_test_name(test);
+    bool same_size = actual.size() == expected.size();
+    double difference = same_size ? relative_difference(actual, expected) : NAN;
+    bool passed = same_size && (close ? difference <= limit : difference > limit);   // NaN fails both
+    printf("    input: %-36s expected: ", input);
+    print_value(expected);
+    printf("   actual: ");
+    print_value(actual);
+    printf("   difference: %g (%s %g)   %s  (line %d)\n", difference, close ? "at most" : "more than", limit,
+           passed ? "ok" : "FAIL", line);
+    fflush(stdout);
+    assert(passed && "the values are printed above");
+}
+
+/// Two lists that must be close: expected +/- tolerance, as a fraction of the largest value.
+static void check_near(const char* test, const char* input, const std::vector<float>& actual,
+                       const std::vector<float>& expected, double tolerance, int line) {
+    check_lists(test, input, actual, expected, tolerance, true, line);
+}
+
 // __func__ is the name of the function the check is in: the test case.
 // Lists inside need ( ) around { }: ASSERT_EQ(v.shape(), Shape({4, 2})).
+// ASSERT_NEAR takes two numbers or two lists of floats; ASSERT_FAR takes two lists.
 #define ASSERT_EQ(actual, expected) check_equal(__func__, #actual, (actual), (expected), __LINE__)
 #define ASSERT_NEAR(actual, expected, tolerance) \
     check_near(__func__, #actual, (actual), (expected), (tolerance), __LINE__)
+#define ASSERT_FAR(actual, expected, bound) \
+    check_lists(__func__, #actual, (actual), (expected), (bound), false, __LINE__)
 
-#endif // TESTS_CHECK_H
+#endif // TESTS_TEST_HELPERS_H

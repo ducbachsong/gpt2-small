@@ -12,7 +12,7 @@
 //     tensor 2: {2, 2, 3} 12 values   starts at value 20
 //
 // Part 2 runs every test of tests/test_tensor.cu again, on a tensor inside a buffer.
-#include "check.h"                // ASSERT_EQ, ASSERT_NEAR, sample_data
+#include "test_helpers.h"         // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "../llmc/tensor_buffer.cuh"
 
 // ── adding tensors ────────────────────────────────────────────────────────────
@@ -25,12 +25,17 @@ static void add_returns_each_tensors_index(void) {
     ASSERT_EQ(buffer.num_tensors(), 2);
 }
 
-static void add_many_returns_the_first_index(void) {
-    // Expect: after one add, add_many of three shapes gives 1, the index of the first of
-    // them; the buffer then has 4 tensors.
+static void add_many_returns_its_group(void) {
+    // Expect: after one add (a tensor, not a group), add_many of two shapes gives group 0
+    // and add_many of one shape group 1. The buffer then has 2 groups of 2 and 1 tensors,
+    // and 1 + 2 + 1 = 4 tensors in all.
     TensorBuffer buffer;
     buffer.add({4});
-    ASSERT_EQ(buffer.add_many({{2, 4}, {12}, {2, 2, 3}}), 1);
+    ASSERT_EQ(buffer.add_many({{2, 4}, {12}}), 0);
+    ASSERT_EQ(buffer.add_many({{2, 2, 3}}), 1);
+    ASSERT_EQ(buffer.num_groups(), 2);
+    ASSERT_EQ(buffer.group_size(0), 2);
+    ASSERT_EQ(buffer.group_size(1), 1);
     ASSERT_EQ(buffer.num_tensors(), 4);
 }
 
@@ -141,7 +146,67 @@ static void matrices_are_the_tensors_with_2_or_more_dims(void) {
     ASSERT_EQ(buffer.tensor(3).dim() >= 2, true);
 }
 
+// ── groups ────────────────────────────────────────────────────────────────────
+// Two groups of the same three tensors, as AdamW adds its params and then their grads:
+//
+//     flat()   [ group 0: tensors 0, 1, 2 = values 0..31 | group 1: tensors 3, 4, 5 = values 32..63 ]
+
+/// The buffer above, allocated, with 0..63 written into flat().
+static TensorBuffer two_groups_of_three(void) {
+    TensorBuffer buffer;
+    buffer.add_many({{2, 4}, {12}, {2, 2, 3}});
+    buffer.add_many({{2, 4}, {12}, {2, 2, 3}});
+    buffer.allocate();
+    buffer.flat().copy_from_cpu(sample_data(64).data());
+    return buffer;
+}
+
+static void a_group_is_one_flat_tensor_of_its_values(void) {
+    // Expect: group(0) is one flat tensor of its 8 + 12 + 12 = 32 values, 0..31; group(1)
+    // starts 32 values into flat() and holds 32..63.
+    TensorBuffer buffer = two_groups_of_three();
+    ASSERT_EQ(buffer.group(0).shape(), Shape({32}));
+    ASSERT_EQ(buffer.group(0).data(), buffer.flat().data());
+    ASSERT_EQ(buffer.group(0).tolist(), sample_data(32));
+    std::vector<float> values_32_to_63;
+    for (int i = 32; i < 64; i++) values_32_to_63.push_back((float)i);
+    ASSERT_EQ(buffer.group(1).data(), buffer.flat().data() + 32);
+    ASSERT_EQ(buffer.group(1).tolist(), values_32_to_63);
+}
+
+static void tensor_g_k_is_tensor_k_of_group_g(void) {
+    // Expect: with groups of 3, tensor(0, 1) is tensor(1), and tensor(1, 0) is tensor(3),
+    // the first of group 1: the same memory, the same shape. tensor(1, 2) is {2, 2, 3}.
+    TensorBuffer buffer = two_groups_of_three();
+    ASSERT_EQ(buffer.tensor(0, 1).data(), buffer.tensor(1).data());
+    ASSERT_EQ(buffer.tensor(1, 0).data(), buffer.tensor(3).data());
+    ASSERT_EQ(buffer.tensor(1, 0).shape(), Shape({2, 4}));
+    ASSERT_EQ(buffer.tensor(1, 2).shape(), Shape({2, 2, 3}));
+}
+
+static void writing_a_group_writes_only_its_part(void) {
+    // Expect: group(1).zero_() makes values 32..63 of flat() 0, in one call (as the trainer
+    // zeroes all its gradients); group 0 keeps 0..31.
+    TensorBuffer buffer = two_groups_of_three();
+    buffer.group(1).zero_();
+    std::vector<float> expected = sample_data(32);
+    expected.resize(64, 0.0f);                                 // 0..31, then 32 zeros
+    ASSERT_EQ(buffer.flat().tolist(), expected);
+}
+
 // ── zeros_like ────────────────────────────────────────────────────────────────
+
+static void zeros_like_copies_the_groups(void) {
+    // Expect: zeros_like of the two groups of three has the same groups: 2 of them, 3
+    // tensors each, group(1) 32 values starting 32 in, all 0.
+    TensorBuffer buffer = two_groups_of_three();
+    TensorBuffer copy = TensorBuffer::zeros_like(buffer);
+    ASSERT_EQ(copy.num_groups(), 2);
+    ASSERT_EQ(copy.group_size(0), 3);
+    ASSERT_EQ(copy.group_size(1), 3);
+    ASSERT_EQ(copy.group(1).data(), copy.flat().data() + 32);
+    ASSERT_EQ(copy.group(1).tolist(), std::vector<float>(32, 0.0f));
+}
 
 static void zeros_like_copies_the_layout_not_the_memory(void) {
     // Expect: zeros_like(params) has the same 3 tensors with the same shapes and 32
@@ -253,11 +318,11 @@ static void buffer_tensor_value_i_j_sits_at_i_times_stride_0_plus_j(void) {
     TensorBuffer buffer = buffer_with_neighbours({2, 4});
     Tensor t = buffer.tensor(1);
     t.copy_from_cpu(sample_data(8).data());
-    std::vector<float> values = t.tolist();
+    std::vector<float> values_on_cpu = t.tolist();
     for (size_t i = 0; i < 2; i++) {
-        for (size_t j = 0; j < 4; j++) ASSERT_EQ(values[i * t.stride(0) + j * t.stride(1)], (float)(i * 4 + j));
+        for (size_t j = 0; j < 4; j++) ASSERT_EQ(values_on_cpu[i * t.stride(0) + j * t.stride(1)], (float)(i * 4 + j));
     }
-    ASSERT_EQ(values[1 * t.stride(0) + 2 * t.stride(1)], 6.0f);
+    ASSERT_EQ(values_on_cpu[1 * t.stride(0) + 2 * t.stride(1)], 6.0f);
 }
 
 // ── view: the same values, another shape ──────────────────────────────────────
@@ -268,11 +333,11 @@ static void buffer_tensor_view_changes_the_shape_not_the_values(void) {
     TensorBuffer buffer = buffer_with_neighbours({2, 4});
     Tensor t = buffer.tensor(1);
     t.copy_from_cpu(sample_data(8).data());
-    Tensor v = t.view({4, 2});
-    ASSERT_EQ(v.shape(), Shape({4, 2}));
-    ASSERT_EQ(v.stride(), Shape({2, 1}));
-    ASSERT_EQ(v.data(), t.data());                         // not a copy
-    ASSERT_EQ(v.tolist(), sample_data(8));
+    Tensor view = t.view({4, 2});
+    ASSERT_EQ(view.shape(), Shape({4, 2}));
+    ASSERT_EQ(view.stride(), Shape({2, 1}));
+    ASSERT_EQ(view.data(), t.data());                         // not a copy
+    ASSERT_EQ(view.tolist(), sample_data(8));
     ASSERT_EQ(t.view({8}).shape(), Shape({8}));
 }
 
@@ -281,8 +346,8 @@ static void buffer_tensor_view_shares_the_values(void) {
     // neighbours stay 0.
     TensorBuffer buffer = buffer_with_neighbours({2, 4});
     Tensor t = buffer.tensor(1);
-    Tensor v = t.view({8});
-    v.copy_from_cpu(sample_data(8).data());
+    Tensor view = t.view({8});
+    view.copy_from_cpu(sample_data(8).data());
     ASSERT_EQ(t.tolist(), sample_data(8));
     ASSERT_EQ(buffer.tensor(0).tolist(), std::vector<float>(4, 0.0f));
     ASSERT_EQ(buffer.tensor(2).tolist(), std::vector<float>(4, 0.0f));
@@ -291,14 +356,14 @@ static void buffer_tensor_view_shares_the_values(void) {
 static void buffer_tensor_view_keeps_the_memory_alive(void) {
     // Expect: a view of tensor(1) still reads 0..7 after the buffer is gone: the view shares
     // the buffer's memory, so the memory stays.
-    Tensor v;
+    Tensor view;
     {
         TensorBuffer buffer = buffer_with_neighbours({2, 4});
         Tensor t = buffer.tensor(1);
         t.copy_from_cpu(sample_data(8).data());
-        v = t.view({8});
+        view = t.view({8});
     }
-    ASSERT_EQ(v.tolist(), sample_data(8));
+    ASSERT_EQ(view.tolist(), sample_data(8));
 }
 
 // ── narrow: some rows ─────────────────────────────────────────────────────────
@@ -363,14 +428,14 @@ static void buffer_tensor_zeros_like_and_empty_like_copy_shape_and_dtype(void) {
     TensorBuffer buffer = buffer_with_neighbours({2, 5}, DType::Int32);
     Tensor t = buffer.tensor(1);
     t.fill_(1);
-    Tensor z = Tensor::zeros_like(t);
-    Tensor e = Tensor::empty_like(t);
-    ASSERT_EQ(z.shape(), Shape({2, 5}));
-    ASSERT_EQ(z.dtype() == DType::Int32, true);
-    ASSERT_EQ(e.shape(), Shape({2, 5}));
-    ASSERT_EQ(e.dtype() == DType::Int32, true);
-    ASSERT_EQ(z.data_ptr<int>() != t.data_ptr<int>(), true);
-    ASSERT_EQ(z.tolist<int>(), std::vector<int>(10, 0));
+    Tensor zeros_like_t = Tensor::zeros_like(t);
+    Tensor empty_like_t = Tensor::empty_like(t);
+    ASSERT_EQ(zeros_like_t.shape(), Shape({2, 5}));
+    ASSERT_EQ(zeros_like_t.dtype() == DType::Int32, true);
+    ASSERT_EQ(empty_like_t.shape(), Shape({2, 5}));
+    ASSERT_EQ(empty_like_t.dtype() == DType::Int32, true);
+    ASSERT_EQ(zeros_like_t.data_ptr<int>() != t.data_ptr<int>(), true);
+    ASSERT_EQ(zeros_like_t.tolist<int>(), std::vector<int>(10, 0));
 }
 
 static void buffer_tensor_fill_1_makes_ones(void) {
@@ -461,12 +526,12 @@ static void buffer_tensor_normal_has_the_mean_and_std_asked_for(void) {
     TensorBuffer buffer = buffer_with_neighbours({100000});
     Tensor::manual_seed(1);
     buffer.tensor(1).normal_(0.0f, 0.02f);
-    std::vector<float> values = buffer.tensor(1).tolist();
+    std::vector<float> values_on_cpu = buffer.tensor(1).tolist();
     double sum = 0.0, sum_squares = 0.0;
-    for (float value : values) sum += value;
-    double mean = sum / values.size();
-    for (float value : values) sum_squares += (value - mean) * (value - mean);
-    double deviation = sqrt(sum_squares / values.size());
+    for (float value : values_on_cpu) sum += value;
+    double mean = sum / values_on_cpu.size();
+    for (float value : values_on_cpu) sum_squares += (value - mean) * (value - mean);
+    double deviation = sqrt(sum_squares / values_on_cpu.size());
     ASSERT_NEAR(mean, 0.0, 0.0005);
     ASSERT_NEAR(deviation, 0.02, 0.02 * 0.02);                 // 2% of 0.02
     ASSERT_EQ(buffer.tensor(0).tolist(), std::vector<float>(4, 0.0f));
@@ -488,9 +553,9 @@ static void buffer_tensor_copy_copies_gpu_to_gpu(void) {
     ASSERT_EQ(t.shape(), Shape({3, 2}));
     ASSERT_EQ(buffer.tensor(0).tolist(), std::vector<float>(4, 0.0f));
     ASSERT_EQ(buffer.tensor(2).tolist(), std::vector<float>(4, 0.0f));
-    Tensor out = Tensor::zeros({6});
-    out.copy_(t);
-    ASSERT_EQ(out.tolist(), sample_data(6));
+    Tensor copied_out = Tensor::zeros({6});
+    copied_out.copy_(t);
+    ASSERT_EQ(copied_out.tolist(), sample_data(6));
 }
 
 static void buffer_tensor_clone_is_outside_the_buffer(void) {
@@ -540,7 +605,7 @@ static void buffer_tensor_indexing_picks_rows_and_values(void) {
 
 int main(void) {
     add_returns_each_tensors_index();
-    add_many_returns_the_first_index();
+    add_many_returns_its_group();
     numel_is_known_before_allocate();
     allocate_makes_one_flat_tensor_of_zeros();
     each_tensor_has_its_own_shape();
@@ -550,6 +615,10 @@ int main(void) {
     zeroing_all_zeroes_every_tensor();
     a_tensor_keeps_the_memory_alive();
     matrices_are_the_tensors_with_2_or_more_dims();
+    a_group_is_one_flat_tensor_of_its_values();
+    tensor_g_k_is_tensor_k_of_group_g();
+    writing_a_group_writes_only_its_part();
+    zeros_like_copies_the_groups();
     zeros_like_copies_the_layout_not_the_memory();
     an_int_buffer_holds_ints();
 
