@@ -10,7 +10,7 @@
 //                                                     ↑ decayed_count
 //
 // Each thread takes 4 values with float4 loads, so every tensor's size must be a
-// multiple of 4. The norm stays on the GPU (from global_norm.cuh).
+// multiple of 4. The norm stays on the GPU (from grad_norm.cuh).
 #ifndef ADAMW_CUH
 #define ADAMW_CUH
 
