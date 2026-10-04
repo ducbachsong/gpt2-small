@@ -5,6 +5,7 @@
 // Part 1 checks the norm against PyTorch's, from torch::nn::utils::clip_grad_norm_ (it
 // returns the norm of all the gradients it was given); part 2 checks numbers worked out by
 // hand, and how the work is shared out between the blocks.
+#include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
 #include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
@@ -125,59 +126,112 @@ static void whole_model_norm_matches_pytorch(void)
     }
 }
 
-static void time_20_norms_on_gpt2_small_size(void)
+/// Times 20 norms of gradients of these shapes, mine against PyTorch's two ways, and prints a
+/// table under `test`'s name. All three read the same values on the GPU:
+///
+///     my GradNorm          one launch over the flat buffer (every tensor one after the other)
+///     PyTorch per tensor   what C++ clip_grad_norm_ does before it clips: grad.norm() of each
+///                          tensor, then the norm of those norms (one launch per tensor, + 2)
+///     PyTorch foreach      what Python's clip_grad_norm_ does: _foreach_norm over all the
+///                          tensors at once (fewer, grouped launches), then the norm of the norms
+///
+/// The clip itself (multiplying every gradient) is not timed: it is not part of measuring.
+/// Each norm reads every value once. Checks at the end that all three measured the same norm.
+static void time_20_norms(const char *test, const std::vector<Shape> &param_shapes)
 {
-    // Prints the times on as many values as GPT-2 small has: 162,030 x 768 + 768 =
-    // 124,439,808. Each norm reads every value once: 124,439,808 x 4 bytes = 498 MB, so at a
-    // T4's 320 GB/s, at least 1.56 ms. PyTorch's side is what clip_grad_norm_ does before it
-    // clips: the norm of each tensor, then the norm of those norms (timed without the clip,
-    // which would also multiply every gradient by its factor). Checks at the end that both
-    // measured the same norm.
     Tensor::manual_seed(0);
-    std::vector<Shape> param_shapes = {{162030, 768}, {768}};
-    // one flat buffer: [ grads: 124,439,808 | block sums: 2 x 512 | grad_norm: 1 ]
+    int num_params = (int)param_shapes.size();
+    // one flat buffer: [ grads | block sums: 2 x 512 | grad_norm: 1 ]
     TensorBuffer buffer;
     int grads_group = buffer.add_many(param_shapes);
     int block_sums_index = buffer.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
     int grad_norm_index = buffer.add({1});
     buffer.allocate();
-    for (int k = 0; k < 2; k++)
-        buffer.tensor(grads_group, k).normal_(0.0f, 1.0f); // made on the CPU: a few seconds
+    const Tensor &grads = buffer.group(grads_group); // every gradient, one flat view
+    grads.normal_(0.0f, 1.0f);                        // made on the CPU: a few seconds
+    // PyTorch's: each tensor's gradient its own tensor, a copy of mine
     std::vector<torch::Tensor> pytorch_grads;
-    for (int k = 0; k < 2; k++)
+    for (int k = 0; k < num_params; k++)
         pytorch_grads.push_back(pytorch_copy_of(buffer.tensor(grads_group, k)));
     GradNorm grad_norm_kernel(buffer.tensor(block_sums_index));
     const Tensor &grad_norm = buffer.tensor(grad_norm_index);
-    torch::Tensor pytorch_norm;
-    const Tensor &grads = buffer.group(grads_group); // every gradient, one flat view
-    size_t n = grads.numel();
+    torch::Tensor per_tensor_norm, foreach_norm;
 
     // Step 1 does first-time work (CUDA loads each side's kernels), so the average is of 2..20.
-    print_test_name(__func__);
-    printf("    time of one norm, in ms:   step   my GradNorm   PyTorch\n");
-    double my_total = 0.0, pytorch_total = 0.0;
+    print_test_name(test);
+    printf("    %d tensors, %zu values\n", num_params, grads.numel());
+    printf("    time of one norm, in ms:   step   my GradNorm   PyTorch per tensor   PyTorch foreach\n");
+    double my_total = 0.0, per_tensor_total = 0.0, foreach_total = 0.0;
     for (int t = 1; t <= 20; t++)
     {
         float my_ms = gpu_milliseconds([&] { grad_norm_kernel.compute(grads, grad_norm); });
-        float pytorch_ms = gpu_milliseconds([&] {
+        float per_tensor_ms = gpu_milliseconds([&] {
             std::vector<torch::Tensor> norms;
             for (const torch::Tensor &grad : pytorch_grads)
                 norms.push_back(grad.norm());
-            pytorch_norm = torch::stack(norms).norm();
+            per_tensor_norm = torch::stack(norms).norm();
         });
-        printf("                               %4d   %13.3f   %7.3f\n", t, my_ms, pytorch_ms);
+        float foreach_ms = gpu_milliseconds([&] {
+            std::vector<torch::Tensor> norms = at::_foreach_norm(pytorch_grads);
+            foreach_norm = torch::stack(norms).norm();
+        });
+        printf("                               %4d   %11.3f   %18.3f   %15.3f\n", t, my_ms, per_tensor_ms, foreach_ms);
         if (t == 1)
             continue;
         my_total += my_ms;
-        pytorch_total += pytorch_ms;
+        per_tensor_total += per_tensor_ms;
+        foreach_total += foreach_ms;
     }
-    double bytes = (double)n * sizeof(float);
-    printf("    average of steps 2..20:           %13.3f   %7.3f   PyTorch takes %.2fx as long\n", my_total / 19,
-           pytorch_total / 19, pytorch_total / my_total);
-    printf("    memory read, in GB/s:             %13.0f   %7.0f\n", bytes / (my_total / 19) / 1e6,
-           bytes / (pytorch_total / 19) / 1e6);
-    double expected = pytorch_norm.item<double>();
+    double bytes = (double)grads.numel() * sizeof(float);
+    printf("    average of steps 2..20:           %11.3f   %18.3f   %15.3f\n", my_total / 19, per_tensor_total / 19,
+           foreach_total / 19);
+    printf("    memory read, in GB/s:             %11.0f   %18.0f   %15.0f\n", bytes / (my_total / 19) / 1e6,
+           bytes / (per_tensor_total / 19) / 1e6, bytes / (foreach_total / 19) / 1e6);
+    printf("    PyTorch takes, against mine:                   %16.2fx   %14.2fx\n", per_tensor_total / my_total,
+           foreach_total / my_total);
+    double expected = per_tensor_norm.item<double>();
     ASSERT_NEAR(grad_norm.item(), expected, TOLERANCE * expected);
+    ASSERT_NEAR(foreach_norm.item<double>(), expected, TOLERANCE * expected);
+}
+
+/// Makes GPT-2 small's 148 parameter shapes, in the model's order: wte (vocab 50,257) and wpe,
+/// then the 12 shapes of each of the 12 layers, then the final LayerNorm. 124,439,808 values.
+static std::vector<Shape> gpt2_small_param_shapes(void)
+{
+    std::vector<Shape> shapes = {{50257, 768}, {1024, 768}}; // wte, wpe
+    for (int layer = 0; layer < 12; layer++)
+    {
+        std::vector<Shape> layer_shapes = {
+            {768}, {768},         // ln1w, ln1b
+            {2304, 768}, {2304},  // qkvw, qkvb
+            {768, 768}, {768},    // attprojw, attprojb
+            {768}, {768},         // ln2w, ln2b
+            {3072, 768}, {3072},  // fcw, fcb
+            {768, 3072}, {768},   // fcprojw, fcprojb
+        };
+        shapes.insert(shapes.end(), layer_shapes.begin(), layer_shapes.end());
+    }
+    shapes.push_back({768}); // lnfw
+    shapes.push_back({768}); // lnfb
+    return shapes;
+}
+
+static void time_20_norms_on_gpt2_small_size(void)
+{
+    // Prints the times on as many values as GPT-2 small has, as 2 tensors: 162,030 x 768 + 768 =
+    // 124,439,808. Each norm reads every value once: 498 MB, so at a T4's 320 GB/s, at least
+    // 1.56 ms. With 2 tensors PyTorch launches only a few kernels: this compares the kernels.
+    time_20_norms(__func__, {{162030, 768}, {768}});
+}
+
+static void time_20_norms_on_gpt2_small_148_tensors(void)
+{
+    // Prints the times on GPT-2 small's real 148 tensors: the same 124,439,808 values, but
+    // PyTorch now has 148 separate gradients (per tensor: 148 norm launches + 2), while mine is
+    // still one launch over one flat buffer. What the flat buffer is worth shows here.
+    std::vector<Shape> param_shapes = gpt2_small_param_shapes();
+    ASSERT_EQ(param_shapes.size(), (size_t)148);
+    time_20_norms(__func__, param_shapes);
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
@@ -352,6 +406,7 @@ int main(void)
 {
     whole_model_norm_matches_pytorch();
     time_20_norms_on_gpt2_small_size();
+    time_20_norms_on_gpt2_small_148_tensors();
 
     computes_the_norm_of_all_gradients_together();
     a_3_and_minus_4_give_5();
