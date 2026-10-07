@@ -4,7 +4,8 @@
 //
 // Part 1 checks both against PyTorch's embedding, with autograd for the backward; part 2
 // checks numbers worked out by hand; part 3 checks that each kernel's registers fit a block
-// of ENCODER_THREADS; part 4 times each kernel with other block and thread counts. (The C#
+// of ENCODER_THREADS; part 4 times each kernel with other block and thread counts; part 5 tests
+// what part 4 found (a wte backward with float4 loads, a finer sweep of the forward). (The C#
 // trainer had no encoder test: TorchSharp's embedding was trusted.)
 //
 // The tests use a Tensor for each weight, the simplest to write. The timing runs twice: with a
@@ -322,7 +323,7 @@ static void backward_adds_onto_the_gradients_already_there(void)
 static void many_threads_adding_onto_one_row_lose_nothing(void)
 {
     // Expect: GPT-2 small's sizes, batch_size = 4 rows of seq_len = 1024 ids, every id 5,
-    // encoded_grad all 1. The wte backward's 524,288 threads add 6 values each, 3,145,728 adds,
+    // encoded_grad all 1. The wte backward's 524,288 threads take 786,432 float4s, 3,145,728 adds,
     // and the 4096 adds of each column all go onto the same value of token 5's row, many at the
     // same moment. With atomicAdd no add is lost: 4096 x 1 = 4096, exactly (whole numbers this
     // small add exactly in floats); with a plain += most of them would be. Tokens 0 .. 4 stay 0.
@@ -382,6 +383,18 @@ static float average_milliseconds(Run run)
     return total / 19;
 }
 
+/// Keeps the GPU busy with `run` for about a second before timing. While the CPU makes random
+/// numbers for seconds the GPU idles and its clock drops; without this, the first launches timed
+/// run while the clock is still rising, and with few threads they come out slower by a different
+/// amount every run.
+template <typename Run>
+static void warm_up_gpu(Run run)
+{
+    float total = 0.0f;
+    while (total < 1000.0f)
+        total += gpu_milliseconds(run);
+}
+
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of each of the 3 kernels on GPT-2 small's sizes (batch_size = 4, seq_len =
@@ -418,7 +431,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
         cudaCheck(cudaGetLastError());
     };
     auto backward_wte = [&] {
-        encoder_backward_wte_kernel<<<blocks, threads>>>(wte_grad.data(), encoded_grad.data(),
+        encoder_backward_wte_kernel<<<blocks, threads>>>(wte_grad.data(), (const float4 *)encoded_grad.data(),
                                                          token_ids.data_ptr<int>(), batch_size, seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
@@ -427,6 +440,9 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                                                          batch_size, seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
+    blocks = ENCODER_BLOCKS;
+    threads = ENCODER_THREADS;
+    warm_up_gpu(forward);
 
     int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096};
     int thread_counts[] = {128, 256, 512, 1024};
@@ -484,6 +500,159 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     ASSERT_EQ(launches_with_the_same_result, 8 * 4);
 }
 
+// ══ part 5: experiments on what part 4 found ══════════════════════════════════
+
+/// The wte backward as encoder.cuh had it before: one float of encoded_grad per load, then one
+/// float atomicAdd, 3,145,728 jobs. Kept here for part 5, to compare with encoder.cuh's kernel,
+/// which loads a float4 (16 bytes in flight per thread instead of 4) and then does four adds.
+__global__ void encoder_backward_wte_float_kernel(float *wte_grad, const float *encoded_grad, const int *token_ids,
+                                                  size_t batch_size, size_t seq_len, size_t embed_dim)
+{
+    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_values = batch_size * seq_len * embed_dim;
+    for (size_t index = thread_number; index < total_values; index += (size_t)gridDim.x * blockDim.x)
+    {
+        size_t token_index = index / embed_dim;
+        size_t embed_index = index % embed_dim;
+        size_t token_id = token_ids[token_index];
+        atomicAdd(&wte_grad[token_id * embed_dim + embed_index], encoded_grad[index]);
+    }
+}
+
+static void time_wte_backward_with_float4_loads(void)
+{
+    // Prints the wte backward with float loads (above, as encoder.cuh had it) and with float4
+    // loads (encoder.cuh now), each launch size timed for both, one after the other, on GPT-2
+    // small's sizes.
+    //
+    // Expect, if too few bytes in flight is why the wte backward slowed down so much with few
+    // threads: with float4 loads it keeps 4x the bytes in flight per thread, so at 5,120 threads it
+    // slows down far less than with float loads. Measured on a T4 in 5 runs: 2.18-2.21x with float
+    // loads, 1.01-1.03x with float4 loads. Both must give the same wte_grad as the usual launch,
+    // within TOLERANCE.
+    Tensor::manual_seed(0);
+    size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
+    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256), {batch_size, seq_len});
+    Tensor encoded_grad = Tensor::randn({batch_size, seq_len, embed_dim});
+    Tensor wte_grad = Tensor::zeros({vocab_size, embed_dim});
+
+    // The usual launch's result, to compare each launch with.
+    encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(),
+                                                                     (const float4 *)encoded_grad.data(),
+                                                                     token_ids.data_ptr<int>(), batch_size, seq_len,
+                                                                     embed_dim);
+    cudaCheck(cudaGetLastError());
+    torch::Tensor usual_wte_grad = pytorch_copy_of(wte_grad);
+
+    int blocks = 0, threads = 0; // the launch the 2 below use, set by the loop
+    auto float_loads = [&] {
+        encoder_backward_wte_float_kernel<<<blocks, threads>>>(wte_grad.data(), encoded_grad.data(),
+                                                               token_ids.data_ptr<int>(), batch_size, seq_len,
+                                                               embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+    auto float4_loads = [&] {
+        encoder_backward_wte_kernel<<<blocks, threads>>>(wte_grad.data(), (const float4 *)encoded_grad.data(),
+                                                         token_ids.data_ptr<int>(), batch_size, seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+    // Tells if wte_grad, after one backward from 0 with `run`, equals the usual launch's.
+    auto same_as_usual = [&](auto run) {
+        wte_grad.zero_();
+        run();
+        torch::Tensor difference =
+            (pytorch_copy_of(wte_grad) - usual_wte_grad).abs().max() / usual_wte_grad.abs().max();
+        return difference.item<float>() <= TOLERANCE;
+    };
+    blocks = ENCODER_BLOCKS;
+    threads = ENCODER_THREADS;
+    warm_up_gpu(float4_loads);
+
+    int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096};
+    int thread_counts[] = {128, 256, 512, 1024};
+    float float_ms[8][4], float4_ms[8][4];
+    int launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   all threads   float loads   float4 loads   same result\n");
+    for (int block_index = 0; block_index < 8; block_index++)
+    {
+        for (int thread_index = 0; thread_index < 4; thread_index++)
+        {
+            blocks = block_counts[block_index];
+            threads = thread_counts[thread_index];
+            float_ms[block_index][thread_index] = average_milliseconds(float_loads);
+            float4_ms[block_index][thread_index] = average_milliseconds(float4_loads);
+            bool same = same_as_usual(float_loads) && same_as_usual(float4_loads);
+            if (same)
+                launches_with_the_same_result++;
+            printf("                %6d   %7d   %11d   %11.3f   %12.3f   %s\n", blocks, threads, blocks * threads,
+                   float_ms[block_index][thread_index], float4_ms[block_index][thread_index], same ? "yes" : "NO");
+        }
+    }
+    // 40 x 128 is [0][0]; 512 x 1024 is [4][3]
+    printf("    slow-down at 5,120 threads against 512 x 1024:   float loads %.2fx   float4 loads %.2fx\n",
+           float_ms[0][0] / float_ms[4][3], float4_ms[0][0] / float4_ms[4][3]);
+    printf("    slow-down at 10,240 threads (40 x 256):           float loads %.2fx   float4 loads %.2fx\n",
+           float_ms[0][1] / float_ms[4][3], float4_ms[0][1] / float4_ms[4][3]);
+    ASSERT_EQ(launches_with_the_same_result, 8 * 4);
+}
+
+static void time_forward_with_blocks_of_128_around_512(void)
+{
+    // Prints the forward with blocks of 128 threads and 256 to 1,024 blocks in steps of 64, each
+    // timed right after 512 x 1024 so the two are compared in the same moment. In part 4's 6 runs,
+    // 512 x 128 was the fastest forward every time, 4-6% ahead of 512 x 1024.
+    //
+    // Expect one of two shapes: a smooth dip around 512 blocks (a real effect of the launch size)
+    // or one low point at 512 alone (something special about that one launch). The jobs per thread
+    // are printed too: 512 x 128 gives every thread exactly 12 of the 786,432 jobs, but part 4's
+    // launches with exactly 3 each were not faster, so an even share alone is not expected to matter.
+    Tensor::manual_seed(0);
+    size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
+    Tensor wte = Tensor::randn({vocab_size, embed_dim}); // made on the CPU: a few seconds
+    Tensor wpe = Tensor::randn({seq_len, embed_dim});
+    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256), {batch_size, seq_len});
+    Tensor encoded = Tensor::zeros({batch_size, seq_len, embed_dim});
+    encoder_forward(encoded, token_ids, wte, wpe);
+    torch::Tensor usual_encoded = pytorch_copy_of(encoded);
+
+    int blocks = 0, threads = 0; // the launch the forward below uses
+    auto forward = [&] {
+        encoder_forward_kernel<<<blocks, threads>>>((float4 *)encoded.data(), token_ids.data_ptr<int>(),
+                                                    (const float4 *)wte.data(), (const float4 *)wpe.data(),
+                                                    batch_size, seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+
+    blocks = ENCODER_BLOCKS;
+    threads = ENCODER_THREADS;
+    warm_up_gpu(forward);
+
+    int launches_with_the_same_result = 0, launches = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   jobs per thread   forward   512 x 1024 just before   ratio\n");
+    for (int block_count = 256; block_count <= 1024; block_count += 64)
+    {
+        blocks = ENCODER_BLOCKS;
+        threads = ENCODER_THREADS;
+        float usual_ms = average_milliseconds(forward);
+        blocks = block_count;
+        threads = 128;
+        float ms = average_milliseconds(forward);
+
+        encoded.zero_();
+        forward();
+        bool same = torch::equal(pytorch_copy_of(encoded), usual_encoded);
+        if (same)
+            launches_with_the_same_result++;
+        launches++;
+        double jobs_per_thread = (double)(batch_size * seq_len * embed_dim / 4) / (blocks * threads);
+        printf("                %6d   %7d   %15.2f   %7.3f   %22.3f   %5.3f%s\n", blocks, threads, jobs_per_thread,
+               ms, usual_ms, ms / usual_ms, same ? "" : "   NOT THE SAME RESULT");
+    }
+    ASSERT_EQ(launches_with_the_same_result, launches);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -504,6 +673,9 @@ int main(void)
     every_kernel_fits_a_block_of_encoder_threads();
 
     time_each_kernel_with_other_block_and_thread_counts();
+
+    time_wte_backward_with_float4_loads();
+    time_forward_with_blocks_of_128_around_512();
 
     printf("\nall tests passed\n");
     return 0;

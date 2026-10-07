@@ -81,7 +81,7 @@ __global__ void encoder_forward_kernel(float4* encoded, const int* token_ids, co
 // ── backward ──────────────────────────────────────────────────────────────────
 
 // The kernels encoder_backward launches, declared here so it can call them; their code follows it.
-__global__ void encoder_backward_wte_kernel(float* wte_grad, const float* encoded_grad, const int* token_ids,
+__global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encoded_grad, const int* token_ids,
                                             size_t batch_size, size_t seq_len, size_t embed_dim);
 __global__ void encoder_backward_wpe_kernel(float4* wpe_grad, const float4* encoded_grad, size_t batch_size,
                                             size_t seq_len, size_t embed_dim);
@@ -94,7 +94,8 @@ inline void encoder_backward(const Tensor& wte_grad, const Tensor& wpe_grad, con
                              const Tensor& token_ids) {
     encoder_check_shapes(encoded_grad, token_ids, wte_grad, wpe_grad);
     size_t batch_size = encoded_grad.size(0), seq_len = encoded_grad.size(1), embed_dim = encoded_grad.size(2);
-    encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(), encoded_grad.data(),
+    encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(),
+                                                                     (const float4*)encoded_grad.data(),
                                                                      token_ids.data_ptr<int>(), batch_size, seq_len,
                                                                      embed_dim);
     cudaCheck(cudaGetLastError());
@@ -104,26 +105,37 @@ inline void encoder_backward(const Tensor& wte_grad, const Tensor& wpe_grad, con
     cudaCheck(cudaGetLastError());
 }
 
-/// Adds encoded_grad onto wte_grad, one value at a time. Thread n takes values n, n + 524,288,
-/// n + 2 x 524,288, ...: with batch_size = 4, seq_len = 1024 encoded_grad has 4 x 1024 x 768 =
-/// 3,145,728 values, exactly 6 rounds, so every thread adds 6. A token that is read at several
-/// positions has several threads adding onto the same row, maybe at the same moment. Two plain
-/// += on one address at once can lose one:
+/// Adds encoded_grad onto wte_grad, one float4 at a time: one 16-byte load, then four float
+/// atomicAdds. Thread n takes float4s n, n + 524,288, ...: with batch_size = 4, seq_len = 1024
+/// encoded_grad has 786,432 float4s, 1.5 rounds. A token that is read at several positions has
+/// several threads adding onto the same row, maybe at the same moment. Two plain += on one
+/// address at once can lose one:
 ///
 ///     thread A reads 5, thread B reads 5, A writes 5 + 1 = 6, B writes 5 + 2 = 7   (1 is lost)
 ///
 /// atomicAdd makes each read-add-write whole, one thread at a time, so nothing is lost. But
 /// the order of the adds is whatever order the threads get there, so the last bits of a row
 /// can differ from run to run (float adds give slightly different sums in another order).
-__global__ void encoder_backward_wte_kernel(float* wte_grad, const float* encoded_grad, const int* token_ids,
+///
+/// Why a float4 load and four float adds: a T4 has no atomicAdd on a float4 (compute capability
+/// 9.0 and newer), and the adds are not waited for (they compile to RED), so a wide load keeps
+/// 16 bytes in flight per thread instead of 4. With few threads launched that matters: at 5,120
+/// threads one float per load was 2.2x slower than at 512 x 1024, this 1.02x (tests, part 5).
+__global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encoded_grad, const int* token_ids,
                                             size_t batch_size, size_t seq_len, size_t embed_dim) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total_values = batch_size * seq_len * embed_dim;             // all of encoded_grad: 3,145,728
-    for (size_t index = thread_number; index < total_values; index += (size_t)gridDim.x * blockDim.x) {
-        size_t token_index = index / embed_dim;                         // which token of the batch: b x seq_len + t
-        size_t embed_index = index % embed_dim;                         // which of its 768 values
+    size_t float4s_embed_dim = embed_dim / 4;                           // 4 floats per float4: 768 / 4 = 192
+    size_t total_float4s = batch_size * seq_len * float4s_embed_dim;    // all of encoded_grad: 786,432
+    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
+        size_t token_index = index / float4s_embed_dim;                 // which token of the batch: b x seq_len + t
+        size_t float4_embed_index = index % float4s_embed_dim;          // which of its 192 float4s
         size_t token_id = token_ids[token_index];                       // which wte_grad row to add onto
-        atomicAdd(&wte_grad[token_id * embed_dim + embed_index], encoded_grad[index]);
+        float4 grad = encoded_grad[index];
+        float* row = wte_grad + token_id * embed_dim + float4_embed_index * 4;   // the 4 values it adds onto
+        atomicAdd(row + 0, grad.x);
+        atomicAdd(row + 1, grad.y);
+        atomicAdd(row + 2, grad.z);
+        atomicAdd(row + 3, grad.w);
     }
 }
 
