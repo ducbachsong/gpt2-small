@@ -78,6 +78,13 @@ static_assert(LINEAR_BLOCK_PIECE_ROW_LENGTH % 4 == 0, "each piece row must start
 static_assert((LINEAR_VALUES_PER_BLOCK_COLUMNS / LINEAR_VALUES_PER_THREAD_COLUMNS) *
                   (LINEAR_VALUES_PER_THREAD_COLUMNS / 2) == LINEAR_SECOND_HALF_COLUMN_OFFSET,
               "16 threads x 4 columns must fill the first half exactly");
+// The forward numbers its blocks in groups of 8 rows of squares, down a group first, then across, then the
+// next group. The 80 blocks a T4 runs at once (2 on each of 40 SMs) then make about 8 rows x 10 columns of
+// squares: they share 8 bands of x and 10 bands of W, read from GPU memory once and then from L2. Numbered
+// across first, they would make 1 row x 80 columns: one band of x, but 80 different bands of W. For the head
+// (W 50304 x 768, 154 MB, the T4's L2 is 4 MB), that reads all of W once per row of squares: 32 x 154 MB =
+// 4.9 GB per forward. In groups of 8 it is 4 x 154 MB.
+#define LINEAR_BLOCK_ROWS_PER_GROUP 8
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias);
@@ -89,8 +96,9 @@ void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const 
 // ── forward ───────────────────────────────────────────────────────────────────
 
 // The kernel linear_forward launches, declared here so it can call it; its code follows it.
-__global__ void linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
-                                      size_t input_rows, size_t in_features, size_t out_features);
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
+                      size_t input_rows, size_t in_features, size_t out_features);
 // The copies all three kernels use, declared here so the forward can call them; their code is near the end
 __device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t matrix_rows, size_t matrix_columns,
                                                     size_t step_first_k, size_t block_first_column);
@@ -145,8 +153,8 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
 }
 
 /// Works out F1 for one 128 x 128 square of output: y[t][j] = sum over i of x[t][i] · W[j][i] + b[j], for
-/// rows t = 128 block_row .. + 127 and output columns j = 128 block_column .. + 127, where block_row =
-/// blockIdx.x / squares across and block_column = blockIdx.x % squares across. Each thread makes 8 x 8 of
+/// rows t = 128 block_row .. + 127 and output columns j = 128 block_column .. + 127, the square blockIdx.x
+/// gives in groups of 8 rows of squares (see LINEAR_BLOCK_ROWS_PER_GROUP). Each thread makes 8 x 8 of
 /// them: rows 8 (threadIdx.x / 16) .. + 7 and output columns 4 (threadIdx.x % 16) .. + 3 and 64 on from
 /// those, of the block's (see LINEAR_SECOND_HALF_COLUMN_OFFSET).
 ///
@@ -159,20 +167,30 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
 /// The copy is double-buffered. There are two sets of pieces, and each step's math reads one. Before that
 /// math, each thread has already asked GPU memory for its float4s of the next step, which it writes into the
 /// other set once the math is done. The ~300 cycles a read from GPU memory takes pass during the math, not
-/// before it, and one __syncthreads() per step is enough (see the loop).
-__global__ void linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
-                                      size_t input_rows, size_t in_features, size_t out_features) {
+/// before it, and one __syncthreads() per step is enough (see the loop). __launch_bounds__(256, 2) keeps it
+/// at 128 registers or fewer, so 2 blocks fit an SM.
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
+                      size_t input_rows, size_t in_features, size_t out_features) {
     // This step's 8 input columns i of x and W, with i as the rows: block_input_pieces[set][i][t] = x[t][i] and
     // block_weight_pieces[set][i][j] = W[j][i] (a piece of Wᵀ), for the block's 128 rows t and 128 output
     // columns j. The 8 values a thread needs at one i sit next to each other: two float4 reads. Two sets: one
     // step's math reads one while the next step's values go into the other (16.5 KB).
     __shared__ __align__(16) float block_input_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
     __shared__ __align__(16) float block_weight_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
-    // Its square: the blocks are numbered in one line, across first, so / and % turn its number into a row
-    // and a column of squares, as threadIdx.x is turned into a thread's place below
+    // Its square. The blocks are numbered in groups of 8 rows of squares (LINEAR_BLOCK_ROWS_PER_GROUP), down a
+    // group first: / and % find the group, then its row and column inside the group. For the head, 32 rows
+    // x 393 columns of squares: 4 groups of 8 x 393 = 3144 blocks; block 3145 is group 1, row 9, column 0.
     size_t total_block_columns = (out_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
-    size_t block_row = blockIdx.x / total_block_columns;                         // which 128 rows t
-    size_t block_column = blockIdx.x % total_block_columns;                      // which 128 output columns j
+    size_t total_block_rows = (input_rows + LINEAR_VALUES_PER_BLOCK_ROWS - 1) / LINEAR_VALUES_PER_BLOCK_ROWS;
+    size_t blocks_per_group = LINEAR_BLOCK_ROWS_PER_GROUP * total_block_columns;
+    size_t group = blockIdx.x / blocks_per_group;
+    size_t group_first_block_row = group * LINEAR_BLOCK_ROWS_PER_GROUP;
+    size_t group_block_rows = total_block_rows - group_first_block_row;   // 8, or fewer in the last group
+    if (group_block_rows > LINEAR_BLOCK_ROWS_PER_GROUP) group_block_rows = LINEAR_BLOCK_ROWS_PER_GROUP;
+    size_t block_number_in_group = blockIdx.x % blocks_per_group;
+    size_t block_row = group_first_block_row + block_number_in_group % group_block_rows;   // which 128 rows t
+    size_t block_column = block_number_in_group / group_block_rows;              // which 128 output columns j
     size_t block_first_row = block_row * LINEAR_VALUES_PER_BLOCK_ROWS;                    // the block's first t
     size_t block_first_output_column = block_column * LINEAR_VALUES_PER_BLOCK_COLUMNS;    // the block's first j
     // Its 256 threads stand 16 x 16, numbered across first, each making 8 x 8 of the block's 128 x 128
