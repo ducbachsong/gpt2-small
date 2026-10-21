@@ -59,7 +59,7 @@
 #define LINEAR_THREADS_PER_BLOCK 256       // (128 / 8 rows) x (128 / 8 columns) = 16 x 16 threads
 #define LINEAR_VALUES_PER_THREAD 8         // values of the sum (k) each thread adds per step, not output values;
                                            // the block copies these 8 into its pieces
-// linear_copy_piece fills the left piece (128 rows) in dW and the right piece (128 columns) everywhere else
+// linear_store_piece fills the left piece (128 rows) in dW and the right piece (128 columns) everywhere else
 static_assert(LINEAR_VALUES_PER_BLOCK_ROWS == LINEAR_VALUES_PER_BLOCK_COLUMNS, "the copy is written for a square");
 // A row of a piece holds 128 values but is 132 floats long: 4 unused floats at its end. The turned copies have
 // one warp write rows k and k + 4 at once. 128 long, those sit 4 x 128 = 512 floats apart, a multiple of the
@@ -91,6 +91,15 @@ void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const 
 // The kernel linear_forward launches, declared here so it can call it; its code follows it.
 __global__ void linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
                                       size_t input_rows, size_t in_features, size_t out_features);
+// The copies all three kernels use, declared here so the forward can call them; their code is near the end
+__device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t matrix_rows, size_t matrix_columns,
+                                                    size_t step_first_k, size_t block_first_column);
+__device__ __forceinline__ void linear_store_piece(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH], float4 values);
+__device__ __forceinline__ float4 linear_load_piece_turned(const float* matrix, size_t matrix_rows,
+                                                           size_t matrix_columns, size_t block_first_row,
+                                                           size_t step_first_k);
+__device__ __forceinline__ void linear_store_piece_turned(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
+                                                          float4 values);
 
 /// Writes output = input · weightᵀ + bias (F1, and C1's y = x Wᵀ + b): each row of input dotted with each
 /// row of weight, plus that column's bias. input is {..., in_features} ({batch_size, seq_len, in_features}
@@ -146,13 +155,19 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
 /// float4 each; then each thread adds 8 x 8 x 8 = 512 products into its 64 sums, which stay in registers. A
 /// step reads 2 x 1024 values from GPU memory and does 128 x 128 x 8 = 131,072 multiply-adds: 64 per value
 /// read. One thread per output value, reading its two rows from GPU memory, would do 1 per 2 values read.
+///
+/// The copy is double-buffered. There are two sets of pieces, and each step's math reads one. Before that
+/// math, each thread has already asked GPU memory for its float4s of the next step, which it writes into the
+/// other set once the math is done. The ~300 cycles a read from GPU memory takes pass during the math, not
+/// before it, and one __syncthreads() per step is enough (see the loop).
 __global__ void linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
                                       size_t input_rows, size_t in_features, size_t out_features) {
-    // This step's 8 input columns i of x and W, with i as the rows: block_input_piece[i][t] = x[t][i] and
-    // block_weight_piece[i][j] = W[j][i] (a piece of Wᵀ), for the block's 128 rows t and 128 output columns j.
-    // The 8 values a thread needs at one i sit next to each other: two float4 reads.
-    __shared__ __align__(16) float block_input_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
-    __shared__ __align__(16) float block_weight_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+    // This step's 8 input columns i of x and W, with i as the rows: block_input_pieces[set][i][t] = x[t][i] and
+    // block_weight_pieces[set][i][j] = W[j][i] (a piece of Wᵀ), for the block's 128 rows t and 128 output
+    // columns j. The 8 values a thread needs at one i sit next to each other: two float4 reads. Two sets: one
+    // step's math reads one while the next step's values go into the other (16.5 KB).
+    __shared__ __align__(16) float block_input_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+    __shared__ __align__(16) float block_weight_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
     // Its square: the blocks are numbered in one line, across first, so / and % turn its number into a row
     // and a column of squares, as threadIdx.x is turned into a thread's place below
     size_t total_block_columns = (out_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
@@ -166,42 +181,36 @@ __global__ void linear_forward_kernel(float* output, const float* input, const f
     // halves of 4, at 0, 4, .. 60 and 64 on from there (see LINEAR_SECOND_HALF_COLUMN_OFFSET)
     int thread_first_row = (threadIdx.x / threads_across) * LINEAR_VALUES_PER_THREAD_ROWS;
     int thread_first_output_column = (threadIdx.x % threads_across) * (LINEAR_VALUES_PER_THREAD_COLUMNS / 2);
-    // What it copies each step: x and W both sit with i last ({T, n_in}, {n_out, n_in}), so a float4 is 4
-    // neighbouring i of one line, 2 float4s per line: threads 0 and 1 line 0, 2 and 3 line 1, ...
     const int max_floats_per_thread_read = 4;   // a float4: 16 bytes, the widest read one thread can do
-    const int threads_per_line = LINEAR_VALUES_PER_THREAD / max_floats_per_thread_read;   // 8 values of i / 4 = 2
-    // line: a row t of x, an output column j of W; i4: its first i in the step, 0 or 4
-    int line = threadIdx.x / threads_per_line;
-    int i4 = (threadIdx.x % threads_per_line) * max_floats_per_thread_read;
-    size_t copy_input_row = block_first_row + line;               // the row t of x it copies, every step
-    size_t copy_output_column = block_first_output_column + line; // the row of W it copies: output column j
 
     // sums[t][j]: its 64 values of y, in registers (all indexes known when compiling)
     float sums[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS] = {};
-    for (size_t step_first_input_column = 0; step_first_input_column < in_features;
-         step_first_input_column += LINEAR_VALUES_PER_THREAD) {
-        // Where its float4s sit: x and W are flat in memory, row after row, so [row][i] is row x n_in + i
-        size_t copy_input_column = step_first_input_column + i4;                          // its first i: i .. i + 3
-        size_t input_position = copy_input_row * in_features + copy_input_column;         // x[t][i]
-        size_t weight_position = copy_output_column * in_features + copy_input_column;    // W[j][i]
-        // past the edges of x or W: 0s, so a part-full square adds nothing
-        float4 input4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f), weight4 = input4;
-        if (copy_input_row < input_rows && copy_input_column < in_features)
-            input4 = *(const float4*)(input + input_position);
-        if (copy_output_column < out_features && copy_input_column < in_features)
-            weight4 = *(const float4*)(weight + weight_position);
-        // its 4 values go down a column of the piece: i4 .. i4 + 3 of one line
-        block_input_piece[i4 + 0][line] = input4.x;
-        block_input_piece[i4 + 1][line] = input4.y;
-        block_input_piece[i4 + 2][line] = input4.z;
-        block_input_piece[i4 + 3][line] = input4.w;
-        block_weight_piece[i4 + 0][line] = weight4.x;
-        block_weight_piece[i4 + 1][line] = weight4.y;
-        block_weight_piece[i4 + 2][line] = weight4.z;
-        block_weight_piece[i4 + 3][line] = weight4.w;
-        __syncthreads();            // both pieces whole before any thread reads them
+    // i is the summed index: each step sums over 8 input columns. x and W both sit with i last ({T, n_in},
+    // {n_out, n_in}), so both are copied turned round; a row of W is an output column j.
+    size_t total_steps = (in_features + LINEAR_VALUES_PER_THREAD - 1) / LINEAR_VALUES_PER_THREAD;
+    // its float4s of x and W for the step being copied, read from GPU memory into registers: step 0's first
+    float4 input4 = linear_load_piece_turned(input, input_rows, in_features, block_first_row, 0);
+    float4 weight4 = linear_load_piece_turned(weight, out_features, in_features, block_first_output_column, 0);
+    for (size_t step = 0; step < total_steps; step++) {
+        int piece_set = (int)(step % 2);    // the set of pieces this step reads; the next step fills the other
+        linear_store_piece_turned(block_input_pieces[piece_set], input4);
+        linear_store_piece_turned(block_weight_pieces[piece_set], weight4);
+        // Both pieces whole before any thread reads them. Every thread is also past the last step's math, so
+        // no one reads the other set any more: the next step may write over it.
+        __syncthreads();
+        // The next step's float4s, asked for now: the ~300 cycles GPU memory takes pass during the math below,
+        // and they are not needed until the next step's store
+        size_t next_step_first_input_column = (step + 1) * LINEAR_VALUES_PER_THREAD;
+        if (next_step_first_input_column < in_features) {
+            input4 = linear_load_piece_turned(input, input_rows, in_features, block_first_row,
+                                              next_step_first_input_column);
+            weight4 = linear_load_piece_turned(weight, out_features, in_features, block_first_output_column,
+                                               next_step_first_input_column);
+        }
 
         // F1's sum over i, for this step's 8 values of i: sums[t][j] += x[t][i] · W[j][i]
+        const float (*block_input_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH] = block_input_pieces[piece_set];
+        const float (*block_weight_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH] = block_weight_pieces[piece_set];
 #pragma unroll
         for (int i = 0; i < LINEAR_VALUES_PER_THREAD; i++) {
             // x[t][i] of its 8 rows t and W[j][i] of its 8 columns j: a float4 holds 4, so two halves each,
@@ -225,7 +234,6 @@ __global__ void linear_forward_kernel(float* output, const float* input, const f
                     sums[t][j] += input_values[t] * weight_values[j];
             }
         }
-        __syncthreads();            // every thread done reading before the next step copies over the pieces
     }
 
     // y[t][j] = sums[t][j] + b[j], F1's last term; one float4 (4 output columns j) at a time
@@ -253,11 +261,13 @@ __global__ void linear_forward_kernel(float* output, const float* input, const f
 // ── backward ──────────────────────────────────────────────────────────────────
 
 // The kernels linear_backward launches, declared here so it can call them; their code follows it.
-__global__ void linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
-                                          const float* input, size_t input_rows, size_t in_features,
-                                          size_t out_features);
-__global__ void linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
-                                         size_t input_rows, size_t in_features, size_t out_features);
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
+                          const float* input, size_t input_rows, size_t in_features,
+                          size_t out_features);
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
+                         size_t input_rows, size_t in_features, size_t out_features);
 
 /// Works out the gradients of input, weight and bias (B3, B2, B1, as C2's products) from output_grad and
 /// what the forward read: input and weight. input_grad is written over: in GPT-2 it is the gradient of a
@@ -320,22 +330,16 @@ inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad,
 
 // The pieces the two backward kernels are made of, declared here so they can call them; their code follows
 // them, in this order. All are inlined into the kernels, so the sums they are handed stay in registers.
-__device__ __forceinline__ void linear_weight_grad_block(float (*block_left_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         float (*block_right_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         float* weight_grad, float* bias_grad, const float* output_grad,
-                                                         const float* input, size_t input_rows, size_t in_features,
-                                                         size_t out_features, size_t block_row, size_t block_column);
-__device__ __forceinline__ void linear_input_grad_block(float (*block_left_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                        float (*block_right_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                        float* input_grad, const float* output_grad,
-                                                        const float* weight, size_t input_rows, size_t in_features,
-                                                        size_t out_features, size_t block_row, size_t block_column);
-__device__ __forceinline__ void linear_copy_piece(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                  const float* matrix, size_t matrix_rows, size_t matrix_columns,
-                                                  size_t step_first_k, size_t block_first_column);
-__device__ __forceinline__ void linear_copy_piece_turned(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         const float* matrix, size_t matrix_rows, size_t matrix_columns,
-                                                         size_t block_first_row, size_t step_first_k);
+__device__ __forceinline__ void linear_weight_grad_block(
+        float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* weight_grad,
+        float* bias_grad, const float* output_grad, const float* input, size_t input_rows, size_t in_features,
+        size_t out_features, size_t block_row, size_t block_column);
+__device__ __forceinline__ void linear_input_grad_block(
+        float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* input_grad,
+        const float* output_grad, const float* weight, size_t input_rows, size_t in_features, size_t out_features,
+        size_t block_row, size_t block_column);
 __device__ __forceinline__ void linear_add_outer_products(
         float (&sums)[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS],
         const float (*block_left_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
@@ -357,37 +361,45 @@ __device__ __forceinline__ void linear_store_sums(
 // Each kernel works out one 128 x 128 square of its product per block: / and % turn the block's number into
 // a row and a column of squares, across first, and its sub-function (linear_weight_grad_block,
 // linear_input_grad_block) does the rest.
+//
+// __launch_bounds__(256, 2) asks the compiler to fit 2 blocks of 256 threads on an SM: at most 65,536 / 512
+// = 128 registers per thread. With the double-buffered copy, left to itself it took 133 (dW) and 130 (dx),
+// and only 1 block fit an SM.
 
 /// Works out one 128 x 128 square of weight_grad (B2), and of bias_grad with it (B1): see
 /// linear_weight_grad_block. For the qkv, 108 blocks: 18 squares down (output columns j), 6 across (input
 /// columns i).
-__global__ void linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
-                                          const float* input, size_t input_rows, size_t in_features,
-                                          size_t out_features) {
-    // This step's 8 values of k of left and right, with k as the rows: block_left_piece[k][r] = left[r][k] and
-    // block_right_piece[k][c] = right[k][c], for the block's 128 rows r and 128 columns c (8.25 KB)
-    __shared__ __align__(16) float block_left_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
-    __shared__ __align__(16) float block_right_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
+                          const float* input, size_t input_rows, size_t in_features,
+                          size_t out_features) {
+    // This step's 8 values of k of left and right, with k as the rows: block_left_pieces[set][k][r] = left[r][k]
+    // and block_right_pieces[set][k][c] = right[k][c], for the block's 128 rows r and 128 columns c. Two sets
+    // (double buffering, see the forward): one step's math reads one while the next step's values go into the
+    // other (16.5 KB).
+    __shared__ __align__(16) float block_left_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+    __shared__ __align__(16) float block_right_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
     size_t total_block_columns =                                                              // columns i: 6
         (in_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
     size_t block_row = blockIdx.x / total_block_columns;           // which 128 rows r of dW: output columns j
     size_t block_column = blockIdx.x % total_block_columns;        // which 128 columns c: input columns i
-    linear_weight_grad_block(block_left_piece, block_right_piece, weight_grad, bias_grad, output_grad, input,
+    linear_weight_grad_block(block_left_pieces, block_right_pieces, weight_grad, bias_grad, output_grad, input,
                              input_rows, in_features, out_features, block_row, block_column);
 }
 
 /// Works out one 128 x 128 square of input_grad (B3): see linear_input_grad_block. For the qkv, 192 blocks:
 /// 32 squares down (rows t), 6 across (input columns i).
-__global__ void linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
-                                         size_t input_rows, size_t in_features, size_t out_features) {
-    // the same pair of pieces as linear_weight_grad_kernel's (8.25 KB)
-    __shared__ __align__(16) float block_left_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
-    __shared__ __align__(16) float block_right_piece[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+__global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
+linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
+                         size_t input_rows, size_t in_features, size_t out_features) {
+    // the same two sets of pieces as linear_weight_grad_kernel's (16.5 KB)
+    __shared__ __align__(16) float block_left_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
+    __shared__ __align__(16) float block_right_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
     size_t total_block_columns =                                                              // columns i: 6
         (in_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
     size_t block_row = blockIdx.x / total_block_columns;           // which 128 rows r of dx: rows t
     size_t block_column = blockIdx.x % total_block_columns;        // which 128 columns c: input columns i
-    linear_input_grad_block(block_left_piece, block_right_piece, input_grad, output_grad, weight, input_rows,
+    linear_input_grad_block(block_left_pieces, block_right_pieces, input_grad, output_grad, weight, input_rows,
                             in_features, out_features, block_row, block_column);
 }
 
@@ -401,11 +413,11 @@ __global__ void linear_input_grad_kernel(float* input_grad, const float* output_
 /// (inside linear_add_outer_products, from the values it reads anyway), and the 16 threads with thread_first_column
 /// 0 add them onto bias_grad at the end. One thread per bias_grad value, adding in the same order every run:
 /// bias_grad is the same to the last bit (no atomicAdd).
-__device__ __forceinline__ void linear_weight_grad_block(float (*block_left_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         float (*block_right_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         float* weight_grad, float* bias_grad, const float* output_grad,
-                                                         const float* input, size_t input_rows, size_t in_features,
-                                                         size_t out_features, size_t block_row, size_t block_column) {
+__device__ __forceinline__ void linear_weight_grad_block(
+        float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* weight_grad,
+        float* bias_grad, const float* output_grad, const float* input, size_t input_rows, size_t in_features,
+        size_t out_features, size_t block_row, size_t block_column) {
     size_t block_first_row = block_row * LINEAR_VALUES_PER_BLOCK_ROWS;             // its first r: an output column j
     size_t block_first_column = block_column * LINEAR_VALUES_PER_BLOCK_COLUMNS;    // its first c: an input column i
     // Its threads as the forward's: 16 x 16, numbered across first, each making 8 x 8 of the 128 x 128
@@ -419,19 +431,27 @@ __device__ __forceinline__ void linear_weight_grad_block(float (*block_left_piec
     // its 64 values of dW, in registers
     float sums[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS] = {};
     float bias_sums[LINEAR_VALUES_PER_THREAD_ROWS] = {};                   // with adds_bias_grad: db of its 8 rows r
-    // k is t: each step sums over 8 input rows
-    for (size_t step_first_input_row = 0; step_first_input_row < input_rows;
-         step_first_input_row += LINEAR_VALUES_PER_THREAD) {
-        // dy as {k, r}, and x as {k, c}: both copied as they sit
-        linear_copy_piece(block_left_piece, output_grad, input_rows, out_features, step_first_input_row,
-                          block_first_row);
-        linear_copy_piece(block_right_piece, input, input_rows, in_features, step_first_input_row,
-                          block_first_column);
-        __syncthreads();            // both pieces whole before any thread reads them
+    // k is t: each step sums over 8 input rows. dy as {k, r}, and x as {k, c}: both copied as they sit
+    size_t total_steps = (input_rows + LINEAR_VALUES_PER_THREAD - 1) / LINEAR_VALUES_PER_THREAD;
+    // its float4s of dy and x for the step being copied, read from GPU memory into registers: step 0's first
+    float4 left4 = linear_load_piece(output_grad, input_rows, out_features, 0, block_first_row);
+    float4 right4 = linear_load_piece(input, input_rows, in_features, 0, block_first_column);
+    for (size_t step = 0; step < total_steps; step++) {
+        int piece_set = (int)(step % 2);    // the set of pieces this step reads; the next step fills the other
+        linear_store_piece(block_left_pieces[piece_set], left4);
+        linear_store_piece(block_right_pieces[piece_set], right4);
+        __syncthreads();            // both pieces whole, and the other set free: see the forward's loop
+        // the next step's float4s, asked for now: GPU memory's wait passes during the math below
+        size_t next_step_first_input_row = (step + 1) * LINEAR_VALUES_PER_THREAD;
+        if (next_step_first_input_row < input_rows) {
+            left4 = linear_load_piece(output_grad, input_rows, out_features, next_step_first_input_row,
+                                      block_first_row);
+            right4 = linear_load_piece(input, input_rows, in_features, next_step_first_input_row,
+                                       block_first_column);
+        }
         // and B1: with adds_bias_grad, bias_sums gets left's values as they are read
-        linear_add_outer_products(sums, block_left_piece, block_right_piece, thread_first_row, thread_first_column,
-                                  bias_sums, adds_bias_grad);
-        __syncthreads();            // every thread done reading before the next step copies over the pieces
+        linear_add_outer_products(sums, block_left_pieces[piece_set], block_right_pieces[piece_set],
+                                  thread_first_row, thread_first_column, bias_sums, adds_bias_grad);
     }
 
     linear_store_sums(weight_grad, out_features, in_features, sums, block_first_row + thread_first_row,
@@ -449,11 +469,11 @@ __device__ __forceinline__ void linear_weight_grad_block(float (*block_left_piec
 /// Makes one 128 x 128 square of input_grad, B3: dx = dy W, written over (see linear_backward). r is a row t,
 /// c an input column i, and the sum runs over the n_out output columns j. dy sits as {T, n_out}, which is
 /// {r, k}: it is copied turned round, as the forward copies x.
-__device__ __forceinline__ void linear_input_grad_block(float (*block_left_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                        float (*block_right_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                        float* input_grad, const float* output_grad,
-                                                        const float* weight, size_t input_rows, size_t in_features,
-                                                        size_t out_features, size_t block_row, size_t block_column) {
+__device__ __forceinline__ void linear_input_grad_block(
+        float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* input_grad,
+        const float* output_grad, const float* weight, size_t input_rows, size_t in_features, size_t out_features,
+        size_t block_row, size_t block_column) {
     size_t block_first_row = block_row * LINEAR_VALUES_PER_BLOCK_ROWS;             // its first r: a row t
     size_t block_first_column = block_column * LINEAR_VALUES_PER_BLOCK_COLUMNS;    // its first c: an input column i
     // Its threads as the forward's: 16 x 16, numbered across first, each making 8 x 8 of the 128 x 128
@@ -466,52 +486,70 @@ __device__ __forceinline__ void linear_input_grad_block(float (*block_left_piece
     // its 64 values of dx, in registers
     float sums[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS] = {};
     float no_bias_sums[LINEAR_VALUES_PER_THREAD_ROWS];                   // never written: dx has no bias part
-    // k is j: each step sums over 8 output columns
-    for (size_t step_first_output_column = 0; step_first_output_column < out_features;
-         step_first_output_column += LINEAR_VALUES_PER_THREAD) {
-        // dy as {r, k}, copied turned round; W as {k, c}, copied as it sits
-        linear_copy_piece_turned(block_left_piece, output_grad, input_rows, out_features, block_first_row,
-                                 step_first_output_column);
-        linear_copy_piece(block_right_piece, weight, out_features, in_features, step_first_output_column,
-                          block_first_column);
-        __syncthreads();            // both pieces whole before any thread reads them
-        linear_add_outer_products(sums, block_left_piece, block_right_piece, thread_first_row, thread_first_column,
-                                  no_bias_sums, false);
-        __syncthreads();            // every thread done reading before the next step copies over the pieces
+    // k is j: each step sums over 8 output columns. dy as {r, k}, copied turned round; W as {k, c}, as it sits
+    size_t total_steps = (out_features + LINEAR_VALUES_PER_THREAD - 1) / LINEAR_VALUES_PER_THREAD;
+    // its float4s of dy and W for the step being copied, read from GPU memory into registers: step 0's first
+    float4 left4 = linear_load_piece_turned(output_grad, input_rows, out_features, block_first_row, 0);
+    float4 right4 = linear_load_piece(weight, out_features, in_features, 0, block_first_column);
+    for (size_t step = 0; step < total_steps; step++) {
+        int piece_set = (int)(step % 2);    // the set of pieces this step reads; the next step fills the other
+        linear_store_piece_turned(block_left_pieces[piece_set], left4);
+        linear_store_piece(block_right_pieces[piece_set], right4);
+        __syncthreads();            // both pieces whole, and the other set free: see the forward's loop
+        // the next step's float4s, asked for now: GPU memory's wait passes during the math below
+        size_t next_step_first_output_column = (step + 1) * LINEAR_VALUES_PER_THREAD;
+        if (next_step_first_output_column < out_features) {
+            left4 = linear_load_piece_turned(output_grad, input_rows, out_features, block_first_row,
+                                             next_step_first_output_column);
+            right4 = linear_load_piece(weight, out_features, in_features, next_step_first_output_column,
+                                       block_first_column);
+        }
+        linear_add_outer_products(sums, block_left_pieces[piece_set], block_right_pieces[piece_set],
+                                  thread_first_row, thread_first_column, no_bias_sums, false);
     }
 
     linear_store_sums(input_grad, input_rows, in_features, sums, block_first_row + thread_first_row,
                       block_first_column + thread_first_column, false);
 }
 
-/// Copies one step's piece of a matrix that sits with k first, {k, c}, as it is: block_piece[k][c] =
-/// matrix[step_first_k + k][block_first_column + c] for the step's 8 values of k and the block's 128 columns c;
-/// 0 past the matrix's edges, so a part-full square adds nothing. matrix is {matrix_rows, matrix_columns}. Each of
-/// the 256 threads copies one float4, 4 neighbouring c at one k: 32 threads per k, a warp reading 512 bytes
-/// in a row.
-__device__ __forceinline__ void linear_copy_piece(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                  const float* matrix, size_t matrix_rows, size_t matrix_columns,
-                                                  size_t step_first_k, size_t block_first_column) {
+/// Reads, for linear_store_piece, this thread's float4 of one step's piece of a matrix that sits with k first,
+/// {k, c}: matrix[step_first_k + k][block_first_column + c .. c + 3], for the step's 8 values of k and the block's
+/// 128 columns c; 0 past the matrix's edges, so a part-full square adds nothing. matrix is {matrix_rows,
+/// matrix_columns}. The 256 threads read one float4 each, 4 neighbouring c at one k: 32 threads per k, a warp
+/// reading 512 bytes in a row. It only reads, into a register: the value is not needed until linear_store_piece,
+/// so the thread can do other work while GPU memory answers.
+__device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t matrix_rows, size_t matrix_columns,
+                                                    size_t step_first_k, size_t block_first_column) {
     const int max_floats_per_thread_read = 4;   // a float4: 16 bytes, the widest read one thread can do
     // a row of block_piece is 128 columns c: 128 / 4 = 32 threads per row, one warp, 8 rows
     const int threads_per_block_piece_row = LINEAR_VALUES_PER_BLOCK_COLUMNS / max_floats_per_thread_read;
-    // its float4: block_piece[k][c .. c + 3]
+    // its float4: matrix[step_first_k + k][block_first_column + c .. c + 3]
     int k = threadIdx.x / threads_per_block_piece_row;
     int c = (threadIdx.x % threads_per_block_piece_row) * max_floats_per_thread_read;
     size_t matrix_row = step_first_k + k, matrix_column = block_first_column + c;
     float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (matrix_row < matrix_rows && matrix_column < matrix_columns)
         values = *(const float4*)(matrix + matrix_row * matrix_columns + matrix_column);
+    return values;
+}
+
+/// Writes the float4 linear_load_piece read into block_piece as it sat: block_piece[k][c .. c + 3], the same k and
+/// c the thread read, one float4 write.
+__device__ __forceinline__ void linear_store_piece(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH], float4 values) {
+    const int max_floats_per_thread_write = 4;   // a float4: 16 bytes, the widest write one thread can do
+    const int threads_per_block_piece_row = LINEAR_VALUES_PER_BLOCK_COLUMNS / max_floats_per_thread_write;   // 32
+    int k = threadIdx.x / threads_per_block_piece_row;
+    int c = (threadIdx.x % threads_per_block_piece_row) * max_floats_per_thread_write;
     *(float4*)&block_piece[k][c] = values;
 }
 
-/// Copies one step's piece of a matrix that sits with k last, {r, k}, turned round: block_piece[k][r] =
-/// matrix[block_first_row + r][step_first_k + k] for the block's 128 rows r and the step's 8 values of k; 0 past
-/// the matrix's edges. matrix is {matrix_rows, matrix_columns}. Each thread reads one float4, 4 neighbouring k
-/// of one r (2 threads per r), and writes its 4 values down a column of the piece, one at a time.
-__device__ __forceinline__ void linear_copy_piece_turned(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
-                                                         const float* matrix, size_t matrix_rows, size_t matrix_columns,
-                                                         size_t block_first_row, size_t step_first_k) {
+/// Reads, for linear_store_piece_turned, this thread's float4 of one step's piece of a matrix that sits with k
+/// last, {r, k}: matrix[block_first_row + r][step_first_k + k .. k + 3], for the block's 128 rows r and the step's
+/// 8 values of k; 0 past the matrix's edges. matrix is {matrix_rows, matrix_columns}. Each thread reads 4
+/// neighbouring k of one r (2 threads per r), into a register, as linear_load_piece does.
+__device__ __forceinline__ float4 linear_load_piece_turned(const float* matrix, size_t matrix_rows,
+                                                           size_t matrix_columns, size_t block_first_row,
+                                                           size_t step_first_k) {
     const int max_floats_per_thread_read = 4;   // a float4: 16 bytes, the widest read one thread can do
     const int threads_per_line = LINEAR_VALUES_PER_THREAD / max_floats_per_thread_read;   // 8 values of k / 4 = 2
     // its float4: matrix row r, k .. k + 3
@@ -521,12 +559,22 @@ __device__ __forceinline__ void linear_copy_piece_turned(float (*block_piece)[LI
     float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (matrix_row < matrix_rows && matrix_column < matrix_columns)
         values = *(const float4*)(matrix + matrix_row * matrix_columns + matrix_column);
+    return values;
+}
+
+/// Writes the float4 linear_load_piece_turned read into block_piece turned round: block_piece[k .. k + 3][r],
+/// its 4 values down a column of the piece, one at a time (4 neighbouring k are 4 rows of the piece).
+__device__ __forceinline__ void linear_store_piece_turned(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
+                                                          float4 values) {
+    const int max_floats_per_thread_read = 4;   // the float4 it read: 4 values of k
+    const int threads_per_line = LINEAR_VALUES_PER_THREAD / max_floats_per_thread_read;   // 2
+    int r = threadIdx.x / threads_per_line;
+    int k = (threadIdx.x % threads_per_line) * max_floats_per_thread_read;
     block_piece[k + 0][r] = values.x;
     block_piece[k + 1][r] = values.y;
     block_piece[k + 2][r] = values.z;
     block_piece[k + 3][r] = values.w;
 }
-
 /// Adds one step's 8 outer products into a thread's 64 sums, C1's sum over k for the step's 8 values of k:
 /// sums[r][c] += left[r][k] · right[k][c], for its 8 rows r (thread_first_row .. + 7) and 8 columns c
 /// (thread_first_column .. + 3 and the 4 that are 64 on) of the block's square. At each k it reads its 8
