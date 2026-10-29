@@ -11,10 +11,16 @@
 //
 // Each thread takes 4 values with float4 loads, so every tensor's size must be a
 // multiple of 4. The norm stays on the GPU (from grad_norm.cuh).
+//
+// params and grads may be float or bfloat16 (T, the kernel's template); m and v are always
+// float. Each value is read as a float, updated in float, and the new parameter rounded to
+// T as it is stored (load4 and store4, tensor.cuh). A bfloat16 keeps 8 significant bits:
+// an update smaller than half the gap to the next bfloat16 (up to 2^-8 of the value) is lost.
 #ifndef ADAMW_CUH
 #define ADAMW_CUH
 
 #include "cuda_common.h"
+#include "../tensor.cuh"             // load4, store4: 4 values of float or bfloat16 as a float4
 
 __device__ __forceinline__ float adamw_value(float p, float g, float* m, float* v, float clip, float decay_factor,
                                              float beta1, float beta2, float eps, float step_size,
@@ -27,7 +33,8 @@ __device__ __forceinline__ float adamw_value(float p, float g, float* m, float* 
     return p - step_size * *m / denominator;
 }
 
-__global__ void adamw_kernel(float* params, const float* grads, float* m_memory, float* v_memory, size_t n,
+template <typename T>
+__global__ void adamw_kernel(T* params, const T* grads, float* m_memory, float* v_memory, size_t n,
                              size_t decayed_count, const float* grad_norm, float max_norm, float weight_decay_factor,
                              float beta1, float beta2, float eps, float step_size,
                              float inverse_sqrt_bias_correction2) {
@@ -41,22 +48,24 @@ __global__ void adamw_kernel(float* params, const float* grads, float* m_memory,
     // Before the border: a matrix, weight decay. decayed_count is a multiple of 4, so
     // all 4 values of this thread are on the same side.
     float decay_factor = group * 4 < decayed_count ? weight_decay_factor : 1.0f;
-    float4 p = reinterpret_cast<float4*>(params)[group];
-    float4 g = reinterpret_cast<const float4*>(grads)[group];
+    float4 p = load4(params + 4 * group);
+    float4 g = load4(grads + 4 * group);
     float4 m = reinterpret_cast<float4*>(m_memory)[group];
     float4 v = reinterpret_cast<float4*>(v_memory)[group];
     p.x = adamw_value(p.x, g.x, &m.x, &v.x, clip, decay_factor, beta1, beta2, eps, step_size, inverse_sqrt_bias_correction2);
     p.y = adamw_value(p.y, g.y, &m.y, &v.y, clip, decay_factor, beta1, beta2, eps, step_size, inverse_sqrt_bias_correction2);
     p.z = adamw_value(p.z, g.z, &m.z, &v.z, clip, decay_factor, beta1, beta2, eps, step_size, inverse_sqrt_bias_correction2);
     p.w = adamw_value(p.w, g.w, &m.w, &v.w, clip, decay_factor, beta1, beta2, eps, step_size, inverse_sqrt_bias_correction2);
-    reinterpret_cast<float4*>(params)[group] = p;
+    store4(params + 4 * group, p);
     reinterpret_cast<float4*>(m_memory)[group] = m;
     reinterpret_cast<float4*>(v_memory)[group] = v;
 }
 
 /// One AdamW step t on n values in a row: all the parameters, matrices first. The first
-/// decayed_count values get weight decay, the rest do not. max_norm 0: no clipping.
-void adamw_update(float* params, const float* grads, float* m, float* v, size_t n, size_t decayed_count,
+/// decayed_count values get weight decay, the rest do not. max_norm 0: no clipping. params and
+/// grads are float* or nv_bfloat16*, both the same; m, v and grad_norm float*.
+template <typename T>
+void adamw_update(T* params, const T* grads, float* m, float* v, size_t n, size_t decayed_count,
                   const float* grad_norm, float max_norm, float learning_rate, float beta1, float beta2, float eps,
                   float weight_decay, int t) {
     if (n % 4 != 0 || decayed_count % 4 != 0 || decayed_count > n) {
@@ -64,11 +73,15 @@ void adamw_update(float* params, const float* grads, float* m, float* v, size_t 
                         "decayed_count <= n; got n = %zu, decayed_count = %zu\n", n, decayed_count);
         exit(EXIT_FAILURE);
     }
-    // float4 loads need each block to start on 16 bytes (a multiple of 4 floats); off it,
-    // the GPU stops with "misaligned address" at some later call, far from the cause.
-    if ((size_t)params % 16 != 0 || (size_t)grads % 16 != 0 || (size_t)m % 16 != 0 || (size_t)v % 16 != 0) {
-        fprintf(stderr, "error: AdamW needs params, grads, m and v to start on 16 bytes (float4 loads); got "
-                        "%p, %p, %p, %p\n", (void*)params, (const void*)grads, (void*)m, (void*)v);
+    // 4-value loads need each block to start on 4 values: 16 bytes for float (m and v always),
+    // 8 for bfloat16; off it, the GPU stops with "misaligned address" at some later call, far
+    // from the cause.
+    size_t four_values = 4 * sizeof(T);
+    if ((size_t)params % four_values != 0 || (size_t)grads % four_values != 0 || (size_t)m % 16 != 0 ||
+        (size_t)v % 16 != 0) {
+        fprintf(stderr, "error: AdamW needs params and grads to start on %zu bytes and m and v on 16 (4-value "
+                        "loads); got %p, %p, %p, %p\n", four_values, (void*)params, (const void*)grads, (void*)m,
+                (void*)v);
         exit(EXIT_FAILURE);
     }
     float bias_correction1 = 1.0f - powf(beta1, (float)t);

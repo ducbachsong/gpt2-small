@@ -51,6 +51,14 @@
 //     B3     dxᵀ {in, rows},  ld in       = W  as is      · dy as is       in_features   rows          out_features
 //     B2     dWᵀ {in, out},   ld in       = x  as is      · dy turned      in_features   out_features  rows
 //     B1     db  {out}                    = dy as is      · 1s             out_features  rows          –
+//
+// ── float or bfloat16 ────────────────────────────────────────────────────────────
+// The tensors are all float or all bfloat16. Each call is told the number type of its matrices
+// (CUDA_R_32F or CUDA_R_16BF) and always sums in float (CUBLAS_COMPUTE_32F): bfloat16 matrices are read
+// as floats, multiplied and added in float, and the results rounded once as they are stored. The classic
+// calls for float, cublasSgemm and cublasSgemv, have no bfloat16 form; cublasGemmEx is the one call that
+// takes any number type, so the backward uses it for both, with B1 as a product of {out, rows} by
+// {rows, 1}.
 #ifndef LINEAR_CUBLAS_CUH
 #define LINEAR_CUBLAS_CUH
 
@@ -76,15 +84,19 @@ void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const 
 /// settings; making one takes milliseconds), cuBLASLt's workspace, and the 1s B1 multiplies by. They stay
 /// until the program ends.
 struct LinearCublas {
-    cublasHandle_t handle;           // for cublasSgemm and cublasSgemv
+    cublasHandle_t handle;           // for cublasSgemm, cublasSgemv and cublasGemmEx
     cublasLtHandle_t lt_handle;      // for cublasLtMatmul
     void* workspace;                 // LINEAR_CUBLAS_WORKSPACE_BYTES on the GPU, for cublasLtMatmul
     float* ones;                     // ones_length 1s on the GPU, for B1
     size_t ones_length;
+    nv_bfloat16* bfloat16_ones;      // bfloat16_ones_length 1s as bfloat16s, for B1 in bfloat16
+    size_t bfloat16_ones_length;
 };
 
 LinearCublas& linear_cublas();                                       // the handles, made on first use
 const float* linear_cublas_ones(size_t length);                      // a vector of at least `length` 1s
+const nv_bfloat16* linear_cublas_bfloat16_ones(size_t length);       // the same, as bfloat16s
+cudaDataType_t linear_cublas_number_type(const Tensor& tensor);      // CUDA_R_32F or CUDA_R_16BF
 uint32_t linear_cublas_alignment(const void* pointer);               // the bytes `pointer` is a multiple of
 
 // Every cuBLAS call returns a status; this stops with the file and line, as cudaCheck does.
@@ -104,15 +116,15 @@ static inline void cublas_check(cublasStatus_t status, const char* file, int lin
 /// value. input is {..., in_features} ({batch_size, seq_len, in_features} in GPT-2), output the same with
 /// out_features last, weight {out_features, in_features}, bias {out_features} or Tensor() for none (the head).
 ///
-/// First it stops with a message if the tensors do not fit together. Unlike linear.cuh, any sizes and any
-/// start addresses work: cuBLAS picks a kernel that fits them.
+/// First it stops with a message if the tensors do not fit together, or are not all float or all bfloat16.
+/// Unlike linear.cuh, any sizes and any start addresses work: cuBLAS picks a kernel that fits them.
 ///
 /// A cuBLASLt call is described, not just made: a description of the product (its number types, which inputs
 /// are turned round, the bias), one of each matrix's layout in memory, and how much workspace it may use. From
 /// these, cuBLASLt's "heuristic" picks the kernel it expects to be fastest. The descriptions are made and freed
 /// on every call, as PyTorch does: a few microseconds, against 0.6 ms for the smallest GPT-2 forward.
 inline void linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias) {
-    bool has_bias = bias.data() != nullptr;                     // Tensor() has no values: no bias
+    bool has_bias = bias.data_ptr() != nullptr;                 // Tensor() has no values: no bias
     bool fits = input.dim() >= 1 && weight.dim() == 2 && output.dim() == input.dim() &&
                 input.size(input.dim() - 1) == weight.size(1) && output.size(output.dim() - 1) == weight.size(0) &&
                 (!has_bias || bias.shape() == Shape({weight.size(0)}));
@@ -122,6 +134,12 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
                         "same rows, weight {out_features, in_features}, bias {out_features} or Tensor()\n");
         exit(EXIT_FAILURE);
     }
+    DType dtype = input.dtype();
+    if ((dtype != DType::Float32 && dtype != DType::BFloat16) || output.dtype() != dtype || weight.dtype() != dtype ||
+        (has_bias && bias.dtype() != dtype)) {
+        fprintf(stderr, "error: a linear layer needs output, input, weight and bias all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
     size_t out_features = weight.size(0), in_features = weight.size(1), input_rows = input.numel() / in_features;
     if (input_rows > INT_MAX || in_features > INT_MAX || out_features > INT_MAX) {     // cuBLAS takes int sizes
         fprintf(stderr, "error: a linear layer's sizes must each be below 2^31; got %zu rows, in_features %zu, "
@@ -129,10 +147,12 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
         exit(EXIT_FAILURE);
     }
     LinearCublas& cublas = linear_cublas();
+    cudaDataType_t number_type = linear_cublas_number_type(input);      // CUDA_R_32F or CUDA_R_16BF
 
-    // The product: float numbers, float sums. A (weight) turned round, B (input) as it is; see the table at
-    // the top, row F1. With a bias, the epilogue adds bias[j] to every value of C's row j as cuBLAS sees it,
-    // which is our output column j.
+    // The product: float sums, whatever the matrices' number type (alpha and beta are floats too). A (weight)
+    // turned round, B (input) as it is; see the table at the top, row F1. With a bias, the epilogue adds
+    // bias[j] to every value of C's row j as cuBLAS sees it, which is our output column j; the bias has C's
+    // number type.
     cublasLtMatmulDesc_t product;
     cublasCheck(cublasLtMatmulDescCreate(&product, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     cublasOperation_t turned = CUBLAS_OP_T, as_is = CUBLAS_OP_N;
@@ -140,7 +160,7 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
     cublasCheck(cublasLtMatmulDescSetAttribute(product, CUBLASLT_MATMUL_DESC_TRANSB, &as_is, sizeof(as_is)));
     if (has_bias) {
         cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-        const float* bias_values = bias.data();
+        const void* bias_values = bias.data_ptr();
         cublasCheck(cublasLtMatmulDescSetAttribute(product, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
                                                    sizeof(epilogue)));
         cublasCheck(cublasLtMatmulDescSetAttribute(product, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_values,
@@ -150,9 +170,9 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
     // Each matrix as cuBLAS sees it in memory, before turning: rows, columns, and the floats one column takes.
     // For the qkv: weight {768, 2304}, input {768, 4096}, output {2304, 4096}.
     cublasLtMatrixLayout_t weight_layout, input_layout, output_layout;
-    cublasCheck(cublasLtMatrixLayoutCreate(&weight_layout, CUDA_R_32F, in_features, out_features, in_features));
-    cublasCheck(cublasLtMatrixLayoutCreate(&input_layout, CUDA_R_32F, in_features, input_rows, in_features));
-    cublasCheck(cublasLtMatrixLayoutCreate(&output_layout, CUDA_R_32F, out_features, input_rows, out_features));
+    cublasCheck(cublasLtMatrixLayoutCreate(&weight_layout, number_type, in_features, out_features, in_features));
+    cublasCheck(cublasLtMatrixLayoutCreate(&input_layout, number_type, in_features, input_rows, in_features));
+    cublasCheck(cublasLtMatrixLayoutCreate(&output_layout, number_type, out_features, input_rows, out_features));
 
     // What the kernel may count on. cuBLASLt assumes every matrix starts on 256 bytes unless told otherwise, and
     // may then pick a kernel that reads 16 bytes at a time: on a view that starts 4 bytes in, that kernel would
@@ -162,9 +182,9 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
     cublasLtMatmulPreference_t preference;
     cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
     uint64_t workspace_bytes = LINEAR_CUBLAS_WORKSPACE_BYTES;
-    uint32_t weight_alignment = linear_cublas_alignment(weight.data());
-    uint32_t input_alignment = linear_cublas_alignment(input.data());
-    uint32_t output_alignment = linear_cublas_alignment(output.data());
+    uint32_t weight_alignment = linear_cublas_alignment(weight.data_ptr());
+    uint32_t input_alignment = linear_cublas_alignment(input.data_ptr());
+    uint32_t output_alignment = linear_cublas_alignment(output.data_ptr());
     cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                      &workspace_bytes, sizeof(workspace_bytes)));
     cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
@@ -188,8 +208,8 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
         exit(EXIT_FAILURE);
     }
     float one = 1.0f, zero = 0.0f;
-    cublasCheck(cublasLtMatmul(cublas.lt_handle, product, &one, weight.data(), weight_layout, input.data(),
-                               input_layout, &zero, output.data(), output_layout, output.data(), output_layout,
+    cublasCheck(cublasLtMatmul(cublas.lt_handle, product, &one, weight.data_ptr(), weight_layout, input.data_ptr(),
+                               input_layout, &zero, output.data_ptr(), output_layout, output.data_ptr(), output_layout,
                                &best.algo, cublas.workspace, LINEAR_CUBLAS_WORKSPACE_BYTES, 0));
 
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -205,14 +225,15 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
 /// input and weight, with three cuBLAS calls. As linear.cuh's: input_grad is written over; weight_grad and
 /// bias_grad are added onto, so they must be 0 before the first backward of a step. The shapes are the
 /// forward's: input_grad as input, weight_grad as weight, bias_grad as bias (Tensor() for none), output_grad as
-/// output. It stops with a message if the tensors do not fit together.
+/// output. It stops with a message if the tensors do not fit together, or are not all float or all bfloat16.
 ///
 /// The classic cuBLAS calls, not cuBLASLt: they need no description, add onto C with beta = 1, and take any
 /// start address. For the qkv, B2 is a product of 2304 x 768 values, each a sum over the 4096 rows; cuBLAS
 /// splits that sum into parts when it fills the GPU better (5, for the qkv on a T4), which our kernel does not.
+/// In bfloat16, cublasGemmEx for all three (see the top of the file).
 inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
                             const Tensor& output_grad, const Tensor& input, const Tensor& weight) {
-    bool has_bias = bias_grad.data() != nullptr;                // Tensor() has no values: no bias
+    bool has_bias = bias_grad.data_ptr() != nullptr;            // Tensor() has no values: no bias
     bool fits = input.dim() >= 1 && weight.dim() == 2 && output_grad.dim() == input.dim() &&
                 input.size(input.dim() - 1) == weight.size(1) &&
                 output_grad.size(output_grad.dim() - 1) == weight.size(0) && input_grad.shape() == input.shape() &&
@@ -230,9 +251,36 @@ inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad,
                         "out_features %zu\n", input_rows, in_features, out_features);
         exit(EXIT_FAILURE);
     }
+    DType dtype = input.dtype();
+    if ((dtype != DType::Float32 && dtype != DType::BFloat16) || input_grad.dtype() != dtype ||
+        weight_grad.dtype() != dtype || output_grad.dtype() != dtype || weight.dtype() != dtype ||
+        (has_bias && bias_grad.dtype() != dtype)) {
+        fprintf(stderr, "error: a linear layer's backward needs its tensors all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
     int rows = (int)input_rows, in = (int)in_features, out = (int)out_features;
     LinearCublas& cublas = linear_cublas();
     float one = 1.0f, zero = 0.0f;
+
+    if (dtype == DType::BFloat16) {
+        // The same three products as below, by cublasGemmEx: bfloat16 matrices, float sums
+        cudaDataType_t bf16 = CUDA_R_16BF;
+        // B3: dxᵀ = W · dyᵀ, written over input_grad (beta 0)
+        cublasCheck(cublasGemmEx(cublas.handle, CUBLAS_OP_N, CUBLAS_OP_N, in, rows, out, &one, weight.data_ptr(), bf16,
+                                 in, output_grad.data_ptr(), bf16, out, &zero, input_grad.data_ptr(), bf16, in,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        // B2: dWᵀ = xᵀ · (dyᵀ) turned, added onto weight_grad (beta 1)
+        cublasCheck(cublasGemmEx(cublas.handle, CUBLAS_OP_N, CUBLAS_OP_T, in, out, rows, &one, input.data_ptr(), bf16,
+                                 in, output_grad.data_ptr(), bf16, out, &one, weight_grad.data_ptr(), bf16, in,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        // B1: db {out, 1} = dyᵀ {out, rows} · {rows, 1} of 1s, added onto bias_grad (beta 1)
+        if (has_bias)
+            cublasCheck(cublasGemmEx(cublas.handle, CUBLAS_OP_N, CUBLAS_OP_N, out, 1, rows, &one,
+                                     output_grad.data_ptr(), bf16, out, linear_cublas_bfloat16_ones(input_rows), bf16,
+                                     rows, &one, bias_grad.data_ptr(), bf16, out, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT));
+        return;
+    }
 
     // B3: dxᵀ {in, rows} = W {in, out as cuBLAS sees it} · dyᵀ {out, rows}, written over input_grad (beta 0)
     cublasCheck(cublasSgemm(cublas.handle, CUBLAS_OP_N, CUBLAS_OP_N, in, rows, out, &one, weight.data(), in,
@@ -273,6 +321,25 @@ inline const float* linear_cublas_ones(size_t length) {
         cublas.ones_length = length;
     }
     return cublas.ones;
+}
+
+/// Gives a vector of at least `length` 1s as bfloat16s on the GPU, for B1's sums in bfloat16, made as
+/// linear_cublas_ones makes its floats. 1 is a bfloat16 exactly.
+inline const nv_bfloat16* linear_cublas_bfloat16_ones(size_t length) {
+    LinearCublas& cublas = linear_cublas();
+    if (cublas.bfloat16_ones_length < length) {
+        if (cublas.bfloat16_ones != nullptr) cudaCheck(cudaFree(cublas.bfloat16_ones));
+        std::vector<nv_bfloat16> ones(length, from_float<nv_bfloat16>(1.0f));
+        cudaCheck(cudaMalloc(&cublas.bfloat16_ones, length * sizeof(nv_bfloat16)));
+        cudaCheck(cudaMemcpy(cublas.bfloat16_ones, ones.data(), length * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+        cublas.bfloat16_ones_length = length;
+    }
+    return cublas.bfloat16_ones;
+}
+
+/// Gives the number type cuBLAS is told for a tensor: CUDA_R_32F for float, CUDA_R_16BF for bfloat16.
+inline cudaDataType_t linear_cublas_number_type(const Tensor& tensor) {
+    return tensor.dtype() == DType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F;
 }
 
 /// Gives the largest power of 2, up to 256, that `pointer`'s address is a multiple of: 256 for cudaMalloc's own

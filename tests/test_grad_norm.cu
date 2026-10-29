@@ -126,6 +126,24 @@ static void whole_model_norm_matches_pytorch(void)
     }
 }
 
+static void norm_of_bfloat16_gradients_matches_pytorch(void)
+{
+    // Expect: 10,007 random gradients rounded to bfloat16 (2501 whole float4s and 3 left over, which the
+    // threads 0 .. 2 add on their own). Each is read as a float and squared and added in float, so the norm is
+    // PyTorch's norm of the same values as floats within 1e-5: bfloat16 changes only what is read. block_sums
+    // and grad_norm stay float.
+    Tensor::manual_seed(0);
+    Tensor grads = Tensor::empty({10007});
+    grads.copy_from_cpu(random_values({10007}).data());
+    grads = grads.to(DType::BFloat16);
+    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel(block_sums);
+    Tensor grad_norm = Tensor::zeros({1});
+    grad_norm_kernel.compute(grads, grad_norm);
+    double pytorch_norm = pytorch_copy_of(grads.to(DType::Float32)).norm().item<double>();
+    ASSERT_NEAR(grad_norm.item(), pytorch_norm, TOLERANCE * pytorch_norm);
+}
+
 /// Times 20 norms of gradients of these shapes, mine against PyTorch's two ways, and prints a
 /// table under `test`'s name. All three read the same values on the GPU:
 ///
@@ -405,6 +423,7 @@ static void changes_nothing_but_the_norm(void)
 int main(void)
 {
     whole_model_norm_matches_pytorch();
+    norm_of_bfloat16_gradients_matches_pytorch();
     time_20_norms_on_gpt2_small_size();
     time_20_norms_on_gpt2_small_148_tensors();
 

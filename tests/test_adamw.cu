@@ -702,6 +702,42 @@ static void only_the_values_before_decayed_count_decay(void)
         ASSERT_NEAR(param_values[i], expected[i], 1e-6);
 }
 
+static void bfloat16_params_and_grads_match_pytorch(void)
+{
+    // Expect: (new) one step of adamw_update on a {32, 32} weight in bfloat16, values about GPT-2's
+    // (normal, std 0.02), with bfloat16 gradients (std 1); m and v float. PyTorch's fused AdamW, in float, on
+    // the same values: m and v, worked out in float from the same numbers, within 1e-5; the weight is
+    // PyTorch's rounded to bfloat16, which moves a value by up to 2^-8 (0.4%) of it: within twice that of the
+    // largest value, 8e-3. And the step is not lost to the rounding: each value moves by about lr = 1e-3, more
+    // than the 2^-8 x 0.08 = 3.1e-4 that a bfloat16 near the largest value rounds by, so the weight is far from
+    // where it started: 1e-3 / 0.08 = 1.25e-2, more than 8e-3.
+    Tensor::manual_seed(0);
+    AdamWConfig config;
+    config.learning_rate = 1e-3f;
+    Shape shape = {32, 32};
+    Tensor param = Tensor::empty(shape), grad = Tensor::empty(shape);
+    param.copy_from_cpu(random_values(shape, 0.02f).data());
+    grad.copy_from_cpu(random_values(shape, 1.0f).data());
+    param = param.to(DType::BFloat16);
+    grad = grad.to(DType::BFloat16);
+    Tensor m = Tensor::zeros(shape), v = Tensor::zeros(shape), grad_norm = Tensor::zeros({1});
+    std::vector<float> start_values = param.to(DType::Float32).tolist(), grad_values = grad.to(DType::Float32).tolist();
+    adamw_update(param.data_ptr<nv_bfloat16>(), grad.data_ptr<nv_bfloat16>(), m.data(), v.data(), param.numel(),
+                 param.numel(), grad_norm.data(), 0.0f, config.learning_rate, config.beta1, config.beta2, config.eps,
+                 config.weight_decay, 1);
+
+    std::vector<torch::Tensor> pytorch_params = {pytorch_param(start_values, shape)};
+    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
+    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
+    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
+    pytorch_params[0].mutable_grad() = to_gpu(grad_values, pytorch_params[0].sizes());
+    pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
+    ASSERT_NEAR(m.tolist(), values_of(pytorch_m[0]), TOLERANCE);
+    ASSERT_NEAR(v.tolist(), values_of(pytorch_v[0]), TOLERANCE);
+    ASSERT_NEAR(param.to(DType::Float32).tolist(), values_of(pytorch_params[0]), 8e-3);
+    ASSERT_FAR(param.to(DType::Float32).tolist(), start_values, 8e-3);
+}
+
 static void nothing_past_a_tensors_end_changes(void)
 {
     // Expect: (new) a launch covers 256 threads x 4 values, far more than a tensor of 8.
@@ -795,6 +831,7 @@ int main(void)
     a_parameter_the_loss_did_not_use_only_decays();
     weight_decay_follows_the_shape_not_the_order();
     only_the_values_before_decayed_count_decay();
+    bfloat16_params_and_grads_match_pytorch();
     nothing_past_a_tensors_end_changes();
     step_leaves_the_gradients_as_they_are();
     adamw_counts_the_matrices_and_the_steps();

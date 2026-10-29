@@ -5,6 +5,10 @@
 #include "cuda_common.h"             // cudaCheck only: the adding up is written out in the kernel, below
 #include "../tensor.cuh"             // compute takes views: each knows its address and its numel
 
+// The gradients may be float or bfloat16; the kernel is a template on that dtype, T. It reads 4 values at a
+// time either way (for bfloat16, one 8-byte read that load4 turns into 4 floats) and adds the squares in
+// float. block_sums and grad_norm are always float.
+
 #define GRAD_NORM_BLOCKS 512        // blocks in the launch: each writes one block sum
 #define GRAD_NORM_THREADS 1024      // threads per block
 
@@ -40,7 +44,8 @@ inline GradNorm::GradNorm(const Tensor& block_sums) {
 // ── the norm ──────────────────────────────────────────────────────────────────
 
 // The kernel compute launches, declared here so compute can call it; its code follows it.
-__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const float* grads,
+template <typename T>
+__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const T* grads,
                                          size_t grads_numel);
 
 /// Works out the norm of every value in `grads` and writes it into `grad_norm`, both views of the flat buffer, with
@@ -49,14 +54,23 @@ inline void GradNorm::compute(const Tensor& grads, const Tensor& grad_norm) cons
         fprintf(stderr, "error: GradNorm writes 1 value, but grad_norm has %zu\n", grad_norm.numel());
         exit(EXIT_FAILURE);
     }
-    // Off 16 bytes, the GPU stops with "misaligned address" at some later call, far from the cause.
-    if ((size_t)grads.data() % 16 != 0) {
-        fprintf(stderr, "error: GradNorm reads grads 4 floats at a time (float4), so they must start on 16 bytes; got %p\n",
-                (void*)grads.data());
+    if (grads.dtype() != DType::Float32 && grads.dtype() != DType::BFloat16) {
+        fprintf(stderr, "error: GradNorm needs grads float or bfloat16\n");
         exit(EXIT_FAILURE);
     }
-    compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, GRAD_NORM_THREADS>>>(grad_norm.data(), block_sums_.data(),
-                                                                      blocks_done_.data(), grads.data(), grads.numel());
+    // Off 4 values, the GPU stops with "misaligned address" at some later call, far from the cause.
+    size_t four_values = 4 * grads.element_size();                      // 16 bytes for float, 8 for bfloat16
+    if ((size_t)grads.data_ptr() % four_values != 0) {
+        fprintf(stderr, "error: GradNorm reads grads 4 values at a time, so they must start on %zu bytes; got %p\n",
+                four_values, grads.data_ptr());
+        exit(EXIT_FAILURE);
+    }
+    if (grads.dtype() == DType::BFloat16)
+        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, GRAD_NORM_THREADS>>>(
+            grad_norm.data(), block_sums_.data(), blocks_done_.data(), grads.data_ptr<nv_bfloat16>(), grads.numel());
+    else
+        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, GRAD_NORM_THREADS>>>(
+            grad_norm.data(), block_sums_.data(), blocks_done_.data(), grads.data(), grads.numel());
     cudaCheck(cudaGetLastError());
 }
 
@@ -70,7 +84,8 @@ inline void GradNorm::compute(const Tensor& grads, const Tensor& grad_norm) cons
 /// warp totals go to shared memory, then each warp adds those 32 the same way. Blocks cannot wait for each other, so
 /// the counter tells the last one that every block sum is written. The last block adds block_sums[0 .. 511] in that
 /// order whichever block it is: the same norm every run, to the last bit.
-__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const float* grads,
+template <typename T>
+__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const T* grads,
                                          size_t grads_numel) {
     __shared__ float warp_totals[32];           // one per warp, shared by the whole block: used in steps 2 and 3
     __shared__ bool is_last_block;              // one per block: did this block finish last?
@@ -82,15 +97,14 @@ __global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, fl
     //    groups: 59.3 rounds, so each thread reads 59 or 60 float4s.
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t groups = grads_numel / 4;                                    // whole float4s; 0 .. 3 values are left over
-    const float4* grads4 = reinterpret_cast<const float4*>(grads);
     float sum = 0.0f;
     for (size_t g = thread_number; g < groups; g += (size_t)gridDim.x * blockDim.x) {
-        float4 v = grads4[g];
+        float4 v = load4(grads + 4 * g);
         sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
     //    The 0 .. 3 values after the last whole float4 (grads_numel not a multiple of 4): one each for threads 0 .. 2.
     size_t leftover = groups * 4 + thread_number;
-    if (leftover < grads_numel) sum += grads[leftover] * grads[leftover];
+    if (leftover < grads_numel) sum += to_float(grads[leftover]) * to_float(grads[leftover]);
 
     // 2. this block's 1024 sums, added.
     //    Round 1: each warp adds its 32 sums: every thread takes the value of the thread `offset` away,

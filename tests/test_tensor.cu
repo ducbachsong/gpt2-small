@@ -189,6 +189,158 @@ static void int_tensors_hold_ints(void) {
     ASSERT_EQ(tokens.tolist<int>(), ids);
 }
 
+// ── half tensors ──────────────────────────────────────────────────────────────
+
+/// Reads halves as floats, to compare them: every half is a float exactly, so nothing is lost.
+static std::vector<float> as_floats(const std::vector<half>& halves) {
+    std::vector<float> floats(halves.size());
+    for (size_t i = 0; i < halves.size(); i++) floats[i] = __half2float(halves[i]);
+    return floats;
+}
+
+/// Rounds floats to halves on the CPU, to put values into a half tensor.
+static std::vector<half> as_halves(const std::vector<float>& floats) {
+    std::vector<half> halves(floats.size());
+    for (size_t i = 0; i < floats.size(); i++) halves[i] = __float2half(floats[i]);
+    return halves;
+}
+
+static void half_tensors_take_2_bytes_a_value(void) {
+    // Expect: a {2, 4} half tensor has element_size 2, where float and int have 4. Its strides are {4, 1},
+    // counted in values as for floats, so row 1 starts 4 values in, which is 4 x 2 = 8 bytes.
+    Tensor t = Tensor::zeros({2, 4}, DType::Float16);
+    ASSERT_EQ(t.element_size(), (size_t)2);
+    ASSERT_EQ(Tensor::zeros({1}).element_size(), (size_t)4);
+    ASSERT_EQ(Tensor::zeros({1}, DType::Int32).element_size(), (size_t)4);
+    ASSERT_EQ(t.stride(), Shape({4, 1}));
+    ASSERT_EQ(t[1].data_ptr<half>(), t.data_ptr<half>() + 4);
+    ASSERT_EQ((size_t)((char*)t[1].data_ptr<half>() - (char*)t.data_ptr<half>()), (size_t)8);
+    ASSERT_EQ(as_floats(t.tolist<half>()), std::vector<float>(8, 0.0f));
+}
+
+static void half_values_come_back_as_they_went_in(void) {
+    // Expect: 0..7 as halves copied into a 2x4 half tensor come back as 0..7: small whole numbers are
+    // halves exactly.
+    Tensor t = Tensor::zeros({2, 4}, DType::Float16);
+    t.copy_from_cpu(as_halves(sample_data(8)).data());
+    ASSERT_EQ(as_floats(t.tolist<half>()), sample_data(8));
+}
+
+static void to_half_rounds_each_value_to_the_nearest_half(void) {
+    // Expect: a half keeps 11 significant bits, so to(Float16) rounds:
+    //     1/3   -> 0.333251953125      0.1 -> 0.0999755859375      1 and -2.5 stay
+    //     2049  -> 2048: from 2048 to 4096 the halves are 2 apart, and 2049 is halfway from 2048 to 2050;
+    //                    a tie goes to the half whose last bit is 0, 2048
+    //     2051  -> 2052: halfway from 2050 to 2052, and 2052's last bit is 0
+    //     65504 stays: the largest half;  70000 -> inf;  1e-8 -> 0: below half the smallest half, 6e-8
+    // to(Float32) gives the same numbers back as floats, and the shape stays {9}.
+    std::vector<float> values = {1.0f, 1.0f / 3.0f, 0.1f, -2.5f, 2049.0f, 2051.0f, 65504.0f, 70000.0f, 1e-8f};
+    std::vector<float> rounded = {1.0f, 0.333251953125f, 0.0999755859375f, -2.5f, 2048.0f, 2052.0f, 65504.0f,
+                                  INFINITY, 0.0f};
+    Tensor floats = Tensor::zeros({9});
+    floats.copy_from_cpu(values.data());
+    Tensor halves = floats.to(DType::Float16);
+    ASSERT_EQ(halves.dtype() == DType::Float16, true);
+    ASSERT_EQ(halves.shape(), Shape({9}));
+    ASSERT_EQ(as_floats(halves.tolist<half>()), rounded);
+    ASSERT_EQ(halves.to(DType::Float32).tolist(), rounded);
+}
+
+static void copy_converts_between_float_and_half(void) {
+    // Expect: copy_ of floats {0.1, 0.5, 3} into a half {1, 3} rounds 0.1 to 0.0999755859375; copy_ of that
+    // into a float {3} gives the halves back exactly.
+    Tensor floats = Tensor::zeros({3});
+    floats.copy_from_cpu(std::vector<float>({0.1f, 0.5f, 3.0f}).data());
+    Tensor halves = Tensor::zeros({1, 3}, DType::Float16);
+    halves.copy_(floats);
+    ASSERT_EQ(as_floats(halves.tolist<half>()), std::vector<float>({0.0999755859375f, 0.5f, 3.0f}));
+    Tensor back = Tensor::zeros({3});
+    back.copy_(halves);
+    ASSERT_EQ(back.tolist(), std::vector<float>({0.0999755859375f, 0.5f, 3.0f}));
+}
+
+static void to_its_own_dtype_shares_the_tensor(void) {
+    // Expect: to(Float32) of a float tensor and to(Float16) of a half one are the same tensors, not copies.
+    Tensor floats = Tensor::zeros({4});
+    Tensor halves = Tensor::zeros({4}, DType::Float16);
+    ASSERT_EQ(floats.to(DType::Float32).data(), floats.data());
+    ASSERT_EQ(halves.to(DType::Float16).data_ptr<half>(), halves.data_ptr<half>());
+}
+
+static void fill_ones_and_zero_for_halves(void) {
+    // Expect: ones({3}, Float16) is {1, 1, 1}. fill_(0.1) on rows 1 and 2 of a 4x3 half of zeros gives them
+    // 0.1 rounded, 0.0999755859375, and leaves rows 0 and 3 at 0; zero_() then makes all 12 values 0.
+    ASSERT_EQ(as_floats(Tensor::ones({3}, DType::Float16).tolist<half>()), std::vector<float>({1, 1, 1}));
+    Tensor t = Tensor::zeros({4, 3}, DType::Float16);
+    t.narrow(0, 1, 2).fill_(0.1);
+    float r = 0.0999755859375f;
+    ASSERT_EQ(as_floats(t.tolist<half>()), std::vector<float>({0, 0, 0, r, r, r, r, r, r, 0, 0, 0}));
+    t.zero_();
+    ASSERT_EQ(as_floats(t.tolist<half>()), std::vector<float>(12, 0.0f));
+}
+
+static void narrow_then_view_on_halves(void) {
+    // Expect: values 8..19 of a flat half 20, seen as 3x4, start 8 halves = 16 bytes in and hold 8..19, as
+    // TensorBuffer makes its tensors.
+    Tensor whole = Tensor::zeros({20}, DType::Float16);
+    whole.copy_from_cpu(as_halves(sample_data(20)).data());
+    Tensor piece = whole.narrow(0, 8, 12).view({3, 4});
+    ASSERT_EQ(piece.data_ptr<half>(), whole.data_ptr<half>() + 8);
+    ASSERT_EQ(as_floats(piece.tolist<half>()), std::vector<float>({8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}));
+}
+
+static void randn_in_half_is_randn_in_float_rounded(void) {
+    // Expect: after manual_seed(7), randn({1000}, Float16) is randn({1000}) after the same seed, each value
+    // rounded to a half: the numbers are made as floats either way.
+    Tensor::manual_seed(7);
+    std::vector<float> floats_rounded = as_floats(Tensor::randn({1000}).to(DType::Float16).tolist<half>());
+    Tensor::manual_seed(7);
+    std::vector<float> made_as_halves = as_floats(Tensor::randn({1000}, DType::Float16).tolist<half>());
+    ASSERT_EQ(made_as_halves, floats_rounded);
+}
+
+static void item_and_indexing_on_halves(void) {
+    // Expect: in a 2x4 half holding 0..7, t[1][2] is 6, read with item<half>(); a half {1} filled with 42.5
+    // reads 42.5.
+    Tensor t = Tensor::zeros({2, 4}, DType::Float16);
+    t.copy_from_cpu(as_halves(sample_data(8)).data());
+    ASSERT_EQ(__half2float(t[1][2].item<half>()), 6.0f);
+    Tensor loss = Tensor::zeros({1}, DType::Float16);
+    loss.fill_(42.5);
+    ASSERT_EQ(__half2float(loss.item<half>()), 42.5f);
+}
+
+// ── bfloat16 tensors ──────────────────────────────────────────────────────────
+
+static void bfloat16_has_float_s_range_and_8_significant_bits(void) {
+    // Expect: a bfloat16 is a float's first 16 bits: float's range, but 8 significant bits, so to(BFloat16)
+    // rounds:
+    //     1/3   -> 0.333984375         0.1 -> 0.10009765625        1 and -2.5 stay
+    //     257   -> 256: from 256 to 512 the bfloat16s are 2 apart, and 257 is halfway from 256 to 258;
+    //                   a tie goes to the one whose last bit is 0, 256
+    //     259   -> 260: halfway from 258 to 260, and 260's last bit is 0
+    //     65504 -> 65536 and 70000 -> 70144: no inf, where a half had 65504 and inf
+    //     1e-8  -> 1.0011717677116394e-8: small values keep their 8 bits, where a half had 0
+    // to(Float32) gives them back exactly; element_size is 2; fill_(0.1) gives 0.10009765625; to(Float16) of
+    // 70144 is inf, past the largest half; tolist<nv_bfloat16>() reads the same values.
+    std::vector<float> values = {1.0f, 1.0f / 3.0f, 0.1f, -2.5f, 257.0f, 259.0f, 65504.0f, 70000.0f, 1e-8f};
+    std::vector<float> rounded = {1.0f, 0.333984375f, 0.10009765625f, -2.5f, 256.0f, 260.0f, 65536.0f, 70144.0f,
+                                  1.0011717677116394e-8f};
+    Tensor floats = Tensor::zeros({9});
+    floats.copy_from_cpu(values.data());
+    Tensor bfloat16s = floats.to(DType::BFloat16);
+    ASSERT_EQ(bfloat16s.dtype() == DType::BFloat16, true);
+    ASSERT_EQ(bfloat16s.element_size(), (size_t)2);
+    ASSERT_EQ(bfloat16s.to(DType::Float32).tolist(), rounded);
+    std::vector<float> read_on_cpu;
+    for (nv_bfloat16 value : bfloat16s.tolist<nv_bfloat16>()) read_on_cpu.push_back(to_float(value));
+    ASSERT_EQ(read_on_cpu, rounded);
+    ASSERT_EQ(bfloat16s.to(DType::Float16)[7].to(DType::Float32).item(), INFINITY);
+    Tensor filled = Tensor::zeros({3}, DType::BFloat16);
+    filled.fill_(0.1);
+    ASSERT_EQ(filled.to(DType::Float32).tolist(), std::vector<float>(3, 0.10009765625f));
+}
+
 // ── setting values ────────────────────────────────────────────────────────────
 
 static void zero_sets_every_value_to_0(void) {
@@ -317,6 +469,16 @@ int main(void) {
     ones_makes_a_tensor_of_ones();
     zeros_like_and_empty_like_copy_shape_and_dtype();
     int_tensors_hold_ints();
+    half_tensors_take_2_bytes_a_value();
+    half_values_come_back_as_they_went_in();
+    to_half_rounds_each_value_to_the_nearest_half();
+    copy_converts_between_float_and_half();
+    to_its_own_dtype_shares_the_tensor();
+    fill_ones_and_zero_for_halves();
+    narrow_then_view_on_halves();
+    randn_in_half_is_randn_in_float_rounded();
+    item_and_indexing_on_halves();
+    bfloat16_has_float_s_range_and_8_significant_bits();
     zero_sets_every_value_to_0();
     fill_sets_every_value();
     fill_on_a_narrow_fills_only_those_rows();

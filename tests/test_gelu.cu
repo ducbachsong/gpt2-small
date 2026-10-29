@@ -12,6 +12,9 @@
 #include "../llmc/kernels/gelu.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so one
+// rounding moves a value by up to 2^-8, about 0.4% of it. Twice that.
+static const double BFLOAT16_TOLERANCE = 8e-3;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -101,6 +104,27 @@ static void matches_pytorch_with_a_part_full_last_block(void)
     // Expect: {3, 7, 100}: 2100 values, 525 float4s, 3 blocks of 256 threads; the last has 13 float4s
     // for 256 threads, and its other 243 threads must write nothing. The same as PyTorch within 1e-5.
     forward_and_backward_match_pytorch({3, 7, 100});
+}
+
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: {2, 8, 3072} random values rounded to bfloat16, in bfloat16 tensors. Each value is read as a
+    // float, its gelu and gelu' worked out in float, and the result rounded once as it is stored. So output
+    // and input_grad are PyTorch's float gelu of the same values, within one bfloat16 rounding:
+    // BFLOAT16_TOLERANCE.
+    torch::manual_seed(0);
+    Shape shape = {2, 8, 3072};
+    Tensor input = random_tensor_on_gpu(shape).to(DType::BFloat16);
+    Tensor output_grad = random_tensor_on_gpu(shape).to(DType::BFloat16);
+    Tensor output = Tensor::zeros(shape, DType::BFloat16), input_grad = Tensor::zeros(shape, DType::BFloat16);
+    gelu_forward(output, input);
+    gelu_backward(input_grad, output_grad, input);
+
+    torch::Tensor pytorch_input = pytorch_copy_of(input.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_output = torch::gelu(pytorch_input, "tanh");
+    pytorch_output.backward(pytorch_copy_of(output_grad.to(DType::Float32)));
+    ASSERT_NEAR(output.to(DType::Float32).tolist(), list_of(pytorch_output), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(input_grad.to(DType::Float32).tolist(), list_of(pytorch_input.grad()), BFLOAT16_TOLERANCE);
 }
 
 static void time_20_steps_on_gpt2_small_size(void)
@@ -266,7 +290,7 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)gelu_forward_kernel, (const void *)gelu_backward_kernel};
+    const void *kernels[] = {(const void *)gelu_forward_kernel<float>, (const void *)gelu_backward_kernel<float>};
     const char *names[] = {"gelu_forward_kernel", "gelu_backward_kernel"};
     for (int k = 0; k < 2; k++)
     {
@@ -333,13 +357,12 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
 
     int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
     auto forward = [&] {
-        gelu_forward_kernel<<<blocks, threads>>>((float4 *)output.data(), (const float4 *)input.data(),
-                                                 total_float4s);
+        gelu_forward_kernel<float><<<blocks, threads>>>(output.data(), input.data(), total_float4s);
         cudaCheck(cudaGetLastError());
     };
     auto backward = [&] {
-        gelu_backward_kernel<<<blocks, threads>>>((float4 *)input_grad.data(), (const float4 *)output_grad.data(),
-                                                  (const float4 *)input.data(), total_float4s);
+        gelu_backward_kernel<float><<<blocks, threads>>>(input_grad.data(), output_grad.data(), input.data(),
+                                                         total_float4s);
         cudaCheck(cudaGetLastError());
     };
     blocks = usual_blocks;
@@ -404,6 +427,7 @@ int main(void)
 {
     matches_pytorch_on_mlp_rows();
     matches_pytorch_with_a_part_full_last_block();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
 
     gelu_of_0_is_0_and_its_slope_is_one_half();

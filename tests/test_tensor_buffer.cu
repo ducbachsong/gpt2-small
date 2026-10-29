@@ -240,6 +240,30 @@ static void an_int_buffer_holds_ints(void) {
     ASSERT_EQ(copy.flat().dtype() == DType::Int32, true);
 }
 
+// ── bfloat16 buffers ──────────────────────────────────────────────────────────
+
+static void a_bfloat16_buffer_takes_2_bytes_a_value(void) {
+    // Expect: allocate(DType::BFloat16) of {2, 4}, {12}, {2, 2, 3} gives BFloat16 tensors of zeros, each
+    // starting 2 bytes per value after the last: tensor(1) 8 values = 16 bytes in, tensor(2) 20 values = 40
+    // bytes in. 0..11 written into tensor(1) reads back as 0..11 (whole numbers below 256 are bfloat16s
+    // exactly), and its neighbours stay 0. zeros_like keeps BFloat16.
+    TensorBuffer buffer;
+    buffer.add_many({{2, 4}, {12}, {2, 2, 3}});
+    buffer.allocate(DType::BFloat16);
+    const char* start = (const char*)buffer.flat().data_ptr<nv_bfloat16>();
+    ASSERT_EQ(buffer.flat().dtype() == DType::BFloat16, true);
+    ASSERT_EQ((size_t)((const char*)buffer.tensor(1).data_ptr<nv_bfloat16>() - start), (size_t)16);
+    ASSERT_EQ((size_t)((const char*)buffer.tensor(2).data_ptr<nv_bfloat16>() - start), (size_t)40);
+    Tensor values = Tensor::zeros({12});
+    values.copy_from_cpu(sample_data(12).data());
+    buffer.tensor(1).copy_(values);                                     // float into bfloat16: copy_ rounds
+    ASSERT_EQ(buffer.tensor(1).to(DType::Float32).tolist(), sample_data(12));
+    ASSERT_EQ(buffer.tensor(0).to(DType::Float32).tolist(), std::vector<float>(8, 0.0f));
+    ASSERT_EQ(buffer.tensor(2).to(DType::Float32).tolist(), std::vector<float>(12, 0.0f));
+    TensorBuffer copy = TensorBuffer::zeros_like(buffer);
+    ASSERT_EQ(copy.flat().dtype() == DType::BFloat16, true);
+}
+
 // ══ every Tensor test again, on a tensor inside a TensorBuffer ════════════════
 // The cases of tests/test_tensor.cu, with the same numbers, but the tensor under test
 // is tensor(1) of a buffer, between two neighbours of 4 values:
@@ -621,6 +645,7 @@ int main(void) {
     zeros_like_copies_the_groups();
     zeros_like_copies_the_layout_not_the_memory();
     an_int_buffer_holds_ints();
+    a_bfloat16_buffer_takes_2_bytes_a_value();
 
     buffer_tensor_starts_as_zeros();
     buffer_tensor_strides_follow_row_order();

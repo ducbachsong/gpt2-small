@@ -12,6 +12,9 @@
 #include "../llmc/kernels/classifier.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so one
+// rounding moves a value by up to 2^-8, about 0.4% of it. Twice that.
+static const double BFLOAT16_TOLERANCE = 8e-3;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -160,6 +163,38 @@ static void matches_pytorch_with_a_small_vocabulary(void)
     // each forward block have nothing, and float4 2 holds words 8, 9 and padding 10, 11. The backward's
     // 45 float4s are 1 part-full block. The same as PyTorch within 1e-5.
     forward_and_backward_match_pytorch({3, 5, 12}, 10);
+}
+
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: matches_pytorch_on_gpt2_rows's {2, 8, 50304} logits and targets, with logits and logits_grad
+    // in bfloat16. The forward reads each logit as a float and works in float, so the losses,
+    // max_of_each_row and sum_of_each_row are PyTorch's float cross_entropy of the same values within 1e-5:
+    // bfloat16 changes only what is read, not the math. logits_grad is rounded once as it is stored: within
+    // BFLOAT16_TOLERANCE. The 47 padding columns get 0 exactly.
+    torch::manual_seed(0);
+    size_t batch_size = 2, seq_len = 8, rows = batch_size * seq_len, vocab_size = 50257;
+    Shape logits_shape = {batch_size, seq_len, 50304};
+    Tensor logits = random_tensor_on_gpu(logits_shape).to(DType::BFloat16);
+    Tensor targets = random_targets_on_gpu({batch_size, seq_len}, vocab_size);
+    Tensor losses = Tensor::zeros({batch_size, seq_len});
+    Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
+    Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
+    Tensor logits_grad = Tensor::zeros(logits_shape, DType::BFloat16);
+    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
+    classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
+
+    torch::Tensor pytorch_logits = pytorch_copy_of(logits.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor word_logits = word_logits_of(pytorch_logits, vocab_size);
+    torch::Tensor pytorch_losses = torch::cross_entropy_loss(word_logits, pytorch_targets_of(targets).reshape({-1}),
+                                                             {}, at::Reduction::None);
+    pytorch_losses.backward(pytorch_copy_of(losses_grad).reshape({-1}));
+    torch::Tensor pytorch_max_of_each_row = std::get<0>(word_logits.max(1));
+    torch::Tensor pytorch_sum_of_each_row = (word_logits - pytorch_max_of_each_row.unsqueeze(1)).exp().sum(1);
+    ASSERT_NEAR(losses.tolist(), list_of(pytorch_losses), TOLERANCE);
+    ASSERT_NEAR(max_of_each_row.tolist(), list_of(pytorch_max_of_each_row), TOLERANCE);
+    ASSERT_NEAR(sum_of_each_row.tolist(), list_of(pytorch_sum_of_each_row), TOLERANCE);
+    ASSERT_NEAR(logits_grad.to(DType::Float32).tolist(), list_of(pytorch_logits.grad()), BFLOAT16_TOLERANCE);
 }
 
 static void time_20_steps_on_gpt2_small_size(void)
@@ -421,7 +456,8 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread: at most 64 for 1024 threads (a T4 has 65,536)
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)classifier_forward_kernel, (const void *)classifier_backward_kernel};
+    const void *kernels[] = {(const void *)classifier_forward_kernel<float>,
+                             (const void *)classifier_backward_kernel<float>};
     const char *names[] = {"classifier_forward_kernel", "classifier_backward_kernel"};
     int threads[] = {CLASSIFIER_FORWARD_THREADS_PER_BLOCK, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK};
     for (int k = 0; k < 2; k++)
@@ -495,16 +531,17 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
 
     int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loops
     auto forward = [&] {
-        classifier_forward_kernel<<<blocks, threads>>>(losses.data(), max_of_each_row.data(), sum_of_each_row.data(),
-                                                       (const float4 *)logits.data(), targets.data_ptr<int>(), rows,
-                                                       vocab_size, padded_vocab_size);
+        classifier_forward_kernel<float><<<blocks, threads>>>(losses.data(), max_of_each_row.data(),
+                                                              sum_of_each_row.data(), logits.data(),
+                                                              targets.data_ptr<int>(), rows, vocab_size,
+                                                              padded_vocab_size);
         cudaCheck(cudaGetLastError());
     };
     auto backward = [&] {
-        classifier_backward_kernel<<<blocks, threads>>>((float4 *)logits_grad.data(), losses_grad.data(),
-                                                        (const float4 *)logits.data(), targets.data_ptr<int>(),
-                                                        max_of_each_row.data(), sum_of_each_row.data(), rows, vocab_size,
-                                                        padded_vocab_size);
+        classifier_backward_kernel<float><<<blocks, threads>>>(logits_grad.data(), losses_grad.data(), logits.data(),
+                                                               targets.data_ptr<int>(), max_of_each_row.data(),
+                                                               sum_of_each_row.data(), rows, vocab_size,
+                                                               padded_vocab_size);
         cudaCheck(cudaGetLastError());
     };
     blocks = (int)rows;
@@ -599,6 +636,7 @@ int main(void)
 {
     matches_pytorch_on_gpt2_rows();
     matches_pytorch_with_a_small_vocabulary();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
 
     forward_of_1_2_3_4();

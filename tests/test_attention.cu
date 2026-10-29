@@ -13,6 +13,13 @@
 #include "../llmc/kernels/attention.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values. A bfloat16 keeps 8 significant bits, so each
+// rounding moves a value by up to 2^-8, about 0.4% of it, and attention rounds several times in a row:
+// the scores before the softmax (a score of 4 by up to 0.008, which moves its weight by 0.8%), the weights,
+// the outputs. The backward rounds da, ds and the three gradients on top, and ds = a (da - row_dot) takes
+// two close numbers apart, so its errors are larger next to its own size.
+static const double BFLOAT16_TOLERANCE = 2e-2;
+static const double BFLOAT16_GRAD_TOLERANCE = 5e-2;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -35,12 +42,14 @@ static Tensor random_tensor_on_gpu(const Shape &shape)
     return tensor;
 }
 
-/// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU.
+/// Makes a PyTorch float tensor on the GPU with a copy of my tensor's values, GPU to GPU. A bfloat16 tensor's
+/// values are turned into floats first, exactly.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
 {
+    Tensor floats = tensor.to(DType::Float32);  // the tensor itself if it is float already
     torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
     std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
-    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
+    return torch::from_blob(floats.data(), sizes, on_gpu).clone();
 }
 
 /// Gives every value of a PyTorch tensor as a CPU list in row order, to compare with mine.
@@ -84,19 +93,22 @@ struct AttentionTensors
     Tensor qkv, output, query, key, value, weights, head_outputs;                        // forward
     Tensor output_grad, qkv_grad, head_outputs_grad, weights_grad, query_grad, key_grad, value_grad;   // backward
 
-    /// Makes them for batch_size x num_heads heads of seq_len tokens and head_size columns.
-    AttentionTensors(size_t batch_size, size_t num_heads, size_t seq_len, size_t head_size)
+    /// Makes them for batch_size x num_heads heads of seq_len tokens and head_size columns, all of dtype.
+    AttentionTensors(size_t batch_size, size_t num_heads, size_t seq_len, size_t head_size,
+                     DType dtype = DType::Float32)
     {
         size_t embed_dim = num_heads * head_size;
         Shape per_head = {batch_size, num_heads, seq_len, head_size};
         Shape per_pair = {batch_size, num_heads, seq_len, seq_len};
-        qkv = Tensor::zeros({batch_size, seq_len, 3 * embed_dim});
-        output = Tensor::zeros({batch_size, seq_len, embed_dim});
-        query = Tensor::zeros(per_head), key = Tensor::zeros(per_head), value = Tensor::zeros(per_head);
-        weights = Tensor::zeros(per_pair), head_outputs = Tensor::zeros(per_head);
-        output_grad = Tensor::zeros(output.shape()), qkv_grad = Tensor::zeros(qkv.shape());
-        head_outputs_grad = Tensor::zeros(per_head), weights_grad = Tensor::zeros(per_pair);
-        query_grad = Tensor::zeros(per_head), key_grad = Tensor::zeros(per_head), value_grad = Tensor::zeros(per_head);
+        qkv = Tensor::zeros({batch_size, seq_len, 3 * embed_dim}, dtype);
+        output = Tensor::zeros({batch_size, seq_len, embed_dim}, dtype);
+        query = Tensor::zeros(per_head, dtype), key = Tensor::zeros(per_head, dtype);
+        value = Tensor::zeros(per_head, dtype);
+        weights = Tensor::zeros(per_pair, dtype), head_outputs = Tensor::zeros(per_head, dtype);
+        output_grad = Tensor::zeros(output.shape(), dtype), qkv_grad = Tensor::zeros(qkv.shape(), dtype);
+        head_outputs_grad = Tensor::zeros(per_head, dtype), weights_grad = Tensor::zeros(per_pair, dtype);
+        query_grad = Tensor::zeros(per_head, dtype), key_grad = Tensor::zeros(per_head, dtype);
+        value_grad = Tensor::zeros(per_head, dtype);
     }
 
     /// Runs attention_forward on these tensors.
@@ -171,6 +183,25 @@ static void matches_pytorch_with_a_seq_len_of_37(void)
     // tokens 0 .. 30 leave some lanes with no column at all, which must add nothing. The same as PyTorch
     // within 1e-5.
     forward_and_backward_match_pytorch(3, 2, 37, 8);
+}
+
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: matches_pytorch_on_gpt2_heads's {2, 12, 64, 64} with every tensor bfloat16: the six products
+    // by cublasGemmStridedBatchedEx (CUDA_R_16BF, float sums), the kernels reading and writing bfloat16.
+    // PyTorch is given the same bfloat16 values as floats and works in float: output and weights within
+    // BFLOAT16_TOLERANCE, qkv_grad within BFLOAT16_GRAD_TOLERANCE.
+    torch::manual_seed(0);
+    AttentionTensors mine(2, 12, 64, 64, DType::BFloat16);
+    mine.qkv = random_tensor_on_gpu(mine.qkv.shape()).to(DType::BFloat16);
+    mine.output_grad = random_tensor_on_gpu(mine.output.shape()).to(DType::BFloat16);
+    mine.forward();
+    mine.backward();
+
+    PytorchAttention pytorch(mine);
+    ASSERT_NEAR(mine.output.to(DType::Float32).tolist(), list_of(pytorch.output), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(mine.weights.to(DType::Float32).tolist(), list_of(pytorch.weights), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(mine.qkv_grad.to(DType::Float32).tolist(), list_of(pytorch.qkv.grad()), BFLOAT16_GRAD_TOLERANCE);
 }
 
 static void time_20_steps_on_gpt2_small_size(void)
@@ -480,10 +511,12 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)attention_split_qkv_kernel, (const void *)attention_softmax_forward_kernel,
-                             (const void *)attention_merge_heads_kernel, (const void *)attention_split_heads_kernel,
-                             (const void *)attention_softmax_backward_kernel,
-                             (const void *)attention_merge_qkv_grad_kernel};
+    const void *kernels[] = {(const void *)attention_split_qkv_kernel<float>,
+                             (const void *)attention_softmax_forward_kernel<float>,
+                             (const void *)attention_merge_heads_kernel<float>,
+                             (const void *)attention_split_heads_kernel<float>,
+                             (const void *)attention_softmax_backward_kernel<float>,
+                             (const void *)attention_merge_qkv_grad_kernel<float>};
     const char *names[] = {"attention_split_qkv_kernel", "attention_softmax_forward_kernel",
                            "attention_merge_heads_kernel", "attention_split_heads_kernel",
                            "attention_softmax_backward_kernel", "attention_merge_qkv_grad_kernel"};
@@ -562,12 +595,12 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
 
     int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
     auto forward = [&] {
-        attention_softmax_forward_kernel<<<blocks, threads>>>(tensors.weights.data(), rows, seq_len);
+        attention_softmax_forward_kernel<float><<<blocks, threads>>>(tensors.weights.data(), rows, seq_len);
         cudaCheck(cudaGetLastError());
     };
     auto backward = [&] {
-        attention_softmax_backward_kernel<<<blocks, threads>>>(tensors.weights_grad.data(), tensors.weights.data(),
-                                                               rows, seq_len);
+        attention_softmax_backward_kernel<float><<<blocks, threads>>>(tensors.weights_grad.data(),
+                                                                      tensors.weights.data(), rows, seq_len);
         cudaCheck(cudaGetLastError());
     };
     blocks = usual_blocks;
@@ -634,6 +667,7 @@ int main(void)
 {
     matches_pytorch_on_gpt2_heads();
     matches_pytorch_with_a_seq_len_of_37();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
 
     forward_of_the_note_s_example();

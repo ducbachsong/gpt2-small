@@ -11,6 +11,10 @@
 #include "../llmc/kernels/layer_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so each
+// rounding moves a value by up to 2^-8, about 0.4% of it. weight_grad and bias_grad are rounded once per
+// block that adds onto them, 8 times here.
+static const double BFLOAT16_TOLERANCE = 2e-2;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,6 +121,43 @@ static void backward_matches_pytorch(void)
     ASSERT_NEAR(input_grad.tolist(), list_of(pytorch_input.grad()), TOLERANCE);
     ASSERT_NEAR(weight_grad.tolist(), list_of(pytorch_weight.grad()), TOLERANCE);
     ASSERT_NEAR(bias_grad.tolist(), list_of(pytorch_bias.grad()), TOLERANCE);
+}
+
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: backward_matches_pytorch's 256 rows of 768 (8 blocks of the backward), with input, weight,
+    // bias, output_grad and the gradients in bfloat16; mean and rstd stay float. Every sum is in float from
+    // the same bfloat16 values PyTorch is given as floats, so mean and rstd are PyTorch's within 1e-5; output
+    // and input_grad are rounded once as they are stored, weight_grad and bias_grad once per block: within
+    // BFLOAT16_TOLERANCE.
+    Tensor::manual_seed(0);
+    size_t batch_size = 4, seq_len = 64, embed_dim = 768;
+    Shape shape = {batch_size, seq_len, embed_dim};
+    Tensor input = tensor_of(shape, random_values(shape)).to(DType::BFloat16);
+    Tensor weight = tensor_of({embed_dim}, random_values({embed_dim})).to(DType::BFloat16);
+    Tensor bias = tensor_of({embed_dim}, random_values({embed_dim})).to(DType::BFloat16);
+    Tensor output_grad = tensor_of(shape, random_values(shape)).to(DType::BFloat16);
+    Tensor output = Tensor::zeros(shape, DType::BFloat16);
+    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
+    Tensor input_grad = Tensor::zeros(shape, DType::BFloat16);
+    Tensor weight_grad = Tensor::zeros({embed_dim}, DType::BFloat16);
+    Tensor bias_grad = Tensor::zeros({embed_dim}, DType::BFloat16);
+    layer_norm_forward(output, mean, rstd, input, weight, bias);
+    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
+
+    torch::Tensor pytorch_input = pytorch_copy_of(input.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_weight = pytorch_copy_of(weight.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_bias = pytorch_copy_of(bias.to(DType::Float32)).requires_grad_(true);
+    std::vector<int64_t> normalized_shape = {(int64_t)embed_dim};
+    auto [pytorch_output, pytorch_mean, pytorch_rstd] =
+        torch::native_layer_norm(pytorch_input, normalized_shape, pytorch_weight, pytorch_bias, 1e-5);
+    pytorch_output.backward(pytorch_copy_of(output_grad.to(DType::Float32)));
+    ASSERT_NEAR(mean.tolist(), list_of(pytorch_mean), TOLERANCE);
+    ASSERT_NEAR(rstd.tolist(), list_of(pytorch_rstd), TOLERANCE);
+    ASSERT_NEAR(output.to(DType::Float32).tolist(), list_of(pytorch_output), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(input_grad.to(DType::Float32).tolist(), list_of(pytorch_input.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(weight_grad.to(DType::Float32).tolist(), list_of(pytorch_weight.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(bias_grad.to(DType::Float32).tolist(), list_of(pytorch_bias.grad()), BFLOAT16_TOLERANCE);
 }
 
 static void time_20_steps_on_gpt2_small_size(void)
@@ -330,7 +371,8 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)layer_norm_forward_kernel, (const void *)layer_norm_backward_kernel};
+    const void *kernels[] = {(const void *)layer_norm_forward_kernel<float>,
+                             (const void *)layer_norm_backward_kernel<float>};
     const char *names[] = {"layer_norm_forward_kernel", "layer_norm_backward_kernel"};
     int threads[] = {LAYER_NORM_THREADS_PER_BLOCK, LAYER_NORM_BACKWARD_THREADS_PER_BLOCK};
     for (int k = 0; k < 2; k++)
@@ -376,10 +418,13 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the forward and the backward on GPT-2 small's sizes (batch_size = 4,
-    // seq_len = 1024: 4096 rows of embed_dim = 768) for 8 block counts x 5 thread counts, each the
+    // seq_len = 1024: 4096 rows of embed_dim = 768) for 8 block counts x 4 thread counts, each the
     // average of runs 2..20. The kernels are launched here directly, <<<blocks, threads>>>, instead
     // of through layer_norm_forward and layer_norm_backward, which always launch 512 x 256 and
-    // 128 x 512.
+    // 128 x 512. Not 1024 threads: since the kernels became templates for bfloat16, each takes 66
+    // registers per thread, and a block of 1024 may have 65,536 / 1024 = 64 (cudaFuncGetAttributes:
+    // largest block 896). Held to 64, the backward spilled 8 bytes; and blocks of 1024 were never the
+    // fastest here.
     //
     // Expect: every launch gives the same result as the usual ones. Whatever the counts, each row
     // is one warp's and its threads add in the same order, so output, mean, rstd and input_grad are
@@ -418,15 +463,14 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
     size_t shared_bytes = 2 * embed_dim * sizeof(float);     // the backward's block copy of bias_grad, weight_grad
     auto forward = [&] {
-        layer_norm_forward_kernel<<<blocks, threads>>>((float4 *)output.data(), mean.data(), rstd.data(),
-                                                       (const float4 *)input.data(), (const float4 *)weight.data(),
-                                                       (const float4 *)bias.data(), rows, embed_dim);
+        layer_norm_forward_kernel<float><<<blocks, threads>>>(output.data(), mean.data(), rstd.data(), input.data(),
+                                                              weight.data(), bias.data(), rows, embed_dim);
         cudaCheck(cudaGetLastError());
     };
     auto backward = [&] {
-        layer_norm_backward_kernel<<<blocks, threads, shared_bytes>>>(
-            (float4 *)input_grad.data(), weight_grad.data(), bias_grad.data(), (const float4 *)output_grad.data(),
-            (const float4 *)input.data(), (const float4 *)weight.data(), mean.data(), rstd.data(), rows, embed_dim);
+        layer_norm_backward_kernel<float><<<blocks, threads, shared_bytes>>>(
+            input_grad.data(), weight_grad.data(), bias_grad.data(), output_grad.data(), input.data(), weight.data(),
+            mean.data(), rstd.data(), rows, embed_dim);
         cudaCheck(cudaGetLastError());
     };
     blocks = usual_forward_blocks;
@@ -434,7 +478,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     warm_up_gpu(forward);
 
     int block_counts[] = {40, 80, 128, 256, 512, 1024, 2048, 4096};
-    int thread_counts[] = {64, 128, 256, 512, 1024};
+    int thread_counts[] = {64, 128, 256, 512};
     const char *kernel_names[] = {"forward", "backward"};
     float fastest_ms[2] = {1e9f, 1e9f};
     int fastest_blocks[2] = {0, 0}, fastest_threads[2] = {0, 0};
@@ -498,7 +542,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     for (int k = 0; k < 2; k++)
         printf("    fastest %-8s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[k], fastest_blocks[k],
                fastest_threads[k], fastest_ms[k]);
-    ASSERT_EQ(launches_with_the_same_result, 8 * 5);
+    ASSERT_EQ(launches_with_the_same_result, 8 * 4);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -507,6 +551,7 @@ int main(void)
 {
     forward_matches_pytorch();
     backward_matches_pytorch();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
 
     forward_moves_a_row_to_mean_0_and_standard_deviation_1();

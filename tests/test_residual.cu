@@ -105,6 +105,30 @@ static void matches_pytorch_with_a_part_full_last_block(void)
     forward_and_backward_match_pytorch({3, 7, 100});
 }
 
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: {2, 8, 768} random values rounded to bfloat16, added in bfloat16 tensors. Each value is read as
+    // a float, added in float, and rounded once to bfloat16 as it is stored: the same as PyTorch's float add
+    // of the same values, rounded to bfloat16 by PyTorch, to the last bit (both round to the nearest, a tie
+    // to the even one). The gradients are output_grad copied, so the same bfloat16s exactly.
+    torch::manual_seed(0);
+    Shape shape = {2, 8, 768};
+    Tensor residual = random_tensor_on_gpu(shape).to(DType::BFloat16);
+    Tensor branch_output = random_tensor_on_gpu(shape).to(DType::BFloat16);
+    Tensor output_grad = random_tensor_on_gpu(shape).to(DType::BFloat16);
+    Tensor output = Tensor::zeros(shape, DType::BFloat16);
+    Tensor residual_grad = Tensor::zeros(shape, DType::BFloat16);
+    Tensor branch_output_grad = Tensor::zeros(shape, DType::BFloat16);
+    residual_forward(output, residual, branch_output);
+    residual_backward(residual_grad, branch_output_grad, output_grad);
+
+    torch::Tensor pytorch_output = pytorch_copy_of(residual.to(DType::Float32)) +
+                                   pytorch_copy_of(branch_output.to(DType::Float32));
+    ASSERT_EQ(output.to(DType::Float32).tolist(), list_of(pytorch_output.to(torch::kBFloat16).to(torch::kFloat)));
+    ASSERT_EQ(residual_grad.to(DType::Float32).tolist(), output_grad.to(DType::Float32).tolist());
+    ASSERT_EQ(branch_output_grad.to(DType::Float32).tolist(), output_grad.to(DType::Float32).tolist());
+}
+
 static void time_20_steps_on_gpt2_small_size(void)
 {
     // Prints the times of 20 forwards and 20 backwards on GPT-2 small's residual stream, {4, 1024, 768}:
@@ -268,7 +292,8 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)residual_forward_kernel, (const void *)residual_backward_kernel};
+    const void *kernels[] = {(const void *)residual_forward_kernel<float>,
+                             (const void *)residual_backward_kernel<float>};
     const char *names[] = {"residual_forward_kernel", "residual_backward_kernel"};
     for (int k = 0; k < 2; k++)
     {
@@ -338,14 +363,13 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
 
     int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
     auto forward = [&] {
-        residual_forward_kernel<<<blocks, threads>>>((float4 *)output.data(), (const float4 *)residual.data(),
-                                                     (const float4 *)branch_output.data(), total_float4s);
+        residual_forward_kernel<float><<<blocks, threads>>>(output.data(), residual.data(), branch_output.data(),
+                                                            total_float4s);
         cudaCheck(cudaGetLastError());
     };
     auto backward = [&] {
-        residual_backward_kernel<<<blocks, threads>>>((float4 *)residual_grad.data(),
-                                                      (float4 *)branch_output_grad.data(),
-                                                      (const float4 *)output_grad.data(), total_float4s);
+        residual_backward_kernel<float><<<blocks, threads>>>(residual_grad.data(), branch_output_grad.data(),
+                                                             output_grad.data(), total_float4s);
         cudaCheck(cudaGetLastError());
     };
     blocks = usual_blocks;
@@ -412,6 +436,7 @@ int main(void)
 {
     matches_pytorch_on_gpt2_rows();
     matches_pytorch_with_a_part_full_last_block();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
 
     forward_of_the_note_s_example();

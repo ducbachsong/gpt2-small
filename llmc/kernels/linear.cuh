@@ -44,6 +44,11 @@
 //
 // The forward kernel's loops are F1's t, i, j. The two backward kernels' are C1's r, c, k, as they make two
 // products with one code: product[r][c] = sum over k of left[r][k] · right[k][c], k the summed index.
+//
+// The tensors are all float or all bfloat16; the kernels are templates on that dtype, T. Only the reads from
+// and writes to GPU memory see T: load4 (tensor.cuh) turns 4 values into a float4 as they are read (for
+// bfloat16, one 8-byte read), store4 rounds them back as they are written. The pieces in shared memory, the
+// 64 sums in registers and every multiply-add are float, whatever T is.
 #ifndef LINEAR_CUH
 #define LINEAR_CUH
 
@@ -96,14 +101,17 @@ void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const 
 // ── forward ───────────────────────────────────────────────────────────────────
 
 // The kernel linear_forward launches, declared here so it can call it; its code follows it.
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
-                      size_t input_rows, size_t in_features, size_t out_features);
+linear_forward_kernel(T* output, const T* input, const T* weight, const T* bias, size_t input_rows,
+                      size_t in_features, size_t out_features);
 // The copies all three kernels use, declared here so the forward can call them; their code is near the end
-__device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t matrix_rows, size_t matrix_columns,
+template <typename T>
+__device__ __forceinline__ float4 linear_load_piece(const T* matrix, size_t matrix_rows, size_t matrix_columns,
                                                     size_t step_first_k, size_t block_first_column);
 __device__ __forceinline__ void linear_store_piece(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH], float4 values);
-__device__ __forceinline__ float4 linear_load_piece_turned(const float* matrix, size_t matrix_rows,
+template <typename T>
+__device__ __forceinline__ float4 linear_load_piece_turned(const T* matrix, size_t matrix_rows,
                                                            size_t matrix_columns, size_t block_first_row,
                                                            size_t step_first_k);
 __device__ __forceinline__ void linear_store_piece_turned(float (*block_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
@@ -116,11 +124,11 @@ __device__ __forceinline__ void linear_store_piece_turned(float (*block_piece)[L
 /// for the qkv, 4096 rows and 2304 output columns, 18 x 32 = 576 blocks of 256 threads.
 ///
 /// First it stops with a message if the tensors do not fit together, before the kernel reads past one;
-/// or if in_features or out_features is not a multiple of 4, or a tensor does not start on 16 bytes: the
-/// kernel reads 4 floats at a time (float4), and off 16 bytes the GPU stops with "misaligned address" at
-/// some later call, far from the cause.
+/// if they are not all float or all bfloat16; or if in_features or out_features is not a multiple of 4,
+/// or a tensor does not start on 4 values (16 bytes for float, 8 for bfloat16): the kernel reads 4 values
+/// at a time, and off that the GPU stops with "misaligned address" at some later call, far from the cause.
 inline void linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias) {
-    bool has_bias = bias.data() != nullptr;                     // Tensor() has no values: no bias
+    bool has_bias = bias.data_ptr() != nullptr;                 // Tensor() has no values: no bias
     bool fits = input.dim() >= 1 && weight.dim() == 2 && output.dim() == input.dim() &&
                 input.size(input.dim() - 1) == weight.size(1) && output.size(output.dim() - 1) == weight.size(0) &&
                 (!has_bias || bias.shape() == Shape({weight.size(0)}));
@@ -130,13 +138,21 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
                         "same rows, weight {out_features, in_features}, bias {out_features} or Tensor()\n");
         exit(EXIT_FAILURE);
     }
-    if (weight.size(0) % 4 != 0 || weight.size(1) % 4 != 0 || (size_t)output.data() % 16 != 0 ||
-        (size_t)input.data() % 16 != 0 || (size_t)weight.data() % 16 != 0 || (size_t)bias.data() % 16 != 0) {
-        fprintf(stderr, "error: a linear layer reads 4 floats at a time (float4), so in_features and out_features "
-                        "must be multiples of 4 and output, input, weight, bias must start on 16 bytes; got "
-                        "in_features %zu, out_features %zu, %p, %p, %p, %p\n",
-                weight.size(1), weight.size(0), (void*)output.data(), (void*)input.data(), (void*)weight.data(),
-                (void*)bias.data());
+    DType dtype = input.dtype();
+    if ((dtype != DType::Float32 && dtype != DType::BFloat16) || output.dtype() != dtype || weight.dtype() != dtype ||
+        (has_bias && bias.dtype() != dtype)) {
+        fprintf(stderr, "error: a linear layer needs output, input, weight and bias all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t four_values = 4 * input.element_size();                      // 16 bytes for float, 8 for bfloat16
+    if (weight.size(0) % 4 != 0 || weight.size(1) % 4 != 0 || (size_t)output.data_ptr() % four_values != 0 ||
+        (size_t)input.data_ptr() % four_values != 0 || (size_t)weight.data_ptr() % four_values != 0 ||
+        (size_t)bias.data_ptr() % four_values != 0) {
+        fprintf(stderr, "error: a linear layer reads 4 values at a time, so in_features and out_features must be "
+                        "multiples of 4 and output, input, weight, bias must start on %zu bytes; got in_features "
+                        "%zu, out_features %zu, %p, %p, %p, %p\n",
+                four_values, weight.size(1), weight.size(0), output.data_ptr(), input.data_ptr(), weight.data_ptr(),
+                bias.data_ptr());
         exit(EXIT_FAILURE);
     }
 
@@ -146,9 +162,14 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
     size_t total_block_columns = (out_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
     size_t total_block_rows = (input_rows + LINEAR_VALUES_PER_BLOCK_ROWS - 1) / LINEAR_VALUES_PER_BLOCK_ROWS;
     unsigned total_blocks = (unsigned)(total_block_columns * total_block_rows);
-    linear_forward_kernel<<<total_blocks, LINEAR_THREADS_PER_BLOCK>>>(output.data(), input.data(), weight.data(),
-                                                                      bias.data(), input_rows, in_features,
-                                                                      out_features);
+    if (dtype == DType::BFloat16)
+        linear_forward_kernel<<<total_blocks, LINEAR_THREADS_PER_BLOCK>>>(
+            output.data_ptr<nv_bfloat16>(), input.data_ptr<nv_bfloat16>(), weight.data_ptr<nv_bfloat16>(),
+            has_bias ? bias.data_ptr<nv_bfloat16>() : nullptr, input_rows, in_features, out_features);
+    else
+        linear_forward_kernel<<<total_blocks, LINEAR_THREADS_PER_BLOCK>>>(
+            output.data(), input.data(), weight.data(), has_bias ? bias.data() : nullptr, input_rows, in_features,
+            out_features);
     cudaCheck(cudaGetLastError());
 }
 
@@ -169,9 +190,10 @@ inline void linear_forward(const Tensor& output, const Tensor& input, const Tens
 /// other set once the math is done. The ~300 cycles a read from GPU memory takes pass during the math, not
 /// before it, and one __syncthreads() per step is enough (see the loop). __launch_bounds__(256, 2) keeps it
 /// at 128 registers or fewer, so 2 blocks fit an SM.
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_forward_kernel(float* output, const float* input, const float* weight, const float* bias,
-                      size_t input_rows, size_t in_features, size_t out_features) {
+linear_forward_kernel(T* output, const T* input, const T* weight, const T* bias, size_t input_rows,
+                      size_t in_features, size_t out_features) {
     // This step's 8 input columns i of x and W, with i as the rows: block_input_pieces[set][i][t] = x[t][i] and
     // block_weight_pieces[set][i][j] = W[j][i] (a piece of Wᵀ), for the block's 128 rows t and 128 output
     // columns j. The 8 values a thread needs at one i sit next to each other: two float4 reads. Two sets: one
@@ -268,10 +290,10 @@ linear_forward_kernel(float* output, const float* input, const float* weight, co
             if (row >= input_rows || output_column >= out_features) continue;   // past the edge of a part-full square
             float4 result = make_float4(sums[t][j], sums[t][j + 1], sums[t][j + 2], sums[t][j + 3]);
             if (bias != nullptr) {
-                float4 bias4 = *(const float4*)(bias + output_column);
+                float4 bias4 = load4(bias + output_column);
                 result = make_float4(result.x + bias4.x, result.y + bias4.y, result.z + bias4.z, result.w + bias4.w);
             }
-            *(float4*)(output + row * out_features + output_column) = result;
+            store4(output + row * out_features + output_column, result);
         }
     }
 }
@@ -279,13 +301,14 @@ linear_forward_kernel(float* output, const float* input, const float* weight, co
 // ── backward ──────────────────────────────────────────────────────────────────
 
 // The kernels linear_backward launches, declared here so it can call them; their code follows it.
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
-                          const float* input, size_t input_rows, size_t in_features,
-                          size_t out_features);
+linear_weight_grad_kernel(T* weight_grad, T* bias_grad, const T* output_grad, const T* input, size_t input_rows,
+                          size_t in_features, size_t out_features);
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
-                         size_t input_rows, size_t in_features, size_t out_features);
+linear_input_grad_kernel(T* input_grad, const T* output_grad, const T* weight, size_t input_rows,
+                         size_t in_features, size_t out_features);
 
 /// Works out the gradients of input, weight and bias (B3, B2, B1, as C2's products) from output_grad and
 /// what the forward read: input and weight. input_grad is written over: in GPT-2 it is the gradient of a
@@ -302,7 +325,7 @@ linear_input_grad_kernel(float* input_grad, const float* output_grad, const floa
 /// as the forward does, if the tensors do not fit together or are not ready for float4 reads.
 inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
                             const Tensor& output_grad, const Tensor& input, const Tensor& weight) {
-    bool has_bias = bias_grad.data() != nullptr;                // Tensor() has no values: no bias
+    bool has_bias = bias_grad.data_ptr() != nullptr;            // Tensor() has no values: no bias
     bool fits = input.dim() >= 1 && weight.dim() == 2 && output_grad.dim() == input.dim() &&
                 input.size(input.dim() - 1) == weight.size(1) &&
                 output_grad.size(output_grad.dim() - 1) == weight.size(0) && input_grad.shape() == input.shape() &&
@@ -314,14 +337,23 @@ inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad,
                         "bias_grad {out_features} or Tensor()\n");
         exit(EXIT_FAILURE);
     }
-    if (weight.size(0) % 4 != 0 || weight.size(1) % 4 != 0 || (size_t)input_grad.data() % 16 != 0 ||
-        (size_t)weight_grad.data() % 16 != 0 || (size_t)bias_grad.data() % 16 != 0 ||
-        (size_t)output_grad.data() % 16 != 0 || (size_t)input.data() % 16 != 0 || (size_t)weight.data() % 16 != 0) {
-        fprintf(stderr, "error: a linear layer reads 4 floats at a time (float4), so in_features and out_features "
-                        "must be multiples of 4 and input_grad, weight_grad, bias_grad, output_grad, input, weight "
-                        "must start on 16 bytes; got in_features %zu, out_features %zu, %p, %p, %p, %p, %p, %p\n",
-                weight.size(1), weight.size(0), (void*)input_grad.data(), (void*)weight_grad.data(),
-                (void*)bias_grad.data(), (void*)output_grad.data(), (void*)input.data(), (void*)weight.data());
+    DType dtype = input.dtype();
+    if ((dtype != DType::Float32 && dtype != DType::BFloat16) || input_grad.dtype() != dtype ||
+        weight_grad.dtype() != dtype || output_grad.dtype() != dtype || weight.dtype() != dtype ||
+        (has_bias && bias_grad.dtype() != dtype)) {
+        fprintf(stderr, "error: a linear layer's backward needs its tensors all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t four_values = 4 * input.element_size();                      // 16 bytes for float, 8 for bfloat16
+    if (weight.size(0) % 4 != 0 || weight.size(1) % 4 != 0 || (size_t)input_grad.data_ptr() % four_values != 0 ||
+        (size_t)weight_grad.data_ptr() % four_values != 0 || (size_t)bias_grad.data_ptr() % four_values != 0 ||
+        (size_t)output_grad.data_ptr() % four_values != 0 || (size_t)input.data_ptr() % four_values != 0 ||
+        (size_t)weight.data_ptr() % four_values != 0) {
+        fprintf(stderr, "error: a linear layer reads 4 values at a time, so in_features and out_features must be "
+                        "multiples of 4 and input_grad, weight_grad, bias_grad, output_grad, input, weight must start "
+                        "on %zu bytes; got in_features %zu, out_features %zu, %p, %p, %p, %p, %p, %p\n",
+                four_values, weight.size(1), weight.size(0), input_grad.data_ptr(), weight_grad.data_ptr(),
+                bias_grad.data_ptr(), output_grad.data_ptr(), input.data_ptr(), weight.data_ptr());
         exit(EXIT_FAILURE);
     }
 
@@ -338,25 +370,38 @@ inline void linear_backward(const Tensor& input_grad, const Tensor& weight_grad,
         (in_features + LINEAR_VALUES_PER_BLOCK_COLUMNS - 1) / LINEAR_VALUES_PER_BLOCK_COLUMNS;
     unsigned total_weight_grad_blocks = (unsigned)(total_weight_grad_block_rows * total_weight_grad_block_columns);
     unsigned total_input_grad_blocks = (unsigned)(total_input_grad_block_rows * total_input_grad_block_columns);
-    linear_weight_grad_kernel<<<total_weight_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(   // 108 blocks
-        weight_grad.data(), bias_grad.data(), output_grad.data(), input.data(), input_rows, in_features, out_features);
-    cudaCheck(cudaGetLastError());
-    linear_input_grad_kernel<<<total_input_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(     // 192 blocks
-        input_grad.data(), output_grad.data(), weight.data(), input_rows, in_features, out_features);
+    if (dtype == DType::BFloat16) {
+        linear_weight_grad_kernel<<<total_weight_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(   // 108 blocks
+            weight_grad.data_ptr<nv_bfloat16>(), has_bias ? bias_grad.data_ptr<nv_bfloat16>() : nullptr,
+            output_grad.data_ptr<nv_bfloat16>(), input.data_ptr<nv_bfloat16>(), input_rows, in_features, out_features);
+        cudaCheck(cudaGetLastError());
+        linear_input_grad_kernel<<<total_input_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(     // 192 blocks
+            input_grad.data_ptr<nv_bfloat16>(), output_grad.data_ptr<nv_bfloat16>(), weight.data_ptr<nv_bfloat16>(),
+            input_rows, in_features, out_features);
+    } else {
+        linear_weight_grad_kernel<<<total_weight_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(   // 108 blocks
+            weight_grad.data(), has_bias ? bias_grad.data() : nullptr, output_grad.data(), input.data(), input_rows,
+            in_features, out_features);
+        cudaCheck(cudaGetLastError());
+        linear_input_grad_kernel<<<total_input_grad_blocks, LINEAR_THREADS_PER_BLOCK>>>(     // 192 blocks
+            input_grad.data(), output_grad.data(), weight.data(), input_rows, in_features, out_features);
+    }
     cudaCheck(cudaGetLastError());
 }
 
 // The pieces the two backward kernels are made of, declared here so they can call them; their code follows
 // them, in this order. All are inlined into the kernels, so the sums they are handed stay in registers.
+template <typename T>
 __device__ __forceinline__ void linear_weight_grad_block(
         float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
-        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* weight_grad,
-        float* bias_grad, const float* output_grad, const float* input, size_t input_rows, size_t in_features,
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], T* weight_grad,
+        T* bias_grad, const T* output_grad, const T* input, size_t input_rows, size_t in_features,
         size_t out_features, size_t block_row, size_t block_column);
+template <typename T>
 __device__ __forceinline__ void linear_input_grad_block(
         float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
-        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* input_grad,
-        const float* output_grad, const float* weight, size_t input_rows, size_t in_features, size_t out_features,
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], T* input_grad,
+        const T* output_grad, const T* weight, size_t input_rows, size_t in_features, size_t out_features,
         size_t block_row, size_t block_column);
 __device__ __forceinline__ void linear_add_outer_products(
         float (&sums)[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS],
@@ -364,8 +409,9 @@ __device__ __forceinline__ void linear_add_outer_products(
         const float (*block_right_piece)[LINEAR_BLOCK_PIECE_ROW_LENGTH],
         int thread_first_row, int thread_first_column,
         float (&bias_sums)[LINEAR_VALUES_PER_THREAD_ROWS], bool adds_bias_grad);
+template <typename T>
 __device__ __forceinline__ void linear_store_sums(
-        float* product, size_t product_rows, size_t product_columns,
+        T* product, size_t product_rows, size_t product_columns,
         const float (&sums)[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS], size_t first_row,
         size_t first_column, bool add_onto);
 
@@ -387,10 +433,10 @@ __device__ __forceinline__ void linear_store_sums(
 /// Works out one 128 x 128 square of weight_grad (B2), and of bias_grad with it (B1): see
 /// linear_weight_grad_block. For the qkv, 108 blocks: 18 squares down (output columns j), 6 across (input
 /// columns i).
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* output_grad,
-                          const float* input, size_t input_rows, size_t in_features,
-                          size_t out_features) {
+linear_weight_grad_kernel(T* weight_grad, T* bias_grad, const T* output_grad, const T* input, size_t input_rows,
+                          size_t in_features, size_t out_features) {
     // This step's 8 values of k of left and right, with k as the rows: block_left_pieces[set][k][r] = left[r][k]
     // and block_right_pieces[set][k][c] = right[k][c], for the block's 128 rows r and 128 columns c. Two sets
     // (double buffering, see the forward): one step's math reads one while the next step's values go into the
@@ -407,9 +453,10 @@ linear_weight_grad_kernel(float* weight_grad, float* bias_grad, const float* out
 
 /// Works out one 128 x 128 square of input_grad (B3): see linear_input_grad_block. For the qkv, 192 blocks:
 /// 32 squares down (rows t), 6 across (input columns i).
+template <typename T>
 __global__ void __launch_bounds__(LINEAR_THREADS_PER_BLOCK, 2)
-linear_input_grad_kernel(float* input_grad, const float* output_grad, const float* weight,
-                         size_t input_rows, size_t in_features, size_t out_features) {
+linear_input_grad_kernel(T* input_grad, const T* output_grad, const T* weight, size_t input_rows,
+                         size_t in_features, size_t out_features) {
     // the same two sets of pieces as linear_weight_grad_kernel's (16.5 KB)
     __shared__ __align__(16) float block_left_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
     __shared__ __align__(16) float block_right_pieces[2][LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH];
@@ -431,10 +478,11 @@ linear_input_grad_kernel(float* input_grad, const float* output_grad, const floa
 /// (inside linear_add_outer_products, from the values it reads anyway), and the 16 threads with thread_first_column
 /// 0 add them onto bias_grad at the end. One thread per bias_grad value, adding in the same order every run:
 /// bias_grad is the same to the last bit (no atomicAdd).
+template <typename T>
 __device__ __forceinline__ void linear_weight_grad_block(
         float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
-        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* weight_grad,
-        float* bias_grad, const float* output_grad, const float* input, size_t input_rows, size_t in_features,
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], T* weight_grad,
+        T* bias_grad, const T* output_grad, const T* input, size_t input_rows, size_t in_features,
         size_t out_features, size_t block_row, size_t block_column) {
     size_t block_first_row = block_row * LINEAR_VALUES_PER_BLOCK_ROWS;             // its first r: an output column j
     size_t block_first_column = block_column * LINEAR_VALUES_PER_BLOCK_COLUMNS;    // its first c: an input column i
@@ -479,7 +527,7 @@ __device__ __forceinline__ void linear_weight_grad_block(
 #pragma unroll
         for (int r = 0; r < LINEAR_VALUES_PER_THREAD_ROWS; r++) {
             size_t row = block_first_row + thread_first_row + r;                  // a row r of dW: output column j
-            if (row < out_features) bias_grad[row] += bias_sums[r];
+            if (row < out_features) bias_grad[row] = from_float<T>(to_float(bias_grad[row]) + bias_sums[r]);
         }
     }
 }
@@ -487,10 +535,11 @@ __device__ __forceinline__ void linear_weight_grad_block(
 /// Makes one 128 x 128 square of input_grad, B3: dx = dy W, written over (see linear_backward). r is a row t,
 /// c an input column i, and the sum runs over the n_out output columns j. dy sits as {T, n_out}, which is
 /// {r, k}: it is copied turned round, as the forward copies x.
+template <typename T>
 __device__ __forceinline__ void linear_input_grad_block(
         float (*block_left_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH],
-        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], float* input_grad,
-        const float* output_grad, const float* weight, size_t input_rows, size_t in_features, size_t out_features,
+        float (*block_right_pieces)[LINEAR_VALUES_PER_THREAD][LINEAR_BLOCK_PIECE_ROW_LENGTH], T* input_grad,
+        const T* output_grad, const T* weight, size_t input_rows, size_t in_features, size_t out_features,
         size_t block_row, size_t block_column) {
     size_t block_first_row = block_row * LINEAR_VALUES_PER_BLOCK_ROWS;             // its first r: a row t
     size_t block_first_column = block_column * LINEAR_VALUES_PER_BLOCK_COLUMNS;    // its first c: an input column i
@@ -536,7 +585,8 @@ __device__ __forceinline__ void linear_input_grad_block(
 /// matrix_columns}. The 256 threads read one float4 each, 4 neighbouring c at one k: 32 threads per k, a warp
 /// reading 512 bytes in a row. It only reads, into a register: the value is not needed until linear_store_piece,
 /// so the thread can do other work while GPU memory answers.
-__device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t matrix_rows, size_t matrix_columns,
+template <typename T>
+__device__ __forceinline__ float4 linear_load_piece(const T* matrix, size_t matrix_rows, size_t matrix_columns,
                                                     size_t step_first_k, size_t block_first_column) {
     const int max_floats_per_thread_read = 4;   // a float4: 16 bytes, the widest read one thread can do
     // a row of block_piece is 128 columns c: 128 / 4 = 32 threads per row, one warp, 8 rows
@@ -547,7 +597,7 @@ __device__ __forceinline__ float4 linear_load_piece(const float* matrix, size_t 
     size_t matrix_row = step_first_k + k, matrix_column = block_first_column + c;
     float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (matrix_row < matrix_rows && matrix_column < matrix_columns)
-        values = *(const float4*)(matrix + matrix_row * matrix_columns + matrix_column);
+        values = load4(matrix + matrix_row * matrix_columns + matrix_column);
     return values;
 }
 
@@ -565,7 +615,8 @@ __device__ __forceinline__ void linear_store_piece(float (*block_piece)[LINEAR_B
 /// last, {r, k}: matrix[block_first_row + r][step_first_k + k .. k + 3], for the block's 128 rows r and the step's
 /// 8 values of k; 0 past the matrix's edges. matrix is {matrix_rows, matrix_columns}. Each thread reads 4
 /// neighbouring k of one r (2 threads per r), into a register, as linear_load_piece does.
-__device__ __forceinline__ float4 linear_load_piece_turned(const float* matrix, size_t matrix_rows,
+template <typename T>
+__device__ __forceinline__ float4 linear_load_piece_turned(const T* matrix, size_t matrix_rows,
                                                            size_t matrix_columns, size_t block_first_row,
                                                            size_t step_first_k) {
     const int max_floats_per_thread_read = 4;   // a float4: 16 bytes, the widest read one thread can do
@@ -576,7 +627,7 @@ __device__ __forceinline__ float4 linear_load_piece_turned(const float* matrix, 
     size_t matrix_row = block_first_row + r, matrix_column = step_first_k + k;
     float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (matrix_row < matrix_rows && matrix_column < matrix_columns)
-        values = *(const float4*)(matrix + matrix_row * matrix_columns + matrix_column);
+        values = load4(matrix + matrix_row * matrix_columns + matrix_column);
     return values;
 }
 
@@ -636,8 +687,9 @@ __device__ __forceinline__ void linear_add_outer_products(
 /// Writes a thread's 64 sums into product, {product_rows, product_columns}, at rows first_row .. + 7 and
 /// columns first_column .. + 3 and the 4 that are 64 on: added onto what is there with add_onto (dW), written
 /// over without (dx). One float4 (4 columns) at a time; past the edges of a part-full square, nothing.
+template <typename T>
 __device__ __forceinline__ void linear_store_sums(
-        float* product, size_t product_rows, size_t product_columns,
+        T* product, size_t product_rows, size_t product_columns,
         const float (&sums)[LINEAR_VALUES_PER_THREAD_ROWS][LINEAR_VALUES_PER_THREAD_COLUMNS], size_t first_row,
         size_t first_column, bool add_onto) {
     const int max_floats_per_thread_write = 4;   // a float4: 16 bytes, the widest write one thread can do
@@ -651,12 +703,12 @@ __device__ __forceinline__ void linear_store_sums(
             size_t column = first_column + half * LINEAR_SECOND_HALF_COLUMN_OFFSET;
             if (row >= product_rows || column >= product_columns) continue;   // past the edge of a part-full square
             float4 result = make_float4(sums[r][c], sums[r][c + 1], sums[r][c + 2], sums[r][c + 3]);
-            float4* product4 = (float4*)(product + row * product_columns + column);
+            T* product4 = product + row * product_columns + column;          // its 4 values
             if (add_onto) {
-                float4 old = *product4;
+                float4 old = load4(product4);
                 result = make_float4(old.x + result.x, old.y + result.y, old.z + result.z, old.w + result.w);
             }
-            *product4 = result;
+            store4(product4, result);
         }
     }
 }

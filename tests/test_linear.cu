@@ -11,6 +11,10 @@
 #include "../llmc/kernels/linear.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values: every sum is in float, and each result is rounded
+// once as it is stored. A bfloat16 keeps 8 significant bits, so that rounding moves a value by at most 2^-8,
+// about 0.4% of it. Twice that.
+static const double BFLOAT16_TOLERANCE = 8e-3;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -141,6 +145,36 @@ static void matches_pytorch_without_bias(void)
 /// tokens, mine against PyTorch's linear with autograd, and prints the averages and TFLOPS under
 /// `test`'s name. Both sides write input_grad and add 20 backwards onto weight_grad and bias_grad; at
 /// the end they must still agree within `tolerance`.
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: input {2, 37, 96}, weight {132, 96} and bias, all in bfloat16: 74 rows, 1 square down, 2 across,
+    // neither full, so the edges of the 4-value loads are covered. The pieces in shared memory and the sums
+    // are float, so output, input_grad, weight_grad and bias_grad are PyTorch's float linear of the same
+    // values, each rounded once as it is stored: within BFLOAT16_TOLERANCE.
+    Tensor::manual_seed(0);
+    size_t in_features = 96, out_features = 132;
+    Shape input_shape = {2, 37, in_features}, output_shape = {2, 37, out_features};
+    Tensor input = tensor_of(input_shape, random_values(input_shape)).to(DType::BFloat16);
+    Tensor weight = tensor_of({out_features, in_features}, random_values({out_features, in_features})).to(DType::BFloat16);
+    Tensor bias = tensor_of({out_features}, random_values({out_features})).to(DType::BFloat16);
+    Tensor output_grad = tensor_of(output_shape, random_values(output_shape)).to(DType::BFloat16);
+    Tensor output = Tensor::zeros(output_shape, DType::BFloat16), input_grad = Tensor::zeros(input_shape, DType::BFloat16);
+    Tensor weight_grad = Tensor::zeros({out_features, in_features}, DType::BFloat16);
+    Tensor bias_grad = Tensor::zeros({out_features}, DType::BFloat16);
+    linear_forward(output, input, weight, bias);
+    linear_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight);
+
+    torch::Tensor pytorch_input = pytorch_copy_of(input.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_weight = pytorch_copy_of(weight.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_bias = pytorch_copy_of(bias.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_output = torch::linear(pytorch_input, pytorch_weight, pytorch_bias);
+    pytorch_output.backward(pytorch_copy_of(output_grad.to(DType::Float32)));
+    ASSERT_NEAR(output.to(DType::Float32).tolist(), list_of(pytorch_output), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(input_grad.to(DType::Float32).tolist(), list_of(pytorch_input.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(weight_grad.to(DType::Float32).tolist(), list_of(pytorch_weight.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(bias_grad.to(DType::Float32).tolist(), list_of(pytorch_bias.grad()), BFLOAT16_TOLERANCE);
+}
+
 static void time_20_steps(const char *test, size_t in_features, size_t out_features, bool with_bias,
                           double tolerance)
 {
@@ -422,10 +456,18 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)linear_forward_kernel, (const void *)linear_weight_grad_kernel,
-                             (const void *)linear_input_grad_kernel};
-    const char *names[] = {"linear_forward_kernel", "linear_weight_grad_kernel", "linear_input_grad_kernel"};
-    for (int k = 0; k < 3; k++)
+    //
+    // The bfloat16 kernels too: they hold the same sums, and turn each value read into a float on the way in.
+    const void *kernels[] = {(const void *)linear_forward_kernel<float>,
+                             (const void *)linear_weight_grad_kernel<float>,
+                             (const void *)linear_input_grad_kernel<float>,
+                             (const void *)linear_forward_kernel<nv_bfloat16>,
+                             (const void *)linear_weight_grad_kernel<nv_bfloat16>,
+                             (const void *)linear_input_grad_kernel<nv_bfloat16>};
+    const char *names[] = {"linear_forward_kernel<float>", "linear_weight_grad_kernel<float>",
+                           "linear_input_grad_kernel<float>", "linear_forward_kernel<nv_bfloat16>",
+                           "linear_weight_grad_kernel<nv_bfloat16>", "linear_input_grad_kernel<nv_bfloat16>"};
+    for (int k = 0; k < 6; k++)
     {
         cudaFuncAttributes attributes;
         cudaCheck(cudaFuncGetAttributes(&attributes, kernels[k]));
@@ -444,6 +486,7 @@ int main(void)
     matches_pytorch_on_qkv_sizes();
     matches_pytorch_on_sizes_that_do_not_fill_the_squares();
     matches_pytorch_without_bias();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_qkv();
     time_20_steps_on_attention_output();
     time_20_steps_on_mlp_up();

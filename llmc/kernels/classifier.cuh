@@ -40,6 +40,11 @@
 // out again from logits, max_of_each_row and sum_of_each_row, as LayerNorm's backward does with mean and rstd
 // (note 6.1).
 // logits4 is one float4 of the logits: the 4 columns a thread has.
+//
+// logits and logits_grad are both float or both bfloat16; losses, max_of_each_row, sum_of_each_row and
+// losses_grad are always float. The kernels are templates on that dtype, T. A float4 is 4 neighbouring
+// values either way: for bfloat16, one 8-byte read that load4 (tensor.cuh) turns into 4 floats, and store4
+// rounds back. The exps and sums are always in float.
 #ifndef CLASSIFIER_CUH
 #define CLASSIFIER_CUH
 
@@ -65,8 +70,9 @@ void classifier_check_shapes(const Tensor& losses, const Tensor& max_of_each_row
 // ── forward ───────────────────────────────────────────────────────────────────
 
 // The kernel classifier_forward launches, declared here so it can call it; its code follows it.
+template <typename T>
 __global__ void classifier_forward_kernel(float* losses, float* max_of_each_row, float* sum_of_each_row,
-                                          const float4* logits, const int* targets, size_t rows, size_t vocab_size,
+                                          const T* logits, const int* targets, size_t rows, size_t vocab_size,
                                           size_t padded_vocab_size);
 
 /// Writes each row's loss into losses, and its row_max and row_sum into max_of_each_row and sum_of_each_row for the
@@ -78,9 +84,14 @@ inline void classifier_forward(const Tensor& losses, const Tensor& max_of_each_r
                                const Tensor& logits, const Tensor& targets, size_t vocab_size) {
     classifier_check_shapes(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
     size_t rows = logits.size(0) * logits.size(1);
-    classifier_forward_kernel<<<(int)rows, CLASSIFIER_FORWARD_THREADS_PER_BLOCK>>>(
-        losses.data(), max_of_each_row.data(), sum_of_each_row.data(), (const float4*)logits.data(),
-        targets.data_ptr<int>(), rows, vocab_size, logits.size(2));
+    if (logits.dtype() == DType::BFloat16)
+        classifier_forward_kernel<<<(int)rows, CLASSIFIER_FORWARD_THREADS_PER_BLOCK>>>(
+            losses.data(), max_of_each_row.data(), sum_of_each_row.data(), logits.data_ptr<nv_bfloat16>(),
+            targets.data_ptr<int>(), rows, vocab_size, logits.size(2));
+    else
+        classifier_forward_kernel<<<(int)rows, CLASSIFIER_FORWARD_THREADS_PER_BLOCK>>>(
+            losses.data(), max_of_each_row.data(), sum_of_each_row.data(), logits.data(), targets.data_ptr<int>(),
+            rows, vocab_size, logits.size(2));
     cudaCheck(cudaGetLastError());
 }
 
@@ -102,25 +113,25 @@ inline void classifier_forward(const Tensor& losses, const Tensor& max_of_each_r
 /// shuffles, then across the 32 warps in shared memory. Two reads, one for the max and one for the sum,
 /// would read the 196 KB row twice. This is note 6.2 and its Figure 3: step 1 below is the update rule,
 /// steps 2 and 3 the merge rule; the results are F1's m, F4's S and F5's loss.
+template <typename T>
 __global__ void classifier_forward_kernel(float* losses, float* max_of_each_row, float* sum_of_each_row,
-                                          const float4* logits, const int* targets, size_t rows, size_t vocab_size,
+                                          const T* logits, const int* targets, size_t rows, size_t vocab_size,
                                           size_t padded_vocab_size) {
     // warp_max and warp_sum of every warp of the block, slot w for warp w, so warp 0 can put them together:
     // shuffles only pass values inside one warp. 32 slots: a block has at most 1024 / 32 = 32 warps.
     __shared__ float max_of_each_warp[32], sum_of_each_warp[32];
     int thread_in_warp = threadIdx.x % 32, warp_in_block = threadIdx.x / 32, warps_in_block = blockDim.x / 32;
-    size_t float4s_per_row = padded_vocab_size / 4;          // 50304 / 4 = 12,576
     size_t float4s_with_words = (vocab_size + 3) / 4;        // 50257 words: 12,565, the last part padding
 
     for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
-        const float4* row_logits = logits + row * float4s_per_row;
+        const T* row_logits = logits + row * padded_vocab_size;
 
         // 1. this thread's (max, sum), over its float4s: note 6.2's update rule. Padding columns count as
         //    -FLT_MAX: exp of them is 0 (note 6.3). Only float4s with at least one word, so the max of the 4
         //    is never -FLT_MAX itself.
         float thread_max = -FLT_MAX, thread_sum = 0.0f;
         for (size_t float4_in_row = threadIdx.x; float4_in_row < float4s_with_words; float4_in_row += blockDim.x) {
-            float4 logits4 = row_logits[float4_in_row];
+            float4 logits4 = load4(row_logits + 4 * float4_in_row);
             size_t first_column = float4_in_row * 4;
             float logit0 = logits4.x;                                     // first_column is always a word here
             float logit1 = first_column + 1 < vocab_size ? logits4.y : -FLT_MAX;
@@ -161,7 +172,7 @@ __global__ void classifier_forward_kernel(float* losses, float* max_of_each_row,
                 row_max = new_max;
             }
             if (thread_in_warp == 0) {
-                float target_logit = ((const float*)row_logits)[targets[row]];
+                float target_logit = to_float(row_logits[targets[row]]);
                 max_of_each_row[row] = row_max;                            // F1: m
                 sum_of_each_row[row] = row_sum;                            // F4: S
                 losses[row] = logf(row_sum) - (target_logit - row_max);   // F5: ℓ = log S - a_t, -log(prob of the target)
@@ -174,7 +185,8 @@ __global__ void classifier_forward_kernel(float* losses, float* max_of_each_row,
 // ── backward ──────────────────────────────────────────────────────────────────
 
 // The kernel classifier_backward launches, declared here so it can call it; its code follows it.
-__global__ void classifier_backward_kernel(float4* logits_grad, const float* losses_grad, const float4* logits,
+template <typename T>
+__global__ void classifier_backward_kernel(T* logits_grad, const float* losses_grad, const T* logits,
                                            const int* targets, const float* max_of_each_row,
                                            const float* sum_of_each_row, size_t rows, size_t vocab_size,
                                            size_t padded_vocab_size);
@@ -191,17 +203,24 @@ inline void classifier_backward(const Tensor& logits_grad, const Tensor& losses_
                                 const Tensor& targets, const Tensor& max_of_each_row, const Tensor& sum_of_each_row,
                                 size_t vocab_size) {
     classifier_check_shapes(losses_grad, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
-    if (logits_grad.shape() != logits.shape() || (size_t)logits_grad.data() % 16 != 0) {
-        fprintf(stderr, "error: the classifier needs logits_grad the same shape as logits, starting on 16 bytes\n");
+    if (logits_grad.shape() != logits.shape() || logits_grad.dtype() != logits.dtype() ||
+        (size_t)logits_grad.data_ptr() % (4 * logits.element_size()) != 0) {
+        fprintf(stderr, "error: the classifier needs logits_grad the same shape and dtype as logits, starting on 4 "
+                        "values\n");
         exit(EXIT_FAILURE);
     }
     size_t rows = logits.size(0) * logits.size(1);
     size_t total_float4s = logits.numel() / 4;
     int blocks = (int)((total_float4s + CLASSIFIER_BACKWARD_THREADS_PER_BLOCK - 1) /
                        CLASSIFIER_BACKWARD_THREADS_PER_BLOCK);    // rounded up: a part-full last block
-    classifier_backward_kernel<<<blocks, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK>>>(
-        (float4*)logits_grad.data(), losses_grad.data(), (const float4*)logits.data(), targets.data_ptr<int>(),
-        max_of_each_row.data(), sum_of_each_row.data(), rows, vocab_size, logits.size(2));
+    if (logits.dtype() == DType::BFloat16)
+        classifier_backward_kernel<<<blocks, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK>>>(
+            logits_grad.data_ptr<nv_bfloat16>(), losses_grad.data(), logits.data_ptr<nv_bfloat16>(),
+            targets.data_ptr<int>(), max_of_each_row.data(), sum_of_each_row.data(), rows, vocab_size, logits.size(2));
+    else
+        classifier_backward_kernel<<<blocks, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK>>>(
+            logits_grad.data(), losses_grad.data(), logits.data(), targets.data_ptr<int>(), max_of_each_row.data(),
+            sum_of_each_row.data(), rows, vocab_size, logits.size(2));
     cudaCheck(cudaGetLastError());
 }
 
@@ -210,7 +229,8 @@ inline void classifier_backward(const Tensor& logits_grad, const Tensor& losses_
 /// losses_grad. A row is 12,576 float4s, so the threads of a block all read the same row's four, which
 /// come from the cache after the first. The loop body is the note's C2, written out as in its 6.4; the
 /// seven steps B1..B7 of its Section 3 are never run one by one.
-__global__ void classifier_backward_kernel(float4* logits_grad, const float* losses_grad, const float4* logits,
+template <typename T>
+__global__ void classifier_backward_kernel(T* logits_grad, const float* losses_grad, const T* logits,
                                            const int* targets, const float* max_of_each_row,
                                            const float* sum_of_each_row, size_t rows, size_t vocab_size,
                                            size_t padded_vocab_size) {
@@ -225,7 +245,7 @@ __global__ void classifier_backward_kernel(float4* logits_grad, const float* los
         float row_max = max_of_each_row[row], one_over_row_sum = 1.0f / sum_of_each_row[row];
         float row_loss_grad = losses_grad[row];
 
-        float4 logits4 = logits[float4_index];
+        float4 logits4 = load4(logits + 4 * float4_index);
         float logit_values[4] = {logits4.x, logits4.y, logits4.z, logits4.w};
         float grad_values[4];
         for (int value_in_float4 = 0; value_in_float4 < 4; value_in_float4++) {
@@ -235,7 +255,7 @@ __global__ void classifier_backward_kernel(float4* logits_grad, const float* los
             grad_values[value_in_float4] =                                                    // C2: dz_j = dℓ · (p_j - [j = t]);
                 column < vocab_size ? (prob - one_at_target) * row_loss_grad : 0.0f;          // padding gets 0 (note 6.3)
         }
-        logits_grad[float4_index] = make_float4(grad_values[0], grad_values[1], grad_values[2], grad_values[3]);
+        store4(logits_grad + 4 * float4_index, make_float4(grad_values[0], grad_values[1], grad_values[2], grad_values[3]));
     }
 }
 
@@ -243,9 +263,10 @@ __global__ void classifier_backward_kernel(float4* logits_grad, const float* los
 
 /// Stops with a message if the tensors do not fit together, before a kernel reads past one: logits
 /// {batch_size, seq_len, padded_vocab_size}; targets, losses, max_of_each_row and sum_of_each_row {batch_size,
-/// seq_len}, targets ints; 0 < vocab_size <= padded_vocab_size. Also padded_vocab_size a multiple of 4
-/// and logits starting on 16 bytes, for the float4 loads: off 16 bytes, the GPU stops with "misaligned
-/// address" at some later call, far from the cause. Backward passes losses_grad in losses' place.
+/// seq_len}, targets ints; 0 < vocab_size <= padded_vocab_size; logits float or bfloat16, the other four
+/// float. Also padded_vocab_size a multiple of 4 and logits starting on 4 values (16 bytes for float, 8 for
+/// bfloat16), for the 4-value loads: off that, the GPU stops with "misaligned address" at some later call,
+/// far from the cause. Backward passes losses_grad in losses' place.
 inline void classifier_check_shapes(const Tensor& losses, const Tensor& max_of_each_row, const Tensor& sum_of_each_row,
                                     const Tensor& logits, const Tensor& targets, size_t vocab_size) {
     bool fits = logits.dim() == 3 && targets.shape() == Shape({logits.size(0), logits.size(1)}) &&
@@ -259,10 +280,17 @@ inline void classifier_check_shapes(const Tensor& losses, const Tensor& max_of_e
                         "padded_vocab_size\n");
         exit(EXIT_FAILURE);
     }
-    if (logits.size(2) % 4 != 0 || (size_t)logits.data() % 16 != 0) {
-        fprintf(stderr, "error: the classifier reads 4 floats at a time (float4), so padded_vocab_size must be a "
-                        "multiple of 4 and logits must start on 16 bytes; got %zu, %p\n",
-                logits.size(2), (void*)logits.data());
+    if ((logits.dtype() != DType::Float32 && logits.dtype() != DType::BFloat16) || losses.dtype() != DType::Float32 ||
+        max_of_each_row.dtype() != DType::Float32 || sum_of_each_row.dtype() != DType::Float32) {
+        fprintf(stderr, "error: the classifier needs logits float or bfloat16, and losses, max_of_each_row and "
+                        "sum_of_each_row float\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t four_values = 4 * logits.element_size();                     // 16 bytes for float, 8 for bfloat16
+    if (logits.size(2) % 4 != 0 || (size_t)logits.data_ptr() % four_values != 0) {
+        fprintf(stderr, "error: the classifier reads 4 values at a time, so padded_vocab_size must be a multiple of "
+                        "4 and logits must start on %zu bytes; got %zu, %p\n",
+                four_values, logits.size(2), logits.data_ptr());
         exit(EXIT_FAILURE);
     }
 }

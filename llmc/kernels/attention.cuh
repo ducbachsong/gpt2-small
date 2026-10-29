@@ -49,6 +49,11 @@
 // F2, F5, B2, B3, B7 and B8 are matrix products, one per (batch, head): 48 at once for GPT-2 small, made by
 // cuBLAS's strided batched product (note 6). F4 and B4-B6 are a kernel each, one warp per row of weights;
 // F1, F6, B1 and B9 only move values, one float4 per thread. A name ending in 4 is one float4 of that tensor.
+//
+// The tensors are all float or all bfloat16. The kernels are templates on that dtype, T, and the six products
+// are told it (attention_product: CUDA_R_16BF for bfloat16). A float4 is 4 neighbouring values either way:
+// for bfloat16, one 8-byte read that load4 (tensor.cuh) turns into 4 floats, and store4 rounds back. The
+// softmax and every product sum in float; each result is rounded to the tensors' dtype once, as it is stored.
 #ifndef ATTENTION_CUH
 #define ATTENTION_CUH
 
@@ -69,6 +74,9 @@ void attention_backward(const Tensor& qkv_grad, const Tensor& output_grad, const
 
 // ── for both ──────────────────────────────────────────────────────────────────
 cublasHandle_t attention_cublas();
+void attention_product(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
+                       const Tensor& a, int lda, long long stride_a, const Tensor& b, int ldb, long long stride_b,
+                       const Tensor& c, int ldc, long long stride_c, int batch);
 __device__ __forceinline__ size_t attention_merged_index(size_t index, size_t num_heads, size_t seq_len,
                                                          size_t head_float4s, size_t row_float4s);
 int attention_blocks(size_t total, int threads_per_block, size_t per_thread);
@@ -88,11 +96,17 @@ static inline void attention_cublas_check(cublasStatus_t status, const char* fil
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
-// The kernels attention_forward launches, declared here so it can call them; their code follows it.
-__global__ void attention_split_qkv_kernel(float4* query, float4* key, float4* value, const float4* qkv,
-                                           size_t total_float4s, size_t num_heads, size_t seq_len, size_t head_float4s);
-__global__ void attention_softmax_forward_kernel(float* weights, size_t rows, size_t seq_len);
-__global__ void attention_merge_heads_kernel(float4* output, const float4* head_outputs, size_t total_float4s,
+// What attention_forward calls, declared here so it can call them; their code follows it.
+template <typename Value>
+void attention_forward_in(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
+                          const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv);
+template <typename T>
+__global__ void attention_split_qkv_kernel(T* query, T* key, T* value, const T* qkv, size_t total_float4s,
+                                           size_t num_heads, size_t seq_len, size_t head_float4s);
+template <typename T>
+__global__ void attention_softmax_forward_kernel(T* weights, size_t rows, size_t seq_len);
+template <typename T>
+__global__ void attention_merge_heads_kernel(T* output, const T* head_outputs, size_t total_float4s,
                                              size_t num_heads, size_t seq_len, size_t head_float4s);
 
 /// Writes output = causal self-attention of qkv, and keeps query, key, value and weights for the backward.
@@ -108,58 +122,67 @@ __global__ void attention_merge_heads_kernel(float4* output, const float4* head_
 inline void attention_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
                               const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
     attention_check_shapes(output, query, key, value, weights, head_outputs, qkv);
+    if (qkv.dtype() == DType::BFloat16)
+        attention_forward_in<nv_bfloat16>(output, query, key, value, weights, head_outputs, qkv);
+    else
+        attention_forward_in<float>(output, query, key, value, weights, head_outputs, qkv);
+}
+
+/// attention_forward's six steps, the tensors' values being Value: float or nv_bfloat16. The tensors are
+/// already checked. (Value, not T: T is seq_len here, as in the note.)
+template <typename Value>
+inline void attention_forward_in(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
+                                 const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
     size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
     size_t heads_in_batch = query.size(0) * num_heads, rows = heads_in_batch * seq_len;   // 48 heads, 49,152 rows
     size_t total_float4s = query.numel() / 4, head_float4s = head_size / 4;
     int T = (int)seq_len, d = (int)head_size;
-    float scale = 1.0f / sqrtf((float)head_size), one = 1.0f, zero = 0.0f;
+    float scale = 1.0f / sqrtf((float)head_size);
+    long long head_values = (long long)T * d, head_weights = (long long)T * T;   // the stride from head to head
 
     // F1: query, key, value, each head's rows next to each other, as the batched products read them
     attention_split_qkv_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
                                  ATTENTION_THREADS_PER_BLOCK>>>(
-        (float4*)query.data(), (float4*)key.data(), (float4*)value.data(), (const float4*)qkv.data(), total_float4s,
+        query.data_ptr<Value>(), key.data_ptr<Value>(), value.data_ptr<Value>(), qkv.data_ptr<Value>(), total_float4s,
         num_heads, seq_len, head_float4s);
     cudaCheck(cudaGetLastError());
 
     // F2: scores = scale · query · keyᵀ, {T, T} per head, into weights. cuBLAS reads by columns (see
     // linear_cublas.cuh), so it is asked for scoresᵀ = key · queryᵀ: key's memory, read by columns, is keyᵀ
     // {d, T}, turned round (OP_T) it is key {T, d}; query's memory read by columns is queryᵀ {d, T}, as is.
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, &scale,
-                                                   key.data(), d, (long long)T * d, query.data(), d, (long long)T * d,
-                                                   &zero, weights.data(), T, (long long)T * T, (int)heads_in_batch));
+    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, scale, key, d, head_values, query, d, head_values, weights,
+                      T, head_weights, (int)heads_in_batch);
 
     // F3, F4: the mask and the softmax, in place: weights holds the scores before, the weights after
     attention_softmax_forward_kernel<<<attention_blocks(rows, ATTENTION_SOFTMAX_THREADS_PER_BLOCK, 32),
-                                       ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(weights.data(), rows, seq_len);
+                                       ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(weights.data_ptr<Value>(), rows, seq_len);
     cudaCheck(cudaGetLastError());
 
     // F5: head_outputs = weights · value, {T, d} per head; asked for as head_outputsᵀ = valueᵀ · weightsᵀ,
     // which are value's and weights' memory read by columns, both as is.
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, &one,
-                                                   value.data(), d, (long long)T * d, weights.data(), T,
-                                                   (long long)T * T, &zero, head_outputs.data(), d, (long long)T * d,
-                                                   (int)heads_in_batch));
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, 1.0f, value, d, head_values, weights, T, head_weights,
+                      head_outputs, d, head_values, (int)heads_in_batch);
 
     // F6: the heads side by side again, one row of embed_dim per token
     attention_merge_heads_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
                                    ATTENTION_THREADS_PER_BLOCK>>>(
-        (float4*)output.data(), (const float4*)head_outputs.data(), total_float4s, num_heads, seq_len, head_float4s);
+        output.data_ptr<Value>(), head_outputs.data_ptr<Value>(), total_float4s, num_heads, seq_len, head_float4s);
     cudaCheck(cudaGetLastError());
 }
 
 /// F1: copies qkv's three parts into query, key and value, one float4 of each per thread. Float4 n of query
 /// is (batch, head, token, the n-th 4 columns of the head), and the same float4 of qkv's row (batch, token)
 /// is in its query part; key's and value's are embed_dim and 2 embed_dim floats further along that row.
-__global__ void attention_split_qkv_kernel(float4* query, float4* key, float4* value, const float4* qkv,
-                                           size_t total_float4s, size_t num_heads, size_t seq_len,
-                                           size_t head_float4s) {
+template <typename T>
+__global__ void attention_split_qkv_kernel(T* query, T* key, T* value, const T* qkv, size_t total_float4s,
+                                           size_t num_heads, size_t seq_len, size_t head_float4s) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t embed_float4s = num_heads * head_float4s;                       // 768 / 4 = 192
     for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
         size_t query_part = attention_merged_index(index, num_heads, seq_len, head_float4s, 3 * embed_float4s);
-        query[index] = qkv[query_part];
-        key[index] = qkv[query_part + embed_float4s];
-        value[index] = qkv[query_part + 2 * embed_float4s];
+        store4(query + 4 * index, load4(qkv + 4 * query_part));
+        store4(key + 4 * index, load4(qkv + 4 * (query_part + embed_float4s)));
+        store4(value + 4 * index, load4(qkv + 4 * (query_part + 2 * embed_float4s)));
     }
 }
 
@@ -171,18 +194,19 @@ __global__ void attention_split_qkv_kernel(float4* query, float4* key, float4* v
 /// keeps the largest score it has seen and the sum of exp(score - that largest), over columns
 /// thread_in_warp, + 32, ...; then the 32 pairs are put together with shuffles. A second read writes
 /// exp(score - row_max) / row_sum. Each thread writes only the columns it read.
-__global__ void attention_softmax_forward_kernel(float* weights, size_t rows, size_t seq_len) {
+template <typename T>
+__global__ void attention_softmax_forward_kernel(T* weights, size_t rows, size_t seq_len) {
     int thread_in_warp = threadIdx.x % 32;
     size_t warp_number = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
     size_t warps_launched = (size_t)gridDim.x * blockDim.x / 32;
     for (size_t row = warp_number; row < rows; row += warps_launched) {
         size_t token = row % seq_len;                    // the query's token: it sees columns 0 .. token
-        float* row_weights = weights + row * seq_len;
+        T* row_weights = weights + row * seq_len;
 
         // 1. this thread's (max, sum), over its columns up to token
         float thread_max = -FLT_MAX, thread_sum = 0.0f;
         for (size_t column = thread_in_warp; column <= token; column += 32) {
-            float score = row_weights[column];
+            float score = to_float(row_weights[column]);
             float new_max = fmaxf(thread_max, score);
             thread_sum = thread_sum * expf(thread_max - new_max) + expf(score - new_max);
             thread_max = new_max;
@@ -202,29 +226,39 @@ __global__ void attention_softmax_forward_kernel(float* weights, size_t rows, si
         // 3. the weights: F4 for the columns it sees, 0 for the ones after (F3)
         float one_over_row_sum = 1.0f / row_sum;
         for (size_t column = thread_in_warp; column < seq_len; column += 32)
-            row_weights[column] = column <= token ? expf(row_weights[column] - row_max) * one_over_row_sum : 0.0f;
+            row_weights[column] = from_float<T>(
+                column <= token ? expf(to_float(row_weights[column]) - row_max) * one_over_row_sum : 0.0f);
     }
 }
 
 /// F6: copies head_outputs into output, one float4 per thread: float4 n of head_outputs (batch, head, token,
 /// columns) goes to row (batch, token) of output, at the head's place in it.
-__global__ void attention_merge_heads_kernel(float4* output, const float4* head_outputs, size_t total_float4s,
+template <typename T>
+__global__ void attention_merge_heads_kernel(T* output, const T* head_outputs, size_t total_float4s,
                                              size_t num_heads, size_t seq_len, size_t head_float4s) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t embed_float4s = num_heads * head_float4s;
     for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x)
-        output[attention_merged_index(index, num_heads, seq_len, head_float4s, embed_float4s)] = head_outputs[index];
+        store4(output + 4 * attention_merged_index(index, num_heads, seq_len, head_float4s, embed_float4s),
+               load4(head_outputs + 4 * index));
 }
 
 // ── backward ──────────────────────────────────────────────────────────────────
 
-// The kernels attention_backward launches, declared here so it can call them; their code follows it.
-__global__ void attention_split_heads_kernel(float4* head_outputs_grad, const float4* output_grad, size_t total_float4s,
+// What attention_backward calls, declared here so it can call them; their code follows it.
+template <typename Value>
+void attention_backward_in(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query, const Tensor& key,
+                           const Tensor& value, const Tensor& weights, const Tensor& head_outputs_grad,
+                           const Tensor& weights_grad, const Tensor& query_grad, const Tensor& key_grad,
+                           const Tensor& value_grad);
+template <typename T>
+__global__ void attention_split_heads_kernel(T* head_outputs_grad, const T* output_grad, size_t total_float4s,
                                              size_t num_heads, size_t seq_len, size_t head_float4s);
-__global__ void attention_softmax_backward_kernel(float* weights_grad, const float* weights, size_t rows,
-                                                  size_t seq_len);
-__global__ void attention_merge_qkv_grad_kernel(float4* qkv_grad, const float4* query_grad, const float4* key_grad,
-                                                const float4* value_grad, size_t total_float4s, size_t num_heads,
+template <typename T>
+__global__ void attention_softmax_backward_kernel(T* weights_grad, const T* weights, size_t rows, size_t seq_len);
+template <typename T>
+__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad, const T* query_grad, const T* key_grad,
+                                                const T* value_grad, size_t total_float4s, size_t num_heads,
                                                 size_t seq_len, size_t head_float4s);
 
 /// Writes qkv_grad, the gradient of the qkv linear's output, from output_grad and what the forward kept:
@@ -246,67 +280,77 @@ inline void attention_backward(const Tensor& qkv_grad, const Tensor& output_grad
                                const Tensor& value_grad) {
     attention_check_shapes(output_grad, query, key, value, weights, head_outputs_grad, qkv_grad);
     attention_check_shapes(output_grad, query_grad, key_grad, value_grad, weights_grad, head_outputs_grad, qkv_grad);
+    if (qkv_grad.dtype() == DType::BFloat16)
+        attention_backward_in<nv_bfloat16>(qkv_grad, output_grad, query, key, value, weights, head_outputs_grad,
+                                           weights_grad, query_grad, key_grad, value_grad);
+    else
+        attention_backward_in<float>(qkv_grad, output_grad, query, key, value, weights, head_outputs_grad,
+                                     weights_grad, query_grad, key_grad, value_grad);
+}
+
+/// attention_backward's nine steps, the tensors' values being Value: float or nv_bfloat16. The tensors are
+/// already checked.
+template <typename Value>
+inline void attention_backward_in(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query,
+                                  const Tensor& key, const Tensor& value, const Tensor& weights,
+                                  const Tensor& head_outputs_grad, const Tensor& weights_grad,
+                                  const Tensor& query_grad, const Tensor& key_grad, const Tensor& value_grad) {
     size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
     size_t heads_in_batch = query.size(0) * num_heads, rows = heads_in_batch * seq_len;
     size_t total_float4s = query.numel() / 4, head_float4s = head_size / 4;
     int T = (int)seq_len, d = (int)head_size;
-    float scale = 1.0f / sqrtf((float)head_size), one = 1.0f, zero = 0.0f;
+    float scale = 1.0f / sqrtf((float)head_size);
     long long head_values = (long long)T * d, head_weights = (long long)T * T;   // the stride from head to head
 
     // B1: output_grad cut into heads, as F1 cut qkv
     attention_split_heads_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
                                    ATTENTION_THREADS_PER_BLOCK>>>(
-        (float4*)head_outputs_grad.data(), (const float4*)output_grad.data(), total_float4s, num_heads, seq_len,
+        head_outputs_grad.data_ptr<Value>(), output_grad.data_ptr<Value>(), total_float4s, num_heads, seq_len,
         head_float4s);
     cudaCheck(cudaGetLastError());
 
     // B2: weights_grad = head_outputs_grad · valueᵀ, asked for as its turned-round, value · head_outputs_gradᵀ:
     // F2's form, value and head_outputs_grad in place of key and query
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, &one,
-                                                   value.data(), d, head_values, head_outputs_grad.data(), d,
-                                                   head_values, &zero, weights_grad.data(), T, head_weights,
-                                                   (int)heads_in_batch));
+    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, 1.0f, value, d, head_values, head_outputs_grad, d,
+                      head_values, weights_grad, T, head_weights, (int)heads_in_batch);
 
     // B3: value_grad = weightsᵀ · head_outputs_grad, asked for as value_gradᵀ = head_outputs_gradᵀ · weights:
     // head_outputs_grad's memory as is, weights' turned round
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, &one,
-                                                   head_outputs_grad.data(), d, head_values, weights.data(), T,
-                                                   head_weights, &zero, value_grad.data(), d, head_values,
-                                                   (int)heads_in_batch));
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, 1.0f, head_outputs_grad, d, head_values, weights, T,
+                      head_weights, value_grad, d, head_values, (int)heads_in_batch);
 
     // B4-B6: the softmax's backward, in place: weights_grad holds da before, ds after
     attention_softmax_backward_kernel<<<attention_blocks(rows, ATTENTION_SOFTMAX_THREADS_PER_BLOCK, 32),
-                                        ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(weights_grad.data(), weights.data(),
-                                                                               rows, seq_len);
+                                        ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(
+        weights_grad.data_ptr<Value>(), weights.data_ptr<Value>(), rows, seq_len);
     cudaCheck(cudaGetLastError());
 
     // B7: query_grad = scale · scores_grad · key, asked for as query_gradᵀ = keyᵀ · scores_gradᵀ, both as is
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, &scale,
-                                                   key.data(), d, head_values, weights_grad.data(), T, head_weights,
-                                                   &zero, query_grad.data(), d, head_values, (int)heads_in_batch));
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, scale, key, d, head_values, weights_grad, T, head_weights,
+                      query_grad, d, head_values, (int)heads_in_batch);
 
     // B8: key_grad = scale · scores_gradᵀ · query, asked for as key_gradᵀ = queryᵀ · scores_grad: query's memory
     // as is, scores_grad's turned round
-    attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, &scale,
-                                                   query.data(), d, head_values, weights_grad.data(), T, head_weights,
-                                                   &zero, key_grad.data(), d, head_values, (int)heads_in_batch));
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, scale, query, d, head_values, weights_grad, T, head_weights,
+                      key_grad, d, head_values, (int)heads_in_batch);
 
     // B9: the three gradients put back into qkv_grad's three parts, as F1 took them out
     attention_merge_qkv_grad_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
                                       ATTENTION_THREADS_PER_BLOCK>>>(
-        (float4*)qkv_grad.data(), (const float4*)query_grad.data(), (const float4*)key_grad.data(),
-        (const float4*)value_grad.data(), total_float4s, num_heads, seq_len, head_float4s);
+        qkv_grad.data_ptr<Value>(), query_grad.data_ptr<Value>(), key_grad.data_ptr<Value>(),
+        value_grad.data_ptr<Value>(), total_float4s, num_heads, seq_len, head_float4s);
     cudaCheck(cudaGetLastError());
 }
 
 /// B1: copies output_grad into head_outputs_grad, one float4 per thread: F6 the other way round.
-__global__ void attention_split_heads_kernel(float4* head_outputs_grad, const float4* output_grad, size_t total_float4s,
+template <typename T>
+__global__ void attention_split_heads_kernel(T* head_outputs_grad, const T* output_grad, size_t total_float4s,
                                              size_t num_heads, size_t seq_len, size_t head_float4s) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t embed_float4s = num_heads * head_float4s;
     for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x)
-        head_outputs_grad[index] = output_grad[attention_merged_index(index, num_heads, seq_len, head_float4s,
-                                                                      embed_float4s)];
+        store4(head_outputs_grad + 4 * index,
+               load4(output_grad + 4 * attention_merged_index(index, num_heads, seq_len, head_float4s, embed_float4s)));
 }
 
 /// B4-B6: turns each row of weights_grad (da) into scores_grad (ds), in place, one warp per row, as the
@@ -317,41 +361,43 @@ __global__ void attention_split_heads_kernel(float4* head_outputs_grad, const fl
 /// for the columns token t sees, and 0 for the ones after: their weights were 0, so are their gradients.
 /// One read for row_dot, added up across the warp with shuffles; a second read writes ds. Each thread writes
 /// only the columns it read.
-__global__ void attention_softmax_backward_kernel(float* weights_grad, const float* weights, size_t rows,
-                                                  size_t seq_len) {
+template <typename T>
+__global__ void attention_softmax_backward_kernel(T* weights_grad, const T* weights, size_t rows, size_t seq_len) {
     int thread_in_warp = threadIdx.x % 32;
     size_t warp_number = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
     size_t warps_launched = (size_t)gridDim.x * blockDim.x / 32;
     for (size_t row = warp_number; row < rows; row += warps_launched) {
         size_t token = row % seq_len;
-        float* row_grad = weights_grad + row * seq_len;
-        const float* row_weights = weights + row * seq_len;
+        T* row_grad = weights_grad + row * seq_len;
+        const T* row_weights = weights + row * seq_len;
 
         // 1. row_dot: this thread's part, then the warp's
         float row_dot = 0.0f;
         for (size_t column = thread_in_warp; column <= token; column += 32)
-            row_dot += row_weights[column] * row_grad[column];
+            row_dot += to_float(row_weights[column]) * to_float(row_grad[column]);
         for (int offset = 16; offset > 0; offset /= 2)
             row_dot += __shfl_xor_sync(0xffffffff, row_dot, offset);
 
         // 2. ds: C1 for the columns token sees, 0 for the ones after
         for (size_t column = thread_in_warp; column < seq_len; column += 32)
-            row_grad[column] = column <= token ? row_weights[column] * (row_grad[column] - row_dot) : 0.0f;
+            row_grad[column] = from_float<T>(
+                column <= token ? to_float(row_weights[column]) * (to_float(row_grad[column]) - row_dot) : 0.0f);
     }
 }
 
 /// B9: copies query_grad, key_grad and value_grad into qkv_grad's three parts, one float4 of each per thread:
 /// F1 the other way round.
-__global__ void attention_merge_qkv_grad_kernel(float4* qkv_grad, const float4* query_grad, const float4* key_grad,
-                                                const float4* value_grad, size_t total_float4s, size_t num_heads,
+template <typename T>
+__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad, const T* query_grad, const T* key_grad,
+                                                const T* value_grad, size_t total_float4s, size_t num_heads,
                                                 size_t seq_len, size_t head_float4s) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t embed_float4s = num_heads * head_float4s;
     for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
         size_t query_part = attention_merged_index(index, num_heads, seq_len, head_float4s, 3 * embed_float4s);
-        qkv_grad[query_part] = query_grad[index];
-        qkv_grad[query_part + embed_float4s] = key_grad[index];
-        qkv_grad[query_part + 2 * embed_float4s] = value_grad[index];
+        store4(qkv_grad + 4 * query_part, load4(query_grad + 4 * index));
+        store4(qkv_grad + 4 * (query_part + embed_float4s), load4(key_grad + 4 * index));
+        store4(qkv_grad + 4 * (query_part + 2 * embed_float4s), load4(value_grad + 4 * index));
     }
 }
 
@@ -366,6 +412,26 @@ inline cublasHandle_t attention_cublas() {
         return made;
     }();
     return handle;
+}
+
+/// Makes one of the six products for every head at once, with cuBLAS's strided batched product: C = alpha ·
+/// op(A) · op(B), written over C (beta 0), for `batch` heads, each head's matrix stride_* values after the
+/// last. m x n is C's size as cuBLAS sees it (by columns: see linear_cublas.cuh), k the summed index, ld* how
+/// many values one column takes. Float tensors go to cublasSgemmStridedBatched; bfloat16 tensors to
+/// cublasGemmStridedBatchedEx, told CUDA_R_16BF and to sum in float (CUBLAS_COMPUTE_32F).
+inline void attention_product(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
+                              const Tensor& a, int lda, long long stride_a, const Tensor& b, int ldb,
+                              long long stride_b, const Tensor& c, int ldc, long long stride_c, int batch) {
+    float zero = 0.0f;
+    if (c.dtype() == DType::BFloat16)
+        attentionCublasCheck(cublasGemmStridedBatchedEx(
+            attention_cublas(), op_a, op_b, m, n, k, &alpha, a.data_ptr(), CUDA_R_16BF, lda, stride_a, b.data_ptr(),
+            CUDA_R_16BF, ldb, stride_b, &zero, c.data_ptr(), CUDA_R_16BF, ldc, stride_c, batch, CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
+    else
+        attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), op_a, op_b, m, n, k, &alpha, a.data(), lda,
+                                                       stride_a, b.data(), ldb, stride_b, &zero, c.data(), ldc,
+                                                       stride_c, batch));
 }
 
 /// Gives where float4 `index` of a per-head tensor {batch_size, num_heads, seq_len, head_size} sits in a
@@ -393,9 +459,10 @@ inline int attention_blocks(size_t total, int threads_per_block, size_t per_thre
 /// Stops with a message if the tensors do not fit together, before a kernel reads past one: query, key,
 /// value and head_outputs {batch_size, num_heads, seq_len, head_size}; weights {batch_size, num_heads,
 /// seq_len, seq_len}; output {batch_size, seq_len, num_heads * head_size}; qkv the same with 3 times the
-/// columns. Also head_size a multiple of 4 and every tensor starting on 16 bytes, for the float4 loads: off
-/// 16 bytes, the GPU stops with "misaligned address" at some later call, far from the cause. Backward passes
-/// output_grad, the gradients and qkv_grad in the forward's places.
+/// columns; all float or all bfloat16. Also head_size a multiple of 4 and every tensor starting on 4 values
+/// (16 bytes for float, 8 for bfloat16), for the 4-value loads: off that, the GPU stops with "misaligned
+/// address" at some later call, far from the cause. Backward passes output_grad, the gradients and qkv_grad in
+/// the forward's places.
 inline void attention_check_shapes(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
                                    const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
     bool fits = query.dim() == 4 && key.shape() == query.shape() && value.shape() == query.shape() &&
@@ -414,11 +481,19 @@ inline void attention_check_shapes(const Tensor& output, const Tensor& query, co
         exit(EXIT_FAILURE);
     }
     const Tensor* all[] = {&output, &query, &key, &value, &weights, &head_outputs, &qkv};
+    DType dtype = qkv.dtype();
+    bool same_dtype = dtype == DType::Float32 || dtype == DType::BFloat16;
+    for (const Tensor* tensor : all) same_dtype = same_dtype && tensor->dtype() == dtype;
+    if (!same_dtype) {
+        fprintf(stderr, "error: attention needs its tensors all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t four_values = 4 * qkv.element_size();                        // 16 bytes for float, 8 for bfloat16
     bool aligned = query.size(3) % 4 == 0;
-    for (const Tensor* tensor : all) aligned = aligned && (size_t)tensor->data() % 16 == 0;
+    for (const Tensor* tensor : all) aligned = aligned && (size_t)tensor->data_ptr() % four_values == 0;
     if (!aligned) {
-        fprintf(stderr, "error: attention reads 4 floats at a time (float4), so head_size must be a multiple of 4 "
-                        "and every tensor must start on 16 bytes; got head_size %zu\n", query.size(3));
+        fprintf(stderr, "error: attention reads 4 values at a time, so head_size must be a multiple of 4 and every "
+                        "tensor must start on %zu bytes; got head_size %zu\n", four_values, query.size(3));
         exit(EXIT_FAILURE);
     }
 }

@@ -17,6 +17,10 @@
 #include "../llmc/kernels/encoder.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+// In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so each
+// rounding moves a value by up to 2^-8, about 0.4% of it. A repeated token's wte_grad row is rounded
+// once per add, a few times here.
+static const double BFLOAT16_TOLERANCE = 2e-2;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -38,21 +42,6 @@ static std::vector<int> random_token_ids(size_t count, int highest_id)
     return ids;
 }
 
-/// Makes my tensor on the GPU from values in row order: floats, or ints for token ids.
-template <typename T>
-static Tensor my_tensor_of(const std::vector<T> &row_values, const Shape &shape)
-{
-    Tensor tensor = Tensor::empty(shape, std::is_same<T, int>::value ? DType::Int32 : DType::Float32);
-    tensor.copy_from_cpu(row_values.data());
-    return tensor;
-}
-
-/// Gives a Shape as the sizes PyTorch takes: {2, 4} as int64_t.
-static std::vector<int64_t> sizes_of(const Shape &shape)
-{
-    return std::vector<int64_t>(shape.begin(), shape.end());
-}
-
 /// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU. Token ids
 /// become int64, the type PyTorch's embedding is usually given.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
@@ -60,7 +49,8 @@ static torch::Tensor pytorch_copy_of(const Tensor &tensor)
     bool ints = tensor.dtype() == DType::Int32;
     torch::TensorOptions on_gpu = torch::TensorOptions().dtype(ints ? torch::kInt : torch::kFloat).device(torch::kCUDA);
     void *values = ints ? (void *)tensor.data_ptr<int>() : (void *)tensor.data();
-    torch::Tensor copy = torch::from_blob(values, sizes_of(tensor.shape()), on_gpu).clone();
+    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
+    torch::Tensor copy = torch::from_blob(values, sizes, on_gpu).clone();
     return ints ? copy.to(torch::kLong) : copy;
 }
 
@@ -99,9 +89,12 @@ static void forward_matches_pytorch(void)
     // Each value is one float add of the same two numbers on both sides, so it rounds the same.
     Tensor::manual_seed(0);
     size_t batch_size = 4, seq_len = 8;
-    Tensor wte = my_tensor_of(random_values({64, 16}), {64, 16});
-    Tensor wpe = my_tensor_of(random_values({16, 16}), {16, 16});
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 63), {batch_size, seq_len});
+    Tensor wte = Tensor::empty({64, 16});
+    wte.copy_from_cpu(random_values({64, 16}).data());
+    Tensor wpe = Tensor::empty({16, 16});
+    wpe.copy_from_cpu(random_values({16, 16}).data());
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 63).data());
     Tensor encoded = Tensor::zeros({batch_size, seq_len, 16});
     encoder_forward(encoded, token_ids, wte, wpe);
 
@@ -119,10 +112,14 @@ static void backward_matches_pytorch(void)
     // read) stay 0, and so do wpe_grad's rows 8 .. 15 (positions after seq_len).
     Tensor::manual_seed(0);
     size_t batch_size = 4, seq_len = 8;
-    Tensor wte = my_tensor_of(random_values({64, 16}), {64, 16});
-    Tensor wpe = my_tensor_of(random_values({16, 16}), {16, 16});
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 15), {batch_size, seq_len});
-    Tensor encoded_grad = my_tensor_of(random_values({batch_size, seq_len, 16}), {batch_size, seq_len, 16});
+    Tensor wte = Tensor::empty({64, 16});
+    wte.copy_from_cpu(random_values({64, 16}).data());
+    Tensor wpe = Tensor::empty({16, 16});
+    wpe.copy_from_cpu(random_values({16, 16}).data());
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 15).data());
+    Tensor encoded_grad = Tensor::empty({batch_size, seq_len, 16});
+    encoded_grad.copy_from_cpu(random_values({batch_size, seq_len, 16}).data());
     Tensor wte_grad = Tensor::zeros({64, 16}), wpe_grad = Tensor::zeros({16, 16});
     encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
 
@@ -137,6 +134,44 @@ static void backward_matches_pytorch(void)
     ASSERT_EQ(wpe_grad.narrow(0, 8, 8).tolist(), std::vector<float>(8 * 16, 0.0f));
 }
 
+static void forward_and_backward_in_bfloat16(void)
+{
+    // Expect: forward_matches_pytorch's and backward_matches_pytorch's tiny encoder, with ids from 0 .. 15,
+    // in bfloat16 tensors. encoded is each pair of bfloat16s added in float and rounded once: PyTorch's float
+    // add of the same values, rounded to bfloat16 by PyTorch, to the last bit. wpe_grad adds the 4 rows in
+    // float and rounds once; wte_grad rounds after each add onto a repeated token's row (the 8-byte
+    // compare-and-swap of atomic_add4): both within BFLOAT16_TOLERANCE of PyTorch's float sums. The rows
+    // never read stay 0.
+    Tensor::manual_seed(0);
+    size_t batch_size = 4, seq_len = 8;
+    Tensor wte = Tensor::empty({64, 16});
+    wte.copy_from_cpu(random_values({64, 16}).data());
+    wte = wte.to(DType::BFloat16);
+    Tensor wpe = Tensor::empty({16, 16});
+    wpe.copy_from_cpu(random_values({16, 16}).data());
+    wpe = wpe.to(DType::BFloat16);
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 15).data());
+    Tensor encoded_grad = Tensor::empty({batch_size, seq_len, 16});
+    encoded_grad.copy_from_cpu(random_values({batch_size, seq_len, 16}).data());
+    encoded_grad = encoded_grad.to(DType::BFloat16);
+    Tensor encoded = Tensor::zeros({batch_size, seq_len, 16}, DType::BFloat16);
+    Tensor wte_grad = Tensor::zeros({64, 16}, DType::BFloat16), wpe_grad = Tensor::zeros({16, 16}, DType::BFloat16);
+    encoder_forward(encoded, token_ids, wte, wpe);
+    encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
+
+    torch::Tensor pytorch_wte = pytorch_copy_of(wte.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_wpe = pytorch_copy_of(wpe.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_encoded =
+        torch::embedding(pytorch_wte, pytorch_copy_of(token_ids)) + pytorch_wpe.narrow(0, 0, seq_len);
+    pytorch_encoded.backward(pytorch_copy_of(encoded_grad.to(DType::Float32)));
+    ASSERT_EQ(encoded.to(DType::Float32).tolist(), list_of(pytorch_encoded.to(torch::kBFloat16).to(torch::kFloat)));
+    ASSERT_NEAR(wte_grad.to(DType::Float32).tolist(), list_of(pytorch_wte.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(wpe_grad.to(DType::Float32).tolist(), list_of(pytorch_wpe.grad()), BFLOAT16_TOLERANCE);
+    ASSERT_EQ(wte_grad.narrow(0, 16, 48).to(DType::Float32).tolist(), std::vector<float>(48 * 16, 0.0f));
+    ASSERT_EQ(wpe_grad.narrow(0, 8, 8).to(DType::Float32).tolist(), std::vector<float>(8 * 16, 0.0f));
+}
+
 /// Times 20 forwards and 20 backwards of the encoder, mine against PyTorch's embedding with
 /// autograd, and prints a table under `test`'s name. wte and wpe hold the weights, wte_grad and
 /// wpe_grad start at 0; the batch is 4 rows of seq_len = wpe.size(0) random ids. Both sides add
@@ -145,8 +180,8 @@ static void time_20_steps(const char *test, const Tensor &wte, const Tensor &wpe
                           const Tensor &wpe_grad)
 {
     size_t batch_size = 4, seq_len = wpe.size(0), embed_dim = wte.size(1);
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256),   // GPT-2's real ids: 0 .. 50256
-                                    {batch_size, seq_len});
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 50256).data()); // GPT-2's real ids: 0 .. 50256
     Tensor encoded_grad = Tensor::randn({batch_size, seq_len, embed_dim});
     Tensor encoded = Tensor::zeros({batch_size, seq_len, embed_dim});
 
@@ -227,21 +262,26 @@ static void time_20_steps_on_gpt2_small_size_in_tensor_buffer(void)
 /// Makes the wte of part 2: 3 tokens, rows 0 1 2 3 | 4 5 6 7 | 8 9 10 11.
 static Tensor small_wte(void)
 {
-    return my_tensor_of(sample_data(12), {3, 4});
+    Tensor wte = Tensor::empty({3, 4});
+    wte.copy_from_cpu(sample_data(12).data());
+    return wte;
 }
 
 /// Makes the wpe of part 2: 4 positions, rows of 100s, 200s, 300s, 400s.
 static Tensor small_wpe(void)
 {
     std::vector<float> rows = {100, 100, 100, 100, 200, 200, 200, 200, 300, 300, 300, 300, 400, 400, 400, 400};
-    return my_tensor_of(rows, {4, 4});
+    Tensor wpe = Tensor::empty({4, 4});
+    wpe.copy_from_cpu(rows.data());
+    return wpe;
 }
 
 static void forward_adds_the_tokens_row_and_the_positions_row(void)
 {
     // Expect: ids {2, 0}: encoded row 0 is token 2's row + position 0's = 8 9 10 11 + 100 =
     // 108 109 110 111; encoded row 1 is token 0's + position 1's = 0 1 2 3 + 200 = 200 201 202 203.
-    Tensor token_ids = my_tensor_of(std::vector<int>{2, 0}, {1, 2});
+    Tensor token_ids = Tensor::empty({1, 2}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{2, 0}.data());
     Tensor encoded = Tensor::zeros({1, 2, 4});
     encoder_forward(encoded, token_ids, small_wte(), small_wpe());
     ASSERT_EQ(encoded.tolist(), std::vector<float>({108, 109, 110, 111, 200, 201, 202, 203}));
@@ -251,7 +291,8 @@ static void the_same_token_at_another_position_gets_another_row(void)
 {
     // Expect: ids {1, 1, 1}, token 1 three times: 4 5 6 7 plus 100, then 200, then 300. The
     // position row is what tells the model the 3 apart.
-    Tensor token_ids = my_tensor_of(std::vector<int>{1, 1, 1}, {1, 3});
+    Tensor token_ids = Tensor::empty({1, 3}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{1, 1, 1}.data());
     Tensor encoded = Tensor::zeros({1, 3, 4});
     encoder_forward(encoded, token_ids, small_wte(), small_wpe());
     ASSERT_EQ(encoded.tolist(), std::vector<float>({104, 105, 106, 107, 204, 205, 206, 207, 304, 305, 306, 307}));
@@ -264,7 +305,8 @@ static void every_row_of_the_batch_starts_again_at_position_0(void)
     //
     //     b 0:  token 0 + position 0 = 100 101 102 103     token 1 + position 1 = 204 205 206 207
     //     b 1:  token 2 + position 0 = 108 109 110 111     token 0 + position 1 = 200 201 202 203
-    Tensor token_ids = my_tensor_of(std::vector<int>{0, 1, 2, 0}, {2, 2});
+    Tensor token_ids = Tensor::empty({2, 2}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{0, 1, 2, 0}.data());
     Tensor encoded = Tensor::zeros({2, 2, 4});
     encoder_forward(encoded, token_ids, small_wte(), small_wpe());
     ASSERT_EQ(encoded.tolist(),
@@ -276,8 +318,10 @@ static void backward_adds_a_repeated_tokens_rows_together(void)
     // Expect: ids {1, 1, 1} and encoded_grad rows of 1s, 2s, 3s. Token 1 made all 3 rows, so its
     // wte_grad row gets all 3: 1 + 2 + 3 = 6. Tokens 0 and 2 were not read: 0. Each position
     // made one row, so wpe_grad's rows are 1, 2, 3, and position 3 (after seq_len = 3) stays 0.
-    Tensor token_ids = my_tensor_of(std::vector<int>{1, 1, 1}, {1, 3});
-    Tensor encoded_grad = my_tensor_of(std::vector<float>({1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3}), {1, 3, 4});
+    Tensor token_ids = Tensor::empty({1, 3}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{1, 1, 1}.data());
+    Tensor encoded_grad = Tensor::empty({1, 3, 4});
+    encoded_grad.copy_from_cpu(std::vector<float>({1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3}).data());
     Tensor wte_grad = Tensor::zeros({3, 4}), wpe_grad = Tensor::zeros({4, 4});
     encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
     ASSERT_EQ(wte_grad.tolist(), std::vector<float>({0, 0, 0, 0, 6, 6, 6, 6, 0, 0, 0, 0}));
@@ -296,8 +340,10 @@ static void backward_adds_the_batch_rows_at_each_position(void)
     //     wte_grad token 0    = (b 0, t 0) + (b 1, t 1) = 12 14 16 18
     //              token 1    = (b 0, t 1)              =  4  5  6  7
     //              token 2    = (b 1, t 0)              =  8  9 10 11
-    Tensor token_ids = my_tensor_of(std::vector<int>{0, 1, 2, 0}, {2, 2});
-    Tensor encoded_grad = my_tensor_of(sample_data(16), {2, 2, 4});
+    Tensor token_ids = Tensor::empty({2, 2}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{0, 1, 2, 0}.data());
+    Tensor encoded_grad = Tensor::empty({2, 2, 4});
+    encoded_grad.copy_from_cpu(sample_data(16).data());
     Tensor wte_grad = Tensor::zeros({3, 4}), wpe_grad = Tensor::zeros({4, 4});
     encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
     ASSERT_EQ(wte_grad.tolist(), std::vector<float>({12, 14, 16, 18, 4, 5, 6, 7, 8, 9, 10, 11}));
@@ -309,8 +355,10 @@ static void backward_adds_onto_the_gradients_already_there(void)
     // Expect: every gradient starts at 10 (as if an earlier micro-batch had left it there). One
     // token, id 0, encoded_grad 1 2 3 4: row 0 of both becomes 11 12 13 14 and every other row stays
     // 10. A second backward adds again: 12 14 16 18. Gradient accumulation relies on this.
-    Tensor token_ids = my_tensor_of(std::vector<int>{0}, {1, 1});
-    Tensor encoded_grad = my_tensor_of(std::vector<float>({1, 2, 3, 4}), {1, 1, 4});
+    Tensor token_ids = Tensor::empty({1, 1}, DType::Int32);
+    token_ids.copy_from_cpu(std::vector<int>{0}.data());
+    Tensor encoded_grad = Tensor::empty({1, 1, 4});
+    encoded_grad.copy_from_cpu(std::vector<float>({1, 2, 3, 4}).data());
     Tensor wte_grad = Tensor::zeros({3, 4}).fill_(10), wpe_grad = Tensor::zeros({4, 4}).fill_(10);
     encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
     ASSERT_EQ(wte_grad.tolist(), std::vector<float>({11, 12, 13, 14, 10, 10, 10, 10, 10, 10, 10, 10}));
@@ -351,8 +399,9 @@ static void every_kernel_fits_a_block_of_encoder_threads(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with: 1024 if it fits
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)encoder_forward_kernel, (const void *)encoder_backward_wte_kernel,
-                             (const void *)encoder_backward_wpe_kernel};
+    const void *kernels[] = {(const void *)encoder_forward_kernel<float>,
+                             (const void *)encoder_backward_wte_kernel<float>,
+                             (const void *)encoder_backward_wpe_kernel<float>};
     const char *names[] = {"encoder_forward_kernel", "encoder_backward_wte_kernel", "encoder_backward_wpe_kernel"};
     for (int k = 0; k < 3; k++)
     {
@@ -411,8 +460,8 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
     Tensor wte = Tensor::randn({vocab_size, embed_dim});              // made on the CPU: a few seconds
     Tensor wpe = Tensor::randn({seq_len, embed_dim});
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256),   // GPT-2's real ids: 0 .. 50256
-                                    {batch_size, seq_len});
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 50256).data()); // GPT-2's real ids: 0 .. 50256
     Tensor encoded_grad = Tensor::randn({batch_size, seq_len, embed_dim});
     Tensor encoded = Tensor::zeros({batch_size, seq_len, embed_dim});
     Tensor wte_grad = Tensor::zeros({vocab_size, embed_dim}), wpe_grad = Tensor::zeros({seq_len, embed_dim});
@@ -425,19 +474,19 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
 
     int blocks = 0, threads = 0; // the launch the 3 below use, set by the loop
     auto forward = [&] {
-        encoder_forward_kernel<<<blocks, threads>>>((float4 *)encoded.data(), token_ids.data_ptr<int>(),
-                                                    (const float4 *)wte.data(), (const float4 *)wpe.data(),
-                                                    batch_size, seq_len, embed_dim);
+        encoder_forward_kernel<float><<<blocks, threads>>>(encoded.data(), token_ids.data_ptr<int>(), wte.data(),
+                                                           wpe.data(), batch_size, seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
     auto backward_wte = [&] {
-        encoder_backward_wte_kernel<<<blocks, threads>>>(wte_grad.data(), (const float4 *)encoded_grad.data(),
-                                                         token_ids.data_ptr<int>(), batch_size, seq_len, embed_dim);
+        encoder_backward_wte_kernel<float><<<blocks, threads>>>(wte_grad.data(), encoded_grad.data(),
+                                                                token_ids.data_ptr<int>(), batch_size, seq_len,
+                                                                embed_dim);
         cudaCheck(cudaGetLastError());
     };
     auto backward_wpe = [&] {
-        encoder_backward_wpe_kernel<<<blocks, threads>>>((float4 *)wpe_grad.data(), (const float4 *)encoded_grad.data(),
-                                                         batch_size, seq_len, embed_dim);
+        encoder_backward_wpe_kernel<float><<<blocks, threads>>>(wpe_grad.data(), encoded_grad.data(), batch_size,
+                                                                seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
     blocks = ENCODER_BLOCKS;
@@ -532,15 +581,15 @@ static void time_wte_backward_with_float4_loads(void)
     // within TOLERANCE.
     Tensor::manual_seed(0);
     size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256), {batch_size, seq_len});
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 50256).data());
     Tensor encoded_grad = Tensor::randn({batch_size, seq_len, embed_dim});
     Tensor wte_grad = Tensor::zeros({vocab_size, embed_dim});
 
     // The usual launch's result, to compare each launch with.
-    encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(),
-                                                                     (const float4 *)encoded_grad.data(),
-                                                                     token_ids.data_ptr<int>(), batch_size, seq_len,
-                                                                     embed_dim);
+    encoder_backward_wte_kernel<float><<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(), encoded_grad.data(),
+                                                                            token_ids.data_ptr<int>(), batch_size,
+                                                                            seq_len, embed_dim);
     cudaCheck(cudaGetLastError());
     torch::Tensor usual_wte_grad = pytorch_copy_of(wte_grad);
 
@@ -552,8 +601,9 @@ static void time_wte_backward_with_float4_loads(void)
         cudaCheck(cudaGetLastError());
     };
     auto float4_loads = [&] {
-        encoder_backward_wte_kernel<<<blocks, threads>>>(wte_grad.data(), (const float4 *)encoded_grad.data(),
-                                                         token_ids.data_ptr<int>(), batch_size, seq_len, embed_dim);
+        encoder_backward_wte_kernel<float><<<blocks, threads>>>(wte_grad.data(), encoded_grad.data(),
+                                                                token_ids.data_ptr<int>(), batch_size, seq_len,
+                                                                embed_dim);
         cudaCheck(cudaGetLastError());
     };
     // Tells if wte_grad, after one backward from 0 with `run`, equals the usual launch's.
@@ -611,16 +661,16 @@ static void time_forward_with_blocks_of_128_around_512(void)
     size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
     Tensor wte = Tensor::randn({vocab_size, embed_dim}); // made on the CPU: a few seconds
     Tensor wpe = Tensor::randn({seq_len, embed_dim});
-    Tensor token_ids = my_tensor_of(random_token_ids(batch_size * seq_len, 50256), {batch_size, seq_len});
+    Tensor token_ids = Tensor::empty({batch_size, seq_len}, DType::Int32);
+    token_ids.copy_from_cpu(random_token_ids(batch_size * seq_len, 50256).data());
     Tensor encoded = Tensor::zeros({batch_size, seq_len, embed_dim});
     encoder_forward(encoded, token_ids, wte, wpe);
     torch::Tensor usual_encoded = pytorch_copy_of(encoded);
 
     int blocks = 0, threads = 0; // the launch the forward below uses
     auto forward = [&] {
-        encoder_forward_kernel<<<blocks, threads>>>((float4 *)encoded.data(), token_ids.data_ptr<int>(),
-                                                    (const float4 *)wte.data(), (const float4 *)wpe.data(),
-                                                    batch_size, seq_len, embed_dim);
+        encoder_forward_kernel<float><<<blocks, threads>>>(encoded.data(), token_ids.data_ptr<int>(), wte.data(),
+                                                           wpe.data(), batch_size, seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
 
@@ -659,6 +709,7 @@ int main(void)
 {
     forward_matches_pytorch();
     backward_matches_pytorch();
+    forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
     time_20_steps_on_gpt2_small_size_in_tensor_buffer();
 

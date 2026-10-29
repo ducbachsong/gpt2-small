@@ -15,6 +15,10 @@
 //
 //     wte_grad[token_ids[b][t]] += encoded_grad[b][t]    a token seen 5 times gets 5 rows added
 //     wpe_grad[t]               += encoded_grad[b][t]    each position t gets batch_size rows
+//
+// wte, wpe, encoded and their gradients are all float or all bfloat16; the kernels are templates on that
+// dtype, T. A float4 is 4 neighbouring values either way: for bfloat16, one 8-byte read that load4
+// (tensor.cuh) turns into 4 floats, and store4 rounds back. The adds are always in float.
 #ifndef ENCODER_CUH
 #define ENCODER_CUH
 
@@ -37,7 +41,8 @@ void encoder_check_shapes(const Tensor& encoded, const Tensor& token_ids, const 
 // ── forward ───────────────────────────────────────────────────────────────────
 
 // The kernel encoder_forward launches, declared here so it can call it; its code follows it.
-__global__ void encoder_forward_kernel(float4* encoded, const int* token_ids, const float4* wte, const float4* wpe,
+template <typename T>
+__global__ void encoder_forward_kernel(T* encoded, const int* token_ids, const T* wte, const T* wpe,
                                        size_t batch_size, size_t seq_len, size_t embed_dim);
 
 /// Writes encoded[b][t] = wte[token_ids[b][t]] + wpe[t] for every b < batch_size and
@@ -48,9 +53,14 @@ __global__ void encoder_forward_kernel(float4* encoded, const int* token_ids, co
 inline void encoder_forward(const Tensor& encoded, const Tensor& token_ids, const Tensor& wte, const Tensor& wpe) {
     encoder_check_shapes(encoded, token_ids, wte, wpe);
     size_t batch_size = encoded.size(0), seq_len = encoded.size(1), embed_dim = encoded.size(2);
-    encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>((float4*)encoded.data(), token_ids.data_ptr<int>(),
-                                                                (const float4*)wte.data(), (const float4*)wpe.data(),
-                                                                batch_size, seq_len, embed_dim);
+    if (encoded.dtype() == DType::BFloat16)
+        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(
+            encoded.data_ptr<nv_bfloat16>(), token_ids.data_ptr<int>(), wte.data_ptr<nv_bfloat16>(),
+            wpe.data_ptr<nv_bfloat16>(), batch_size, seq_len, embed_dim);
+    else
+        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(encoded.data(), token_ids.data_ptr<int>(),
+                                                                    wte.data(), wpe.data(), batch_size, seq_len,
+                                                                    embed_dim);
     cudaCheck(cudaGetLastError());
 }
 
@@ -61,7 +71,8 @@ inline void encoder_forward(const Tensor& encoded, const Tensor& token_ids, cons
 /// and the rest 1.
 /// Threads next to each other take float4s next to each other in the row, so a warp reads
 /// 32 x 16 = 512 bytes of wte in a row, in a few big requests.
-__global__ void encoder_forward_kernel(float4* encoded, const int* token_ids, const float4* wte, const float4* wpe,
+template <typename T>
+__global__ void encoder_forward_kernel(T* encoded, const int* token_ids, const T* wte, const T* wpe,
                                        size_t batch_size, size_t seq_len, size_t embed_dim) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t float4s_embed_dim = embed_dim / 4;                           // 4 floats per float4: 768 / 4 = 192
@@ -71,19 +82,22 @@ __global__ void encoder_forward_kernel(float4* encoded, const int* token_ids, co
         size_t float4_embed_index = index % float4s_embed_dim;          // which of its 192 float4s
         size_t position = token_index % seq_len;                        // t: its place in its row of text
         size_t token_id = token_ids[token_index];                       // which wte row to read
-        float4 token_embed = wte[token_id * float4s_embed_dim + float4_embed_index];
-        float4 position_embed = wpe[position * float4s_embed_dim + float4_embed_index];
-        encoded[index] = make_float4(token_embed.x + position_embed.x, token_embed.y + position_embed.y,
-                                     token_embed.z + position_embed.z, token_embed.w + position_embed.w);
+        float4 token_embed = load4(wte + (token_id * float4s_embed_dim + float4_embed_index) * 4);
+        float4 position_embed = load4(wpe + (position * float4s_embed_dim + float4_embed_index) * 4);
+        store4(encoded + index * 4,
+               make_float4(token_embed.x + position_embed.x, token_embed.y + position_embed.y,
+                           token_embed.z + position_embed.z, token_embed.w + position_embed.w));
     }
 }
 
 // ── backward ──────────────────────────────────────────────────────────────────
 
 // The kernels encoder_backward launches, declared here so it can call them; their code follows it.
-__global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encoded_grad, const int* token_ids,
+template <typename T>
+__global__ void encoder_backward_wte_kernel(T* wte_grad, const T* encoded_grad, const int* token_ids,
                                             size_t batch_size, size_t seq_len, size_t embed_dim);
-__global__ void encoder_backward_wpe_kernel(float4* wpe_grad, const float4* encoded_grad, size_t batch_size,
+template <typename T>
+__global__ void encoder_backward_wpe_kernel(T* wpe_grad, const T* encoded_grad, size_t batch_size,
                                             size_t seq_len, size_t embed_dim);
 
 /// Adds encoded_grad back into the rows the forward read: row (b, t) of encoded_grad onto row
@@ -94,14 +108,21 @@ inline void encoder_backward(const Tensor& wte_grad, const Tensor& wpe_grad, con
                              const Tensor& token_ids) {
     encoder_check_shapes(encoded_grad, token_ids, wte_grad, wpe_grad);
     size_t batch_size = encoded_grad.size(0), seq_len = encoded_grad.size(1), embed_dim = encoded_grad.size(2);
-    encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(),
-                                                                     (const float4*)encoded_grad.data(),
-                                                                     token_ids.data_ptr<int>(), batch_size, seq_len,
-                                                                     embed_dim);
-    cudaCheck(cudaGetLastError());
-    encoder_backward_wpe_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>((float4*)wpe_grad.data(),
-                                                                     (const float4*)encoded_grad.data(), batch_size,
-                                                                     seq_len, embed_dim);
+    if (encoded_grad.dtype() == DType::BFloat16) {
+        encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(
+            wte_grad.data_ptr<nv_bfloat16>(), encoded_grad.data_ptr<nv_bfloat16>(), token_ids.data_ptr<int>(),
+            batch_size, seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+        encoder_backward_wpe_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(
+            wpe_grad.data_ptr<nv_bfloat16>(), encoded_grad.data_ptr<nv_bfloat16>(), batch_size, seq_len, embed_dim);
+    } else {
+        encoder_backward_wte_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wte_grad.data(), encoded_grad.data(),
+                                                                         token_ids.data_ptr<int>(), batch_size,
+                                                                         seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+        encoder_backward_wpe_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(wpe_grad.data(), encoded_grad.data(),
+                                                                         batch_size, seq_len, embed_dim);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -121,7 +142,10 @@ inline void encoder_backward(const Tensor& wte_grad, const Tensor& wpe_grad, con
 /// 9.0 and newer), and the adds are not waited for (they compile to RED), so a wide load keeps
 /// 16 bytes in flight per thread instead of 4. With few threads launched that matters: at 5,120
 /// threads one float per load was 2.2x slower than at 512 x 1024, this 1.02x (tests, part 5).
-__global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encoded_grad, const int* token_ids,
+/// In bfloat16, atomic_add4 swaps the 4 values' 8 bytes in whole instead (tensor.cuh): a T4 has no
+/// atomicAdd on a bfloat16 either.
+template <typename T>
+__global__ void encoder_backward_wte_kernel(T* wte_grad, const T* encoded_grad, const int* token_ids,
                                             size_t batch_size, size_t seq_len, size_t embed_dim) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t float4s_embed_dim = embed_dim / 4;                           // 4 floats per float4: 768 / 4 = 192
@@ -130,12 +154,8 @@ __global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encod
         size_t token_index = index / float4s_embed_dim;                 // which token of the batch: b x seq_len + t
         size_t float4_embed_index = index % float4s_embed_dim;          // which of its 192 float4s
         size_t token_id = token_ids[token_index];                       // which wte_grad row to add onto
-        float4 grad = encoded_grad[index];
-        float* row = wte_grad + token_id * embed_dim + float4_embed_index * 4;   // the 4 values it adds onto
-        atomicAdd(row + 0, grad.x);
-        atomicAdd(row + 1, grad.y);
-        atomicAdd(row + 2, grad.z);
-        atomicAdd(row + 3, grad.w);
+        float4 grad = load4(encoded_grad + index * 4);
+        atomic_add4(wte_grad + token_id * embed_dim + float4_embed_index * 4, grad);   // the 4 values it adds onto
     }
 }
 
@@ -146,7 +166,8 @@ __global__ void encoder_backward_wte_kernel(float* wte_grad, const float4* encod
 /// wpe_grad has one thread, so no other thread writes it and no atomics are needed. It adds
 /// b = 0, 1, ..., batch_size - 1 in that order, every run: the same wpe_grad every time, to the
 /// last bit.
-__global__ void encoder_backward_wpe_kernel(float4* wpe_grad, const float4* encoded_grad, size_t batch_size,
+template <typename T>
+__global__ void encoder_backward_wpe_kernel(T* wpe_grad, const T* encoded_grad, size_t batch_size,
                                             size_t seq_len, size_t embed_dim) {
     size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t float4s_embed_dim = embed_dim / 4;                           // 4 floats per float4: 768 / 4 = 192
@@ -154,14 +175,14 @@ __global__ void encoder_backward_wpe_kernel(float4* wpe_grad, const float4* enco
     for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
         float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (size_t b = 0; b < batch_size; b++) {
-            float4 g = encoded_grad[b * seq_len * float4s_embed_dim + index]; // row (b, t), the same float4 of it
+            float4 g = load4(encoded_grad + (b * seq_len * float4s_embed_dim + index) * 4); // row (b, t), the same float4
             sum.x += g.x;
             sum.y += g.y;
             sum.z += g.z;
             sum.w += g.w;
         }
-        float4 old = wpe_grad[index];
-        wpe_grad[index] = make_float4(old.x + sum.x, old.y + sum.y, old.z + sum.z, old.w + sum.w);
+        float4 old = load4(wpe_grad + index * 4);
+        store4(wpe_grad + index * 4, make_float4(old.x + sum.x, old.y + sum.y, old.z + sum.z, old.w + sum.w));
     }
 }
 
@@ -169,10 +190,11 @@ __global__ void encoder_backward_wpe_kernel(float4* wpe_grad, const float4* enco
 
 /// Stops with a message if the tensors do not fit together, before a kernel reads past one:
 /// encoded {batch_size, seq_len, embed_dim}, token_ids {batch_size, seq_len} ints, wte
-/// {vocab_size, embed_dim}, wpe {max_seq_len, embed_dim} with seq_len <= max_seq_len. Also
-/// embed_dim a multiple of 4 and every float tensor starting on 16 bytes, for the float4 loads:
-/// off 16 bytes, the GPU stops with "misaligned address" at some later call, far from the
-/// cause. Backward passes the gradients in their place.
+/// {vocab_size, embed_dim}, wpe {max_seq_len, embed_dim} with seq_len <= max_seq_len; encoded, wte
+/// and wpe all float or all bfloat16. Also embed_dim a multiple of 4 and those three starting on 4
+/// values (16 bytes for float, 8 for bfloat16), for the 4-value loads: off that, the GPU stops with
+/// "misaligned address" at some later call, far from the cause. Backward passes the gradients in their
+/// place.
 inline void encoder_check_shapes(const Tensor& encoded, const Tensor& token_ids, const Tensor& wte, const Tensor& wpe) {
     bool fits = encoded.dim() == 3 && token_ids.dim() == 2 && wte.dim() == 2 && wpe.dim() == 2 &&
                 token_ids.dtype() == DType::Int32 && token_ids.size(0) == encoded.size(0) &&
@@ -184,11 +206,17 @@ inline void encoder_check_shapes(const Tensor& encoded, const Tensor& token_ids,
                         "max_seq_len\n");
         exit(EXIT_FAILURE);
     }
-    if (encoded.size(2) % 4 != 0 || (size_t)encoded.data() % 16 != 0 || (size_t)wte.data() % 16 != 0 ||
-        (size_t)wpe.data() % 16 != 0) {
-        fprintf(stderr, "error: the encoder reads 4 floats at a time (float4), so embed_dim must be a multiple of 4 "
-                        "and encoded, wte, wpe must start on 16 bytes; got embed_dim %zu, %p, %p, %p\n",
-                encoded.size(2), (void*)encoded.data(), (void*)wte.data(), (void*)wpe.data());
+    DType dtype = encoded.dtype();
+    if ((dtype != DType::Float32 && dtype != DType::BFloat16) || wte.dtype() != dtype || wpe.dtype() != dtype) {
+        fprintf(stderr, "error: the encoder needs encoded, wte and wpe all float or all bfloat16\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t four_values = 4 * encoded.element_size();                    // 16 bytes for float, 8 for bfloat16
+    if (encoded.size(2) % 4 != 0 || (size_t)encoded.data_ptr() % four_values != 0 ||
+        (size_t)wte.data_ptr() % four_values != 0 || (size_t)wpe.data_ptr() % four_values != 0) {
+        fprintf(stderr, "error: the encoder reads 4 values at a time, so embed_dim must be a multiple of 4 and "
+                        "encoded, wte, wpe must start on %zu bytes; got embed_dim %zu, %p, %p, %p\n",
+                four_values, encoded.size(2), encoded.data_ptr(), wte.data_ptr(), wpe.data_ptr());
         exit(EXIT_FAILURE);
     }
 }
