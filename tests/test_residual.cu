@@ -309,21 +309,6 @@ static void every_kernel_fits_its_block(void)
 
 // ══ part 4: other block and thread counts ═════════════════════════════════════
 
-/// Runs `run` 20 times on the GPU and gives the average time of runs 2..20, in milliseconds;
-/// run 1 does first-time work, so it is left out.
-template <typename Run>
-static float average_milliseconds(Run run)
-{
-    float total = 0.0f;
-    for (int t = 1; t <= 20; t++)
-    {
-        float milliseconds = gpu_milliseconds(run);
-        if (t > 1)
-            total += milliseconds;
-    }
-    return total / 19;
-}
-
 /// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
 /// run while its clock is still rising from idle.
 template <typename Run>
@@ -337,14 +322,19 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the forward and the backward on GPT-2 small's residual stream, {4, 1024, 768}
-    // (786,432 float4s), for 8 block counts x 4 thread counts, each the average of runs 2..20. The
-    // kernels are launched here directly, <<<blocks, threads>>>, instead of through residual_forward and
-    // residual_backward, which always launch 3072 x 256: one float4 per thread. With fewer, each thread
-    // walks more float4s.
+    // (786,432 float4s), in float and in bfloat16, for 8 block counts x 4 thread counts, each the average of
+    // 20 runs. The 32 launches take turns: 20 rounds, each timing every launch once (the forward and the
+    // backward in float, then both in bfloat16). One launch's 20 runs in a row would all land in the same
+    // stretch of the test, and a T4's clock can drift as it heats up (the first launch timed would get the
+    // fastest clock); taking turns gives every launch runs from early, middle and late alike. Run 1 is
+    // counted too: warm_up_gpu has already done the first-time work. The kernels are launched here directly,
+    // <<<blocks, threads>>>, instead of through residual_forward and residual_backward, which always launch
+    // 3072 x 256: one float4 per thread. With fewer, each thread walks more float4s. A bfloat16 float4 is one
+    // 8-byte read instead of 16, so each thread keeps half the bytes in flight: its best launch may differ.
     //
-    // Expect: every launch gives the same output and gradients as the usual ones, to the last bit: each
-    // value is worked out alone, the same way whichever thread does it. Only the time changes. A T4 runs
-    // at most 40 SMs x 1024 threads = 40,960 threads at once (160 blocks of 256): far fewer than that
+    // Expect: every launch gives the same output and gradients as the usual ones of its dtype, to the last
+    // bit: each value is worked out alone, the same way whichever thread does it. Only the time changes. A
+    // T4 runs at most 40 SMs x 1024 threads = 40,960 threads at once (160 blocks of 256): far fewer than that
     // likely cannot keep enough reads in flight to fill the memory bus.
     torch::manual_seed(0);
     Shape shape = {4, 1024, 768};
@@ -353,15 +343,26 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     Tensor output_grad = random_tensor_on_gpu(shape);
     Tensor output = Tensor::zeros(shape);
     Tensor residual_grad = Tensor::zeros(shape), branch_output_grad = Tensor::zeros(shape);
+    // The same values in bfloat16, with outputs of their own.
+    Tensor residual_bf16 = residual.to(DType::BFloat16), branch_output_bf16 = branch_output.to(DType::BFloat16);
+    Tensor output_grad_bf16 = output_grad.to(DType::BFloat16);
+    Tensor output_bf16 = Tensor::zeros(shape, DType::BFloat16);
+    Tensor residual_grad_bf16 = Tensor::zeros(shape, DType::BFloat16);
+    Tensor branch_output_grad_bf16 = Tensor::zeros(shape, DType::BFloat16);
 
     // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
     residual_forward(output, residual, branch_output);
     residual_backward(residual_grad, branch_output_grad, output_grad);
+    residual_forward(output_bf16, residual_bf16, branch_output_bf16);
+    residual_backward(residual_grad_bf16, branch_output_grad_bf16, output_grad_bf16);
     torch::Tensor usual_output = pytorch_copy_of(output), usual_residual_grad = pytorch_copy_of(residual_grad);
     torch::Tensor usual_branch_output_grad = pytorch_copy_of(branch_output_grad);
+    torch::Tensor usual_output_bf16 = pytorch_copy_of(output_bf16.to(DType::Float32));
+    torch::Tensor usual_residual_grad_bf16 = pytorch_copy_of(residual_grad_bf16.to(DType::Float32));
+    torch::Tensor usual_branch_output_grad_bf16 = pytorch_copy_of(branch_output_grad_bf16.to(DType::Float32));
     int usual_blocks = residual_blocks(total_float4s);       // 3072
 
-    int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
+    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loop
     auto forward = [&] {
         residual_forward_kernel<float><<<blocks, threads>>>(output.data(), residual.data(), branch_output.data(),
                                                             total_float4s);
@@ -372,62 +373,98 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                                                              output_grad.data(), total_float4s);
         cudaCheck(cudaGetLastError());
     };
+    auto forward_bf16 = [&] {
+        residual_forward_kernel<nv_bfloat16><<<blocks, threads>>>(output_bf16.data_ptr<nv_bfloat16>(),
+                                                                  residual_bf16.data_ptr<nv_bfloat16>(),
+                                                                  branch_output_bf16.data_ptr<nv_bfloat16>(),
+                                                                  total_float4s);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_bf16 = [&] {
+        residual_backward_kernel<nv_bfloat16><<<blocks, threads>>>(residual_grad_bf16.data_ptr<nv_bfloat16>(),
+                                                                   branch_output_grad_bf16.data_ptr<nv_bfloat16>(),
+                                                                   output_grad_bf16.data_ptr<nv_bfloat16>(),
+                                                                   total_float4s);
+        cudaCheck(cudaGetLastError());
+    };
     blocks = usual_blocks;
     threads = RESIDUAL_THREADS_PER_BLOCK;
     warm_up_gpu(forward);
 
     int block_counts[] = {40, 80, 160, 320, 640, 1280, 1536, 3072};
     int thread_counts[] = {128, 256, 512, 1024};
-    const char *kernel_names[] = {"forward", "backward"};
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {0, 0}, fastest_threads[2] = {0, 0};
-    int launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   float4s per thread   forward   backward   same result\n");
-    for (int block_count : block_counts)
+    const int launches = 8 * 4, rounds = 20;
+    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
+    float total_ms[launches][4] = {};
+    for (int round = 1; round <= rounds; round++)
     {
-        for (int thread_count : thread_counts)
+        for (int k = 0; k < launches; k++)
         {
-            blocks = block_count;
-            threads = thread_count;
-            float times[2];
-            times[0] = average_milliseconds(forward);
-            times[1] = average_milliseconds(backward);
-            for (int k = 0; k < 2; k++)
-            {
-                if (times[k] < fastest_ms[k])
-                {
-                    fastest_ms[k] = times[k];
-                    fastest_blocks[k] = blocks;
-                    fastest_threads[k] = threads;
-                }
-            }
-
-            // One forward and one backward from 0 with this launch, against the usual launches'.
-            output.zero_();
-            residual_grad.zero_();
-            branch_output_grad.zero_();
-            forward();
-            backward();
-            bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
-                        torch::equal(pytorch_copy_of(residual_grad), usual_residual_grad) &&
-                        torch::equal(pytorch_copy_of(branch_output_grad), usual_branch_output_grad);
-            if (same)
-                launches_with_the_same_result++;
-
-            size_t threads_launched = (size_t)blocks * threads;
-            int float4s_per_thread = (int)((total_float4s + threads_launched - 1) / threads_launched); // the most
-            const char *usual = blocks == usual_blocks && threads == RESIDUAL_THREADS_PER_BLOCK
-                                    ? "   <- what residual_forward and residual_backward launch"
-                                    : "";
-            printf("                  %6d   %7d   %18d   %7.3f   %8.3f   %-11s%s\n", blocks, threads,
-                   float4s_per_thread, times[0], times[1], same ? "yes" : "NO", usual);
+            blocks = block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(forward);
+            total_ms[k][1] += gpu_milliseconds(backward);
+            total_ms[k][2] += gpu_milliseconds(forward_bf16);
+            total_ms[k][3] += gpu_milliseconds(backward_bf16);
         }
     }
-    for (int k = 0; k < 2; k++)
-        printf("    fastest %-8s  %5d blocks x %4d threads: %.3f ms\n", kernel_names[k], fastest_blocks[k],
-               fastest_threads[k], fastest_ms[k]);
-    ASSERT_EQ(launches_with_the_same_result, 8 * 4);
+
+    const char *kernel_names[] = {"forward", "backward", "bf16 forward", "bf16 backward"};
+    float fastest_ms[4] = {1e9f, 1e9f, 1e9f, 1e9f};
+    int fastest_blocks[4] = {}, fastest_threads[4] = {};
+    int launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   float4s per thread   forward   backward   bf16 forward   "
+           "bf16 backward   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[4];
+        for (int j = 0; j < 4; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+
+        // One forward and one backward from 0 with this launch in each dtype, against the usual launches'.
+        output.zero_();
+        residual_grad.zero_();
+        branch_output_grad.zero_();
+        output_bf16.zero_();
+        residual_grad_bf16.zero_();
+        branch_output_grad_bf16.zero_();
+        forward();
+        backward();
+        forward_bf16();
+        backward_bf16();
+        bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
+                    torch::equal(pytorch_copy_of(residual_grad), usual_residual_grad) &&
+                    torch::equal(pytorch_copy_of(branch_output_grad), usual_branch_output_grad) &&
+                    torch::equal(pytorch_copy_of(output_bf16.to(DType::Float32)), usual_output_bf16) &&
+                    torch::equal(pytorch_copy_of(residual_grad_bf16.to(DType::Float32)), usual_residual_grad_bf16) &&
+                    torch::equal(pytorch_copy_of(branch_output_grad_bf16.to(DType::Float32)),
+                                 usual_branch_output_grad_bf16);
+        if (same)
+            launches_with_the_same_result++;
+
+        size_t threads_launched = (size_t)blocks * threads;
+        int float4s_per_thread = (int)((total_float4s + threads_launched - 1) / threads_launched); // the most
+        const char *usual = blocks == usual_blocks && threads == RESIDUAL_THREADS_PER_BLOCK
+                                ? "   <- what residual_forward and residual_backward launch"
+                                : "";
+        printf("                  %6d   %7d   %18d   %7.3f   %8.3f   %12.3f   %13.3f   %-11s%s\n", blocks, threads,
+               float4s_per_thread, times[0], times[1], times[2], times[3], same ? "yes" : "NO", usual);
+    }
+    for (int j = 0; j < 4; j++)
+        printf("    fastest %-13s  %5d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
+               fastest_threads[j], fastest_ms[j]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────

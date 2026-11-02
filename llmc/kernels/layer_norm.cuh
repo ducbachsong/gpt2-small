@@ -46,8 +46,14 @@
 #include "cuda_common.h"             // cudaCheck only: the rest is written out below
 #include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
 
-#define LAYER_NORM_THREADS_PER_BLOCK 256            // forward: 8 warps, one row each
-#define LAYER_NORM_BACKWARD_THREADS_PER_BLOCK 512   // backward: 16 warps, two rows each
+#define LAYER_NORM_THREADS_PER_BLOCK 512            // forward: 16 warps, one row each
+#define LAYER_NORM_BACKWARD_BLOCKS 40               // backward: blocks in every launch, one per SM on a T4
+#define LAYER_NORM_BACKWARD_THREADS_PER_BLOCK 512   // backward: 16 warps; 40 x 16 = 640 warps, 7 rows each
+// Both the fastest in test_layer_norm's sweep on a T4, in float and bfloat16 together. Forward: 0.114 and
+// 0.062 ms, against 0.138 and 0.061 for blocks of 256. Backward: 0.300 and 0.206 ms, against 0.329 and
+// 0.266 for two rows per warp (128 x 512); in float alone 128 x 128 was faster (0.277), but 0.294 in
+// bfloat16. A block of 512 threads (66 registers each) is the only block on its SM, so at most 16 warps'
+// rows share the SM's L1.
 #define LAYER_NORM_EPS 1e-5f                        // added to the variance, as GPT-2 and PyTorch's default do
 
 // ── forward and backward ──────────────────────────────────────────────────────
@@ -73,7 +79,7 @@ __global__ void layer_norm_forward_kernel(T* output, float* mean, float* rstd, c
 /// Writes output = LayerNorm(input) * weight + bias for every row, and each row's mean and rstd for the
 /// backward. output and input are {batch_size, seq_len, embed_dim}, mean and rstd {batch_size, seq_len},
 /// weight and bias {embed_dim}. One warp per row: with batch_size = 4, seq_len = 1024 that is 4096 rows,
-/// 4096 / 8 = 512 blocks of 256 threads.
+/// 4096 / 16 = 256 blocks of 512 threads.
 inline void layer_norm_forward(const Tensor& output, const Tensor& mean, const Tensor& rstd, const Tensor& input,
                                const Tensor& weight, const Tensor& bias) {
     layer_norm_check_shapes(output, mean, rstd, input, weight, bias);
@@ -166,15 +172,15 @@ __global__ void layer_norm_backward_kernel(T* input_grad, T* weight_grad, T* bia
 /// gradient, which also gets the gradient of the layer it skips. The shapes are the forward's: input_grad
 /// and output_grad as input, weight_grad and bias_grad as weight.
 ///
-/// 16 warps per block, two rows per warp: with 4096 rows, 4096 / 32 = 128 blocks of 512 threads.
+/// LAYER_NORM_BACKWARD_BLOCKS blocks of 16 warps, whatever the rows: with 4096 rows, 40 x 16 = 640 warps,
+/// each walking 6 or 7 rows.
 inline void layer_norm_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
                                 const Tensor& output_grad, const Tensor& input, const Tensor& weight,
                                 const Tensor& mean, const Tensor& rstd) {
     layer_norm_check_shapes(output_grad, mean, rstd, input, weight, bias_grad);
     layer_norm_check_shapes(input_grad, mean, rstd, input, weight_grad, bias_grad);
     size_t rows = input.size(0) * input.size(1), embed_dim = input.size(2);
-    size_t rows_per_block = (LAYER_NORM_BACKWARD_THREADS_PER_BLOCK / 32) * 2;
-    int blocks = (int)((rows + rows_per_block - 1) / rows_per_block);   // rounded up: a part-full last block
+    int blocks = LAYER_NORM_BACKWARD_BLOCKS;
     size_t shared_bytes = 2 * embed_dim * sizeof(float);                 // the block's bias_grad and weight_grad
     if (input.dtype() == DType::BFloat16)
         layer_norm_backward_kernel<<<blocks, LAYER_NORM_BACKWARD_THREADS_PER_BLOCK, shared_bytes>>>(
@@ -192,10 +198,11 @@ inline void layer_norm_backward(const Tensor& input_grad, const Tensor& weight_g
 /// warp of that row is the only one writing it. weight_grad and bias_grad are sums over every row of the
 /// batch, so many warps add onto the same 768 values at once. Each block first adds its rows into a copy
 /// of its own in shared memory (atomicAdd there stays on the SM), and at the end adds that copy onto
-/// weight_grad and bias_grad in GPU memory, one atomicAdd per value per block: with 128 blocks,
-/// 128 x 2 x 768 = 196,608 adds in GPU memory instead of 4096 x 2 x 768 = 6,291,456. The order of the
+/// weight_grad and bias_grad in GPU memory, one atomicAdd per value per block: with 40 blocks,
+/// 40 x 2 x 768 = 61,440 adds in GPU memory instead of 4096 x 2 x 768 = 6,291,456. The order of the
 /// adds is whatever order the threads get there, so the last bits of weight_grad and bias_grad can
-/// differ from run to run.
+/// differ from run to run. In bfloat16 each of those adds is rounded to 8 bits, so fewer blocks also
+/// means a weight_grad and bias_grad closer to the float sums.
 ///
 /// Per row, two passes: 1. the two means over the row, mean(norm_grad) and mean(norm_grad * norm),
 /// added up across the warp with shuffles as in the forward; 2. the three gradients. norm is worked out

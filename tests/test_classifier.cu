@@ -150,7 +150,7 @@ static void forward_and_backward_match_pytorch(const Shape &logits_shape, size_t
 static void matches_pytorch_on_gpt2_rows(void)
 {
     // Expect: batch_size = 2 rows of seq_len = 8 tokens, GPT-2's padded_vocab_size = 50304 with
-    // vocab_size = 50257 words: 16 blocks of the forward, each of the 1024 threads taking about 12 of a
+    // vocab_size = 50257 words: 16 blocks of the forward, each of the 256 threads taking about 49 of a
     // row's 12,576 float4s; float4 12,564 holds the last word and 3 padding columns. Random logits and
     // targets: the losses (about log(50257) = 10.8 each, as random logits guess about evenly),
     // max_of_each_row, sum_of_each_row and logits_grad equal PyTorch's within 1e-5.
@@ -159,7 +159,7 @@ static void matches_pytorch_on_gpt2_rows(void)
 
 static void matches_pytorch_with_a_small_vocabulary(void)
 {
-    // Expect: {3, 5, 12} with vocab_size = 10: 3 float4s per row for 1024 threads, so 1021 threads of
+    // Expect: {3, 5, 12} with vocab_size = 10: 3 float4s per row for 256 threads, so 253 threads of
     // each forward block have nothing, and float4 2 holds words 8, 9 and padding 10, 11. The backward's
     // 45 float4s are 1 part-full block. The same as PyTorch within 1e-5.
     forward_and_backward_match_pytorch({3, 5, 12}, 10);
@@ -448,7 +448,7 @@ static void forward_leaves_the_logits_as_they_are(void)
 
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: the forward can be launched with CLASSIFIER_FORWARD_THREADS_PER_BLOCK (1024) and the backward
+    // Expect: the forward can be launched with CLASSIFIER_FORWARD_THREADS_PER_BLOCK (256) and the backward
     // with CLASSIFIER_BACKWARD_THREADS_PER_BLOCK (256), and nothing is spilled. The compiler picks each
     // kernel's registers per thread; cudaFuncGetAttributes reads what it wrote down, without running
     // anything:
@@ -474,21 +474,6 @@ static void every_kernel_fits_its_block(void)
 
 // ══ part 4: other block and thread counts ═════════════════════════════════════
 
-/// Runs `run` 20 times on the GPU and gives the average time of runs 2..20, in milliseconds;
-/// run 1 does first-time work, so it is left out.
-template <typename Run>
-static float average_milliseconds(Run run)
-{
-    float total = 0.0f;
-    for (int t = 1; t <= 20; t++)
-    {
-        float milliseconds = gpu_milliseconds(run);
-        if (t > 1)
-            total += milliseconds;
-    }
-    return total / 19;
-}
-
 /// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
 /// run while its clock is still rising from idle.
 template <typename Run>
@@ -501,15 +486,21 @@ static void warm_up_gpu(Run run)
 
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
-    // Prints the time of the forward and the backward on GPT-2 small's sizes (4096 rows of 50304), each
-    // for 7 block counts x 4 thread counts, each the average of runs 2..20. The kernels are launched here
-    // directly, <<<blocks, threads>>>, instead of through classifier_forward and classifier_backward,
-    // which always launch 4096 x 1024 (one row per block) and 201,216 x 256 (one float4 per thread).
+    // Prints the time of the forward and the backward on GPT-2 small's sizes (4096 rows of 50304), in float
+    // and in bfloat16, each for 7 block counts x 4 thread counts, each the average of 20 runs. Each kernel's
+    // 28 launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
+    // launch's 20 runs in a row would all land in the same stretch of the test, and a T4's clock can drift
+    // as it heats up (the first launch timed would get the fastest clock); taking turns gives every launch
+    // runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has already done the
+    // first-time work. The kernels are launched here directly, <<<blocks, threads>>>, instead of through
+    // classifier_forward and classifier_backward, which always launch 4096 x 256 (one row per block; 4096 x
+    // 1024 before this sweep picked 256) and 201,216 x 256 (one float4 per thread). A bfloat16 row is 98 KB instead of 196 KB, and a bfloat16 float4
+    // one 8-byte read instead of 16: the best launch may differ.
     //
-    // Expect: every forward launch gives the usual losses, max_of_each_row and sum_of_each_row within TOLERANCE, not
-    // to the last bit: another thread count adds each row's exps in another order. Every backward launch
-    // gives the usual logits_grad to the last bit: each value is worked out alone, from the same numbers.
-    // A T4 runs at most 1024 threads per SM, 40,960 in all.
+    // Expect: every forward launch gives the usual losses, max_of_each_row and sum_of_each_row of its dtype
+    // within TOLERANCE, not to the last bit: another thread count adds each row's exps in another order (in
+    // float either way). Every backward launch gives the usual logits_grad of its dtype to the last bit: each
+    // value is worked out alone, from the same numbers. A T4 runs at most 1024 threads per SM, 40,960 in all.
     torch::manual_seed(0);
     size_t batch_size = 4, seq_len = 1024, vocab_size = 50257, padded_vocab_size = 50304;
     size_t rows = batch_size * seq_len;
@@ -519,17 +510,30 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
     Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
     Tensor logits_grad = Tensor::zeros({batch_size, seq_len, padded_vocab_size});
+    // The same logits in bfloat16, with results of their own (losses, the row maxes and sums are float in both).
+    Tensor logits_bf16 = logits.to(DType::BFloat16);
+    Tensor losses_bf16 = Tensor::zeros({batch_size, seq_len});
+    Tensor max_of_each_row_bf16 = Tensor::zeros({batch_size, seq_len});
+    Tensor sum_of_each_row_bf16 = Tensor::zeros({batch_size, seq_len});
+    Tensor logits_grad_bf16 = Tensor::zeros({batch_size, seq_len, padded_vocab_size}, DType::BFloat16);
 
     // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
     classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
     classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
+    classifier_forward(losses_bf16, max_of_each_row_bf16, sum_of_each_row_bf16, logits_bf16, targets, vocab_size);
+    classifier_backward(logits_grad_bf16, losses_grad, logits_bf16, targets, max_of_each_row_bf16,
+                        sum_of_each_row_bf16, vocab_size);
     torch::Tensor usual_losses = pytorch_copy_of(losses);
     torch::Tensor usual_max_of_each_row = pytorch_copy_of(max_of_each_row), usual_sum_of_each_row = pytorch_copy_of(sum_of_each_row);
     torch::Tensor usual_logits_grad = pytorch_copy_of(logits_grad);
+    torch::Tensor usual_losses_bf16 = pytorch_copy_of(losses_bf16);
+    torch::Tensor usual_max_of_each_row_bf16 = pytorch_copy_of(max_of_each_row_bf16);
+    torch::Tensor usual_sum_of_each_row_bf16 = pytorch_copy_of(sum_of_each_row_bf16);
+    torch::Tensor usual_logits_grad_bf16 = pytorch_copy_of(logits_grad_bf16.to(DType::Float32));
     int usual_backward_blocks = (int)((logits.numel() / 4 + CLASSIFIER_BACKWARD_THREADS_PER_BLOCK - 1) /
                                       CLASSIFIER_BACKWARD_THREADS_PER_BLOCK);   // 201,216
 
-    int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loops
+    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loops
     auto forward = [&] {
         classifier_forward_kernel<float><<<blocks, threads>>>(losses.data(), max_of_each_row.data(),
                                                               sum_of_each_row.data(), logits.data(),
@@ -544,6 +548,21 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                                                                padded_vocab_size);
         cudaCheck(cudaGetLastError());
     };
+    auto forward_bf16 = [&] {
+        classifier_forward_kernel<nv_bfloat16><<<blocks, threads>>>(losses_bf16.data(), max_of_each_row_bf16.data(),
+                                                                    sum_of_each_row_bf16.data(),
+                                                                    logits_bf16.data_ptr<nv_bfloat16>(),
+                                                                    targets.data_ptr<int>(), rows, vocab_size,
+                                                                    padded_vocab_size);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_bf16 = [&] {
+        classifier_backward_kernel<nv_bfloat16><<<blocks, threads>>>(
+            logits_grad_bf16.data_ptr<nv_bfloat16>(), losses_grad.data(), logits_bf16.data_ptr<nv_bfloat16>(),
+            targets.data_ptr<int>(), max_of_each_row_bf16.data(), sum_of_each_row_bf16.data(), rows, vocab_size,
+            padded_vocab_size);
+        cudaCheck(cudaGetLastError());
+    };
     blocks = (int)rows;
     threads = CLASSIFIER_FORWARD_THREADS_PER_BLOCK;
     warm_up_gpu(forward);
@@ -551,83 +570,126 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     // The forward: losses, max_of_each_row and sum_of_each_row within TOLERANCE of the usual launch's.
     int forward_block_counts[] = {40, 80, 160, 320, 640, 1280, 4096};
     int thread_counts[] = {128, 256, 512, 1024};
-    float fastest_ms = 1e9f;
-    int fastest_blocks = 0, fastest_threads = 0, launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    forward, time in ms:    blocks   threads   rows per block   time   same result\n");
-    for (int block_count : forward_block_counts)
+    const int launches = 7 * 4, rounds = 20;
+    float total_ms[launches][2] = {}; // launch k is block count number k / 4 x thread_counts[k % 4]; [0] float, [1] bf16
+    for (int round = 1; round <= rounds; round++)
     {
-        for (int thread_count : thread_counts)
+        for (int k = 0; k < launches; k++)
         {
-            blocks = block_count;
-            threads = thread_count;
-            float milliseconds = average_milliseconds(forward);
-            if (milliseconds < fastest_ms)
-            {
-                fastest_ms = milliseconds;
-                fastest_blocks = blocks;
-                fastest_threads = threads;
-            }
-            losses.zero_();
-            max_of_each_row.zero_();
-            sum_of_each_row.zero_();
-            forward();
-            bool same = relative_difference_on_gpu(losses, usual_losses) <= TOLERANCE &&
-                        relative_difference_on_gpu(max_of_each_row, usual_max_of_each_row) <= TOLERANCE &&
-                        relative_difference_on_gpu(sum_of_each_row, usual_sum_of_each_row) <= TOLERANCE;
-            if (same)
-                launches_with_the_same_result++;
-            int rows_per_block = (int)((rows + blocks - 1) / blocks); // the most any block takes
-            const char *usual = blocks == (int)rows && threads == CLASSIFIER_FORWARD_THREADS_PER_BLOCK
-                                    ? "   <- what classifier_forward launches"
-                                    : "";
-            printf("                            %6d   %7d   %14d   %6.3f   %-11s%s\n", blocks, threads,
-                   rows_per_block, milliseconds, same ? "yes" : "NO", usual);
+            blocks = forward_block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(forward);
+            total_ms[k][1] += gpu_milliseconds(forward_bf16);
         }
     }
-    printf("    fastest forward   %6d blocks x %4d threads: %.3f ms\n", fastest_blocks, fastest_threads, fastest_ms);
-    ASSERT_EQ(launches_with_the_same_result, 7 * 4);
+    float fastest_ms[2] = {1e9f, 1e9f};
+    int fastest_blocks[2] = {}, fastest_threads[2] = {}, launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    forward, time in ms:    blocks   threads   rows per block    float     bf16   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = forward_block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[2];
+        for (int j = 0; j < 2; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+        for (const Tensor *tensor : {&losses, &max_of_each_row, &sum_of_each_row, &losses_bf16, &max_of_each_row_bf16,
+                                     &sum_of_each_row_bf16})
+            tensor->zero_();
+        forward();
+        forward_bf16();
+        bool same = relative_difference_on_gpu(losses, usual_losses) <= TOLERANCE &&
+                    relative_difference_on_gpu(max_of_each_row, usual_max_of_each_row) <= TOLERANCE &&
+                    relative_difference_on_gpu(sum_of_each_row, usual_sum_of_each_row) <= TOLERANCE &&
+                    relative_difference_on_gpu(losses_bf16, usual_losses_bf16) <= TOLERANCE &&
+                    relative_difference_on_gpu(max_of_each_row_bf16, usual_max_of_each_row_bf16) <= TOLERANCE &&
+                    relative_difference_on_gpu(sum_of_each_row_bf16, usual_sum_of_each_row_bf16) <= TOLERANCE;
+        if (same)
+            launches_with_the_same_result++;
+        int rows_per_block = (int)((rows + blocks - 1) / blocks); // the most any block takes
+        const char *usual = blocks == (int)rows && threads == CLASSIFIER_FORWARD_THREADS_PER_BLOCK
+                                ? "   <- what classifier_forward launches"
+                                : "";
+        printf("                            %6d   %7d   %14d   %6.3f   %6.3f   %-11s%s\n", blocks, threads,
+               rows_per_block, times[0], times[1], same ? "yes" : "NO", usual);
+    }
+    printf("    fastest forward        %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0],
+           fastest_ms[0]);
+    printf("    fastest bf16 forward   %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1],
+           fastest_ms[1]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
 
     // The backward: logits_grad equal to the usual launch's, to the last bit. It reads the usual
-    // forward's max_of_each_row and sum_of_each_row, which the last forward above wrote again within TOLERANCE, so
-    // put those back first.
+    // forward's max_of_each_row and sum_of_each_row, which the last forwards above wrote again within
+    // TOLERANCE, so put those back first, in both dtypes.
     cudaCheck(cudaMemcpy(max_of_each_row.data(), usual_max_of_each_row.data_ptr<float>(), rows * sizeof(float),
                          cudaMemcpyDeviceToDevice));
     cudaCheck(cudaMemcpy(sum_of_each_row.data(), usual_sum_of_each_row.data_ptr<float>(), rows * sizeof(float),
                          cudaMemcpyDeviceToDevice));
+    cudaCheck(cudaMemcpy(max_of_each_row_bf16.data(), usual_max_of_each_row_bf16.data_ptr<float>(),
+                         rows * sizeof(float), cudaMemcpyDeviceToDevice));
+    cudaCheck(cudaMemcpy(sum_of_each_row_bf16.data(), usual_sum_of_each_row_bf16.data_ptr<float>(),
+                         rows * sizeof(float), cudaMemcpyDeviceToDevice));
     int backward_block_counts[] = {40, 160, 640, 2560, 10240, 40960, usual_backward_blocks};
-    fastest_ms = 1e9f;
-    launches_with_the_same_result = 0;
-    printf("    backward, time in ms:   blocks   threads   float4s per thread   time   same result\n");
-    for (int block_count : backward_block_counts)
+    for (int k = 0; k < launches; k++)
+        total_ms[k][0] = total_ms[k][1] = 0.0f;
+    for (int round = 1; round <= rounds; round++)
     {
-        for (int thread_count : thread_counts)
+        for (int k = 0; k < launches; k++)
         {
-            blocks = block_count;
-            threads = thread_count;
-            float milliseconds = average_milliseconds(backward);
-            if (milliseconds < fastest_ms)
-            {
-                fastest_ms = milliseconds;
-                fastest_blocks = blocks;
-                fastest_threads = threads;
-            }
-            logits_grad.zero_();
-            backward();
-            bool same = torch::equal(pytorch_copy_of(logits_grad), usual_logits_grad);
-            if (same)
-                launches_with_the_same_result++;
-            size_t threads_launched = (size_t)blocks * threads;
-            int float4s_per_thread = (int)((logits.numel() / 4 + threads_launched - 1) / threads_launched); // the most
-            const char *usual = blocks == usual_backward_blocks && threads == CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
-                                    ? "   <- what classifier_backward launches"
-                                    : "";
-            printf("                            %6d   %7d   %18d   %6.3f   %-11s%s\n", blocks, threads,
-                   float4s_per_thread, milliseconds, same ? "yes" : "NO", usual);
+            blocks = backward_block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(backward);
+            total_ms[k][1] += gpu_milliseconds(backward_bf16);
         }
     }
-    printf("    fastest backward  %6d blocks x %4d threads: %.3f ms\n", fastest_blocks, fastest_threads, fastest_ms);
-    ASSERT_EQ(launches_with_the_same_result, 7 * 4);
+    fastest_ms[0] = fastest_ms[1] = 1e9f;
+    launches_with_the_same_result = 0;
+    printf("    backward, time in ms:   blocks   threads   float4s per thread    float     bf16   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = backward_block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[2];
+        for (int j = 0; j < 2; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+        logits_grad.zero_();
+        logits_grad_bf16.zero_();
+        backward();
+        backward_bf16();
+        bool same = torch::equal(pytorch_copy_of(logits_grad), usual_logits_grad) &&
+                    torch::equal(pytorch_copy_of(logits_grad_bf16.to(DType::Float32)), usual_logits_grad_bf16);
+        if (same)
+            launches_with_the_same_result++;
+        size_t threads_launched = (size_t)blocks * threads;
+        int float4s_per_thread = (int)((logits.numel() / 4 + threads_launched - 1) / threads_launched); // the most
+        const char *usual = blocks == usual_backward_blocks && threads == CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
+                                ? "   <- what classifier_backward launches"
+                                : "";
+        printf("                            %6d   %7d   %18d   %6.3f   %6.3f   %-11s%s\n", blocks, threads,
+               float4s_per_thread, times[0], times[1], same ? "yes" : "NO", usual);
+    }
+    printf("    fastest backward       %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0],
+           fastest_ms[0]);
+    printf("    fastest bf16 backward  %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1],
+           fastest_ms[1]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────

@@ -51,7 +51,10 @@
 #include "cuda_common.h"             // cudaCheck only: the rest is written out below
 #include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
 
-#define CLASSIFIER_FORWARD_THREADS_PER_BLOCK 1024   // one block per row: about 12 of its 12,576 float4s each
+#define CLASSIFIER_FORWARD_THREADS_PER_BLOCK 256    // one block per row: about 49 of its 12,576 float4s each.
+                                                    // test_classifier's sweep on a T4: 3.067 ms in float and
+                                                    // 1.638 in bfloat16, against 3.039 and 1.813 for blocks
+                                                    // of 1024 (bfloat16's best, 1.635, was 160 x 256)
 #define CLASSIFIER_BACKWARD_THREADS_PER_BLOCK 256   // one float4 per thread
 
 // ── forward and backward ──────────────────────────────────────────────────────
@@ -79,7 +82,7 @@ __global__ void classifier_forward_kernel(float* losses, float* max_of_each_row,
 /// backward. The logits are left as they are. logits is {batch_size, seq_len, padded_vocab_size},
 /// targets {batch_size, seq_len} ints, losses, max_of_each_row and sum_of_each_row {batch_size, seq_len}; the columns
 /// from vocab_size on are padding. The targets are not checked: a target >= vocab_size reads a padding
-/// column. One block of 1024 threads per row: 4096 blocks for batch_size = 4, seq_len = 1024.
+/// column. One block of 256 threads per row: 4096 blocks for batch_size = 4, seq_len = 1024.
 inline void classifier_forward(const Tensor& losses, const Tensor& max_of_each_row, const Tensor& sum_of_each_row,
                                const Tensor& logits, const Tensor& targets, size_t vocab_size) {
     classifier_check_shapes(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
@@ -97,7 +100,7 @@ inline void classifier_forward(const Tensor& losses, const Tensor& max_of_each_r
 
 /// Works out each row's row_max, row_sum and loss, one block per row. Block b takes rows b, b + blocks
 /// launched, ... (with the usual launch, one row each). Its threads walk the row together, a float4 at a
-/// time: thread t takes float4s t, t + 1024, t + 2048, ..., so a warp reads 32 x 16 = 512 neighbouring
+/// time: thread t takes float4s t, t + 256, t + 512, ..., so a warp reads 32 x 16 = 512 neighbouring
 /// bytes at once.
 ///
 /// row_max and row_sum come from one read of the row: the online softmax. Each thread keeps the largest
@@ -109,8 +112,8 @@ inline void classifier_forward(const Tensor& losses, const Tensor& max_of_each_r
 ///                         seen 2:   max 3   sum 1.1353353 + e^(2-3)          = 1.5032147
 ///                         the same as e^(1-3) + e^(3-3) + e^(2-3), worked out knowing the max first
 ///
-/// Then the 1024 threads' (max, sum) parts are put together the same way: across each warp with
-/// shuffles, then across the 32 warps in shared memory. Two reads, one for the max and one for the sum,
+/// Then the 256 threads' (max, sum) parts are put together the same way: across each warp with
+/// shuffles, then across the 8 warps in shared memory. Two reads, one for the max and one for the sum,
 /// would read the 196 KB row twice. This is note 6.2 and its Figure 3: step 1 below is the update rule,
 /// steps 2 and 3 the merge rule; the results are F1's m, F4's S and F5's loss.
 template <typename T>

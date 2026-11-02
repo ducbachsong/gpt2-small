@@ -84,12 +84,17 @@ inline void GradNorm::compute(const Tensor& grads, const Tensor& grad_norm) cons
 /// warp totals go to shared memory, then each warp adds those 32 the same way. Blocks cannot wait for each other, so
 /// the counter tells the last one that every block sum is written. The last block adds block_sums[0 .. 511] in that
 /// order whichever block it is: the same norm every run, to the last bit.
+///
+/// The numbers above are GradNorm::compute's launch, GRAD_NORM_BLOCKS x GRAD_NORM_THREADS. The kernel reads its
+/// launch from gridDim and blockDim, so test_grad_norm can time it with others: a block of fewer than 32 warps
+/// leaves the warp totals it has no warp for as 0, and with more blocks than threads each thread of the last block
+/// adds several block sums. block_sums must hold one per block.
 template <typename T>
 __global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const T* grads,
                                          size_t grads_numel) {
     __shared__ float warp_totals[32];           // one per warp, shared by the whole block: used in steps 2 and 3
     __shared__ bool is_last_block;              // one per block: did this block finish last?
-    int thread_in_warp = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int thread_in_warp = threadIdx.x % 32, warp = threadIdx.x / 32, warps_in_block = blockDim.x / 32;
 
     // 1. this thread's squares. The grads are read as float4s: group g is values 4g .. 4g + 3, one 16-byte load, so
     //    each request brings 4 floats instead of 1 and memory stays busier. Thread t takes groups t, t + 524,288,
@@ -113,14 +118,14 @@ __global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, fl
     if (thread_in_warp == 0) warp_totals[warp] = sum;
     __syncthreads();                            // wait until all 32 warps have written theirs
     //    Round 2: each thread reads one of the 32 warp totals, and each warp adds them the same way: the block sum.
-    float block_total = warp_totals[thread_in_warp];
+    float block_total = thread_in_warp < warps_in_block ? warp_totals[thread_in_warp] : 0.0f;
     for (int offset = 16; offset > 0; offset /= 2) block_total += __shfl_xor_sync(0xffffffff, block_total, offset);
     //    Thread 0 writes the block sum, then counts the block as done.
     if (threadIdx.x == 0) {
         block_sums[blockIdx.x] = block_total;
         __threadfence();                        // the block sum reaches GPU memory before the count goes up
         float done_before = atomicAdd(blocks_done, 1.0f);   // +1, one block at a time; gives the count before it
-        is_last_block = done_before == GRAD_NORM_BLOCKS - 1;     // 511 before this one: every other block is done
+        is_last_block = done_before == (float)(gridDim.x - 1);   // 511 before this one: every other block is done
     }
     __syncthreads();                            // every thread sees is_last_block, and is done reading warp_totals
     if (!is_last_block) return;
@@ -130,14 +135,15 @@ __global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, fl
     //    to pick up the sums. Threads 0 .. 511 each take block_sums[threadIdx.x]; threads 512 .. 1023 have no slot and
     //    take 0, which adds nothing (one read per thread covers all 512, as 1024 threads >= 512 sums). Then the block
     //    adds the 1024 values in the same two rounds. volatile: read the sums from GPU memory, not from an old copy
-    //    in this SM's cache.
-    float total = threadIdx.x < GRAD_NORM_BLOCKS ? ((volatile float*)block_sums)[threadIdx.x] : 0.0f;
+    //    in this SM's cache. (With more blocks than threads, thread t also takes block sums t + 1024, t + 2048, ...)
+    float total = 0.0f;
+    for (size_t b = threadIdx.x; b < gridDim.x; b += blockDim.x) total += ((volatile float*)block_sums)[b];
     //    Round 1: each warp adds its 32.
     for (int offset = 16; offset > 0; offset /= 2) total += __shfl_xor_sync(0xffffffff, total, offset);
     if (thread_in_warp == 0) warp_totals[warp] = total;
     __syncthreads();                            // wait until all 32 warps have written theirs
     //    Round 2: each warp adds the 32 warp totals: the sum of every square.
-    float all_blocks_total = warp_totals[thread_in_warp];
+    float all_blocks_total = thread_in_warp < warps_in_block ? warp_totals[thread_in_warp] : 0.0f;
     for (int offset = 16; offset > 0; offset /= 2)
         all_blocks_total += __shfl_xor_sync(0xffffffff, all_blocks_total, offset);
     //    Thread 0 writes the square root, the norm, and sets the counter back to 0.

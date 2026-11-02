@@ -3,7 +3,8 @@
 // program.
 //
 // Part 1 checks a block against the same block written in PyTorch, with autograd for the backward, in float
-// and in bfloat16, and times one block on GPT-2 small's size; part 2 checks what can be worked out by hand.
+// and in bfloat16, and times one block on GPT-2 small's size in bfloat16, the dtype training runs in; part 2
+// checks what can be worked out by hand.
 #include <torch/types.h>              // torch::layer_norm, torch::linear, scaled_dot_product_attention; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
@@ -225,17 +226,22 @@ static void forward_and_backward_in_bfloat16(void)
 static void time_20_steps_on_gpt2_small_size(void)
 {
     // Prints the times of 20 forwards and 20 backwards of one block on GPT-2 small's size, {4, 1024, 768}
-    // with 12 heads, float: mine against PyTorch's block with autograd. Steps 1 and 2 do first-time work
-    // (loading kernels, cuBLAS picking its own), so the averages are of 3..20. Each side starts every
-    // backward from gradients of 0, as a training step does; at the end they must agree.
+    // with 12 heads, in bfloat16, the dtype training runs in: mine against PyTorch's block with autograd,
+    // also in bfloat16, on the same values. Steps 1 and 2 do first-time work (loading kernels, cuBLAS
+    // picking its own), so the averages are of 3..20. Each side starts every backward from gradients of 0,
+    // as a training step does. A T4 has no bfloat16 tensor cores (they came with the A100), so neither
+    // side's products get them.
+    //
+    // Expect: at the end, my output and input_grad still match PyTorch's block in float on the same
+    // bfloat16 values within BFLOAT16_TOLERANCE, as in forward_and_backward_in_bfloat16 at this size.
     torch::manual_seed(0);
-    BlockTensors mine(4, 1024, 768, 12);
+    BlockTensors mine(4, 1024, 768, 12, DType::BFloat16);
     mine.fill_random_values();
-    torch::Tensor pytorch_input = pytorch_copy_of(mine.input).requires_grad_(true);
+    torch::Tensor pytorch_input = pytorch_copy_of(mine.input).to(torch::kBFloat16).requires_grad_(true);
     std::vector<torch::Tensor> pytorch_params;
     for (const Tensor &param : mine.params.tensors())
-        pytorch_params.push_back(pytorch_copy_of(param).requires_grad_(true));
-    torch::Tensor pytorch_output_grad = pytorch_copy_of(mine.output_grad), pytorch_output;
+        pytorch_params.push_back(pytorch_copy_of(param).to(torch::kBFloat16).requires_grad_(true));
+    torch::Tensor pytorch_output_grad = pytorch_copy_of(mine.output_grad).to(torch::kBFloat16), pytorch_output;
 
     double totals[4] = {0.0, 0.0, 0.0, 0.0};
     for (int t = 1; t <= 20; t++)
@@ -260,8 +266,9 @@ static void time_20_steps_on_gpt2_small_size(void)
            totals[2] / 18, totals[3] / 18);
     printf("    PyTorch takes, against mine:                          %14.2fx   %15.2fx\n", totals[2] / totals[0],
            totals[3] / totals[1]);
-    ASSERT_NEAR(list_of(mine.output), list_of(pytorch_output), TOLERANCE);
-    ASSERT_NEAR(list_of(mine.input_grad), list_of(pytorch_input.grad()), TOLERANCE);
+    PytorchBlock pytorch_in_float(mine);               // once, not timed: the float answer to check against
+    ASSERT_NEAR(list_of(mine.output), list_of(pytorch_in_float.output), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(list_of(mine.input_grad), list_of(pytorch_in_float.input.grad()), BFLOAT16_TOLERANCE);
 }
 
 // ══ part 2: worked out by hand ════════════════════════════════════════════════

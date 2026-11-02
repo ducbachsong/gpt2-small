@@ -26,7 +26,10 @@
 #include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
 
 #define ENCODER_BLOCKS 512          // blocks in every launch here
-#define ENCODER_THREADS 1024        // threads per block: 512 x 1024 = 524,288 threads in all
+#define ENCODER_THREADS 1024        // threads per block of the two backwards: 512 x 1024 = 524,288 threads in all
+#define ENCODER_FORWARD_THREADS 128 // threads per block of the forward: 512 x 128 = 65,536, 12 float4s each. The
+                                    // fastest in bfloat16, the dtype training runs in (test_encoder's sweep on a
+                                    // T4): 0.067 ms, against 0.078 for 512 x 1024 (in float 0.150 and 0.157)
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void encoder_forward(const Tensor& encoded, const Tensor& token_ids, const Tensor& wte, const Tensor& wpe);
@@ -54,13 +57,12 @@ inline void encoder_forward(const Tensor& encoded, const Tensor& token_ids, cons
     encoder_check_shapes(encoded, token_ids, wte, wpe);
     size_t batch_size = encoded.size(0), seq_len = encoded.size(1), embed_dim = encoded.size(2);
     if (encoded.dtype() == DType::BFloat16)
-        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(
+        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_FORWARD_THREADS>>>(
             encoded.data_ptr<nv_bfloat16>(), token_ids.data_ptr<int>(), wte.data_ptr<nv_bfloat16>(),
             wpe.data_ptr<nv_bfloat16>(), batch_size, seq_len, embed_dim);
     else
-        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_THREADS>>>(encoded.data(), token_ids.data_ptr<int>(),
-                                                                    wte.data(), wpe.data(), batch_size, seq_len,
-                                                                    embed_dim);
+        encoder_forward_kernel<<<ENCODER_BLOCKS, ENCODER_FORWARD_THREADS>>>(
+            encoded.data(), token_ids.data_ptr<int>(), wte.data(), wpe.data(), batch_size, seq_len, embed_dim);
     cudaCheck(cudaGetLastError());
 }
 

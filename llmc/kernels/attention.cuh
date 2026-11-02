@@ -62,11 +62,14 @@
 #include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
 
 #define ATTENTION_THREADS_PER_BLOCK 256           // F1, F6, B1, B9: one float4 per thread
-#define ATTENTION_SOFTMAX_BLOCKS 80               // F4, B4-B6: blocks in every launch, 2 per SM on a T4
-#define ATTENTION_SOFTMAX_THREADS_PER_BLOCK 128   // 4 warps: 80 x 4 = 320 warps, GPT-2 small's 49,152 rows of
-                                                  // weights, 154 each. The fastest in test_attention's sweep
-                                                  // on a T4: forward 1.55 ms, backward 2.02 ms, against 1.85
-                                                  // and 2.77 for one warp per row (6144 x 256)
+// The softmax launches are the fastest in bfloat16, the dtype training runs in (test_attention's sweep on a T4):
+#define ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK 256   // F4: 8 warps, one row each: 6144 blocks for GPT-2 small's
+                                                  // 49,152 rows of weights. 0.779 ms (the best, 6144 x 512, half
+                                                  // its warps idle: 0.769), against 1.334 with 80 x 128. In
+                                                  // float 80 x 128 would be faster (1.55 ms, against 1.84)
+#define ATTENTION_SOFTMAX_BACKWARD_BLOCKS 80              // B4-B6: blocks in every launch, 2 per SM on a T4
+#define ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK 128  // 4 warps: 80 x 4 = 320 warps, 154 rows each. 1.097 ms,
+                                                  // against 1.193 one warp per row (2.02 and 2.77 in float)
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void attention_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
@@ -120,7 +123,7 @@ __global__ void attention_merge_heads_kernel(T* output, const T* head_outputs, s
 ///     step       how                                   GPT-2 small, {4, 1024} tokens, 12 heads of 64
 ///     F1         attention_split_qkv_kernel            786,432 float4s of query (and key, value), 3072 blocks
 ///     F2         cuBLAS, 48 products {1024, 64} · {64, 1024}, scaled by 1 / sqrt(64) = 0.125
-///     F3, F4     attention_softmax_forward_kernel      49,152 rows of weights, 80 blocks of 4 warps
+///     F3, F4     attention_softmax_forward_kernel      49,152 rows of weights, 6144 blocks of 8 warps: one row each
 ///     F5         cuBLAS, 48 products {1024, 1024} · {1024, 64}
 ///     F6         attention_merge_heads_kernel          786,432 float4s, 3072 blocks
 inline void attention_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
@@ -158,8 +161,9 @@ inline void attention_forward_in(const Tensor& output, const Tensor& query, cons
                       T, head_weights, (int)heads_in_batch);
 
     // F3, F4: the mask and the softmax, in place: weights holds the scores before, the weights after
-    attention_softmax_forward_kernel<<<ATTENTION_SOFTMAX_BLOCKS, ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(
-        weights.data_ptr<Value>(), rows, seq_len);
+    attention_softmax_forward_kernel<<<attention_blocks(rows, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK, 32),
+                                       ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK>>>(weights.data_ptr<Value>(), rows,
+                                                                                     seq_len);
     cudaCheck(cudaGetLastError());
 
     // F5: head_outputs = weights · value, {T, d} per head; asked for as head_outputsᵀ = valueᵀ · weightsᵀ,
@@ -324,7 +328,7 @@ inline void attention_backward_in(const Tensor& qkv_grad, const Tensor& output_g
                       head_weights, value_grad, d, head_values, (int)heads_in_batch);
 
     // B4-B6: the softmax's backward, in place: weights_grad holds da before, ds after
-    attention_softmax_backward_kernel<<<ATTENTION_SOFTMAX_BLOCKS, ATTENTION_SOFTMAX_THREADS_PER_BLOCK>>>(
+    attention_softmax_backward_kernel<<<ATTENTION_SOFTMAX_BACKWARD_BLOCKS, ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK>>>(
         weights_grad.data_ptr<Value>(), weights.data_ptr<Value>(), rows, seq_len);
     cudaCheck(cudaGetLastError());
 
@@ -453,8 +457,8 @@ __device__ __forceinline__ size_t attention_merged_index(size_t index, size_t nu
 }
 
 /// Gives the number of blocks of threads_per_block for `total` pieces of work, per_thread threads each:
-/// 1 for the float4 kernels (the softmax kernels launch ATTENTION_SOFTMAX_BLOCKS instead, each warp taking
-/// many rows). Rounded up: a part-full last block.
+/// 1 for the float4 kernels, 32 for the softmax forward's one warp per row (the softmax backward launches
+/// ATTENTION_SOFTMAX_BACKWARD_BLOCKS instead, each warp taking many rows). Rounded up: a part-full last block.
 inline int attention_blocks(size_t total, int threads_per_block, size_t per_thread) {
     size_t threads = total * per_thread;
     return (int)((threads + threads_per_block - 1) / threads_per_block);

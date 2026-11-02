@@ -340,7 +340,7 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 {
     // Expect: GPT-2 small's sizes, batch_size = 4 rows of seq_len = 1024 tokens, embed_dim = 768,
     // random input, weight 1, output_grad all 1. All 4096 rows add onto the same 768 values of
-    // bias_grad: 32 rows into each block's shared copy, then 128 blocks into GPU memory, many at the
+    // bias_grad: 102 or 103 rows into each block's shared copy, then 40 blocks into GPU memory, many at the
     // same moment. With atomicAdd no add is lost: 4096 x 1 = 4096 in every column, exactly (whole
     // numbers this small add exactly in floats). input_grad is 0 in every row, up to rounding, as
     // in the_same_output_grad_on_a_whole_row_gives_no_input_grad.
@@ -363,7 +363,7 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: the forward can be launched with LAYER_NORM_THREADS_PER_BLOCK (256) and the backward
+    // Expect: the forward can be launched with LAYER_NORM_THREADS_PER_BLOCK (512) and the backward
     // with LAYER_NORM_BACKWARD_THREADS_PER_BLOCK (512), and nothing is spilled. The compiler picks
     // each kernel's registers per thread; cudaFuncGetAttributes reads what it wrote down, without
     // running anything:
@@ -389,21 +389,6 @@ static void every_kernel_fits_its_block(void)
 
 // ══ part 4: other block and thread counts ═════════════════════════════════════
 
-/// Runs `run` 20 times on the GPU and gives the average time of runs 2..20, in milliseconds;
-/// run 1 does first-time work, so it is left out.
-template <typename Run>
-static float average_milliseconds(Run run)
-{
-    float total = 0.0f;
-    for (int t = 1; t <= 20; t++)
-    {
-        float milliseconds = gpu_milliseconds(run);
-        if (t > 1)
-            total += milliseconds;
-    }
-    return total / 19;
-}
-
 /// Keeps the GPU busy with `run` for about a second before timing. While the CPU makes random
 /// numbers for seconds the GPU idles and its clock drops; without this, the first launches timed
 /// run while the clock is still rising.
@@ -418,23 +403,34 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the forward and the backward on GPT-2 small's sizes (batch_size = 4,
-    // seq_len = 1024: 4096 rows of embed_dim = 768) for 8 block counts x 4 thread counts, each the
-    // average of runs 2..20. The kernels are launched here directly, <<<blocks, threads>>>, instead
-    // of through layer_norm_forward and layer_norm_backward, which always launch 512 x 256 and
-    // 128 x 512. Not 1024 threads: since the kernels became templates for bfloat16, each takes 66
-    // registers per thread, and a block of 1024 may have 65,536 / 1024 = 64 (cudaFuncGetAttributes:
-    // largest block 896). Held to 64, the backward spilled 8 bytes; and blocks of 1024 were never the
-    // fastest here.
+    // seq_len = 1024: 4096 rows of embed_dim = 768), in float and in bfloat16, for 8 block counts x 4 thread
+    // counts, each the average of 20 runs. The 32 launches take turns: 20 rounds, each timing every launch
+    // once (the forward and the backward in float, then both in bfloat16). One launch's 20 runs in a row
+    // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
+    // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
+    // late alike. Run 1 is counted too: warm_up_gpu has already done the first-time work. The kernels are
+    // launched here directly, <<<blocks, threads>>>, instead of through layer_norm_forward and
+    // layer_norm_backward, which always launch 256 x 512 and 40 x 512 (before this sweep picked those:
+    // 512 x 256 and 128 x 512). Not 1024 threads: since the kernels
+    // became templates for bfloat16, each takes 66 registers per thread, and a block of 1024 may have
+    // 65,536 / 1024 = 64 (cudaFuncGetAttributes: largest block 896). Held to 64, the backward spilled 8
+    // bytes; and blocks of 1024 were never the fastest here. A bfloat16 row is 1.5 KB instead of 3 KB, so
+    // twice as many rows fit in an SM's L1: its best launch may differ.
     //
-    // Expect: every launch gives the same result as the usual ones. Whatever the counts, each row
-    // is one warp's and its threads add in the same order, so output, mean, rstd and input_grad are
-    // the same to the last bit; weight_grad and bias_grad within TOLERANCE (atomicAdd's order). Only
-    // the time changes. On a Colab T4 (at most 40 SMs x 32 warps = 1,280 warps at once) both are
-    // fastest with far fewer warps than that: the forward with 160 to 640 (0.117 ms, against 0.167
-    // for its usual 4096), the backward with about 512 (0.275 ms, against 0.333 for its usual 2048).
-    // Most likely the cache: the forward reads each row 3 times and the backward 2, and the re-reads
-    // come from an SM's L1 (at most 64 KB) only while its warps' rows fit: 16 x 3 KB = 48 KB does,
-    // 26 x 3 KB = 77 KB does not. Not measured directly yet.
+    // Expect: every launch gives the same result as the usual ones of its dtype. Whatever the counts, each
+    // row is one warp's and its threads add in the same order, so output, mean, rstd and input_grad are the
+    // same to the last bit; weight_grad and bias_grad within TOLERANCE in float (atomicAdd's order). In
+    // bfloat16 they are not checked, only printed: each block's add onto them is rounded to 8 bits, in
+    // whatever order the blocks finish, so even two runs of one launch differ, by about 2.5% of the largest
+    // value with 128 blocks (each column about ±64, a bfloat16 step there 0.25 to 0.5, 128 rounded adds).
+    // The column "bf16 grad error" is the largest difference of the bfloat16 weight_grad and bias_grad from
+    // the float ones, as a fraction of their largest value: more blocks, more rounded adds, a larger error.
+    // Only the time changes. On a Colab T4 (at most 40 SMs x 32 warps = 1,280 warps at once), in float, both were fastest
+    // with far fewer warps than that: the forward with 160 to 640 (0.117 ms, against 0.167 for its usual
+    // 4096), the backward with about 512 (0.275 ms, against 0.333 for its usual 2048). Most likely the
+    // cache: the forward reads each row 3 times and the backward 2, and the re-reads come from an SM's L1
+    // (at most 64 KB) only while its warps' rows fit: 16 x 3 KB = 48 KB does, 26 x 3 KB = 77 KB does not.
+    // Not measured directly yet.
     Tensor::manual_seed(0);
     size_t batch_size = 4, seq_len = 1024, embed_dim = 768;
     size_t rows = batch_size * seq_len;
@@ -445,22 +441,35 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
     Tensor input_grad = Tensor::zeros({batch_size, seq_len, embed_dim});
     Tensor weight_grad = Tensor::zeros({embed_dim}), bias_grad = Tensor::zeros({embed_dim});
+    // The same values in bfloat16, with outputs of their own (mean and rstd are float in both).
+    Tensor input_bf16 = input.to(DType::BFloat16), output_grad_bf16 = output_grad.to(DType::BFloat16);
+    Tensor weight_bf16 = weight.to(DType::BFloat16), bias_bf16 = bias.to(DType::BFloat16);
+    Tensor output_bf16 = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
+    Tensor mean_bf16 = Tensor::zeros({batch_size, seq_len}), rstd_bf16 = Tensor::zeros({batch_size, seq_len});
+    Tensor input_grad_bf16 = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
+    Tensor weight_grad_bf16 = Tensor::zeros({embed_dim}, DType::BFloat16);
+    Tensor bias_grad_bf16 = Tensor::zeros({embed_dim}, DType::BFloat16);
 
     // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
     layer_norm_forward(output, mean, rstd, input, weight, bias);
     layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
+    layer_norm_forward(output_bf16, mean_bf16, rstd_bf16, input_bf16, weight_bf16, bias_bf16);
+    layer_norm_backward(input_grad_bf16, weight_grad_bf16, bias_grad_bf16, output_grad_bf16, input_bf16, weight_bf16,
+                        mean_bf16, rstd_bf16);
     torch::Tensor usual_output = pytorch_copy_of(output);
     torch::Tensor usual_mean = pytorch_copy_of(mean), usual_rstd = pytorch_copy_of(rstd);
     torch::Tensor usual_input_grad = pytorch_copy_of(input_grad);
     torch::Tensor usual_weight_grad = pytorch_copy_of(weight_grad), usual_bias_grad = pytorch_copy_of(bias_grad);
+    torch::Tensor usual_output_bf16 = pytorch_copy_of(output_bf16.to(DType::Float32));
+    torch::Tensor usual_mean_bf16 = pytorch_copy_of(mean_bf16), usual_rstd_bf16 = pytorch_copy_of(rstd_bf16);
+    torch::Tensor usual_input_grad_bf16 = pytorch_copy_of(input_grad_bf16.to(DType::Float32));
 
-    // What layer_norm_forward and layer_norm_backward launch, worked out as they do: 512 and 128 blocks.
+    // What layer_norm_forward and layer_norm_backward launch, worked out as they do: 256 and 40 blocks.
     int forward_warps_per_block = LAYER_NORM_THREADS_PER_BLOCK / 32;
     int usual_forward_blocks = (int)((rows + forward_warps_per_block - 1) / forward_warps_per_block);
-    int backward_rows_per_block = (LAYER_NORM_BACKWARD_THREADS_PER_BLOCK / 32) * 2;
-    int usual_backward_blocks = (int)((rows + backward_rows_per_block - 1) / backward_rows_per_block);
+    int usual_backward_blocks = LAYER_NORM_BACKWARD_BLOCKS;
 
-    int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
+    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loop
     size_t shared_bytes = 2 * embed_dim * sizeof(float);     // the backward's block copy of bias_grad, weight_grad
     auto forward = [&] {
         layer_norm_forward_kernel<float><<<blocks, threads>>>(output.data(), mean.data(), rstd.data(), input.data(),
@@ -473,76 +482,111 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
             mean.data(), rstd.data(), rows, embed_dim);
         cudaCheck(cudaGetLastError());
     };
+    auto forward_bf16 = [&] {
+        layer_norm_forward_kernel<nv_bfloat16><<<blocks, threads>>>(
+            output_bf16.data_ptr<nv_bfloat16>(), mean_bf16.data(), rstd_bf16.data(), input_bf16.data_ptr<nv_bfloat16>(),
+            weight_bf16.data_ptr<nv_bfloat16>(), bias_bf16.data_ptr<nv_bfloat16>(), rows, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_bf16 = [&] {
+        layer_norm_backward_kernel<nv_bfloat16><<<blocks, threads, shared_bytes>>>(
+            input_grad_bf16.data_ptr<nv_bfloat16>(), weight_grad_bf16.data_ptr<nv_bfloat16>(),
+            bias_grad_bf16.data_ptr<nv_bfloat16>(), output_grad_bf16.data_ptr<nv_bfloat16>(),
+            input_bf16.data_ptr<nv_bfloat16>(), weight_bf16.data_ptr<nv_bfloat16>(), mean_bf16.data(),
+            rstd_bf16.data(), rows, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
     blocks = usual_forward_blocks;
     threads = LAYER_NORM_THREADS_PER_BLOCK;
     warm_up_gpu(forward);
 
     int block_counts[] = {40, 80, 128, 256, 512, 1024, 2048, 4096};
     int thread_counts[] = {64, 128, 256, 512};
-    const char *kernel_names[] = {"forward", "backward"};
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {0, 0}, fastest_threads[2] = {0, 0};
-    int launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads    warps   rows per warp   forward   backward   same result\n");
-    for (int block_count : block_counts)
+    const int launches = 8 * 4, rounds = 20;
+    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
+    float total_ms[launches][4] = {};
+    for (int round = 1; round <= rounds; round++)
     {
-        for (int thread_count : thread_counts)
+        for (int k = 0; k < launches; k++)
         {
-            blocks = block_count;
-            threads = thread_count;
-            float times[2];
-            times[0] = average_milliseconds(forward);
-            times[1] = average_milliseconds(backward);
-            for (int k = 0; k < 2; k++)
-            {
-                if (times[k] < fastest_ms[k])
-                {
-                    fastest_ms[k] = times[k];
-                    fastest_blocks[k] = blocks;
-                    fastest_threads[k] = threads;
-                }
-            }
-
-            // One forward and one backward from 0 with this launch, against the usual launches':
-            // output, mean, rstd and input_grad to the last bit, weight_grad and bias_grad within
-            // TOLERANCE (atomicAdd's order).
-            output.zero_();
-            mean.zero_();
-            rstd.zero_();
-            input_grad.zero_();
-            weight_grad.zero_();
-            bias_grad.zero_();
-            forward();
-            backward();
-            torch::Tensor weight_grad_difference =
-                (pytorch_copy_of(weight_grad) - usual_weight_grad).abs().max() / usual_weight_grad.abs().max();
-            torch::Tensor bias_grad_difference =
-                (pytorch_copy_of(bias_grad) - usual_bias_grad).abs().max() / usual_bias_grad.abs().max();
-            bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
-                        torch::equal(pytorch_copy_of(mean), usual_mean) &&
-                        torch::equal(pytorch_copy_of(rstd), usual_rstd) &&
-                        torch::equal(pytorch_copy_of(input_grad), usual_input_grad) &&
-                        weight_grad_difference.item<float>() <= TOLERANCE &&
-                        bias_grad_difference.item<float>() <= TOLERANCE;
-            if (same)
-                launches_with_the_same_result++;
-
-            int warps = blocks * threads / 32;
-            int rows_per_warp = (int)((rows + warps - 1) / warps);    // the most any warp takes
-            const char *usual = "";
-            if (blocks == usual_forward_blocks && threads == LAYER_NORM_THREADS_PER_BLOCK)
-                usual = "   <- what layer_norm_forward launches";
-            if (blocks == usual_backward_blocks && threads == LAYER_NORM_BACKWARD_THREADS_PER_BLOCK)
-                usual = "   <- what layer_norm_backward launches";
-            printf("                  %6d   %7d   %6d   %13d   %7.3f   %8.3f   %-11s%s\n", blocks, threads, warps,
-                   rows_per_warp, times[0], times[1], same ? "yes" : "NO", usual);
+            blocks = block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(forward);
+            total_ms[k][1] += gpu_milliseconds(backward);
+            total_ms[k][2] += gpu_milliseconds(forward_bf16);
+            total_ms[k][3] += gpu_milliseconds(backward_bf16);
         }
     }
-    for (int k = 0; k < 2; k++)
-        printf("    fastest %-8s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[k], fastest_blocks[k],
-               fastest_threads[k], fastest_ms[k]);
-    ASSERT_EQ(launches_with_the_same_result, 8 * 4);
+
+    // Tells the largest difference between a launch's gradient and the usual one, as a fraction of the
+    // usual one's largest value.
+    auto difference = [](const torch::Tensor &actual, const torch::Tensor &usual) {
+        return ((actual - usual).abs().max() / usual.abs().max()).item<float>();
+    };
+    const char *kernel_names[] = {"forward", "backward", "bf16 forward", "bf16 backward"};
+    float fastest_ms[4] = {1e9f, 1e9f, 1e9f, 1e9f};
+    int fastest_blocks[4] = {}, fastest_threads[4] = {};
+    int launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads    warps   rows per warp   forward   backward   bf16 forward   "
+           "bf16 backward   bf16 grad error   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[4];
+        for (int j = 0; j < 4; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+
+        // One forward and one backward from 0 with this launch in each dtype, against the usual launches':
+        // output, mean, rstd and input_grad to the last bit, weight_grad and bias_grad within TOLERANCE in
+        // float; in bfloat16 only their error from the float ones, printed.
+        for (const Tensor *tensor : {&output, &mean, &rstd, &input_grad, &weight_grad, &bias_grad, &output_bf16,
+                                     &mean_bf16, &rstd_bf16, &input_grad_bf16, &weight_grad_bf16, &bias_grad_bf16})
+            tensor->zero_();
+        forward();
+        backward();
+        forward_bf16();
+        backward_bf16();
+        bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
+                    torch::equal(pytorch_copy_of(mean), usual_mean) &&
+                    torch::equal(pytorch_copy_of(rstd), usual_rstd) &&
+                    torch::equal(pytorch_copy_of(input_grad), usual_input_grad) &&
+                    difference(pytorch_copy_of(weight_grad), usual_weight_grad) <= TOLERANCE &&
+                    difference(pytorch_copy_of(bias_grad), usual_bias_grad) <= TOLERANCE &&
+                    torch::equal(pytorch_copy_of(output_bf16.to(DType::Float32)), usual_output_bf16) &&
+                    torch::equal(pytorch_copy_of(mean_bf16), usual_mean_bf16) &&
+                    torch::equal(pytorch_copy_of(rstd_bf16), usual_rstd_bf16) &&
+                    torch::equal(pytorch_copy_of(input_grad_bf16.to(DType::Float32)), usual_input_grad_bf16);
+        if (same)
+            launches_with_the_same_result++;
+        float bf16_grad_error =
+            std::max(difference(pytorch_copy_of(weight_grad_bf16.to(DType::Float32)), usual_weight_grad),
+                     difference(pytorch_copy_of(bias_grad_bf16.to(DType::Float32)), usual_bias_grad));
+
+        int warps = blocks * threads / 32;
+        int rows_per_warp = (int)((rows + warps - 1) / warps);    // the most any warp takes
+        const char *usual = "";
+        if (blocks == usual_forward_blocks && threads == LAYER_NORM_THREADS_PER_BLOCK)
+            usual = "   <- what layer_norm_forward launches";
+        if (blocks == usual_backward_blocks && threads == LAYER_NORM_BACKWARD_THREADS_PER_BLOCK)
+            usual = "   <- what layer_norm_backward launches";
+        printf("                  %6d   %7d   %6d   %13d   %7.3f   %8.3f   %12.3f   %13.3f   %14.2f%%   %-11s%s\n",
+               blocks, threads, warps, rows_per_warp, times[0], times[1], times[2], times[3], 100 * bf16_grad_error,
+               same ? "yes" : "NO", usual);
+    }
+    for (int j = 0; j < 4; j++)
+        printf("    fastest %-13s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
+               fastest_threads[j], fastest_ms[j]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────

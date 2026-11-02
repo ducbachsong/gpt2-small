@@ -7,6 +7,7 @@
 // hand, and how the work is shared out between the blocks.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
+#include <torch/utils.h>              // torch::manual_seed, for part 3's random values made on the GPU
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
 #include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
 #include "../llmc/kernels/grad_norm.cuh"
@@ -418,6 +419,127 @@ static void changes_nothing_but_the_norm(void)
     ASSERT_EQ(buffer.tensor(after_index).tolist(), std::vector<float>(4, 7.0f));
 }
 
+// ══ part 3: other block and thread counts ═════════════════════════════════════
+
+/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
+/// run while its clock is still rising from idle.
+template <typename Run>
+static void warm_up_gpu(Run run)
+{
+    float total = 0.0f;
+    while (total < 1000.0f)
+        total += gpu_milliseconds(run);
+}
+
+static void time_the_kernel_with_other_block_and_thread_counts(void)
+{
+    // Prints the time of one norm on as many values as GPT-2 small has, 124,439,808 (31,109,952 float4s), in
+    // float and in bfloat16, for 8 block counts x 4 thread counts, each the average of 20 runs. The 32
+    // launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
+    // launch's 20 runs in a row would all land in the same stretch of the test, and a T4's clock can drift
+    // as it heats up (the first launch timed would get the fastest clock); taking turns gives every launch
+    // runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has already done the
+    // first-time work. The kernel is launched here directly, <<<blocks, threads>>>, with block sums for up
+    // to 4096 blocks, instead of through GradNorm::compute, which always launches GRAD_NORM_BLOCKS x
+    // GRAD_NORM_THREADS (512 x 1024). Each norm reads every value once: 498 MB in float, so at a T4's
+    // 320 GB/s at least 1.56 ms; 249 MB in bfloat16, at least 0.78 ms. A bfloat16 float4 is one 8-byte read
+    // instead of 16, so each thread keeps half the bytes in flight: its best launch may differ.
+    //
+    // Expect: every launch gives the usual norm of its dtype within TOLERANCE, not to the last bit: another
+    // launch gives each thread other values to add up, so the squares are added in another order (in float
+    // either way).
+    torch::manual_seed(0);
+    size_t n = 124439808;
+    Tensor grads = Tensor::empty({n});
+    torch::Tensor values = torch::randn({(int64_t)n}, torch::TensorOptions().device(torch::kCUDA));
+    cudaCheck(cudaMemcpy(grads.data(), values.data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToDevice));
+    Tensor grads_bf16 = grads.to(DType::BFloat16);
+    // Block sums for the largest launch, shared by both dtypes: the launches run one after the other, and
+    // each puts the counter back to 0.
+    Tensor block_sums = Tensor::zeros({4096}), blocks_done = Tensor::zeros({1});
+    Tensor grad_norm = Tensor::zeros({1}), grad_norm_bf16 = Tensor::zeros({1});
+
+    // The usual launch's norms, to compare each launch with.
+    Tensor usual_block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: block sums; row 1, value 0: blocks done
+    GradNorm(usual_block_sums).compute(grads, grad_norm);
+    GradNorm(usual_block_sums).compute(grads_bf16, grad_norm_bf16);
+    double usual_norm = grad_norm.item(), usual_norm_bf16 = grad_norm_bf16.item();
+
+    int blocks = 0, threads = 0; // the launch the 2 below use, set by the loop
+    auto norm = [&] {
+        compute_grad_norm_kernel<float><<<blocks, threads>>>(grad_norm.data(), block_sums.data(), blocks_done.data(),
+                                                             grads.data(), n);
+        cudaCheck(cudaGetLastError());
+    };
+    auto norm_bf16 = [&] {
+        compute_grad_norm_kernel<nv_bfloat16><<<blocks, threads>>>(grad_norm_bf16.data(), block_sums.data(),
+                                                                   blocks_done.data(),
+                                                                   grads_bf16.data_ptr<nv_bfloat16>(), n);
+        cudaCheck(cudaGetLastError());
+    };
+    blocks = GRAD_NORM_BLOCKS;
+    threads = GRAD_NORM_THREADS;
+    warm_up_gpu(norm);
+
+    int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096};
+    int thread_counts[] = {128, 256, 512, 1024};
+    const int launches = 8 * 4, rounds = 20;
+    float total_ms[launches][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] float, [1] bf16
+    for (int round = 1; round <= rounds; round++)
+    {
+        for (int k = 0; k < launches; k++)
+        {
+            blocks = block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(norm);
+            total_ms[k][1] += gpu_milliseconds(norm_bf16);
+        }
+    }
+
+    float fastest_ms[2] = {1e9f, 1e9f};
+    int fastest_blocks[2] = {}, fastest_threads[2] = {}, launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   float4s per thread    float    GB/s     bf16    GB/s   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[2];
+        for (int j = 0; j < 2; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+
+        // One norm with this launch in each dtype, against the usual launch's.
+        norm();
+        norm_bf16();
+        bool same = fabs(grad_norm.item() - usual_norm) <= TOLERANCE * usual_norm &&
+                    fabs(grad_norm_bf16.item() - usual_norm_bf16) <= TOLERANCE * usual_norm_bf16;
+        if (same)
+            launches_with_the_same_result++;
+
+        size_t threads_launched = (size_t)blocks * threads;
+        int float4s_per_thread = (int)((n / 4 + threads_launched - 1) / threads_launched); // the most
+        double float_gb_per_second = (double)n * sizeof(float) / times[0] / 1e6;
+        double bf16_gb_per_second = (double)n * sizeof(nv_bfloat16) / times[1] / 1e6;
+        const char *usual = blocks == GRAD_NORM_BLOCKS && threads == GRAD_NORM_THREADS
+                                ? "   <- what GradNorm::compute launches"
+                                : "";
+        printf("                  %6d   %7d   %18d   %6.3f   %5.0f   %6.3f   %5.0f   %-11s%s\n", blocks, threads,
+               float4s_per_thread, times[0], float_gb_per_second, times[1], bf16_gb_per_second, same ? "yes" : "NO",
+               usual);
+    }
+    printf("    fastest       %5d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0], fastest_ms[0]);
+    printf("    fastest bf16  %5d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1], fastest_ms[1]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -436,6 +558,8 @@ int main(void)
     the_same_values_give_the_same_norm_every_time();
     only_the_values_in_the_view_count();
     changes_nothing_but_the_norm();
+
+    time_the_kernel_with_other_block_and_thread_counts();
 
     printf("\nall tests passed\n");
     return 0;

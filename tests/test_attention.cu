@@ -520,8 +520,9 @@ static void every_kernel_fits_its_block(void)
     const char *names[] = {"attention_split_qkv_kernel", "attention_softmax_forward_kernel",
                            "attention_merge_heads_kernel", "attention_split_heads_kernel",
                            "attention_softmax_backward_kernel", "attention_merge_qkv_grad_kernel"};
-    int threads[] = {ATTENTION_THREADS_PER_BLOCK, ATTENTION_SOFTMAX_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK,
-                     ATTENTION_THREADS_PER_BLOCK, ATTENTION_SOFTMAX_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK};
+    int threads[] = {ATTENTION_THREADS_PER_BLOCK, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK,
+                     ATTENTION_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK,
+                     ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK};
     for (int k = 0; k < 6; k++)
     {
         cudaFuncAttributes attributes;
@@ -549,19 +550,24 @@ static void warm_up_gpu(Run run)
 static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the two softmax kernels on GPT-2 small's weights, {4, 12, 1024, 1024} (49,152 rows),
-    // for 7 block counts x 4 thread counts, each the average of 20 runs. The 28 launches take turns: 20
-    // rounds, each timing every launch once (the forward, then the backward). One launch's 20 runs in a row
-    // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
-    // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
-    // late alike. Run 1 is counted too: warm_up_gpu has already done the first-time work. They are launched
-    // here directly, <<<blocks, threads>>>, instead of through attention_forward and attention_backward, which
-    // always launch ATTENTION_SOFTMAX_BLOCKS x ATTENTION_SOFTMAX_THREADS_PER_BLOCK (80 x 128): 320 warps, 154
-    // rows each. 6144 x 256 is one warp per row, what they launched before this sweep picked 80 x 128. The two cuBLAS products around them
-    // are cuBLAS's to launch, and the four kernels that move values are the same kind as gelu.cuh's.
+    // in float and in bfloat16, for 7 block counts x 4 thread counts, each the average of 20 runs. The 28
+    // launches take turns: 20 rounds, each timing every launch once (the forward and the backward in float,
+    // then both in bfloat16). One launch's 20 runs in a row would all land in the same stretch of the test,
+    // and a T4's clock can drift as it heats up (the first launch timed would get the fastest clock); taking
+    // turns gives every launch runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has
+    // already done the first-time work. They are launched here directly, <<<blocks, threads>>>, instead of
+    // through attention_forward and attention_backward. Their launches are the fastest in bfloat16, the dtype
+    // training runs in: the forward one warp per row, 6144 x ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK
+    // (256); the backward ATTENTION_SOFTMAX_BACKWARD_BLOCKS x ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK
+    // (80 x 128): 320 warps, 154 rows each. The two cuBLAS products around them are
+    // cuBLAS's to launch, and the four kernels that move values are the same kind as gelu.cuh's. A bfloat16
+    // row is 2 KB instead of 4 KB, so twice as many warps' rows fit in the T4's 4 MB L2: its best launch
+    // may differ.
     //
     // Both kernels work in place, so the timed runs change the values; before each check of the result,
     // the scores (or da) are copied back from a kept copy. Expect: every launch gives the same weights and
-    // ds as the usual ones, to the last bit: each row is worked out by one warp, the same way whichever.
+    // ds as the usual ones of its dtype, to the last bit: each row is worked out by one warp, the same way
+    // whichever.
     torch::manual_seed(0);
     AttentionTensors tensors(4, 12, 1024, 64);
     tensors.qkv = random_tensor_on_gpu(tensors.qkv.shape());
@@ -581,9 +587,21 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
                                                    64, 1024 * 64, &zero, weights_grad_before.data(), 1024, 1024 * 1024,
                                                    48));
     torch::Tensor usual_weights = pytorch_copy_of(tensors.weights), usual_scores_grad = pytorch_copy_of(tensors.weights_grad);
-    int one_warp_per_row_blocks = attention_blocks(rows, 256, 32);    // 6144
+    int one_warp_per_row_blocks = attention_blocks(rows, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK, 32);  // 6144
 
-    int blocks = 0, threads = 0;                             // the launch the 2 below use, set by the loop
+    // The same scores and da in bfloat16, and the usual launches' bfloat16 weights and ds from them.
+    Tensor scores_bf16 = scores.to(DType::BFloat16), weights_grad_before_bf16 = weights_grad_before.to(DType::BFloat16);
+    Tensor weights_bf16 = scores_bf16.clone(), weights_grad_bf16 = weights_grad_before_bf16.clone();
+    attention_softmax_forward_kernel<nv_bfloat16><<<one_warp_per_row_blocks, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK>>>(
+        weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
+    attention_softmax_backward_kernel<nv_bfloat16>
+        <<<ATTENTION_SOFTMAX_BACKWARD_BLOCKS, ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK>>>(
+            weights_grad_bf16.data_ptr<nv_bfloat16>(), weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
+    cudaCheck(cudaGetLastError());
+    torch::Tensor usual_weights_bf16 = pytorch_copy_of(weights_bf16);
+    torch::Tensor usual_scores_grad_bf16 = pytorch_copy_of(weights_grad_bf16);
+
+    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loop
     auto forward = [&] {
         attention_softmax_forward_kernel<float><<<blocks, threads>>>(tensors.weights.data(), rows, seq_len);
         cudaCheck(cudaGetLastError());
@@ -593,14 +611,25 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
                                                                       tensors.weights.data(), rows, seq_len);
         cudaCheck(cudaGetLastError());
     };
-    blocks = ATTENTION_SOFTMAX_BLOCKS;
-    threads = ATTENTION_SOFTMAX_THREADS_PER_BLOCK;
-    warm_up_gpu(backward);
+    auto forward_bf16 = [&] {
+        attention_softmax_forward_kernel<nv_bfloat16><<<blocks, threads>>>(weights_bf16.data_ptr<nv_bfloat16>(), rows,
+                                                                           seq_len);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_bf16 = [&] {
+        attention_softmax_backward_kernel<nv_bfloat16><<<blocks, threads>>>(
+            weights_grad_bf16.data_ptr<nv_bfloat16>(), weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
+        cudaCheck(cudaGetLastError());
+    };
+    blocks = ATTENTION_SOFTMAX_BACKWARD_BLOCKS;
+    threads = ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK;
+    warm_up_gpu(backward_bf16);
 
     int block_counts[] = {40, 80, 160, 320, 640, 1280, one_warp_per_row_blocks};
     int thread_counts[] = {128, 256, 512, 1024};
     const int launches = 7 * 4, rounds = 20;
-    float total_ms[launches][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] forward, [1] backward
+    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
+    float total_ms[launches][4] = {};
     for (int round = 1; round <= rounds; round++)
     {
         for (int k = 0; k < launches; k++)
@@ -609,23 +638,27 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
             threads = thread_counts[k % 4];
             total_ms[k][0] += gpu_milliseconds(forward);
             total_ms[k][1] += gpu_milliseconds(backward);
+            total_ms[k][2] += gpu_milliseconds(forward_bf16);
+            total_ms[k][3] += gpu_milliseconds(backward_bf16);
         }
     }
 
-    const char *kernel_names[] = {"forward", "backward"};
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {0, 0}, fastest_threads[2] = {0, 0};
+    const char *kernel_names[] = {"forward", "backward", "bf16 forward", "bf16 backward"};
+    float fastest_ms[4] = {1e9f, 1e9f, 1e9f, 1e9f};
+    int fastest_blocks[4] = {}, fastest_threads[4] = {};
     int launches_with_the_same_result = 0;
     size_t weights_bytes = tensors.weights.numel() * sizeof(float);
     print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   rows per warp   forward   backward   same result\n");
+    printf("    time in ms:   blocks   threads   rows per warp   forward   backward   bf16 forward   bf16 backward   "
+           "same result\n");
     for (int k = 0; k < launches; k++)
     {
         blocks = block_counts[k / 4];
         threads = thread_counts[k % 4];
-        float times[2] = {total_ms[k][0] / rounds, total_ms[k][1] / rounds};
-        for (int j = 0; j < 2; j++)
+        float times[4];
+        for (int j = 0; j < 4; j++)
         {
+            times[j] = total_ms[k][j] / rounds;
             if (times[j] < fastest_ms[j])
             {
                 fastest_ms[j] = times[j];
@@ -634,29 +667,37 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
             }
         }
 
-        // One forward from the scores and one backward from da with this launch, against the usual.
+        // One forward from the scores and one backward from da with this launch in each dtype, against the
+        // usual.
         cudaCheck(cudaMemcpy(tensors.weights.data(), scores.data(), weights_bytes, cudaMemcpyDeviceToDevice));
         forward();
         cudaCheck(cudaMemcpy(tensors.weights_grad.data(), weights_grad_before.data(), weights_bytes,
                              cudaMemcpyDeviceToDevice));
         backward();
+        weights_bf16.copy_(scores_bf16);
+        forward_bf16();
+        weights_grad_bf16.copy_(weights_grad_before_bf16);
+        backward_bf16();
         bool same = torch::equal(pytorch_copy_of(tensors.weights), usual_weights) &&
-                    torch::equal(pytorch_copy_of(tensors.weights_grad), usual_scores_grad);
+                    torch::equal(pytorch_copy_of(tensors.weights_grad), usual_scores_grad) &&
+                    torch::equal(pytorch_copy_of(weights_bf16), usual_weights_bf16) &&
+                    torch::equal(pytorch_copy_of(weights_grad_bf16), usual_scores_grad_bf16);
         if (same)
             launches_with_the_same_result++;
 
         size_t warps_launched = (size_t)blocks * threads / 32;
         int rows_per_warp = (int)((rows + warps_launched - 1) / warps_launched);   // the most
-        const char *usual = blocks == ATTENTION_SOFTMAX_BLOCKS && threads == ATTENTION_SOFTMAX_THREADS_PER_BLOCK
-                                ? "   <- what attention_forward and attention_backward launch"
-                            : blocks == one_warp_per_row_blocks && threads == 256
-                                ? "   <- one warp per row, what they launched before"
-                                : "";
-        printf("                  %6d   %7d   %13d   %7.3f   %8.3f   %-11s%s\n", blocks, threads, rows_per_warp,
-               times[0], times[1], same ? "yes" : "NO", usual);
+        const char *usual =
+            blocks == ATTENTION_SOFTMAX_BACKWARD_BLOCKS && threads == ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK
+                ? "   <- what attention_backward launches"
+            : blocks == one_warp_per_row_blocks && threads == ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK
+                ? "   <- what attention_forward launches: one warp per row"
+                : "";
+        printf("                  %6d   %7d   %13d   %7.3f   %8.3f   %12.3f   %13.3f   %-11s%s\n", blocks, threads,
+               rows_per_warp, times[0], times[1], times[2], times[3], same ? "yes" : "NO", usual);
     }
-    for (int j = 0; j < 2; j++)
-        printf("    fastest %-8s  %5d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
+    for (int j = 0; j < 4; j++)
+        printf("    fastest %-13s  %5d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
                fastest_threads[j], fastest_ms[j]);
     ASSERT_EQ(launches_with_the_same_result, launches);
 }

@@ -447,15 +447,23 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of each of the 3 kernels on GPT-2 small's sizes (batch_size = 4, seq_len =
-    // 1024) for 8 block counts x 4 thread counts, each the average of runs 2..20. The kernels are
-    // launched here directly, <<<blocks, threads>>>, instead of through encoder_forward and
-    // encoder_backward, which always launch ENCODER_BLOCKS x ENCODER_THREADS (512 x 1024).
+    // 1024), in float and in bfloat16, for 8 block counts x 4 thread counts, each the average of 20 runs.
+    // The 32 launches take turns: 20 rounds, each timing every launch once (the forward and the two
+    // backwards in float, then the three in bfloat16). One launch's 20 runs in a row would all land in the
+    // same stretch of the test, and a T4's clock can drift as it heats up (the first launch timed would get
+    // the fastest clock); taking turns gives every launch runs from early, middle and late alike. Run 1 is
+    // counted too: warm_up_gpu has already done the first-time work. The kernels are launched here
+    // directly, <<<blocks, threads>>>, instead of through encoder_forward and encoder_backward, which
+    // launch ENCODER_BLOCKS x ENCODER_FORWARD_THREADS (512 x 128) and ENCODER_BLOCKS x ENCODER_THREADS
+    // (512 x 1024). A bfloat16 float4 is one 8-byte read instead of 16, so each thread keeps half the bytes
+    // in flight: its best launch may differ.
     //
-    // Expect: every launch gives the same result as 512 x 1024 (the grid-stride loop covers
-    // every value whatever the count), so only the time changes. A T4 runs at most 40 SMs x 1024
-    // = 40,960 threads at once: with fewer, too few warps are left to run while the others wait
-    // on memory, so the time should go up; with more, the extra blocks wait their turn and the
-    // time should stay about the same.
+    // Expect: every launch gives the same result as the usual ones of its dtype (the grid-stride loop covers
+    // every value whatever the count): encoded and wpe_grad to the last bit, wte_grad within TOLERANCE in
+    // float and BFLOAT16_TOLERANCE in bfloat16 (atomicAdd's order; in bfloat16 each add onto a repeated
+    // token's row is rounded to 8 bits). Only the time changes. A T4 runs at most 40 SMs x 1024 = 40,960
+    // threads at once: with fewer, too few warps are left to run while the others wait on memory, so the
+    // time should go up; with more, the extra blocks wait their turn and the time should stay about the same.
     Tensor::manual_seed(0);
     size_t batch_size = 4, seq_len = 1024, vocab_size = 50304, embed_dim = 768;
     Tensor wte = Tensor::randn({vocab_size, embed_dim});              // made on the CPU: a few seconds
@@ -465,14 +473,25 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     Tensor encoded_grad = Tensor::randn({batch_size, seq_len, embed_dim});
     Tensor encoded = Tensor::zeros({batch_size, seq_len, embed_dim});
     Tensor wte_grad = Tensor::zeros({vocab_size, embed_dim}), wpe_grad = Tensor::zeros({seq_len, embed_dim});
+    // The same values in bfloat16, with results of their own.
+    Tensor wte_bf16 = wte.to(DType::BFloat16), wpe_bf16 = wpe.to(DType::BFloat16);
+    Tensor encoded_grad_bf16 = encoded_grad.to(DType::BFloat16);
+    Tensor encoded_bf16 = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
+    Tensor wte_grad_bf16 = Tensor::zeros({vocab_size, embed_dim}, DType::BFloat16);
+    Tensor wpe_grad_bf16 = Tensor::zeros({seq_len, embed_dim}, DType::BFloat16);
 
     // The usual launch's results, kept on the GPU as PyTorch tensors to compare each launch with.
     encoder_forward(encoded, token_ids, wte, wpe);
     encoder_backward(wte_grad, wpe_grad, encoded_grad, token_ids);
+    encoder_forward(encoded_bf16, token_ids, wte_bf16, wpe_bf16);
+    encoder_backward(wte_grad_bf16, wpe_grad_bf16, encoded_grad_bf16, token_ids);
     torch::Tensor usual_encoded = pytorch_copy_of(encoded);
     torch::Tensor usual_wte_grad = pytorch_copy_of(wte_grad), usual_wpe_grad = pytorch_copy_of(wpe_grad);
+    torch::Tensor usual_encoded_bf16 = pytorch_copy_of(encoded_bf16.to(DType::Float32));
+    torch::Tensor usual_wte_grad_bf16 = pytorch_copy_of(wte_grad_bf16.to(DType::Float32));
+    torch::Tensor usual_wpe_grad_bf16 = pytorch_copy_of(wpe_grad_bf16.to(DType::Float32));
 
-    int blocks = 0, threads = 0; // the launch the 3 below use, set by the loop
+    int blocks = 0, threads = 0; // the launch the 6 below use, set by the loop
     auto forward = [&] {
         encoder_forward_kernel<float><<<blocks, threads>>>(encoded.data(), token_ids.data_ptr<int>(), wte.data(),
                                                            wpe.data(), batch_size, seq_len, embed_dim);
@@ -489,64 +508,110 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                                                                 seq_len, embed_dim);
         cudaCheck(cudaGetLastError());
     };
+    auto forward_bf16 = [&] {
+        encoder_forward_kernel<nv_bfloat16><<<blocks, threads>>>(
+            encoded_bf16.data_ptr<nv_bfloat16>(), token_ids.data_ptr<int>(), wte_bf16.data_ptr<nv_bfloat16>(),
+            wpe_bf16.data_ptr<nv_bfloat16>(), batch_size, seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_wte_bf16 = [&] {
+        encoder_backward_wte_kernel<nv_bfloat16><<<blocks, threads>>>(
+            wte_grad_bf16.data_ptr<nv_bfloat16>(), encoded_grad_bf16.data_ptr<nv_bfloat16>(), token_ids.data_ptr<int>(),
+            batch_size, seq_len, embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
+    auto backward_wpe_bf16 = [&] {
+        encoder_backward_wpe_kernel<nv_bfloat16><<<blocks, threads>>>(
+            wpe_grad_bf16.data_ptr<nv_bfloat16>(), encoded_grad_bf16.data_ptr<nv_bfloat16>(), batch_size, seq_len,
+            embed_dim);
+        cudaCheck(cudaGetLastError());
+    };
     blocks = ENCODER_BLOCKS;
     threads = ENCODER_THREADS;
     warm_up_gpu(forward);
 
     int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096};
     int thread_counts[] = {128, 256, 512, 1024};
-    const char *kernel_names[] = {"forward", "wte backward", "wpe backward"};
-    float fastest_ms[3] = {1e9f, 1e9f, 1e9f};
-    int fastest_blocks[3] = {0, 0, 0}, fastest_threads[3] = {0, 0, 0};
-    int launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   all threads   forward   wte backward   wpe backward   same result\n");
-    for (int block_count : block_counts)
+    const int launches = 8 * 4, rounds = 20;
+    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
+    float total_ms[launches][6] = {};
+    for (int round = 1; round <= rounds; round++)
     {
-        for (int thread_count : thread_counts)
+        for (int k = 0; k < launches; k++)
         {
-            blocks = block_count;
-            threads = thread_count;
-            float times[3];
-            times[0] = average_milliseconds(forward);
-            times[1] = average_milliseconds(backward_wte);
-            times[2] = average_milliseconds(backward_wpe);
-            for (int k = 0; k < 3; k++)
-            {
-                if (times[k] < fastest_ms[k])
-                {
-                    fastest_ms[k] = times[k];
-                    fastest_blocks[k] = blocks;
-                    fastest_threads[k] = threads;
-                }
-            }
-
-            // One forward and one backward from 0 with this launch, against the usual launch's:
-            // encoded and wpe_grad to the last bit, wte_grad within TOLERANCE (atomicAdd's order).
-            encoded.zero_();
-            wte_grad.zero_();
-            wpe_grad.zero_();
-            forward();
-            backward_wte();
-            backward_wpe();
-            torch::Tensor wte_grad_difference =
-                (pytorch_copy_of(wte_grad) - usual_wte_grad).abs().max() / usual_wte_grad.abs().max();
-            bool same = torch::equal(pytorch_copy_of(encoded), usual_encoded) &&
-                        torch::equal(pytorch_copy_of(wpe_grad), usual_wpe_grad) &&
-                        wte_grad_difference.item<float>() <= TOLERANCE;
-            if (same)
-                launches_with_the_same_result++;
-
-            bool usual = blocks == ENCODER_BLOCKS && threads == ENCODER_THREADS;
-            printf("                %6d   %7d   %11d   %7.3f   %12.3f   %12.3f   %-11s%s\n", blocks, threads,
-                   blocks * threads, times[0], times[1], times[2], same ? "yes" : "NO",
-                   usual ? "   <- what encoder.cuh launches" : "");
+            blocks = block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k][0] += gpu_milliseconds(forward);
+            total_ms[k][1] += gpu_milliseconds(backward_wte);
+            total_ms[k][2] += gpu_milliseconds(backward_wpe);
+            total_ms[k][3] += gpu_milliseconds(forward_bf16);
+            total_ms[k][4] += gpu_milliseconds(backward_wte_bf16);
+            total_ms[k][5] += gpu_milliseconds(backward_wpe_bf16);
         }
     }
-    for (int k = 0; k < 3; k++)
-        printf("    fastest %-12s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[k], fastest_blocks[k],
-               fastest_threads[k], fastest_ms[k]);
-    ASSERT_EQ(launches_with_the_same_result, 8 * 4);
+
+    // Tells the largest difference between a launch's wte_grad and the usual one, as a fraction of the
+    // usual one's largest value.
+    auto difference = [](const torch::Tensor &actual, const torch::Tensor &usual) {
+        return ((actual - usual).abs().max() / usual.abs().max()).item<float>();
+    };
+    const char *kernel_names[] = {"forward", "wte backward", "wpe backward", "bf16 forward", "bf16 wte backward",
+                                  "bf16 wpe backward"};
+    float fastest_ms[6] = {1e9f, 1e9f, 1e9f, 1e9f, 1e9f, 1e9f};
+    int fastest_blocks[6] = {}, fastest_threads[6] = {};
+    int launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   all threads   forward   wte backward   wpe backward   "
+           "bf16 forward   bf16 wte backward   bf16 wpe backward   same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float times[6];
+        for (int j = 0; j < 6; j++)
+        {
+            times[j] = total_ms[k][j] / rounds;
+            if (times[j] < fastest_ms[j])
+            {
+                fastest_ms[j] = times[j];
+                fastest_blocks[j] = blocks;
+                fastest_threads[j] = threads;
+            }
+        }
+
+        // One forward and one backward from 0 with this launch in each dtype, against the usual launch's:
+        // encoded and wpe_grad to the last bit, wte_grad within TOLERANCE (BFLOAT16_TOLERANCE in bfloat16).
+        for (const Tensor *tensor : {&encoded, &wte_grad, &wpe_grad, &encoded_bf16, &wte_grad_bf16, &wpe_grad_bf16})
+            tensor->zero_();
+        forward();
+        backward_wte();
+        backward_wpe();
+        forward_bf16();
+        backward_wte_bf16();
+        backward_wpe_bf16();
+        bool same = torch::equal(pytorch_copy_of(encoded), usual_encoded) &&
+                    torch::equal(pytorch_copy_of(wpe_grad), usual_wpe_grad) &&
+                    difference(pytorch_copy_of(wte_grad), usual_wte_grad) <= TOLERANCE &&
+                    torch::equal(pytorch_copy_of(encoded_bf16.to(DType::Float32)), usual_encoded_bf16) &&
+                    torch::equal(pytorch_copy_of(wpe_grad_bf16.to(DType::Float32)), usual_wpe_grad_bf16) &&
+                    difference(pytorch_copy_of(wte_grad_bf16.to(DType::Float32)), usual_wte_grad_bf16) <=
+                        BFLOAT16_TOLERANCE;
+        if (same)
+            launches_with_the_same_result++;
+
+        const char *usual = blocks == ENCODER_BLOCKS && threads == ENCODER_FORWARD_THREADS
+                                ? "   <- what encoder_forward launches"
+                            : blocks == ENCODER_BLOCKS && threads == ENCODER_THREADS
+                                ? "   <- what encoder_backward launches"
+                                : "";
+        printf("                %6d   %7d   %11d   %7.3f   %12.3f   %12.3f   %12.3f   %17.3f   %17.3f   %-11s%s\n",
+               blocks, threads, blocks * threads, times[0], times[1], times[2], times[3], times[4], times[5],
+               same ? "yes" : "NO", usual);
+    }
+    for (int j = 0; j < 6; j++)
+        printf("    fastest %-17s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
+               fastest_threads[j], fastest_ms[j]);
+    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ══ part 5: experiments on what part 4 found ══════════════════════════════════
