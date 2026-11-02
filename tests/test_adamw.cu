@@ -32,6 +32,17 @@ static std::vector<float> random_values(const Shape &shape, float scale = 1.0f)
     return numbers;
 }
 
+/// Makes a tensor of `shape` with random values, mean 0 and standard deviation `scale`, made by PyTorch
+/// on the GPU: Tensor::randn makes them on the CPU, which takes minutes for GPT-2 small's 124M values.
+static Tensor random_tensor_on_gpu(const Shape &shape, float scale)
+{
+    Tensor tensor = Tensor::empty(shape);
+    torch::Tensor values = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA)) * scale;
+    cudaCheck(cudaMemcpy(tensor.data(), values.data_ptr<float>(), tensor.numel() * sizeof(float),
+                         cudaMemcpyDeviceToDevice));
+    return tensor;
+}
+
 /// Gives every value of my AdamW's parameters, one tensor after the other, to compare
 static std::vector<float> all_my_adamw_values(const AdamW &my_adamw)
 {
@@ -97,6 +108,15 @@ static std::vector<float> values_of(const torch::Tensor &tensor)
 {
     torch::Tensor flat = tensor.detach().to(torch::kCPU).reshape(-1).contiguous();
     return std::vector<float>(flat.data_ptr<float>(), flat.data_ptr<float>() + flat.numel());
+}
+
+/// Makes a PyTorch copy of a float tensor of mine, on the GPU: to keep a result and compare a later one
+/// with it there, without moving 124M values to the CPU.
+static torch::Tensor pytorch_copy_of(const Tensor &tensor)
+{
+    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
+    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
 }
 
 /// Gives every value of these PyTorch tensors, one tensor after the other.
@@ -576,16 +596,6 @@ static void time_20_updates_on_gpt2_small_size(void)
     time_20_updates(__func__, {{162030, 768}, {768}});
 }
 
-static void time_20_updates_on_csharp_benchmark_size(void)
-{
-    // Prints the times on as many values as the C# branch's AdamW benchmark had (GPT-2's
-    // 148 tensors, 128 wide): 69,917 x 128 + 128 = 8,949,376 + 128 = 8,949,504. Each update
-    // moves 7 x 8,949,504 x 4 bytes = 251 MB: at a T4's 320 GB/s, at least 0.78 ms. The C#
-    // numbers to compare, on a T4: PyTorch fused 1.95 ms, the C# flat-buffer AdamW 3.64 ms
-    // (timed on the CPU's clock, with 148 tensors instead of 2).
-    time_20_updates(__func__, {{69917, 128}, {128}});
-}
-
 // ══ part 2: rules worked out by hand ══════════════════════════════════════════
 // My AdamW starts with every value 0, gradients too: a test that wants 0 gradients leaves
 // them as they are.
@@ -740,7 +750,7 @@ static void bfloat16_params_and_grads_match_pytorch(void)
 
 static void nothing_past_a_tensors_end_changes(void)
 {
-    // Expect: (new) a launch covers 256 threads x 4 values, far more than a tensor of 8.
+    // Expect: (new) a launch covers 40 x 128 threads x 4 values, far more than a tensor of 8.
     // adamw_update on tensor 0 of two 8-value tensors side by side leaves tensor 1's p, m
     // and v as they were: p {10..17}, m and v all 0.
     AdamWConfig config;
@@ -810,6 +820,123 @@ static void adamw_counts_the_matrices_and_the_steps(void)
     ASSERT_EQ(my_adamw.steps_taken(), 2);
 }
 
+// ══ part 3: other block and thread counts ═════════════════════════════════════
+
+/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
+/// run while its clock is still rising from idle.
+template <typename Run>
+static void warm_up_gpu(Run run)
+{
+    float total = 0.0f;
+    while (total < 1000.0f)
+        total += gpu_milliseconds(run);
+}
+
+static void time_the_kernel_with_other_block_and_thread_counts(void)
+{
+    // Prints the time of one update on as many values as GPT-2 small has, 124,439,808 (the matrices'
+    // 124,439,040 decayed, then 768), for 7 block counts x 4 thread counts, each the average of 20
+    // runs. The 28 launches take turns: 20 rounds, each timing every launch once. One launch's 20 runs
+    // in a row would all land in the same stretch of the test, and a T4's clock can drift as it heats up
+    // (the first launch timed would get the fastest clock); taking turns gives every launch runs from
+    // early, middle and late alike. The kernel is launched here directly, <<<blocks, threads>>>, instead of through
+    // adamw_update, which always launches ADAMW_BLOCKS x ADAMW_THREADS_PER_BLOCK (40 x 128): 6077 of the
+    // 31,109,952 float4s per thread. 121,524 x 256 is one float4 per thread, what adamw_update launched
+    // before this sweep picked 40 x 128. Each update moves 7 x 124,439,808 x 4 bytes = 3.5 GB:
+    // at a T4's 320 GB/s, at least 10.9 ms, whatever the launch. A T4 runs at most 1024 threads per SM,
+    // 40,960 in all.
+    //
+    // Each run changes p, m and v, so before each check of the result they are put back: p from a kept
+    // copy, m and v to 0. Expect: every launch gives the same p, m and v as the usual one, to the last
+    // bit: each value is worked out alone, from the same numbers.
+    torch::manual_seed(0);
+    AdamWConfig config;
+    config.max_norm = 1.0;
+    size_t n = 124439808, decayed_count = 124439040;
+    Tensor params = random_tensor_on_gpu({n}, 0.02f), grads = random_tensor_on_gpu({n}, 1.0f);
+    Tensor start_params = Tensor::empty({n});
+    cudaCheck(cudaMemcpy(start_params.data(), params.data(), n * sizeof(float), cudaMemcpyDeviceToDevice));
+    Tensor m = Tensor::zeros({n}), v = Tensor::zeros({n}), grad_norm = Tensor::empty({1});
+    float norm = pytorch_copy_of(grads).norm().item<float>(); // about sqrt(124M) = 11,155: clipped
+    grad_norm.copy_from_cpu(&norm);
+
+    // Step t = 1's numbers, worked out as adamw_update does.
+    int t = 1;
+    float step_size = config.learning_rate / (1.0f - powf(config.beta1, (float)t));
+    float inverse_sqrt_bias_correction2 = 1.0f / sqrtf(1.0f - powf(config.beta2, (float)t));
+    float weight_decay_factor = 1.0f - config.learning_rate * config.weight_decay;
+
+    // The usual launch's results, kept on the GPU as PyTorch tensors to compare each launch with.
+    adamw_update(params.data(), grads.data(), m.data(), v.data(), n, decayed_count, grad_norm.data(), config.max_norm,
+                 config.learning_rate, config.beta1, config.beta2, config.eps, config.weight_decay, t);
+    torch::Tensor usual_params = pytorch_copy_of(params), usual_m = pytorch_copy_of(m), usual_v = pytorch_copy_of(v);
+    int one_float4_per_thread_blocks = (int)CEIL_DIV(n / 4, 256); // 121,524
+
+    int blocks = 0, threads = 0; // the launch the update below uses, set by the loop
+    auto update = [&] {
+        adamw_kernel<float><<<blocks, threads>>>(params.data(), grads.data(), m.data(), v.data(), n, decayed_count,
+                                                 grad_norm.data(), config.max_norm, weight_decay_factor, config.beta1,
+                                                 config.beta2, config.eps, step_size, inverse_sqrt_bias_correction2);
+        cudaCheck(cudaGetLastError());
+    };
+    blocks = ADAMW_BLOCKS;
+    threads = ADAMW_THREADS_PER_BLOCK;
+    warm_up_gpu(update);
+
+    int block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks};
+    int thread_counts[] = {128, 256, 512, 1024};
+    const int launches = 7 * 4, rounds = 20;
+    float total_ms[launches] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]
+    for (int round = 1; round <= rounds; round++)
+    {
+        for (int k = 0; k < launches; k++)
+        {
+            blocks = block_counts[k / 4];
+            threads = thread_counts[k % 4];
+            total_ms[k] += gpu_milliseconds(update);
+        }
+    }
+
+    float fastest_ms = 1e9f;
+    int fastest_blocks = 0, fastest_threads = 0, launches_with_the_same_result = 0;
+    print_test_name(__func__);
+    printf("    time in ms:   blocks   threads   float4s per thread   time     same result\n");
+    for (int k = 0; k < launches; k++)
+    {
+        blocks = block_counts[k / 4];
+        threads = thread_counts[k % 4];
+        float milliseconds = total_ms[k] / rounds;
+        if (milliseconds < fastest_ms)
+        {
+            fastest_ms = milliseconds;
+            fastest_blocks = blocks;
+            fastest_threads = threads;
+        }
+
+        // One update from the start with this launch, against the usual launch's.
+        cudaCheck(cudaMemcpy(params.data(), start_params.data(), n * sizeof(float), cudaMemcpyDeviceToDevice));
+        m.zero_();
+        v.zero_();
+        update();
+        bool same = torch::equal(pytorch_copy_of(params), usual_params) &&
+                    torch::equal(pytorch_copy_of(m), usual_m) && torch::equal(pytorch_copy_of(v), usual_v);
+        if (same)
+            launches_with_the_same_result++;
+
+        size_t threads_launched = (size_t)blocks * threads;
+        int float4s_per_thread = (int)((n / 4 + threads_launched - 1) / threads_launched); // the most
+        const char *usual = blocks == ADAMW_BLOCKS && threads == ADAMW_THREADS_PER_BLOCK
+                                ? "   <- what adamw_update launches"
+                            : blocks == one_float4_per_thread_blocks && threads == 256
+                                ? "   <- one float4 per thread, what it launched before"
+                                : "";
+        printf("                  %6d   %7d   %18d   %6.3f   %-11s%s\n", blocks, threads, float4s_per_thread,
+               milliseconds, same ? "yes" : "NO", usual);
+    }
+    printf("    fastest  %6d blocks x %4d threads: %.3f ms\n", fastest_blocks, fastest_threads, fastest_ms);
+    ASSERT_EQ(launches_with_the_same_result, launches);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -824,7 +951,6 @@ int main(void)
     max_norm_0_turns_clipping_off();
     whole_model_matches_pytorch_with_clipping();
     time_20_updates_on_gpt2_small_size();
-    time_20_updates_on_csharp_benchmark_size();
 
     first_step_moves_each_value_by_about_the_learning_rate();
     weight_decay_shrinks_matrices_but_not_biases();
@@ -835,6 +961,8 @@ int main(void)
     nothing_past_a_tensors_end_changes();
     step_leaves_the_gradients_as_they_are();
     adamw_counts_the_matrices_and_the_steps();
+
+    time_the_kernel_with_other_block_and_thread_counts();
 
     printf("\nall tests passed\n");
     return 0;
