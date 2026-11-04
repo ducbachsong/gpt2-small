@@ -750,7 +750,7 @@ static void bfloat16_params_and_grads_match_pytorch(void)
 
 static void nothing_past_a_tensors_end_changes(void)
 {
-    // Expect: (new) a launch covers 40 x 128 threads x 4 values, far more than a tensor of 8.
+    // Expect: (new) a launch covers at least one block of 256 threads x 4 values, far more than a tensor of 8.
     // adamw_update on tensor 0 of two 8-value tensors side by side leaves tensor 1's p, m
     // and v as they were: p {10..17}, m and v all 0.
     AdamWConfig config;
@@ -820,6 +820,176 @@ static void adamw_counts_the_matrices_and_the_steps(void)
     ASSERT_EQ(my_adamw.steps_taken(), 2);
 }
 
+static void set_learning_rate_is_used_from_the_next_step(void)
+{
+    // Expect: (new) 4 values of 1, gradient 1 every step, no weight decay. With the same gradient every step
+    // m̂ = 1 and v̂ = 1, so each step moves each value by exactly its learning rate: 1 - 0.05 = 0.95 after step
+    // 1 at lr 0.05; then set_learning_rate(0.01), and step 2 moves it by 0.01: 0.94.
+    AdamWConfig config;
+    config.learning_rate = 0.05f;
+    config.weight_decay = 0.0f;
+    AdamW my_adamw({{4}}, config);
+    my_adamw.param(0).fill_(1);
+    my_adamw.grad(0).fill_(1);
+    ASSERT_EQ(my_adamw.learning_rate(), 0.05f);
+    my_adamw.step();
+    ASSERT_NEAR(my_adamw.param(0).tolist(), std::vector<float>(4, 0.95f), 1e-6);
+    my_adamw.set_learning_rate(0.01f);
+    ASSERT_EQ(my_adamw.learning_rate(), 0.01f);
+    my_adamw.step();
+    ASSERT_NEAR(my_adamw.param(0).tolist(), std::vector<float>(4, 0.94f), 1e-6);
+}
+
+static void bfloat16_adamw_keeps_a_float_master(void)
+{
+    // Expect: (new) adamw_counts_the_matrices_and_the_steps's params, for a bfloat16 model. The model's params
+    // and grads are bfloat16, in a buffer of their own: grad 0 starts right after the 24 params (48 bytes).
+    // The float buffer has 4 groups, the master params, m, v and grad_norm: 3 x 24 + 1 = 73 values; the
+    // master on 16 bytes, as the kernel's float4 loads need. decayed_count is still 12. After filling param 0
+    // with 0 .. 7 (each exact in bfloat16), copy_params_to_master gives master_param 0 the same values.
+    AdamWConfig config;
+    AdamW my_adamw({{2, 4}, {1, 4}, {8}, {4}}, config, DType::BFloat16);
+    ASSERT_EQ(my_adamw.dtype() == DType::BFloat16, true);
+    ASSERT_EQ(my_adamw.param(0).dtype() == DType::BFloat16, true);
+    ASSERT_EQ(my_adamw.grad(0).dtype() == DType::BFloat16, true);
+    ASSERT_EQ(my_adamw.master_param(0).dtype() == DType::Float32, true);
+    ASSERT_EQ(my_adamw.param(0).shape(), Shape({2, 4}));
+    ASSERT_EQ(my_adamw.master_param(0).shape(), Shape({2, 4}));
+    ASSERT_EQ((const void *)my_adamw.grad(0).data_ptr<nv_bfloat16>(),
+              (const void *)(my_adamw.param(0).data_ptr<nv_bfloat16>() + 24));
+    ASSERT_EQ(my_adamw.all_params().numel(), (size_t)24);
+    ASSERT_EQ(my_adamw.buffer().num_groups(), 4);          // master params, m, v, grad_norm
+    ASSERT_EQ(my_adamw.buffer().numel(), (size_t)73);      // 3 x 24 + 1
+    ASSERT_EQ((size_t)my_adamw.master_param(0).data() % 16, (size_t)0);
+    ASSERT_EQ(my_adamw.decayed_count(), (size_t)12);
+    Tensor values = Tensor::empty({2, 4});
+    values.copy_from_cpu(sample_data(8).data());
+    my_adamw.param(0).copy_(values);
+    my_adamw.copy_params_to_master();
+    ASSERT_EQ(my_adamw.master_param(0).tolist(), sample_data(8));
+}
+
+static void bfloat16_master_steps_match_float_steps(void)
+{
+    // Expect: (new) a {4, 8} weight and an {8} bias, the same values in a float AdamW and a bfloat16 one (each
+    // value rounded to bfloat16 first, so both start equal), 10 steps of the same random gradients (bfloat16,
+    // given to the float one as floats), lr 0.01, clipping at 1. The bfloat16 one's master does the same
+    // float math on the same numbers as the float one's params: equal, allowed 1e-6. Its model params are
+    // that master rounded to bfloat16, to the last bit.
+    Tensor::manual_seed(0);
+    AdamWConfig config;
+    config.learning_rate = 1e-2f;
+    config.max_norm = 1.0f;
+    std::vector<Shape> shapes = {{4, 8}, {8}};
+    AdamW float_adamw(shapes, config), bfloat16_adamw(shapes, config, DType::BFloat16);
+    for (int k = 0; k < 2; k++)
+    {
+        Tensor values = Tensor::empty(shapes[k]);
+        values.copy_from_cpu(random_values(shapes[k], 0.5f).data());
+        bfloat16_adamw.param(k).copy_(values);                // rounded
+        float_adamw.param(k).copy_(bfloat16_adamw.param(k));  // the rounded values, as floats
+    }
+    bfloat16_adamw.copy_params_to_master();
+    for (int t = 1; t <= 10; t++)
+    {
+        std::vector<std::vector<float>> grads;
+        for (int k = 0; k < 2; k++)
+        {
+            Tensor values = Tensor::empty(shapes[k]);
+            values.copy_from_cpu(random_values(shapes[k], 1.0f).data());
+            bfloat16_adamw.grad(k).copy_(values);
+            float_adamw.grad(k).copy_(bfloat16_adamw.grad(k));
+            grads.push_back(float_adamw.grad(k).tolist());
+        }
+        float grad_norm = cpu_grad_norm(grads);                 // about sqrt(40) = 6.3 > 1: clipped
+        float_adamw.grad_norm().copy_from_cpu(&grad_norm);
+        bfloat16_adamw.grad_norm().copy_from_cpu(&grad_norm);
+        float_adamw.step();
+        bfloat16_adamw.step();
+        std::vector<float> master = bfloat16_adamw.buffer().group(0).tolist();   // group 0: the master params
+        ASSERT_NEAR(master, float_adamw.all_params().tolist(), 1e-6);
+        ASSERT_EQ(bfloat16_adamw.all_params().to(DType::Float32).tolist(),
+                  bfloat16_adamw.buffer().group(0).to(DType::BFloat16).to(DType::Float32).tolist());
+    }
+}
+
+static void a_small_update_adds_up_in_the_master(void)
+{
+    // Expect: (new) a LayerNorm weight of 1, gradient 1 every step, lr 6e-4, no weight decay: each step moves
+    // it by exactly 6e-4. The bfloat16 numbers next to 1 are 0.99609375 below and 1.0078125 above, so
+    // 1 - 6e-4 = 0.9994 rounds back to 1.
+    //
+    //     after 10 steps    float master                 bfloat16 param               without a master
+    //                       1 - 10 x 6e-4 = 0.994        0.9921875 (nearest 0.994)    1: every step lost
+    //
+    // 0.994 is 0.0018 from 0.9921875 and 0.0021 from 0.99609375. "Without a master" is adamw_update straight on
+    // bfloat16 params, as AdamW did before it kept one.
+    AdamWConfig config;
+    config.learning_rate = 6e-4f;
+    config.weight_decay = 0.0f;
+    AdamW my_adamw({{4}}, config, DType::BFloat16);
+    my_adamw.param(0).fill_(1);
+    my_adamw.copy_params_to_master();
+    Tensor alone = Tensor::ones({4}, DType::BFloat16), alone_grad = Tensor::ones({4}, DType::BFloat16);
+    Tensor m = Tensor::zeros({4}), v = Tensor::zeros({4}), grad_norm = Tensor::zeros({1});
+    for (int t = 1; t <= 10; t++)
+    {
+        my_adamw.grad(0).fill_(1);
+        my_adamw.step();
+        adamw_update(alone.data_ptr<nv_bfloat16>(), alone_grad.data_ptr<nv_bfloat16>(), m.data(), v.data(), 4, 0,
+                     grad_norm.data(), 0.0f, config.learning_rate, config.beta1, config.beta2, config.eps, 0.0f, t);
+    }
+    ASSERT_NEAR(my_adamw.master_param(0).tolist(), std::vector<float>(4, 0.994f), 1e-5);
+    ASSERT_EQ(my_adamw.param(0).to(DType::Float32).tolist(), std::vector<float>(4, 0.9921875f));
+    ASSERT_EQ(alone.to(DType::Float32).tolist(), std::vector<float>(4, 1.0f));
+}
+
+static void ranks_each_update_their_own_slice(void)
+{
+    // Expect: (new) a {3, 4} weight and a {4} bias: 16 values, decayed_count 12. On 2 GPUs each updates 8: rank 0
+    // values 0 .. 7 (all decayed), rank 1 values 8 .. 15 (8 .. 11 decayed: the border inside its slice). Rank 1's
+    // float buffer holds its master, m and v for 8 values, and grad_norm: 3 x 8 + 1 = 25. One bfloat16 AdamW and
+    // ranks 0 and 1 of 2 get the same params and the same (already averaged) grads, 3 steps. Right after a step,
+    // rank 0's values 8 .. 15 are still the old ones: rank 1 updated them. Put together as the all-gather does
+    // (each rank's slice copied to the other), both equal the one AdamW's params, to the last bit: each value
+    // had the same float math.
+    AdamWConfig config;
+    config.learning_rate = 1e-2f;
+    std::vector<Shape> shapes = {{3, 4}, {4}};
+    AdamW one(shapes, config, DType::BFloat16);
+    AdamW rank0(shapes, config, DType::BFloat16, 0, 2), rank1(shapes, config, DType::BFloat16, 1, 2);
+    ASSERT_EQ(rank1.slice_start(), (size_t)8);
+    ASSERT_EQ(rank1.slice_size(), (size_t)8);
+    ASSERT_EQ(rank1.buffer().numel(), (size_t)25);
+    ASSERT_EQ(rank1.decayed_count(), (size_t)12);
+    Tensor::manual_seed(0);
+    Tensor values = Tensor::empty({16});
+    values.copy_from_cpu(random_values({16}, 0.5f).data());
+    for (AdamW *adamw : {&one, &rank0, &rank1})
+    {
+        adamw->all_params().copy_(values);                      // rounded to bfloat16
+        adamw->copy_params_to_master();
+    }
+    for (int t = 1; t <= 3; t++)
+    {
+        Tensor grads = Tensor::empty({16});
+        grads.copy_from_cpu(random_values({16}, 1.0f).data());
+        std::vector<float> rank0_before = rank0.all_params().to(DType::Float32).tolist();
+        for (AdamW *adamw : {&one, &rank0, &rank1})
+        {
+            adamw->all_grads().copy_(grads);
+            adamw->step();
+        }
+        std::vector<float> rank0_after = rank0.all_params().to(DType::Float32).tolist();
+        ASSERT_EQ(std::vector<float>(rank0_after.begin() + 8, rank0_after.end()),
+                  std::vector<float>(rank0_before.begin() + 8, rank0_before.end()));
+        rank0.all_params().narrow(0, 8, 8).copy_(rank1.all_params().narrow(0, 8, 8));   // the all-gather, by hand
+        rank1.all_params().narrow(0, 0, 8).copy_(rank0.all_params().narrow(0, 0, 8));
+        ASSERT_EQ(rank0.all_params().to(DType::Float32).tolist(), one.all_params().to(DType::Float32).tolist());
+        ASSERT_EQ(rank1.all_params().to(DType::Float32).tolist(), one.all_params().to(DType::Float32).tolist());
+    }
+}
+
 // ══ part 3: other block and thread counts ═════════════════════════════════════
 
 /// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
@@ -836,16 +1006,19 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of one update on as many values as GPT-2 small has, 124,439,808 (the matrices'
     // 124,439,040 decayed, then 768), with params and grads in float and in bfloat16 (m and v float in
-    // both), for 7 block counts x 4 thread counts, each the average of 20 runs. The 28 launches take turns:
+    // both), for 9 block counts x 4 thread counts, each the average of 20 runs: the 7 picked on a T4, then
+    // this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4, 40
+    // again and 80). The 36 launches take turns:
     // 20 rounds, each timing every launch once (in float, then in bfloat16). One launch's 20 runs in a row
     // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
     // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
     // late alike. The kernel is launched here directly, <<<blocks, threads>>>, instead of through
-    // adamw_update, which always launches ADAMW_BLOCKS x ADAMW_THREADS_PER_BLOCK (40 x 128): 6077 of the
-    // 31,109,952 float4s per thread. 121,524 x 256 is one float4 per thread, what adamw_update launched
-    // before this sweep picked 40 x 128. Each update reads p, g, m, v and writes p, m, v: in float 7 x 4 =
-    // 28 bytes per value, 3.5 GB, so at a T4's 320 GB/s at least 10.9 ms; in bfloat16 2 + 2 + 2 + 16 = 22
-    // bytes per value, 2.7 GB, at least 8.6 ms. A T4 runs at most 1024 threads per SM, 40,960 in all.
+    // adamw_update, which launches one float4 per thread: 121,524 x ADAMW_THREADS_PER_BLOCK (256). A T4's
+    // sweep had picked 40 x 128 (6077 float4s per thread; 14.2 ms there against 14.6), but on an H100 PCIe
+    // in bfloat16 it took 5.98 ms against 1.50 for one float4 per thread. Each update reads p, g, m, v and
+    // writes p, m, v: in float 7 x 4 = 28 bytes per value, 3.5 GB, so at a T4's 320 GB/s at least 10.9 ms;
+    // in bfloat16 2 + 2 + 2 + 16 = 22 bytes per value, 2.7 GB, at least 8.6 ms (at an H100 PCIe's 2.0 TB/s,
+    // 1.37 ms). A T4 runs at most 1024 threads per SM, 40,960 in all.
     //
     // Each run changes p, m and v, so before each check of the result they are put back: p from a kept
     // copy, m and v to 0. Expect: every launch gives the same p, m and v as the usual one of its dtype, to
@@ -886,7 +1059,8 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     auto update = [&] {
         adamw_kernel<float><<<blocks, threads>>>(params.data(), grads.data(), m.data(), v.data(), n, decayed_count,
                                                  grad_norm.data(), config.max_norm, weight_decay_factor, config.beta1,
-                                                 config.beta2, config.eps, step_size, inverse_sqrt_bias_correction2);
+                                                 config.beta2, config.eps, step_size, inverse_sqrt_bias_correction2,
+                                                 nullptr);
         cudaCheck(cudaGetLastError());
     };
     auto update_bf16 = [&] {
@@ -895,16 +1069,18 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
                                                        v_bf16.data(), n, decayed_count, grad_norm.data(),
                                                        config.max_norm, weight_decay_factor, config.beta1,
                                                        config.beta2, config.eps, step_size,
-                                                       inverse_sqrt_bias_correction2);
+                                                       inverse_sqrt_bias_correction2, nullptr);
         cudaCheck(cudaGetLastError());
     };
-    blocks = ADAMW_BLOCKS;
+    blocks = one_float4_per_thread_blocks;
     threads = ADAMW_THREADS_PER_BLOCK;
     warm_up_gpu(update);
 
-    int block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks};
+    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
+    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    int block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks, sms, 2 * sms};
     int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 7 * 4, rounds = 20;
+    const int launches = 9 * 4, rounds = 20;
     float total_ms[launches][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] float, [1] bf16
     for (int round = 1; round <= rounds; round++)
     {
@@ -954,10 +1130,10 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
 
         size_t threads_launched = (size_t)blocks * threads;
         int float4s_per_thread = (int)((n / 4 + threads_launched - 1) / threads_launched); // the most
-        const char *usual = blocks == ADAMW_BLOCKS && threads == ADAMW_THREADS_PER_BLOCK
-                                ? "   <- what adamw_update launches"
-                            : blocks == one_float4_per_thread_blocks && threads == 256
-                                ? "   <- one float4 per thread, what it launched before"
+        const char *usual = blocks == one_float4_per_thread_blocks && threads == ADAMW_THREADS_PER_BLOCK
+                                ? "   <- what adamw_update launches: one float4 per thread"
+                            : blocks == 40 && threads == 128
+                                ? "   <- a T4's pick, what it launched before"
                                 : "";
         printf("                  %6d   %7d   %18d   %6.3f   %6.3f   %-11s%s\n", blocks, threads, float4s_per_thread,
                times[0], times[1], same ? "yes" : "NO", usual);
@@ -993,6 +1169,11 @@ int main(void)
     nothing_past_a_tensors_end_changes();
     step_leaves_the_gradients_as_they_are();
     adamw_counts_the_matrices_and_the_steps();
+    set_learning_rate_is_used_from_the_next_step();
+    bfloat16_adamw_keeps_a_float_master();
+    bfloat16_master_steps_match_float_steps();
+    a_small_update_adds_up_in_the_master();
+    ranks_each_update_their_own_slice();
 
     time_the_kernel_with_other_block_and_thread_counts();
 
