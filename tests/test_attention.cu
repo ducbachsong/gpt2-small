@@ -4,7 +4,8 @@
 //
 // Part 1 checks both against PyTorch's scaled_dot_product_attention (causal), with autograd for the
 // backward, and the weights against PyTorch's softmax of the masked scores, and times them on GPT-2
-// small's size; part 2 checks numbers worked out by hand and what the mask must give; part 3 checks that
+// small's size; part 1b checks flash attention (bfloat16, sm_80 or later) against PyTorch and against the
+// attention steps in bfloat16, and times all three; part 2 checks numbers worked out by hand and what the mask must give; part 3 checks that
 // each kernel's registers fit its block; part 4 times the two softmax kernels with other block and thread
 // counts. (The C# trainer had no attention test: TorchSharp's was trusted.)
 #include <torch/types.h>              // torch::scaled_dot_product_attention, torch::randn, backward(); before CUDA headers
@@ -127,7 +128,7 @@ struct AttentionTensors
 /// weights is worked out on the side as GPT-2's original code does: softmax of the masked scores.
 struct PytorchAttention
 {
-    torch::Tensor qkv, output, weights;
+    torch::Tensor qkv, output, weights, logsumexp;                 // logsumexp of each row of masked scores
 
     /// Works out output, qkv.grad() and weights from my qkv and output_grad.
     PytorchAttention(const AttentionTensors &mine)
@@ -148,8 +149,48 @@ struct PytorchAttention
         torch::Tensor scores = q.matmul(k.transpose(-2, -1)) / std::sqrt((double)head_size);
         torch::Tensor after = torch::ones({seq_len, seq_len}, scores.options().dtype(torch::kBool)).triu(1);
         weights = scores.masked_fill(after, -INFINITY).softmax(-1);
+        logsumexp = scores.masked_fill(after, -INFINITY).logsumexp(-1);
     }
 };
+
+/// Every tensor attention_flash_forward and attention_flash_backward take, for one size, all bfloat16 but
+/// logsumexp and row_dot (float), made with 0s except qkv and output_grad, which the test fills.
+struct FlashTensors
+{
+    Tensor qkv, output, query, key, value, logsumexp;              // forward
+    Tensor output_grad, qkv_grad, row_dot;                         // backward
+
+    /// Makes them for batch_size x num_heads heads of seq_len tokens of 64 columns.
+    FlashTensors(size_t batch_size, size_t num_heads, size_t seq_len)
+    {
+        size_t embed_dim = num_heads * FLASH_HEAD_SIZE;
+        Shape per_head = {batch_size, num_heads, seq_len, FLASH_HEAD_SIZE};
+        qkv = Tensor::zeros({batch_size, seq_len, 3 * embed_dim}, DType::BFloat16);
+        output = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
+        query = Tensor::zeros(per_head, DType::BFloat16), key = Tensor::zeros(per_head, DType::BFloat16);
+        value = Tensor::zeros(per_head, DType::BFloat16);
+        logsumexp = Tensor::zeros({batch_size, num_heads, seq_len});
+        output_grad = Tensor::zeros(output.shape(), DType::BFloat16);
+        qkv_grad = Tensor::zeros(qkv.shape(), DType::BFloat16);
+        row_dot = Tensor::zeros({batch_size, num_heads, seq_len});
+    }
+
+    /// Runs attention_flash_forward on these tensors.
+    void forward() { attention_flash_forward(output, query, key, value, logsumexp, qkv); }
+
+    /// Runs attention_flash_backward on these tensors.
+    void backward() { attention_flash_backward(qkv_grad, output_grad, output, query, key, value, logsumexp, row_dot); }
+};
+
+/// Tells if this GPU runs flash attention (sm_80 or later); if not, prints why the test that asked is skipped.
+static bool flash_runs_here(const char *test)
+{
+    if (attention_flash_fits(DType::BFloat16, 1024, FLASH_HEAD_SIZE))
+        return true;
+    print_test_name(test);
+    printf("    skipped: flash attention needs a GPU of compute capability 8.0 or more (A100, H100)\n");
+    return false;
+}
 
 // ══ part 1: mine against PyTorch's ═══════════════════════════════════════════
 
@@ -250,6 +291,149 @@ static void time_20_steps_on_gpt2_small_size(void)
            totals[3] / totals[1]);
     ASSERT_NEAR(relative_difference_on_gpu(mine.output, pytorch_output), 0.0, TOLERANCE);
     ASSERT_NEAR(relative_difference_on_gpu(mine.qkv_grad, pytorch_qkv.grad()), 0.0, TOLERANCE);
+}
+
+// ══ part 1b: flash attention against PyTorch, and against the attention steps ════
+
+/// Runs flash attention's forward and backward on random bfloat16 qkv and output_grad, and the attention
+/// steps on the same values in bfloat16, and PyTorch in float on them too; checks that flash attention's
+/// output and logsumexp are within BFLOAT16_TOLERANCE of PyTorch's, and its qkv_grad within
+/// BFLOAT16_GRAD_TOLERANCE, and that it is as close to the steps' bfloat16 results.
+static void flash_matches_pytorch_and_the_steps(size_t batch_size, size_t num_heads, size_t seq_len)
+{
+    torch::manual_seed(0);
+    AttentionTensors steps(batch_size, num_heads, seq_len, FLASH_HEAD_SIZE, DType::BFloat16);
+    steps.qkv = random_tensor_on_gpu(steps.qkv.shape()).to(DType::BFloat16);
+    steps.output_grad = random_tensor_on_gpu(steps.output.shape()).to(DType::BFloat16);
+    steps.forward();
+    steps.backward();
+    FlashTensors flash(batch_size, num_heads, seq_len);
+    flash.qkv.copy_(steps.qkv);
+    flash.output_grad.copy_(steps.output_grad);
+    flash.forward();
+    flash.backward();
+
+    PytorchAttention pytorch(steps);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.output, pytorch.output), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.logsumexp, pytorch.logsumexp), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.qkv_grad, pytorch.qkv.grad()), 0.0, BFLOAT16_GRAD_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.output, pytorch_copy_of(steps.output)), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.qkv_grad, pytorch_copy_of(steps.qkv_grad)), 0.0,
+                BFLOAT16_GRAD_TOLERANCE);
+}
+
+static void flash_matches_on_one_tile(void)
+{
+    // Expect: {1, 2, 64}: one tile of 64 queries and 64 keys, all on the diagonal, so every score goes through
+    // the mask. Within the bfloat16 tolerances of PyTorch and of the steps.
+    if (flash_runs_here(__func__))
+        flash_matches_pytorch_and_the_steps(1, 2, 64);
+}
+
+static void flash_matches_on_gpt2_heads_of_256_tokens(void)
+{
+    // Expect: {2, 12, 256}: 4 tiles per head, so tiles below the diagonal (no mask), the online softmax's
+    // max moving from tile to tile, the backward's key blocks walking 4, 3, 2, 1 query tiles. The same.
+    if (flash_runs_here(__func__))
+        flash_matches_pytorch_and_the_steps(2, 12, 256);
+}
+
+static void flash_matches_on_gpt2_small_size(void)
+{
+    // Expect: {4, 12, 1024}, as training runs it: 16 tiles per head, 768 blocks. The same.
+    if (flash_runs_here(__func__))
+        flash_matches_pytorch_and_the_steps(4, 12, 1024);
+}
+
+static void flash_needs_bfloat16_head_size_64_and_whole_tiles(void)
+{
+    // Expect: attention_flash_fits says no to float, to a seq_len that is not a multiple of 64 (1000) and to a
+    // head_size other than 64 (32); and yes to bfloat16, 1024 and 64 exactly when the GPU is sm_80 or later.
+    int device = 0, major = 0;
+    cudaCheck(cudaGetDevice(&device));
+    cudaCheck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    ASSERT_EQ(attention_flash_fits(DType::Float32, 1024, 64), false);
+    ASSERT_EQ(attention_flash_fits(DType::BFloat16, 1000, 64), false);
+    ASSERT_EQ(attention_flash_fits(DType::BFloat16, 1024, 32), false);
+    ASSERT_EQ(attention_flash_fits(DType::BFloat16, 1024, 64), major >= 8);
+}
+
+static void flash_backward_writes_over_qkv_grad_the_same_every_time(void)
+{
+    // Expect: qkv_grad filled with 7s first: after a backward, no 7 is left (every value of its three parts
+    // is written), and a second backward gives the same values to the last bit (no two blocks add onto one
+    // value, so nothing depends on which block finishes first).
+    if (!flash_runs_here(__func__))
+        return;
+    torch::manual_seed(0);
+    FlashTensors flash(2, 12, 256);
+    flash.qkv = random_tensor_on_gpu(flash.qkv.shape()).to(DType::BFloat16);
+    flash.output_grad = random_tensor_on_gpu(flash.output.shape()).to(DType::BFloat16);
+    flash.forward();
+    flash.qkv_grad.fill_(7.0);
+    flash.backward();
+    torch::Tensor first = pytorch_copy_of(flash.qkv_grad);
+    ASSERT_EQ((first == 7.0f).sum().item<int64_t>(), (int64_t)0);
+    flash.backward();
+    ASSERT_EQ(torch::equal(pytorch_copy_of(flash.qkv_grad), first), true);
+}
+
+static void time_flash_against_the_steps_and_pytorch(void)
+{
+    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's size, {4, 1024} tokens, 12 heads of
+    // 64, all in bfloat16: flash attention, the attention steps (cuBLAS products, the softmax kernels, the 201
+    // MB of weights) and PyTorch's scaled_dot_product_attention (causal), which in bfloat16 on an sm_80 GPU is
+    // its own flash attention. Averages of steps 3..20. Expect flash attention faster than the steps, and at
+    // the end its output and qkv_grad within the bfloat16 tolerances of PyTorch's.
+    if (!flash_runs_here(__func__))
+        return;
+    torch::manual_seed(0);
+    AttentionTensors steps(4, 12, 1024, 64, DType::BFloat16);
+    steps.qkv = random_tensor_on_gpu(steps.qkv.shape()).to(DType::BFloat16);
+    steps.output_grad = random_tensor_on_gpu(steps.output.shape()).to(DType::BFloat16);
+    FlashTensors flash(4, 12, 1024);
+    flash.qkv.copy_(steps.qkv);
+    flash.output_grad.copy_(steps.output_grad);
+
+    torch::Tensor pytorch_qkv = pytorch_copy_of(steps.qkv).to(torch::kBFloat16).requires_grad_(true);
+    torch::Tensor pytorch_output_grad = pytorch_copy_of(steps.output_grad).to(torch::kBFloat16);
+    torch::Tensor pytorch_output;
+    auto pytorch_forward = [&] {
+        std::vector<torch::Tensor> parts = pytorch_qkv.split(768, 2);
+        auto heads = [](const torch::Tensor &part) { return part.view({4, 1024, 12, 64}).transpose(1, 2); };
+        torch::Tensor y = torch::scaled_dot_product_attention(heads(parts[0]), heads(parts[1]), heads(parts[2]), {},
+                                                              0.0, true);
+        pytorch_output = y.transpose(1, 2).contiguous().view({4, 1024, 768});
+    };
+
+    double totals[6] = {};
+    for (int t = 1; t <= 20; t++)
+    {
+        float times[6];
+        times[0] = gpu_milliseconds([&] { flash.forward(); });
+        times[1] = gpu_milliseconds([&] { flash.backward(); });
+        times[2] = gpu_milliseconds([&] { steps.forward(); });
+        times[3] = gpu_milliseconds([&] { steps.backward(); });
+        times[4] = gpu_milliseconds(pytorch_forward);
+        pytorch_qkv.mutable_grad() = torch::Tensor();
+        times[5] = gpu_milliseconds([&] { pytorch_output.backward(pytorch_output_grad); });
+        if (t <= 2)
+            continue;
+        for (int column = 0; column < 6; column++)
+            totals[column] += times[column];
+    }
+    print_test_name(__func__);
+    printf("    average of steps 3..20, ms:   forward   backward   both\n");
+    const char *sides[] = {"flash attention", "the steps", "PyTorch (flash)"};
+    for (int side = 0; side < 3; side++)
+        printf("        %-22s %10.3f %10.3f %6.3f\n", sides[side], totals[2 * side] / 18, totals[2 * side + 1] / 18,
+               (totals[2 * side] + totals[2 * side + 1]) / 18);
+    printf("    the steps take %.2fx as long as flash attention, PyTorch %.2fx\n",
+           (totals[2] + totals[3]) / (totals[0] + totals[1]), (totals[4] + totals[5]) / (totals[0] + totals[1]));
+    ASSERT_EQ(totals[0] + totals[1] < totals[2] + totals[3], true);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.output, pytorch_output.to(torch::kFloat)), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash.qkv_grad, pytorch_qkv.grad().to(torch::kFloat)), 0.0,
+                BFLOAT16_GRAD_TOLERANCE);
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
@@ -504,26 +688,37 @@ static void backward_writes_over_qkv_grad(void)
 
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: each kernel can be launched with its threads per block (256), and nothing is spilled. The
-    // compiler picks each kernel's registers per thread; cudaFuncGetAttributes reads what it wrote down,
-    // without running anything:
+    // Expect: each kernel can be launched with its threads per block (256; flash attention's 128), and nothing
+    // is spilled. The compiler picks each kernel's registers per thread; cudaFuncGetAttributes reads what it
+    // wrote down, without running anything:
     //
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
+    //
+    // Flash attention's key_grad kernel holds the most: its 16 keys and values as tiles, key_grad, value_grad,
+    // the weights and scores_grad, 160 registers of them, under the 255 a thread may have. On a GPU older than
+    // sm_80 the flash kernels are empty, and fit trivially.
     const void *kernels[] = {(const void *)attention_split_qkv_kernel<float>,
                              (const void *)attention_softmax_forward_kernel<float>,
                              (const void *)attention_merge_heads_kernel<float>,
                              (const void *)attention_split_heads_kernel<float>,
                              (const void *)attention_softmax_backward_kernel<float>,
-                             (const void *)attention_merge_qkv_grad_kernel<float>};
+                             (const void *)attention_merge_qkv_grad_kernel<float>,
+                             (const void *)attention_flash_forward_kernel,
+                             (const void *)attention_flash_row_dot_kernel,
+                             (const void *)attention_flash_key_grad_kernel,
+                             (const void *)attention_flash_query_grad_kernel};
     const char *names[] = {"attention_split_qkv_kernel", "attention_softmax_forward_kernel",
                            "attention_merge_heads_kernel", "attention_split_heads_kernel",
-                           "attention_softmax_backward_kernel", "attention_merge_qkv_grad_kernel"};
+                           "attention_softmax_backward_kernel", "attention_merge_qkv_grad_kernel",
+                           "attention_flash_forward_kernel", "attention_flash_row_dot_kernel",
+                           "attention_flash_key_grad_kernel", "attention_flash_query_grad_kernel"};
     int threads[] = {ATTENTION_THREADS_PER_BLOCK, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK,
                      ATTENTION_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK,
-                     ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK};
-    for (int k = 0; k < 6; k++)
+                     ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK, ATTENTION_THREADS_PER_BLOCK,
+                     FLASH_THREADS, 256, FLASH_THREADS, FLASH_THREADS};
+    for (int k = 0; k < 10; k++)
     {
         cudaFuncAttributes attributes;
         cudaCheck(cudaFuncGetAttributes(&attributes, kernels[k]));
@@ -550,16 +745,17 @@ static void warm_up_gpu(Run run)
 static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the two softmax kernels on GPT-2 small's weights, {4, 12, 1024, 1024} (49,152 rows),
-    // in float and in bfloat16, for 7 block counts x 4 thread counts, each the average of 20 runs. The 28
-    // launches take turns: 20 rounds, each timing every launch once (the forward and the backward in float,
+    // in float and in bfloat16, for 9 block counts x 4 thread counts, each the average of 20 runs: the 7 picked
+    // on a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM;
+    // on a T4 they repeat 40 and 80). The 36 launches take turns: 20 rounds, each timing every launch once (the forward and the backward in float,
     // then both in bfloat16). One launch's 20 runs in a row would all land in the same stretch of the test,
     // and a T4's clock can drift as it heats up (the first launch timed would get the fastest clock); taking
     // turns gives every launch runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has
     // already done the first-time work. They are launched here directly, <<<blocks, threads>>>, instead of
     // through attention_forward and attention_backward. Their launches are the fastest in bfloat16, the dtype
-    // training runs in: the forward one warp per row, 6144 x ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK
-    // (256); the backward ATTENTION_SOFTMAX_BACKWARD_BLOCKS x ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK
-    // (80 x 128): 320 warps, 154 rows each. The two cuBLAS products around them are
+    // training runs in, on an H100 PCIe: both one warp per row, 6144 x ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK
+    // and 6144 x ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK (256 each). A T4's sweep had picked 80 x 128 for
+    // the backward (320 warps, 154 rows each), 5.3x slower on the H100. The two cuBLAS products around them are
     // cuBLAS's to launch, and the four kernels that move values are the same kind as gelu.cuh's. A bfloat16
     // row is 2 KB instead of 4 KB, so twice as many warps' rows fit in the T4's 4 MB L2: its best launch
     // may differ.
@@ -595,7 +791,7 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
     attention_softmax_forward_kernel<nv_bfloat16><<<one_warp_per_row_blocks, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK>>>(
         weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
     attention_softmax_backward_kernel<nv_bfloat16>
-        <<<ATTENTION_SOFTMAX_BACKWARD_BLOCKS, ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK>>>(
+        <<<one_warp_per_row_blocks, ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK>>>(
             weights_grad_bf16.data_ptr<nv_bfloat16>(), weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
     cudaCheck(cudaGetLastError());
     torch::Tensor usual_weights_bf16 = pytorch_copy_of(weights_bf16);
@@ -621,13 +817,15 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
             weights_grad_bf16.data_ptr<nv_bfloat16>(), weights_bf16.data_ptr<nv_bfloat16>(), rows, seq_len);
         cudaCheck(cudaGetLastError());
     };
-    blocks = ATTENTION_SOFTMAX_BACKWARD_BLOCKS;
+    blocks = one_warp_per_row_blocks;
     threads = ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK;
     warm_up_gpu(backward_bf16);
 
-    int block_counts[] = {40, 80, 160, 320, 640, 1280, one_warp_per_row_blocks};
+    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
+    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    int block_counts[] = {40, 80, 160, 320, 640, 1280, one_warp_per_row_blocks, sms, 2 * sms};
     int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 7 * 4, rounds = 20;
+    const int launches = 9 * 4, rounds = 20;
     // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
     float total_ms[launches][4] = {};
     for (int round = 1; round <= rounds; round++)
@@ -688,10 +886,10 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
         size_t warps_launched = (size_t)blocks * threads / 32;
         int rows_per_warp = (int)((rows + warps_launched - 1) / warps_launched);   // the most
         const char *usual =
-            blocks == ATTENTION_SOFTMAX_BACKWARD_BLOCKS && threads == ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK
-                ? "   <- what attention_backward launches"
-            : blocks == one_warp_per_row_blocks && threads == ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK
-                ? "   <- what attention_forward launches: one warp per row"
+            blocks == one_warp_per_row_blocks && threads == ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK
+                ? "   <- what attention_forward and attention_backward launch: one warp per row"
+            : blocks == 80 && threads == 128
+                ? "   <- a T4's pick for the backward, what it launched before"
                 : "";
         printf("                  %6d   %7d   %13d   %7.3f   %8.3f   %12.3f   %13.3f   %-11s%s\n", blocks, threads,
                rows_per_warp, times[0], times[1], times[2], times[3], same ? "yes" : "NO", usual);
@@ -710,6 +908,13 @@ int main(void)
     matches_pytorch_with_a_seq_len_of_37();
     forward_and_backward_in_bfloat16();
     time_20_steps_on_gpt2_small_size();
+
+    flash_needs_bfloat16_head_size_64_and_whole_tiles();
+    flash_matches_on_one_tile();
+    flash_matches_on_gpt2_heads_of_256_tokens();
+    flash_matches_on_gpt2_small_size();
+    flash_backward_writes_over_qkv_grad_the_same_every_time();
+    time_flash_against_the_steps_and_pytorch();
 
     forward_of_the_note_s_example();
     backward_of_the_note_s_example();

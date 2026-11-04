@@ -63,8 +63,9 @@ struct GPT2Params {
 };
 
 /// What the forward keeps for the backward, for the whole model. mean, rstd and the three per-row tensors
-/// are float, the rest of dtype. For GPT-2 small at {4, 1024} in bfloat16: each block's 195 MB (most of
-/// it attention_weights, 101 MB), 2.3 GB for the 12, and 412 MB of logits.
+/// are float, the rest of dtype. For GPT-2 small at {4, 1024} in bfloat16: each block's 195 MB with the
+/// attention steps (most of it attention_weights, 101 MB), 94 MB with flash attention (an sm_80 GPU or later),
+/// so 1.1 GB for the 12, and 412 MB of logits. All of it 4 times that at {16, 1024}.
 struct GPT2Activations {
     Tensor encoded;                                         // {B, T, D}: the encoder's output, block 0's input
     std::vector<BlockActivations> blocks;                   // num_layers of them

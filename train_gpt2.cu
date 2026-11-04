@@ -12,11 +12,13 @@
 //     ./train_gpt2 --checkpoint-dir ckpt --resume ckpt                    # on from the newest (checkpoint.cuh)
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
-// {4, 1024}, 524,288 / (GPUs x 4,096) of them: 16 on 8 GPUs, 128 on one.
+// {16, 1024}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 16 rows, not 4: bigger products
+// for the tensor cores and 4 times fewer launches per step; with flash attention a block keeps 94 MB per 4
+// rows, so 16 rows take about 6 GB of an 80 GB GPU (T4: --batch-size 4).
 //
 //     zero the grads
 //     micro_batches times:   next batch → gpt2_forward → gpt2_backward (each row's loss 1 / (micro_batches x
-//                            4,096), the grads adding up)
+//                            16,384), the grads adding up)
 //     average the grads over the GPUs, each GPU its own slice (on one GPU: nothing to do)
 //     the norm of all the grads → AdamW on this GPU's slice, at this step's learning rate, clipped to norm 1
 //     every GPU's slice of the new params to every GPU (on one GPU: nothing to do)
@@ -46,7 +48,7 @@
 struct TrainConfig {
     std::string train_files = "data/fineweb10B/fineweb_train_%06d.bin";
     std::string val_files = "data/fineweb10B/fineweb_val_%06d.bin";
-    size_t batch_size = 4;                   // rows per micro-batch
+    size_t batch_size = 16;                  // rows per micro-batch, on each GPU
     size_t seq_len = 1024;                   // tokens per row
     size_t tokens_per_step = 524288;         // all GPUs together: 2^19, GPT-2 small's ~0.5M (GPT-3 paper, llm.c)
     int steps = -1;                          // -1: one pass over the train files, 19,073 for 10B tokens
@@ -234,7 +236,7 @@ int main(int argc, char** argv) {
                tokens_per_step, world_size, B, T, tokens_per_round);
         exit(EXIT_FAILURE);
     }
-    int micro_batches = (int)(tokens_per_step / tokens_per_round);     // per GPU: 16 on 8 GPUs, 128 on one
+    int micro_batches = (int)(tokens_per_step / tokens_per_round);     // per GPU: 4 on 8 GPUs, 32 on one
 
     // the data: checks every file's header before anything else; each rank reads its own turns
     DataLoader train_loader(c.train_files, B, T, rank, world_size);
