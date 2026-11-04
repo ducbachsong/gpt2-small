@@ -55,7 +55,10 @@
                                                     // test_classifier's sweep on a T4: 3.067 ms in float and
                                                     // 1.638 in bfloat16, against 3.039 and 1.813 for blocks
                                                     // of 1024 (bfloat16's best, 1.635, was 160 x 256)
-#define CLASSIFIER_BACKWARD_THREADS_PER_BLOCK 256   // one float4 per thread
+#define CLASSIFIER_BACKWARD_BLOCKS 40960            // at most: GPT-2 small's 51,511,296 float4s, 10 per thread
+#define CLASSIFIER_BACKWARD_THREADS_PER_BLOCK 128   // test_classifier's sweep on an H100 PCIe: 0.464 ms in
+                                                    // bfloat16, against 0.527 for one float4 per thread
+                                                    // (201,216 x 256, a T4's pick); 0.907 and 0.916 in float
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void classifier_forward(const Tensor& losses, const Tensor& max_of_each_row, const Tensor& sum_of_each_row,
@@ -200,7 +203,8 @@ __global__ void classifier_backward_kernel(T* logits_grad, const float* losses_g
 /// thread), so the trainer can turn the 824 MB of logits into their gradient without a second 824 MB.
 /// losses_grad[row] is d(loss)/d(losses[row]): 1 / rows in every row for the mean over the rows (note 1.3),
 /// divided again by the micro-batches of a step. The shapes are the forward's: logits_grad as logits,
-/// losses_grad as losses. One float4 per thread: 51,511,296 float4s, 201,216 blocks of 256 threads.
+/// losses_grad as losses. CLASSIFIER_BACKWARD_BLOCKS x CLASSIFIER_BACKWARD_THREADS_PER_BLOCK, each thread
+/// walking float4s: GPT-2 small's 51,511,296, 10 each; fewer blocks when one float4 per thread needs fewer.
 /// Written over, and may be in place: note 6.4.
 inline void classifier_backward(const Tensor& logits_grad, const Tensor& losses_grad, const Tensor& logits,
                                 const Tensor& targets, const Tensor& max_of_each_row, const Tensor& sum_of_each_row,
@@ -214,8 +218,10 @@ inline void classifier_backward(const Tensor& logits_grad, const Tensor& losses_
     }
     size_t rows = logits.size(0) * logits.size(1);
     size_t total_float4s = logits.numel() / 4;
-    int blocks = (int)((total_float4s + CLASSIFIER_BACKWARD_THREADS_PER_BLOCK - 1) /
-                       CLASSIFIER_BACKWARD_THREADS_PER_BLOCK);    // rounded up: a part-full last block
+    size_t one_float4_per_thread_blocks = (total_float4s + CLASSIFIER_BACKWARD_THREADS_PER_BLOCK - 1) /
+                                          CLASSIFIER_BACKWARD_THREADS_PER_BLOCK;
+    int blocks = (int)(one_float4_per_thread_blocks < CLASSIFIER_BACKWARD_BLOCKS ? one_float4_per_thread_blocks
+                                                                                 : CLASSIFIER_BACKWARD_BLOCKS);
     if (logits.dtype() == DType::BFloat16)
         classifier_backward_kernel<<<blocks, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK>>>(
             logits_grad.data_ptr<nv_bfloat16>(), losses_grad.data(), logits.data_ptr<nv_bfloat16>(),

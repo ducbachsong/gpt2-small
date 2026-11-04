@@ -340,7 +340,7 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 {
     // Expect: GPT-2 small's sizes, batch_size = 4 rows of seq_len = 1024 tokens, embed_dim = 768,
     // random input, weight 1, output_grad all 1. All 4096 rows add onto the same 768 values of
-    // bias_grad: 102 or 103 rows into each block's shared copy, then 40 blocks into GPU memory, many at the
+    // bias_grad: 51 or 52 rows into each block's shared copy, then 80 blocks into GPU memory, many at the
     // same moment. With atomicAdd no add is lost: 4096 x 1 = 4096 in every column, exactly (whole
     // numbers this small add exactly in floats). input_grad is 0 in every row, up to rounding, as
     // in the_same_output_grad_on_a_whole_row_gives_no_input_grad.
@@ -403,15 +403,18 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the forward and the backward on GPT-2 small's sizes (batch_size = 4,
-    // seq_len = 1024: 4096 rows of embed_dim = 768), in float and in bfloat16, for 8 block counts x 4 thread
-    // counts, each the average of 20 runs. The 32 launches take turns: 20 rounds, each timing every launch
+    // seq_len = 1024: 4096 rows of embed_dim = 768), in float and in bfloat16, for 10 block counts x 4 thread
+    // counts, each the average of 20 runs: the 8 picked on a T4, then this GPU's SM count x 1 and x 2 (114
+    // and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4 they repeat 40 and 80). The 40 launches take
+    // turns: 20 rounds, each timing every launch
     // once (the forward and the backward in float, then both in bfloat16). One launch's 20 runs in a row
     // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
     // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
     // late alike. Run 1 is counted too: warm_up_gpu has already done the first-time work. The kernels are
     // launched here directly, <<<blocks, threads>>>, instead of through layer_norm_forward and
-    // layer_norm_backward, which always launch 256 x 512 and 40 x 512 (before this sweep picked those:
-    // 512 x 256 and 128 x 512). Not 1024 threads: since the kernels
+    // layer_norm_backward, which always launch 256 x 512 and 80 x 512 (a T4's sweep picked 256 x 512 and
+    // 40 x 512, before them 512 x 256 and 128 x 512; an H100 PCIe's, 80 x 512 for the backward). Not 1024
+    // threads: since the kernels
     // became templates for bfloat16, each takes 66 registers per thread, and a block of 1024 may have
     // 65,536 / 1024 = 64 (cudaFuncGetAttributes: largest block 896). Held to 64, the backward spilled 8
     // bytes; and blocks of 1024 were never the fastest here. A bfloat16 row is 1.5 KB instead of 3 KB, so
@@ -464,7 +467,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     torch::Tensor usual_mean_bf16 = pytorch_copy_of(mean_bf16), usual_rstd_bf16 = pytorch_copy_of(rstd_bf16);
     torch::Tensor usual_input_grad_bf16 = pytorch_copy_of(input_grad_bf16.to(DType::Float32));
 
-    // What layer_norm_forward and layer_norm_backward launch, worked out as they do: 256 and 40 blocks.
+    // What layer_norm_forward and layer_norm_backward launch, worked out as they do: 256 and 80 blocks.
     int forward_warps_per_block = LAYER_NORM_THREADS_PER_BLOCK / 32;
     int usual_forward_blocks = (int)((rows + forward_warps_per_block - 1) / forward_warps_per_block);
     int usual_backward_blocks = LAYER_NORM_BACKWARD_BLOCKS;
@@ -500,9 +503,11 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     threads = LAYER_NORM_THREADS_PER_BLOCK;
     warm_up_gpu(forward);
 
-    int block_counts[] = {40, 80, 128, 256, 512, 1024, 2048, 4096};
+    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
+    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    int block_counts[] = {40, 80, 128, 256, 512, 1024, 2048, 4096, sms, 2 * sms};
     int thread_counts[] = {64, 128, 256, 512};
-    const int launches = 8 * 4, rounds = 20;
+    const int launches = 10 * 4, rounds = 20;
     // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
     float total_ms[launches][4] = {};
     for (int round = 1; round <= rounds; round++)

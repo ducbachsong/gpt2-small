@@ -447,8 +447,9 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of each of the 3 kernels on GPT-2 small's sizes (batch_size = 4, seq_len =
-    // 1024), in float and in bfloat16, for 8 block counts x 4 thread counts, each the average of 20 runs.
-    // The 32 launches take turns: 20 rounds, each timing every launch once (the forward and the two
+    // 1024), in float and in bfloat16, for 10 block counts x 4 thread counts, each the average of 20 runs:
+    // the 8 picked on a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264
+    // on an SXM; on a T4 they repeat 40 and 80). The 40 launches take turns: 20 rounds, each timing every launch once (the forward and the two
     // backwards in float, then the three in bfloat16). One launch's 20 runs in a row would all land in the
     // same stretch of the test, and a T4's clock can drift as it heats up (the first launch timed would get
     // the fastest clock); taking turns gives every launch runs from early, middle and late alike. Run 1 is
@@ -530,9 +531,11 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     threads = ENCODER_THREADS;
     warm_up_gpu(forward);
 
-    int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096};
+    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
+    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096, sms, 2 * sms};
     int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 8 * 4, rounds = 20;
+    const int launches = 10 * 4, rounds = 20;
     // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
     float total_ms[launches][6] = {};
     for (int round = 1; round <= rounds; round++)

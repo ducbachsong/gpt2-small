@@ -449,7 +449,7 @@ static void forward_leaves_the_logits_as_they_are(void)
 static void every_kernel_fits_its_block(void)
 {
     // Expect: the forward can be launched with CLASSIFIER_FORWARD_THREADS_PER_BLOCK (256) and the backward
-    // with CLASSIFIER_BACKWARD_THREADS_PER_BLOCK (256), and nothing is spilled. The compiler picks each
+    // with CLASSIFIER_BACKWARD_THREADS_PER_BLOCK (128), and nothing is spilled. The compiler picks each
     // kernel's registers per thread; cudaFuncGetAttributes reads what it wrote down, without running
     // anything:
     //
@@ -487,14 +487,17 @@ static void warm_up_gpu(Run run)
 static void time_each_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of the forward and the backward on GPT-2 small's sizes (4096 rows of 50304), in float
-    // and in bfloat16, each for 7 block counts x 4 thread counts, each the average of 20 runs. Each kernel's
-    // 28 launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
+    // and in bfloat16, each for 9 block counts x 4 thread counts, each the average of 20 runs: the 7 picked on
+    // a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4
+    // they repeat 40 and 80). Each kernel's 36 launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
     // launch's 20 runs in a row would all land in the same stretch of the test, and a T4's clock can drift
     // as it heats up (the first launch timed would get the fastest clock); taking turns gives every launch
     // runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has already done the
     // first-time work. The kernels are launched here directly, <<<blocks, threads>>>, instead of through
     // classifier_forward and classifier_backward, which always launch 4096 x 256 (one row per block; 4096 x
-    // 1024 before this sweep picked 256) and 201,216 x 256 (one float4 per thread). A bfloat16 row is 98 KB instead of 196 KB, and a bfloat16 float4
+    // 1024 before this sweep picked 256) and CLASSIFIER_BACKWARD_BLOCKS x CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
+    // (40,960 x 128, 10 float4s per thread: an H100 PCIe's pick; a T4's was 201,216 x 256, one float4 per
+    // thread). A bfloat16 row is 98 KB instead of 196 KB, and a bfloat16 float4
     // one 8-byte read instead of 16: the best launch may differ.
     //
     // Expect: every forward launch gives the usual losses, max_of_each_row and sum_of_each_row of its dtype
@@ -530,8 +533,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     torch::Tensor usual_max_of_each_row_bf16 = pytorch_copy_of(max_of_each_row_bf16);
     torch::Tensor usual_sum_of_each_row_bf16 = pytorch_copy_of(sum_of_each_row_bf16);
     torch::Tensor usual_logits_grad_bf16 = pytorch_copy_of(logits_grad_bf16.to(DType::Float32));
-    int usual_backward_blocks = (int)((logits.numel() / 4 + CLASSIFIER_BACKWARD_THREADS_PER_BLOCK - 1) /
-                                      CLASSIFIER_BACKWARD_THREADS_PER_BLOCK);   // 201,216
+    int one_float4_per_thread_blocks = (int)((logits.numel() / 4 + 256 - 1) / 256);   // 201,216 of 256 threads
 
     int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loops
     auto forward = [&] {
@@ -568,9 +570,11 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     warm_up_gpu(forward);
 
     // The forward: losses, max_of_each_row and sum_of_each_row within TOLERANCE of the usual launch's.
-    int forward_block_counts[] = {40, 80, 160, 320, 640, 1280, 4096};
+    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
+    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    int forward_block_counts[] = {40, 80, 160, 320, 640, 1280, 4096, sms, 2 * sms};
     int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 7 * 4, rounds = 20;
+    const int launches = 9 * 4, rounds = 20;
     float total_ms[launches][2] = {}; // launch k is block count number k / 4 x thread_counts[k % 4]; [0] float, [1] bf16
     for (int round = 1; round <= rounds; round++)
     {
@@ -638,7 +642,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                          rows * sizeof(float), cudaMemcpyDeviceToDevice));
     cudaCheck(cudaMemcpy(sum_of_each_row_bf16.data(), usual_sum_of_each_row_bf16.data_ptr<float>(),
                          rows * sizeof(float), cudaMemcpyDeviceToDevice));
-    int backward_block_counts[] = {40, 160, 640, 2560, 10240, 40960, usual_backward_blocks};
+    int backward_block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks, sms, 2 * sms};
     for (int k = 0; k < launches; k++)
         total_ms[k][0] = total_ms[k][1] = 0.0f;
     for (int round = 1; round <= rounds; round++)
@@ -679,8 +683,10 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
             launches_with_the_same_result++;
         size_t threads_launched = (size_t)blocks * threads;
         int float4s_per_thread = (int)((logits.numel() / 4 + threads_launched - 1) / threads_launched); // the most
-        const char *usual = blocks == usual_backward_blocks && threads == CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
+        const char *usual = blocks == CLASSIFIER_BACKWARD_BLOCKS && threads == CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
                                 ? "   <- what classifier_backward launches"
+                            : blocks == one_float4_per_thread_blocks && threads == 256
+                                ? "   <- one float4 per thread: a T4's pick, what it launched before"
                                 : "";
         printf("                            %6d   %7d   %18d   %6.3f   %6.3f   %-11s%s\n", blocks, threads,
                float4s_per_thread, times[0], times[1], same ? "yes" : "NO", usual);
