@@ -6,5 +6,4 @@ duckdb
 pandas
 altair
 vl-convert-python   # PNG/SVG/PDF export of the loss chart
-streamlit           # optional: live training dashboard (MONITOR = True)
-pythonnet>=3.0.3     # traingpt2cs.py: loads the C# trainer into Python
+streamlit           # optional: live training dashboard (csvexplorer)

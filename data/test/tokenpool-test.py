@@ -1,6 +1,6 @@
 """test — run tokenpool on real data, with many threads, and print what happened.
 
-    python test/tokenpool-test.py
+    python data/test/tokenpool-test.py
 
 It downloads two small parquet files (~69 MB, babylm's test and validation
 splits) into RAM through a parquet pool, and tokenizes them with the real gpt2

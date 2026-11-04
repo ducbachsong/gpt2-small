@@ -1,6 +1,6 @@
 """test — run parquetpool against the real Hub, with many threads, and print what happened.
 
-    python test/parquetpool-test.py
+    python data/test/parquetpool-test.py
 
 It downloads two small parquet files (~69 MB, babylm's test and validation
 splits) into RAM, so it needs a working network connection. Nothing is

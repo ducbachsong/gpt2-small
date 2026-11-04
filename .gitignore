@@ -1,14 +1,31 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .ipynb_checkpoints/
+
+# what the programs make: every build in build/, training runs in runs/
+build/
 runs/
 logs/
+
+# data: the token files (data/), PyTorch's reference numbers (tests/reference/), logs
+*.bin
 *.csv
 *.parquet
 *.safetensors
-*.bin
-.DS_Store
+data/tinyshakespeare/
+data/fineweb10B/
+
+# built files that can land outside build/ (MSVC and nvcc on Windows)
+*.exe
+*.obj
+*.exp
+*.lib
+
+# the C# branches build into these, if you switch to one and back
 bin/
 obj/
+
+.DS_Store
