@@ -1,11 +1,6 @@
-// tensor_buffer.cuh — many tensors in one GPU allocation, one after the other. The
-//
-// The matrices (2-D or more) first in each group:
-// the first values up to the border then get weight decay.
-
-// Why one allocation: one cudaMalloc and one memset instead of one per tensor, and a
-// pass over the whole model (the gradient norm, zeroing the gradients) is one launch
-// over flat(). Nothing to free: the memory goes when the last Tensor using it goes.
+// tensor_buffer.cuh — many tensors in one GPU allocation, one after the other, in groups. One cudaMalloc
+// instead of one per tensor, and a pass over everything (the norm, zeroing) is one launch over flat().
+// Matrices go first in each group: the values up to the border then get weight decay.
 #ifndef TENSOR_BUFFER_CUH
 #define TENSOR_BUFFER_CUH
 
@@ -33,17 +28,16 @@ public:
     int num_groups() const;                                             // how many groups were added
 
 private:
-    /// A group, added by one add_many: tensors first_tensor_index ..
-    /// first_tensor_index + num_tensors - 1.
+    /// A group, added by one add_many.
     struct Group {
-        int first_tensor_index;          // the index of its first tensor in the buffer
+        int first_tensor_index;          // its first tensor's index in the buffer
         int num_tensors;                 // how many tensors it has
     };
     std::vector<Shape> tensor_shapes_;   // each tensor's shape, in the order added
     std::vector<Group> groups_;          // each group, in the order added
-    std::vector<Tensor> tensors_;        // tensor k: a view into flat_, made by allocate()
-    std::vector<Tensor> group_views_;    // group g: a flat view into flat_, made by allocate()
-    Tensor flat_;                        // the one allocation: every value, flat
+    std::vector<Tensor> tensors_;        // tensor k: a view into flat_
+    std::vector<Tensor> group_views_;    // group g: a flat view into flat_
+    Tensor flat_;                        // the one allocation
     bool allocated_ = false;
 
     int next_tensor_index() const;                                      // the index the next tensor added gets
@@ -58,8 +52,9 @@ private:
 
 // ── adding tensors, then one allocation ───────────────────────────────────────
 
-/// Adds one tensor of this shape to the buffer and returns its index k, for tensor(k)
-/// later. {768, 3072} for a matrix, {768} for a bias. Only before allocate().
+/// Adds one tensor and gives its index k. Only before allocate().
+///
+///   shape   {768, 3072} for a matrix, {768} for a bias
 inline int TensorBuffer::add(const Shape& shape) {
     int tensor_index = next_tensor_index();
     if (allocated_) {
@@ -70,9 +65,9 @@ inline int TensorBuffer::add(const Shape& shape) {
     return tensor_index;
 }
 
-/// Adds tensors of these shapes, one after the other, as one group, and returns the
-/// group's index g, for group(g) and tensor(g, k) later. add_many({{2, 4}, {12}, {2, 2, 3}})
-/// on an empty buffer adds tensors 0, 1 and 2 as group 0; a second add_many is group 1.
+/// Adds tensors one after the other as one group, and gives the group's index g.
+///
+///   tensor_shapes   at least one shape
 inline int TensorBuffer::add_many(const std::vector<Shape>& tensor_shapes) {
     if (tensor_shapes.empty()) {
         fprintf(stderr, "error: add_many of no shapes: a group needs at least one tensor\n");
@@ -80,40 +75,33 @@ inline int TensorBuffer::add_many(const std::vector<Shape>& tensor_shapes) {
     }
     int group_index = next_group_index();
     Group group;
-    group.first_tensor_index = next_tensor_index();          // its first tensor is the next one added
+    group.first_tensor_index = next_tensor_index();
     group.num_tensors = (int)tensor_shapes.size();
     for (const Shape& shape : tensor_shapes) add(shape);
     groups_.push_back(group);
     return group_index;
 }
 
-/// Gets the GPU memory for every tensor added, in one allocation, all zeros; after it,
-/// tensor(k) and group(g) can be used and nothing more can be added. Each tensor and each
-/// group is a view of its part of the one flat tensor:
+/// Gets one allocation for every tensor added, all zeros; each tensor and group becomes a view of its part.
+/// float4 kernels need every tensor's numel a multiple of 4, as all of GPT-2's are.
 ///
-///     flat_      [ 0 .. 7 | 8 .. 19 ]
-///     tensor 0    narrow(0, 0, 8).view({2, 4})
-///     tensor 1              narrow(0, 8, 12).view({12})
-///     group 0     narrow(0, 0, 20): both tensors, flat
-///
-/// float4 kernels (adamw.cuh) need every tensor to start at a multiple of 4 values:
-/// true when every tensor's numel is a multiple of 4, as all of GPT-2's are.
+///   dtype   of every value
 inline void TensorBuffer::allocate(DType dtype) {
     if (allocated_) {
         fprintf(stderr, "error: allocate() called twice\n");
         exit(EXIT_FAILURE);
     }
     flat_ = Tensor::zeros({numel()}, dtype);
-    std::vector<size_t> starts;                                         // where each tensor starts, in values
+    std::vector<size_t> starts;                                         // where each tensor starts
     size_t start = 0;
     for (const Shape& shape : tensor_shapes_) {
-        size_t size = numel_of(shape);                                  // this tensor's number of values
+        size_t size = numel_of(shape);
         tensors_.push_back(flat_.narrow(0, start, size).view(shape));
         starts.push_back(start);
         start += size;
     }
     for (const Group& group : groups_) {
-        size_t group_numel = 0;                                         // its tensors' values, added up
+        size_t group_numel = 0;
         for (int k = group.first_tensor_index; k < group.first_tensor_index + group.num_tensors; k++) {
             group_numel += numel_of(tensor_shapes_[k]);
         }
@@ -122,8 +110,9 @@ inline void TensorBuffer::allocate(DType dtype) {
     allocated_ = true;
 }
 
-/// Makes a new buffer with the same tensors and groups as `other`, in memory of its own,
-/// all zeros: a buffer of gradients laid out like a buffer of parameters.
+/// Makes a buffer with other's tensors and groups, in memory of its own, all zeros: grads laid out as params.
+///
+///   other   the buffer to copy the layout of
 inline TensorBuffer TensorBuffer::zeros_like(const TensorBuffer& other) {
     TensorBuffer buffer;
     buffer.tensor_shapes_ = other.tensor_shapes_;
@@ -134,23 +123,22 @@ inline TensorBuffer TensorBuffer::zeros_like(const TensorBuffer& other) {
 
 // ── reading ───────────────────────────────────────────────────────────────────
 
-/// Gives tensor k, with its own shape, to read or write. It shares the buffer's memory:
-/// writing into tensor(k) writes into flat().
+/// Gives tensor k, a view sharing the buffer's memory.
+///
+///   k   from add
 inline const Tensor& TensorBuffer::tensor(int k) const {
     stop_if_no_tensor(k);
     stop_if_not_allocated("tensor()");
     return tensors_[k];
 }
 
-/// Gives every value of every tensor as one flat tensor, for a pass over the whole buffer
-/// in one launch: flat().zero_() zeroes everything.
+/// Gives every value as one flat tensor, for one launch over the whole buffer.
 inline const Tensor& TensorBuffer::flat() const { return flat_; }
 
-/// Tells how many tensors were added, by add and add_many together.
+/// Gives how many tensors were added.
 inline int TensorBuffer::num_tensors() const { return (int)tensor_shapes_.size(); }
 
-/// Tells how many values all the tensors hold together: 8 + 12 = 20 for {2, 4} and {12}.
-/// It adds up the shapes, so it is known before allocate() too.
+/// Gives how many values all the tensors hold; known before allocate() too.
 inline size_t TensorBuffer::numel() const {
     size_t total = 0;
     for (const Shape& shape : tensor_shapes_) total += numel_of(shape);
@@ -159,18 +147,19 @@ inline size_t TensorBuffer::numel() const {
 
 // ── groups ────────────────────────────────────────────────────────────────────
 
-/// Gives every value of group g as one flat tensor, for a pass over the whole group in one
-/// launch, as AdamW's step over all its parameters. group(g).numel() is the group's values
-/// added up. It shares the buffer's memory, as tensor(k) does.
+/// Gives every value of group g as one flat tensor, for one launch over the group.
+///
+///   g   from add_many
 inline const Tensor& TensorBuffer::group(int g) const {
     stop_if_no_group(g);
     stop_if_not_allocated("group()");
     return group_views_[g];
 }
 
-/// Gives tensor k of group g, counting from the group's start, so the caller needs no
-/// index arithmetic: with groups of K, tensor(1, 0) is tensor(K). Stops if k is past the
-/// group's end, which would be the next group's tensor.
+/// Gives tensor k of group g, counting from the group's start.
+///
+///   g   from add_many
+///   k   0 .. group_size(g) - 1
 inline const Tensor& TensorBuffer::tensor(int g, int k) const {
     stop_if_no_group(g);
     if (k < 0 || k >= groups_[g].num_tensors) {
@@ -180,26 +169,28 @@ inline const Tensor& TensorBuffer::tensor(int g, int k) const {
     return tensor(groups_[g].first_tensor_index + k);
 }
 
-/// Tells how many tensors group g has: the k in tensor(g, k) goes from 0 to this - 1.
+/// Gives how many tensors group g has.
+///
+///   g   from add_many
 inline int TensorBuffer::group_size(int g) const {
     stop_if_no_group(g);
     return groups_[g].num_tensors;
 }
 
-/// Tells how many groups were added: one per add_many.
+/// Gives how many groups were added.
 inline int TensorBuffer::num_groups() const { return (int)groups_.size(); }
 
 // ── private helpers ───────────────────────────────────────────────────────────
 
-/// Tells the index the next tensor added will get. Indices start at 0, so with N tensors
-/// added (0 .. N-1) the next one gets N.
+/// Gives the index the next tensor added will get.
 inline int TensorBuffer::next_tensor_index() const { return num_tensors(); }
 
-/// Tells the index the next group added will get: with G groups added (0 .. G-1), G.
+/// Gives the index the next group added will get.
 inline int TensorBuffer::next_group_index() const { return num_groups(); }
 
-/// Stops the program with an error if there is no tensor k, before a wrong index reads
-/// memory that is not a tensor.
+/// Stops with a message if there is no tensor k.
+///
+///   k   the index asked for
 inline void TensorBuffer::stop_if_no_tensor(int k) const {
     if (k < 0 || k >= num_tensors()) {
         fprintf(stderr, "error: no tensor %d (the buffer has %d)\n", k, num_tensors());
@@ -207,7 +198,9 @@ inline void TensorBuffer::stop_if_no_tensor(int k) const {
     }
 }
 
-/// Stops the program with an error if there is no group g.
+/// Stops with a message if there is no group g.
+///
+///   g   the index asked for
 inline void TensorBuffer::stop_if_no_group(int g) const {
     if (g < 0 || g >= num_groups()) {
         fprintf(stderr, "error: no group %d (the buffer has %d)\n", g, num_groups());
@@ -215,8 +208,9 @@ inline void TensorBuffer::stop_if_no_group(int g) const {
     }
 }
 
-/// Stops the program with an error if allocate() has not run yet, when there is no memory
-/// to read. `what` names the call, for the message: "tensor() before allocate()".
+/// Stops with a message if allocate() has not run yet.
+///
+///   what   the call, for the message: "tensor()"
 inline void TensorBuffer::stop_if_not_allocated(const char* what) const {
     if (!allocated_) {
         fprintf(stderr, "error: %s before allocate()\n", what);
@@ -224,7 +218,9 @@ inline void TensorBuffer::stop_if_not_allocated(const char* what) const {
     }
 }
 
-/// Tells how many values a tensor of this shape holds: its sizes multiplied, {2, 4} -> 8.
+/// Gives how many values a shape holds: {2, 4} -> 8.
+///
+///   shape   the sizes
 inline size_t TensorBuffer::numel_of(const Shape& shape) {
     size_t numel = 1;
     for (size_t size : shape) numel *= size;

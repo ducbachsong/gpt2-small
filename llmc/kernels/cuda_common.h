@@ -1,5 +1,7 @@
-// cuda_common.h — what every CUDA file here needs: error checks, and adding up
-// numbers across a warp and across a block.
+// cuda_common.h — what every CUDA file here needs: error checks, and sums and maxes across a warp and a block.
+// A warp's sum folds its THREADS_PER_WARP values in log2(THREADS_PER_WARP) steps: each thread adds the value of
+// the thread `offset` away (a shuffle, no memory), offset THREADS_PER_WARP / 2, halved each step down to 1;
+// then every thread holds the total.
 #ifndef CUDA_COMMON_H
 #define CUDA_COMMON_H
 
@@ -9,129 +11,110 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
-// Every CUDA call returns an error code; this stops with the file and line.
-static inline void cuda_check(cudaError_t error, const char* file, int line) {
-    if (error != cudaSuccess) {
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", file, line, cudaGetErrorString(error));
+/// Stops with the file and line if a CUDA call failed.
+///
+///   error_val             what the call returned
+///   file_ptr, line_val    where the call is
+static inline void cuda_check(cudaError_t error_val, const char* file_ptr, int line_val) {
+    if (error_val != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", file_ptr, line_val, cudaGetErrorString(error_val));
         exit(EXIT_FAILURE);
     }
 }
 #define cudaCheck(call) cuda_check((call), __FILE__, __LINE__)
 
-/// a / b rounded up: how many blocks of b threads cover a items. CEIL_DIV(1000, 256) = 4.
-#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))   // a / b rounded up: CEIL_DIV(1000, 256) = 4
+#define THREADS_PER_WARP 32                      // threads that run together: CUDA's warpSize
+#define WARP_ALL_LANES 0xffffffff                // a shuffle's mask: one bit per thread of the warp, all taking part
+#define MAX_THREADS_PER_BLOCK 1024               // CUDA's limit on one block
+#define MAX_WARPS_PER_BLOCK (MAX_THREADS_PER_BLOCK / THREADS_PER_WARP)   // one shared slot per warp holds them all
 
-// ── combining across a warp (a "reduction") ──────────────────────────────────
-// What for: adding up N values with a warp (32 threads that run together) instead
-// of one thread. It goes in two phases:
-//
-//     phase 1: each lane adds up its own share of N / 32 values, all lanes at once
-//              → 32 partial sums, one per lane                     N / 32 steps
-//     phase 2: warp_reduce_sum folds the 32 partial sums into 1    5 steps, always
-//
-//     N = 768 (a LayerNorm row):   1 thread: 768 steps   warp: 24 + 5 = 29 steps
-//
-//     float part = ...;                          // phase 1: this lane's 24 values added
-//     float total = warp_reduce_sum(part);       // phase 2: every lane gets the sum of all 768
-//     float mean = total / 768;
-//
-// Phase 2, the fold: each step, every lane adds the value of a partner lane, read
-// straight from its registers (a "shuffle", no memory). The partner is `offset`
-// lanes away (lane i ^ offset). Each step halves the number of different sums:
-//
-//     32 ──(offset 16)──► 16 ──(8)──► 8 ──(4)──► 4 ──(2)──► 2 ──(1)──► 1: the total, in every lane
-//
-// It starts at offset 16 because a warp's lanes are 0..31: 16 apart is half the warp,
-// so the first step adds the right half onto the left half, like folding paper.
-// With 4 lanes holding 1, 2, 3, 4 (offsets 2, then 1):
-//
-//     offset 2:   1+3=4    2+4=6    3+1=4    4+2=6
-//     offset 1:   4+6=10   6+4=10   4+6=10   6+4=10      every lane: 10
-
-/// The sum of `value` over the 32 threads of the warp, in every thread.
-__device__ __forceinline__ float warp_reduce_sum(float value) {
-    for (int offset = 16; offset > 0; offset /= 2) value += __shfl_xor_sync(0xffffffff, value, offset);
-    return value;
+/// Stops with a message unless a launch's block size is whole warps and within CUDA's limit: every launcher
+/// checks its threads_per_block with it.
+///
+///   threads_per_block_val   the block size asked for
+///   kernel_name_ptr         the launcher's name, for the message
+static inline void check_threads_per_block(int threads_per_block_val, const char* kernel_name_ptr) {
+    if (threads_per_block_val <= 0 || threads_per_block_val > MAX_THREADS_PER_BLOCK ||
+        threads_per_block_val % THREADS_PER_WARP != 0) {
+        fprintf(stderr, "error: %s needs threads_per_block to be a multiple of %d, at most %d; got %d\n",
+                kernel_name_ptr, THREADS_PER_WARP, MAX_THREADS_PER_BLOCK, threads_per_block_val);
+        exit(EXIT_FAILURE);
+    }
 }
 
-// ── the largest value across a warp ──────────────────────────────────────────
-// What for: softmax, exp(x) / sum of exp, used by attention and at the output.
-// exp of a big score overflows a float (exp(1000) = inf, and then NaN), so softmax
-// first subtracts the row's largest score. The answer is the same, since the factor
-// cancels in the division, but now the biggest exp is exp(0) = 1:
-//
-//     scores 1000, 1001, 1002   max 1002   exp(-2), exp(-1), exp(0) = 0.14, 0.37, 1.0
-//
-// Finding that largest score with a warp, instead of one thread, goes in two phases:
-//
-//     phase 1: each lane finds the largest of its own share of N / 32 values,
-//              all lanes at once → 32 partial maxes, one per lane   N / 32 steps
-//     phase 2: warp_reduce_max folds the 32 partial maxes into 1    5 steps, always
-//
-//     N = 1024 (an attention row):   1 thread: 1024 steps   warp: 32 + 5 = 37 steps
-//
-//     float part = ...;                          // phase 1: the largest of this lane's 32 scores
-//     float row_max = warp_reduce_max(part);     // phase 2: every lane gets the largest of all 1024
-//     float e = expf(score - row_max);           // never more than exp(0) = 1
-//
-// Phase 2, the fold: the same as warp_reduce_sum's, but each step keeps the larger of
-// the two values (fmaxf) instead of adding them. Each step, every lane compares its
-// value with a partner lane's, read straight from its registers (a "shuffle", no
-// memory). The partner is `offset` lanes away (lane i ^ offset). Each step halves the
-// number of different maxes:
-//
-//     32 ──(offset 16)──► 16 ──(8)──► 8 ──(4)──► 4 ──(2)──► 2 ──(1)──► 1: the largest, in every lane
-//
-// It starts at offset 16 because a warp's lanes are 0..31: 16 apart is half the warp,
-// so the first step compares the right half with the left half, like folding paper.
-// With 4 lanes holding 3, 9, 1, 5 (offsets 2, then 1):
-//
-//     offset 2:   max(3,1)=3   max(9,5)=9   max(1,3)=3   max(5,9)=9
-//     offset 1:   max(3,9)=9   max(9,3)=9   max(3,9)=9   max(9,3)=9      every lane: 9
-
-/// The largest `value` over the 32 threads of the warp, in every thread.
-__device__ __forceinline__ float warp_reduce_max(float value) {
-    for (int offset = 16; offset > 0; offset /= 2) value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, offset));
-    return value;
+/// Gives the sum of `value_val` over the warp's THREADS_PER_WARP threads, in every thread.
+///
+///   value_val   this thread's part
+__device__ __forceinline__ float warp_reduce_sum(float value_val) {
+    for (int offset_val = THREADS_PER_WARP / 2; offset_val > 0; offset_val /= 2)
+        value_val += __shfl_xor_sync(WARP_ALL_LANES, value_val, offset_val);
+    return value_val;
 }
 
-// ── adding up across a block ─────────────────────────────────────────────────
-// Up to 32 warps: each warp adds its own 32 values, its lane 0 writes the
-// warp's total to shared memory, and the first warp adds those. Every thread of
-// the block must call it (it has __syncthreads() inside); every thread gets the
-// total back. blockDim.x must be a multiple of 32.
-__device__ __forceinline__ float block_reduce_sum(float value) {
-    __shared__ float warp_totals[32];
-    __shared__ float block_total;
-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32, num_warps = blockDim.x / 32;
-    value = warp_reduce_sum(value);
-    if (lane == 0) warp_totals[warp] = value;
+/// Gives the largest `value_val` over the warp's THREADS_PER_WARP threads, in every thread: the same fold, with
+/// fmaxf.
+///
+///   value_val   this thread's part
+__device__ __forceinline__ float warp_reduce_max(float value_val) {
+    for (int offset_val = THREADS_PER_WARP / 2; offset_val > 0; offset_val /= 2)
+        value_val = fmaxf(value_val, __shfl_xor_sync(WARP_ALL_LANES, value_val, offset_val));
+    return value_val;
+}
+
+/// Gives the sum of `value_val` over the block, in every thread: each warp's total to shared memory, then warp 0
+/// adds those. Every thread must call it; blockDim.x a multiple of THREADS_PER_WARP.
+///
+///   value_val   this thread's part
+__device__ __forceinline__ float block_reduce_sum(float value_val) {
+    // one slot per warp; warp 0's THREADS_PER_WARP lanes must cover them all
+    static_assert(MAX_WARPS_PER_BLOCK <= THREADS_PER_WARP, "warp 0 must hold one total per warp");
+    __shared__ float warp_totals_list[MAX_WARPS_PER_BLOCK];
+    __shared__ float block_total_val;
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int warp_index_val = threadIdx.x / THREADS_PER_WARP;
+    int warps_in_block_val = blockDim.x / THREADS_PER_WARP;
+    // 1. each warp's total, by its lane 0
+    value_val = warp_reduce_sum(value_val);
+    if (lane_index_val == 0) warp_totals_list[warp_index_val] = value_val;
     __syncthreads();
-    if (warp == 0) {
-        float total = warp_reduce_sum(lane < num_warps ? warp_totals[lane] : 0.0f);
-        if (lane == 0) block_total = total;
+    // 2. warp 0 adds the warps' totals
+    if (warp_index_val == 0) {
+        float total_val = warp_reduce_sum(lane_index_val < warps_in_block_val ? warp_totals_list[lane_index_val] : 0.0f);
+        if (lane_index_val == 0) block_total_val = total_val;
     }
     __syncthreads();
-    float result = block_total;
-    __syncthreads();          // before anyone calls it again and overwrites warp_totals
-    return result;
+    // 3. every thread reads it
+    float result_val = block_total_val;
+    __syncthreads();          // before a next call writes warp_totals_list again
+    return result_val;
 }
 
-__device__ __forceinline__ float block_reduce_max(float value) {
-    __shared__ float warp_maxima[32];
-    __shared__ float block_max;
-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32, num_warps = blockDim.x / 32;
-    value = warp_reduce_max(value);
-    if (lane == 0) warp_maxima[warp] = value;
+/// Gives the largest `value_val` over the block, in every thread, as block_reduce_sum.
+///
+///   value_val   this thread's part
+__device__ __forceinline__ float block_reduce_max(float value_val) {
+    // one slot per warp; warp 0's THREADS_PER_WARP lanes must cover them all
+    static_assert(MAX_WARPS_PER_BLOCK <= THREADS_PER_WARP, "warp 0 must hold one maximum per warp");
+    __shared__ float warp_maxima_list[MAX_WARPS_PER_BLOCK];
+    __shared__ float block_max_val;
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int warp_index_val = threadIdx.x / THREADS_PER_WARP;
+    int warps_in_block_val = blockDim.x / THREADS_PER_WARP;
+    // 1. each warp's largest, by its lane 0
+    value_val = warp_reduce_max(value_val);
+    if (lane_index_val == 0) warp_maxima_list[warp_index_val] = value_val;
     __syncthreads();
-    if (warp == 0) {
-        float maximum = warp_reduce_max(lane < num_warps ? warp_maxima[lane] : -FLT_MAX);
-        if (lane == 0) block_max = maximum;
+    // 2. warp 0 takes the largest of the warps'
+    if (warp_index_val == 0) {
+        float maximum_val = warp_reduce_max(lane_index_val < warps_in_block_val ? warp_maxima_list[lane_index_val] : -FLT_MAX);
+        if (lane_index_val == 0) block_max_val = maximum_val;
     }
     __syncthreads();
-    float result = block_max;
+    // 3. every thread reads it
+    float result_val = block_max_val;
     __syncthreads();
-    return result;
+    return result_val;
 }
 
 #endif // CUDA_COMMON_H

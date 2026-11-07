@@ -1,0 +1,11 @@
+From build/h100_full_tests (the H100 PCIe run of 2026-11-04, the code of commit 1397010, when these
+timings were still in tests/test_block.cu).
+2026-11-04 06:47:22  NVIDIA H100 PCIe, 81559 MiB, 570.195.03, 1 GPU(s)
+Build cuda_12.8.r12.8/compiler.35583870_0   torch 2.11.0+cu128
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         0.539         1.049             0.333              0.713
+    PyTorch takes, against mine:                                    0.62x              0.68x
+    input: list_of(mine.output)                 expected: {0.437708, -2.19442, -1.18038, -0.0126383, 0.0602729, -1.04156, 0.71205, 0.364307, -0.389574, 0.573877, -2.55302, -1.25552, 3.00888, 0.247904, 0.334181, -1.43414, ... (3145728 values)}   actual: {0.435547, -2.1875, -1.17969, -0.0117188, 0.0546875, -1.04688, 0.71875, 0.369141, -0.398438, 0.578125, -2.54688, -1.25, 3.01562, 0.242188, 0.332031, -1.4375, ... (3145728 values)}   difference: 0.00534527 (at most 0.03)   ok  (line 270)
+    input: list_of(mine.input_grad)             expected: {1.38997, 2.34071, -3.72269, -2.02797, -1.2547, 1.7119, 0.922414, 2.47114, 1.75388, 0.583509, -2.05962, 1.29795, -4.28872, -1.3873, -0.639262, -1.55143, ... (3145728 values)}   actual: {1.40625, 2.32812, -3.71875, -2.04688, -1.25781, 1.71875, 0.921875, 2.48438, 1.75, 0.5625, -2.0625, 1.28906, -4.28125, -1.36719, -0.636719, -1.55469, ... (3145728 values)}   difference: 0.0049634 (at most 0.03)   ok  (line 271)

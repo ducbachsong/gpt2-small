@@ -4,10 +4,11 @@
 //
 // Part 1 checks the norm against PyTorch's, from torch::nn::utils::clip_grad_norm_ (it
 // returns the norm of all the gradients it was given); part 2 checks numbers worked out by
-// hand, and how the work is shared out between the blocks.
+// hand, how the work is shared out between the blocks, and any block size. The timings are in
+// tunes/tune_grad_norm.cu.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
-#include <torch/utils.h>              // torch::manual_seed, for part 3's random values made on the GPU
+#include <torch/utils.h>              // torch::manual_seed
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
 #include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
 #include "../llmc/kernels/grad_norm.cuh"
@@ -16,53 +17,42 @@ static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a f
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Makes random values from Tensor::randn, times `scale`, as a CPU list: the same numbers
+/// Makes random values from Tensor::randn, times `scale_val`, as a CPU list: the same numbers
 /// for both sides of a test.
-static std::vector<float> random_values(const Shape &shape, float scale = 1.0f)
+static std::vector<float> random_values(const Shape &shape_list, float scale_val = 1.0f)
 {
-    std::vector<float> numbers = Tensor::randn(shape).tolist();
-    for (float &number : numbers)
-        number *= scale;
-    return numbers;
+    std::vector<float> numbers_list = Tensor::randn(shape_list).tolist();
+    for (float &number_val : numbers_list)
+        number_val *= scale_val;
+    return numbers_list;
 }
 
 /// Gives a Shape as the sizes PyTorch takes: {2, 4} as int64_t.
-static std::vector<int64_t> sizes_of(const Shape &shape)
+static std::vector<int64_t> sizes_of(const Shape &shape_list)
 {
-    return std::vector<int64_t>(shape.begin(), shape.end());
+    return std::vector<int64_t>(shape_list.begin(), shape_list.end());
 }
 
 /// Makes a new PyTorch tensor on the GPU from values in row order: the tests' CPU lists.
-static torch::Tensor to_gpu(const std::vector<float> &row_values, const Shape &shape)
+static torch::Tensor to_gpu(const std::vector<float> &row_values_list, const Shape &shape_list)
 {
-    return torch::tensor(row_values).reshape(sizes_of(shape)).to(torch::kCUDA);
+    return torch::tensor(row_values_list).reshape(sizes_of(shape_list)).to(torch::kCUDA);
 }
 
 /// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU: for
 /// values too many to pass through a CPU list quickly.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
 {
-    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    return torch::from_blob(tensor.data(), sizes_of(tensor.shape()), on_gpu).clone();
+    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    return torch::from_blob(tensor.data(), sizes_of(tensor.shape()), on_gpu_val).clone();
 }
 
-/// Measures how long `run` takes on the GPU, in milliseconds: a mark on the GPU's queue
-/// before it and one after; the GPU writes down the time as it reaches each.
-template <typename Run>
-static float gpu_milliseconds(Run run)
+/// Makes a tensor of `shape_list` holding `values_list` on the GPU.
+static Tensor tensor_of(const Shape &shape_list, const std::vector<float> &values_list)
 {
-    cudaEvent_t start, end;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&end));
-    cudaCheck(cudaEventRecord(start));
-    run();
-    cudaCheck(cudaEventRecord(end));
-    cudaCheck(cudaEventSynchronize(end)); // wait until the GPU has passed the second mark
-    float milliseconds = 0.0f;
-    cudaCheck(cudaEventElapsedTime(&milliseconds, start, end));
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(end));
-    return milliseconds;
+    Tensor tensor = Tensor::empty(shape_list);
+    tensor.copy_from_cpu(values_list.data());
+    return tensor;
 }
 
 // ══ part 1: my GradNorm against PyTorch's ═══════════════════════════════════
@@ -77,8 +67,10 @@ static void whole_model_norm_matches_pytorch(void)
     // (C#: BackwardThroughTheModelWritesIntoTheFlatGradients checked the same, norm of the
     // flat buffer against norm of each .grad, with gradients from backward(); the C trainer
     // has no backward yet, so the gradients here are random.)
+
+    // 1. the shapes, one flat buffer, and PyTorch's 16 separate parameters
     Tensor::manual_seed(0);
-    std::vector<Shape> param_shapes = {
+    std::vector<Shape> param_shapes_list = {
         // the 6 matrices: 4224 values
         {64, 16}, // wte: vocab 64
         {8, 16},  // wpe: sequence 8
@@ -90,40 +82,40 @@ static void whole_model_norm_matches_pytorch(void)
         {16}, {16}, {48}, {16}, {16}, {16}, {64}, {16}, // ln1w, ln1b, qkvb, attprojb, ln2w, ln2b, fcb, fcprojb
         {16}, {16},                                     // lnfw, lnfb
     };
-    int num_params = (int)param_shapes.size();
-    // one flat buffer: [ grads: 4464 | block sums: 2 x 512 | grad_norm: 1 ]
-    TensorBuffer buffer;
-    int grads_group = buffer.add_many(param_shapes);
-    int block_sums_index = buffer.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
-    int grad_norm_index = buffer.add({1});
-    buffer.allocate();
-    const Tensor &grads = buffer.group(grads_group); // every gradient, one flat tensor
-    const Tensor &grad_norm = buffer.tensor(grad_norm_index);
-    GradNorm grad_norm_kernel(buffer.tensor(block_sums_index));
-    // PyTorch's: 16 separate parameters; only their .grad matters here
-    std::vector<torch::Tensor> pytorch_params;
-    for (const Shape &shape : param_shapes)
-        pytorch_params.push_back(torch::zeros(sizes_of(shape), torch::kCUDA).requires_grad_(true));
+    int num_params_val = (int)param_shapes_list.size();
+    // [ grads: 4464 | block sums: 2 x GRAD_NORM_BLOCKS | grad_norm: 1 ]
+    TensorBuffer buffer_val;
+    int grads_group_val = buffer_val.add_many(param_shapes_list);
+    int block_sums_index_val = buffer_val.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
+    int grad_norm_index_val = buffer_val.add({1});
+    buffer_val.allocate();
+    const Tensor &grads_tensor = buffer_val.group(grads_group_val); // every gradient, one flat tensor
+    const Tensor &grad_norm_tensor = buffer_val.tensor(grad_norm_index_val);
+    GradNorm grad_norm_kernel_val(buffer_val.tensor(block_sums_index_val));
+    std::vector<torch::Tensor> pytorch_params_list;               // only their .grad matters here
+    for (const Shape &shape_list : param_shapes_list)
+        pytorch_params_list.push_back(torch::zeros(sizes_of(shape_list), torch::kCUDA).requires_grad_(true));
 
-    for (int round = 1; round <= 2; round++)
+    // 2. two rounds: big gradients, then small ones
+    for (int round_val = 1; round_val <= 2; round_val++)
     {
-        bool big = round == 1;
-        // 1. the gradients: random, the same on both sides
-        for (int k = 0; k < num_params; k++)
+        bool big_val = round_val == 1;
+        // the gradients: random, the same on both sides
+        for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
         {
-            std::vector<float> grad_values = random_values(param_shapes[k], big ? 1.0f : 1e-3f);
-            buffer.tensor(grads_group, k).copy_from_cpu(grad_values.data());
-            pytorch_params[k].mutable_grad() = to_gpu(grad_values, param_shapes[k]);
+            std::vector<float> grad_values_list = random_values(param_shapes_list[param_index_val], big_val ? 1.0f : 1e-3f);
+            buffer_val.tensor(grads_group_val, param_index_val).copy_from_cpu(grad_values_list.data());
+            pytorch_params_list[param_index_val].mutable_grad() = to_gpu(grad_values_list, param_shapes_list[param_index_val]);
         }
-        // 2. my norm: one compute on the flat gradients' view, all 4464 values
-        grad_norm_kernel.compute(grads, grad_norm);
-        // 3. PyTorch's: clip_grad_norm_ returns the norm of all 16 .grad together. max_norm 1e9
-        //    is far above any norm here, so it only measures (it multiplies each gradient by 1).
-        double pytorch_norm = torch::nn::utils::clip_grad_norm_(pytorch_params, 1e9);
-        // 4. compare: within 1e-5 of the norm, not exactly, as the two add the squares in a
-        //    different order; and the norm is on the side of max_norm 1 this round is meant for
-        ASSERT_NEAR(grad_norm.item(), pytorch_norm, TOLERANCE * pytorch_norm);
-        ASSERT_EQ(grad_norm.item() > 1.0f, big);
+        // my norm: one compute on the flat gradients' view, all 4464 values
+        grad_norm_kernel_val.compute(grads_tensor, grad_norm_tensor);
+        // PyTorch's: clip_grad_norm_ returns the norm of all 16 .grad together. max_norm 1e9 is far above any
+        // norm here, so it only measures (it multiplies each gradient by 1).
+        double pytorch_norm_val = torch::nn::utils::clip_grad_norm_(pytorch_params_list, 1e9);
+        // compare: within 1e-5 of the norm, not exactly, as the two add the squares in a different order; and
+        // the norm is on the side of max_norm 1 this round is meant for
+        ASSERT_NEAR(grad_norm_tensor.item(), pytorch_norm_val, TOLERANCE * pytorch_norm_val);
+        ASSERT_EQ(grad_norm_tensor.item() > 1.0f, big_val);
     }
 }
 
@@ -133,124 +125,17 @@ static void norm_of_bfloat16_gradients_matches_pytorch(void)
     // threads 0 .. 2 add on their own). Each is read as a float and squared and added in float, so the norm is
     // PyTorch's norm of the same values as floats within 1e-5: bfloat16 changes only what is read. block_sums
     // and grad_norm stay float.
+    // 1. random gradients in bfloat16; my norm
     Tensor::manual_seed(0);
-    Tensor grads = Tensor::empty({10007});
-    grads.copy_from_cpu(random_values({10007}).data());
-    grads = grads.to(DType::BFloat16);
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(grads, grad_norm);
-    double pytorch_norm = pytorch_copy_of(grads.to(DType::Float32)).norm().item<double>();
-    ASSERT_NEAR(grad_norm.item(), pytorch_norm, TOLERANCE * pytorch_norm);
-}
-
-/// Times 20 norms of gradients of these shapes, mine against PyTorch's two ways, and prints a
-/// table under `test`'s name. All three read the same values on the GPU:
-///
-///     my GradNorm          one launch over the flat buffer (every tensor one after the other)
-///     PyTorch per tensor   what C++ clip_grad_norm_ does before it clips: grad.norm() of each
-///                          tensor, then the norm of those norms (one launch per tensor, + 2)
-///     PyTorch foreach      what Python's clip_grad_norm_ does: _foreach_norm over all the
-///                          tensors at once (fewer, grouped launches), then the norm of the norms
-///
-/// The clip itself (multiplying every gradient) is not timed: it is not part of measuring.
-/// Each norm reads every value once. Checks at the end that all three measured the same norm.
-static void time_20_norms(const char *test, const std::vector<Shape> &param_shapes)
-{
-    Tensor::manual_seed(0);
-    int num_params = (int)param_shapes.size();
-    // one flat buffer: [ grads | block sums: 2 x 512 | grad_norm: 1 ]
-    TensorBuffer buffer;
-    int grads_group = buffer.add_many(param_shapes);
-    int block_sums_index = buffer.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
-    int grad_norm_index = buffer.add({1});
-    buffer.allocate();
-    const Tensor &grads = buffer.group(grads_group); // every gradient, one flat view
-    grads.normal_(0.0f, 1.0f);                        // made on the CPU: a few seconds
-    // PyTorch's: each tensor's gradient its own tensor, a copy of mine
-    std::vector<torch::Tensor> pytorch_grads;
-    for (int k = 0; k < num_params; k++)
-        pytorch_grads.push_back(pytorch_copy_of(buffer.tensor(grads_group, k)));
-    GradNorm grad_norm_kernel(buffer.tensor(block_sums_index));
-    const Tensor &grad_norm = buffer.tensor(grad_norm_index);
-    torch::Tensor per_tensor_norm, foreach_norm;
-
-    // Step 1 does first-time work (CUDA loads each side's kernels), so the average is of 2..20.
-    print_test_name(test);
-    printf("    %d tensors, %zu values\n", num_params, grads.numel());
-    printf("    time of one norm, in ms:   step   my GradNorm   PyTorch per tensor   PyTorch foreach\n");
-    double my_total = 0.0, per_tensor_total = 0.0, foreach_total = 0.0;
-    for (int t = 1; t <= 20; t++)
-    {
-        float my_ms = gpu_milliseconds([&] { grad_norm_kernel.compute(grads, grad_norm); });
-        float per_tensor_ms = gpu_milliseconds([&] {
-            std::vector<torch::Tensor> norms;
-            for (const torch::Tensor &grad : pytorch_grads)
-                norms.push_back(grad.norm());
-            per_tensor_norm = torch::stack(norms).norm();
-        });
-        float foreach_ms = gpu_milliseconds([&] {
-            std::vector<torch::Tensor> norms = at::_foreach_norm(pytorch_grads);
-            foreach_norm = torch::stack(norms).norm();
-        });
-        printf("                               %4d   %11.3f   %18.3f   %15.3f\n", t, my_ms, per_tensor_ms, foreach_ms);
-        if (t == 1)
-            continue;
-        my_total += my_ms;
-        per_tensor_total += per_tensor_ms;
-        foreach_total += foreach_ms;
-    }
-    double bytes = (double)grads.numel() * sizeof(float);
-    printf("    average of steps 2..20:           %11.3f   %18.3f   %15.3f\n", my_total / 19, per_tensor_total / 19,
-           foreach_total / 19);
-    printf("    memory read, in GB/s:             %11.0f   %18.0f   %15.0f\n", bytes / (my_total / 19) / 1e6,
-           bytes / (per_tensor_total / 19) / 1e6, bytes / (foreach_total / 19) / 1e6);
-    printf("    PyTorch takes, against mine:                   %16.2fx   %14.2fx\n", per_tensor_total / my_total,
-           foreach_total / my_total);
-    double expected = per_tensor_norm.item<double>();
-    ASSERT_NEAR(grad_norm.item(), expected, TOLERANCE * expected);
-    ASSERT_NEAR(foreach_norm.item<double>(), expected, TOLERANCE * expected);
-}
-
-/// Makes GPT-2 small's 148 parameter shapes, in the model's order: wte (vocab 50,257) and wpe,
-/// then the 12 shapes of each of the 12 layers, then the final LayerNorm. 124,439,808 values.
-static std::vector<Shape> gpt2_small_param_shapes(void)
-{
-    std::vector<Shape> shapes = {{50257, 768}, {1024, 768}}; // wte, wpe
-    for (int layer = 0; layer < 12; layer++)
-    {
-        std::vector<Shape> layer_shapes = {
-            {768}, {768},         // ln1w, ln1b
-            {2304, 768}, {2304},  // qkvw, qkvb
-            {768, 768}, {768},    // attprojw, attprojb
-            {768}, {768},         // ln2w, ln2b
-            {3072, 768}, {3072},  // fcw, fcb
-            {768, 3072}, {768},   // fcprojw, fcprojb
-        };
-        shapes.insert(shapes.end(), layer_shapes.begin(), layer_shapes.end());
-    }
-    shapes.push_back({768}); // lnfw
-    shapes.push_back({768}); // lnfb
-    return shapes;
-}
-
-static void time_20_norms_on_gpt2_small_size(void)
-{
-    // Prints the times on as many values as GPT-2 small has, as 2 tensors: 162,030 x 768 + 768 =
-    // 124,439,808. Each norm reads every value once: 498 MB, so at a T4's 320 GB/s, at least
-    // 1.56 ms. With 2 tensors PyTorch launches only a few kernels: this compares the kernels.
-    time_20_norms(__func__, {{162030, 768}, {768}});
-}
-
-static void time_20_norms_on_gpt2_small_148_tensors(void)
-{
-    // Prints the times on GPT-2 small's real 148 tensors: the same 124,439,808 values, but
-    // PyTorch now has 148 separate gradients (per tensor: 148 norm launches + 2), while mine is
-    // still one launch over one flat buffer. What the flat buffer is worth shows here.
-    std::vector<Shape> param_shapes = gpt2_small_param_shapes();
-    ASSERT_EQ(param_shapes.size(), (size_t)148);
-    time_20_norms(__func__, param_shapes);
+    Tensor grads_tensor = tensor_of({10007}, random_values({10007})).to(DType::BFloat16);
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(grads_tensor, grad_norm_tensor);
+    // 2. PyTorch's, of the same values as floats
+    double pytorch_norm_val = pytorch_copy_of(grads_tensor.to(DType::Float32)).norm().item<double>();
+    // 3. check
+    ASSERT_NEAR(grad_norm_tensor.item(), pytorch_norm_val, TOLERANCE * pytorch_norm_val);
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
@@ -260,46 +145,51 @@ static void computes_the_norm_of_all_gradients_together(void)
     // Expect: a weight's gradient {1, 2, 3, 4} and a bias's {5, 6}, one after the other in a
     // flat buffer, have the norm of all six as one long list:
     // sqrt(1 + 4 + 9 + 16 + 25 + 36) = sqrt(91) = 9.539. (C#: ClipReturnsTheNormOfAllGradientsTogether.)
-    // The buffer: [ weight's grad: 4 | bias's grad: 2 | block sums: 2 x 512 | grad_norm: 1 ]
-    TensorBuffer buffer;
-    int grads_group = buffer.add_many({{2, 2}, {2}});
-    int block_sums_index = buffer.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
-    int grad_norm_index = buffer.add({1});
-    buffer.allocate();
-    std::vector<float> weight_grad = {1.0f, 2.0f, 3.0f, 4.0f}, bias_grad = {5.0f, 6.0f};
-    buffer.tensor(grads_group, 0).copy_from_cpu(weight_grad.data());
-    buffer.tensor(grads_group, 1).copy_from_cpu(bias_grad.data());
-    const Tensor &grads = buffer.group(grads_group);
-    const Tensor &grad_norm = buffer.tensor(grad_norm_index);
-    GradNorm grad_norm_kernel(buffer.tensor(block_sums_index));
-    grad_norm_kernel.compute(grads, grad_norm);
-    ASSERT_NEAR(grad_norm.item(), sqrt(91.0), 1e-5);
+    // The buffer: [ weight's grad: 4 | bias's grad: 2 | block sums: 2 x GRAD_NORM_BLOCKS | grad_norm: 1 ]
+    // 1. the buffer, with the two gradients
+    TensorBuffer buffer_val;
+    int grads_group_val = buffer_val.add_many({{2, 2}, {2}});
+    int block_sums_index_val = buffer_val.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
+    int grad_norm_index_val = buffer_val.add({1});
+    buffer_val.allocate();
+    std::vector<float> weight_grad_list = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> bias_grad_list = {5.0f, 6.0f};
+    buffer_val.tensor(grads_group_val, 0).copy_from_cpu(weight_grad_list.data());
+    buffer_val.tensor(grads_group_val, 1).copy_from_cpu(bias_grad_list.data());
+    // 2. the norm
+    const Tensor &grads_tensor = buffer_val.group(grads_group_val);
+    const Tensor &grad_norm_tensor = buffer_val.tensor(grad_norm_index_val);
+    GradNorm grad_norm_kernel_val(buffer_val.tensor(block_sums_index_val));
+    grad_norm_kernel_val.compute(grads_tensor, grad_norm_tensor);
+    // 3. check
+    ASSERT_NEAR(grad_norm_tensor.item(), sqrt(91.0), 1e-5);
 }
 
 static void a_3_and_minus_4_give_5(void)
 {
     // Expect: {3, -4} has norm sqrt(9 + 16) = sqrt(25) = 5, exactly: a minus sign makes no
     // difference once squared.
-    std::vector<float> values = {3.0f, -4.0f};
-    Tensor gradient = Tensor::zeros({2});
-    gradient.copy_from_cpu(values.data());
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(gradient, grad_norm);
-    ASSERT_EQ(grad_norm.item(), 5.0f);
+    // 1. the norm
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(tensor_of({2}, {3.0f, -4.0f}), grad_norm_tensor);
+    // 2. check
+    ASSERT_EQ(grad_norm_tensor.item(), 5.0f);
 }
 
 static void zeros_give_0(void)
 {
     // Expect: 1000 zeros have norm 0, not NaN: sqrt(0) = 0. The norm tensor starts at 7, so
     // a 0 shows the compute really wrote it.
-    Tensor gradient = Tensor::zeros({1000});
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1}).fill_(7);
-    grad_norm_kernel.compute(gradient, grad_norm);
-    ASSERT_EQ(grad_norm.item(), 0.0f);
+    // 1. the norm of zeros, into a 7
+    Tensor gradient_tensor = Tensor::zeros({1000});
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1}).fill_(7);
+    grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+    // 2. check
+    ASSERT_EQ(grad_norm_tensor.item(), 0.0f);
 }
 
 static void each_block_adds_its_share_of_the_values(void)
@@ -308,13 +198,15 @@ static void each_block_adds_its_share_of_the_values(void)
     // so each thread reads 2 float4s: 8 squares. Each block: 8 x 1024 = 8192, so all 512 block
     // sums are 8192. They add up to 512 x 8192 = 4,194,304, and the norm is sqrt(4,194,304) =
     // 2048, exactly.
-    Tensor gradient = Tensor::ones({4194304});
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(gradient, grad_norm);
-    ASSERT_EQ(block_sums[0].tolist(), std::vector<float>(512, 8192.0f));
-    ASSERT_EQ(grad_norm.item(), 2048.0f);
+    // 1. the norm of ones
+    Tensor gradient_tensor = Tensor::ones({4194304});
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+    // 2. check every block sum, and the norm
+    ASSERT_EQ(block_sums_tensor[0].tolist(), std::vector<float>(GRAD_NORM_BLOCKS, 8192.0f));
+    ASSERT_EQ(grad_norm_tensor.item(), 2048.0f);
 }
 
 static void a_last_round_that_is_not_full_still_counts(void)
@@ -328,15 +220,17 @@ static void a_last_round_that_is_not_full_still_counts(void)
     //     block 511   threads 523,264 .. 524,287, all with 1:               1024 x 1 = 1024
     //
     // All of them: 4,000,000 x 0.25 = 1,000,000, so the norm is sqrt(1,000,000) = 1000, exactly.
-    Tensor gradient = Tensor::zeros({4000000}).fill_(0.5);
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(gradient, grad_norm);
-    ASSERT_EQ(block_sums[0][0].item(), 2048.0f);
-    ASSERT_EQ(block_sums[0][464].item(), 1600.0f);
-    ASSERT_EQ(block_sums[0][511].item(), 1024.0f);
-    ASSERT_EQ(grad_norm.item(), 1000.0f);
+    // 1. the norm of 0.5s
+    Tensor gradient_tensor = Tensor::zeros({4000000}).fill_(0.5);
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+    // 2. check three block sums, and the norm
+    ASSERT_EQ(block_sums_tensor[0][0].item(), 2048.0f);
+    ASSERT_EQ(block_sums_tensor[0][464].item(), 1600.0f);
+    ASSERT_EQ(block_sums_tensor[0][511].item(), 1024.0f);
+    ASSERT_EQ(grad_norm_tensor.item(), 1000.0f);
 }
 
 static void values_after_the_last_whole_float4_still_count(void)
@@ -344,49 +238,51 @@ static void values_after_the_last_whole_float4_still_count(void)
     // Expect: 7 values {1, 1, 1, 1, 2, 2, 2}: one whole float4 (the four 1s) and 3 left over (the
     // 2s), which threads 0, 1 and 2 read one float each. Block 0 has them all: 1 + 1 + 1 + 1 +
     // 4 + 4 + 4 = 16, and the norm is sqrt(16) = 4, exactly. Without the leftovers it would be 2.
-    std::vector<float> values = {1.0f, 1.0f, 1.0f, 1.0f, 2.0f, 2.0f, 2.0f};
-    Tensor gradient = Tensor::zeros({7});
-    gradient.copy_from_cpu(values.data());
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(gradient, grad_norm);
-    ASSERT_EQ(block_sums[0][0].item(), 16.0f);
-    ASSERT_EQ(grad_norm.item(), 4.0f);
+    // 1. the norm
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(tensor_of({7}, {1.0f, 1.0f, 1.0f, 1.0f, 2.0f, 2.0f, 2.0f}), grad_norm_tensor);
+    // 2. check
+    ASSERT_EQ(block_sums_tensor[0][0].item(), 16.0f);
+    ASSERT_EQ(grad_norm_tensor.item(), 4.0f);
 }
 
 static void the_same_values_give_the_same_norm_every_time(void)
 {
     // Expect: 1,000,000 random values, 5 computes: all 5 norms are the same, to the last bit.
-    // The last block adds the 512 block sums in the same order every time; atomicAdd into the
+    // The last block adds the block sums in the same order every time; atomicAdd into the
     // norm would not. Each compute also puts the counter back to 0, ready for the next.
+    // 1. the first norm
     Tensor::manual_seed(0);
-    Tensor gradient = Tensor::randn({1000000});
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(gradient, grad_norm);
-    float first_norm = grad_norm.item();
-    for (int run = 2; run <= 5; run++)
+    Tensor gradient_tensor = Tensor::randn({1000000});
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+    float first_norm_val = grad_norm_tensor.item();
+    // 2. four more, each the same
+    for (int run_val = 2; run_val <= 5; run_val++)
     {
-        grad_norm_kernel.compute(gradient, grad_norm);
-        ASSERT_EQ(grad_norm.item(), first_norm);
+        grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+        ASSERT_EQ(grad_norm_tensor.item(), first_norm_val);
     }
-    ASSERT_EQ(block_sums[1][0].item(), 0.0f);
+    // 3. the counter is back to 0
+    ASSERT_EQ(block_sums_tensor[1][0].item(), 0.0f);
 }
 
 static void only_the_values_in_the_view_count(void)
 {
     // Expect: of {3, 4, 100, 100}, the compute is given a view of the first 2 (narrow(0, 0, 2):
     // the address of the 3, numel 2): norm 5. A kernel that read past the view would take a 100 too.
-    std::vector<float> values = {3.0f, 4.0f, 100.0f, 100.0f};
-    Tensor all_values = Tensor::zeros({4});
-    all_values.copy_from_cpu(values.data());
-    Tensor block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the 512 block sums; row 1, value 0: blocks done
-    GradNorm grad_norm_kernel(block_sums);
-    Tensor grad_norm = Tensor::zeros({1});
-    grad_norm_kernel.compute(all_values.narrow(0, 0, 2), grad_norm);
-    ASSERT_EQ(grad_norm.item(), 5.0f);
+    // 1. the norm of a view
+    Tensor all_values_tensor = tensor_of({4}, {3.0f, 4.0f, 100.0f, 100.0f});
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+    GradNorm grad_norm_kernel_val(block_sums_tensor);
+    Tensor grad_norm_tensor = Tensor::zeros({1});
+    grad_norm_kernel_val.compute(all_values_tensor.narrow(0, 0, 2), grad_norm_tensor);
+    // 2. check
+    ASSERT_EQ(grad_norm_tensor.item(), 5.0f);
 }
 
 static void changes_nothing_but_the_norm(void)
@@ -399,158 +295,69 @@ static void changes_nothing_but_the_norm(void)
     // 49): the 7 right after the values is not read). Block sum 0 is 30 (block 0 has all 4
     // values), the other 511 are 0. The counter is back to 0. The values and the 4 after the
     // norm are as they were. (The counter is set to 0 after the fill: it must start at 0.)
-    TensorBuffer buffer;
-    int values_index = buffer.add({4});
-    int block_sums_index = buffer.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
-    int grad_norm_index = buffer.add({1});
-    int after_index = buffer.add({4});
-    buffer.allocate();
-    buffer.flat().fill_(7);
-    buffer.tensor(block_sums_index)[1][0].zero_();
-    std::vector<float> values = {1.0f, 2.0f, 3.0f, 4.0f};
-    buffer.tensor(values_index).copy_from_cpu(values.data());
-    GradNorm grad_norm_kernel(buffer.tensor(block_sums_index));
-    grad_norm_kernel.compute(buffer.tensor(values_index), buffer.tensor(grad_norm_index));
-    ASSERT_NEAR(buffer.tensor(grad_norm_index).item(), sqrt(30.0), 1e-5);
-    ASSERT_EQ(buffer.tensor(block_sums_index)[0][0].item(), 30.0f);
-    ASSERT_EQ(buffer.tensor(block_sums_index)[0][511].item(), 0.0f);
-    ASSERT_EQ(buffer.tensor(block_sums_index)[1][0].item(), 0.0f);
-    ASSERT_EQ(buffer.tensor(values_index).tolist(), values);
-    ASSERT_EQ(buffer.tensor(after_index).tolist(), std::vector<float>(4, 7.0f));
+    // 1. the buffer, all 7, the counter 0, the values 1 2 3 4
+    TensorBuffer buffer_val;
+    int values_index_val = buffer_val.add({4});
+    int block_sums_index_val = buffer_val.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
+    int grad_norm_index_val = buffer_val.add({1});
+    int after_index_val = buffer_val.add({4});
+    buffer_val.allocate();
+    buffer_val.flat().fill_(7);
+    buffer_val.tensor(block_sums_index_val)[1][0].zero_();
+    std::vector<float> values_list = {1.0f, 2.0f, 3.0f, 4.0f};
+    buffer_val.tensor(values_index_val).copy_from_cpu(values_list.data());
+    // 2. the norm
+    GradNorm grad_norm_kernel_val(buffer_val.tensor(block_sums_index_val));
+    grad_norm_kernel_val.compute(buffer_val.tensor(values_index_val), buffer_val.tensor(grad_norm_index_val));
+    // 3. check the norm, the block sums, the counter, and that nothing else changed
+    ASSERT_NEAR(buffer_val.tensor(grad_norm_index_val).item(), sqrt(30.0), 1e-5);
+    ASSERT_EQ(buffer_val.tensor(block_sums_index_val)[0][0].item(), 30.0f);
+    ASSERT_EQ(buffer_val.tensor(block_sums_index_val)[0][GRAD_NORM_BLOCKS - 1].item(), 0.0f);
+    ASSERT_EQ(buffer_val.tensor(block_sums_index_val)[1][0].item(), 0.0f);
+    ASSERT_EQ(buffer_val.tensor(values_index_val).tolist(), values_list);
+    ASSERT_EQ(buffer_val.tensor(after_index_val).tolist(), std::vector<float>(4, 7.0f));
 }
 
-// ══ part 3: other block and thread counts ═════════════════════════════════════
-
-/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
-/// run while its clock is still rising from idle.
-template <typename Run>
-static void warm_up_gpu(Run run)
+static void any_block_size_gives_the_same_norm_within_tolerance(void)
 {
-    float total = 0.0f;
-    while (total < 1000.0f)
-        total += gpu_milliseconds(run);
-}
-
-static void time_the_kernel_with_other_block_and_thread_counts(void)
-{
-    // Prints the time of one norm on as many values as GPT-2 small has, 124,439,808 (31,109,952 float4s), in
-    // float and in bfloat16, for 10 block counts x 4 thread counts, each the average of 20 runs: the 8 picked
-    // on a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on
-    // a T4 they repeat 40 and 80). The 40 launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
-    // launch's 20 runs in a row would all land in the same stretch of the test, and a T4's clock can drift
-    // as it heats up (the first launch timed would get the fastest clock); taking turns gives every launch
-    // runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has already done the
-    // first-time work. The kernel is launched here directly, <<<blocks, threads>>>, with block sums for up
-    // to 4096 blocks, instead of through GradNorm::compute, which always launches GRAD_NORM_BLOCKS x
-    // GRAD_NORM_THREADS (512 x 1024). Each norm reads every value once: 498 MB in float, so at a T4's
-    // 320 GB/s at least 1.56 ms; 249 MB in bfloat16, at least 0.78 ms. A bfloat16 float4 is one 8-byte read
-    // instead of 16, so each thread keeps half the bytes in flight: its best launch may differ.
-    //
-    // Expect: every launch gives the usual norm of its dtype within TOLERANCE, not to the last bit: another
-    // launch gives each thread other values to add up, so the squares are added in another order (in float
-    // either way).
-    torch::manual_seed(0);
-    size_t n = 124439808;
-    Tensor grads = Tensor::empty({n});
-    torch::Tensor values = torch::randn({(int64_t)n}, torch::TensorOptions().device(torch::kCUDA));
-    cudaCheck(cudaMemcpy(grads.data(), values.data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToDevice));
-    Tensor grads_bf16 = grads.to(DType::BFloat16);
-    // Block sums for the largest launch, shared by both dtypes: the launches run one after the other, and
-    // each puts the counter back to 0.
-    Tensor block_sums = Tensor::zeros({4096}), blocks_done = Tensor::zeros({1});
-    Tensor grad_norm = Tensor::zeros({1}), grad_norm_bf16 = Tensor::zeros({1});
-
-    // The usual launch's norms, to compare each launch with.
-    Tensor usual_block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: block sums; row 1, value 0: blocks done
-    GradNorm(usual_block_sums).compute(grads, grad_norm);
-    GradNorm(usual_block_sums).compute(grads_bf16, grad_norm_bf16);
-    double usual_norm = grad_norm.item(), usual_norm_bf16 = grad_norm_bf16.item();
-
-    int blocks = 0, threads = 0; // the launch the 2 below use, set by the loop
-    auto norm = [&] {
-        compute_grad_norm_kernel<float><<<blocks, threads>>>(grad_norm.data(), block_sums.data(), blocks_done.data(),
-                                                             grads.data(), n);
-        cudaCheck(cudaGetLastError());
-    };
-    auto norm_bf16 = [&] {
-        compute_grad_norm_kernel<nv_bfloat16><<<blocks, threads>>>(grad_norm_bf16.data(), block_sums.data(),
-                                                                   blocks_done.data(),
-                                                                   grads_bf16.data_ptr<nv_bfloat16>(), n);
-        cudaCheck(cudaGetLastError());
-    };
-    blocks = GRAD_NORM_BLOCKS;
-    threads = GRAD_NORM_THREADS;
-    warm_up_gpu(norm);
-
-    int sms = 0;                 // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe; 2 x sms is within block_sums' 4096
-    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
-    int block_counts[] = {40, 80, 160, 320, 512, 1024, 2048, 4096, sms, 2 * sms};
-    int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 10 * 4, rounds = 20;
-    float total_ms[launches][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] float, [1] bf16
-    for (int round = 1; round <= rounds; round++)
+    // Expect: 1,000,003 random values (whole float4s and 3 left over), in float and in bfloat16. compute
+    // called with threads_per_block 32, 128, 512 and 1024 (one warp up to MAX_THREADS_PER_BLOCK) gives the
+    // default's norm (GRAD_NORM_THREADS) within TOLERANCE, not to the last bit: another block size gives each
+    // thread other values and each block other threads, so the squares are added in another order. The
+    // same block size twice gives the same bits, and every compute puts the counter back to 0.
+    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    DType dtypes_list[] = {DType::Float32, DType::BFloat16};
+    for (DType dtype_val : dtypes_list)
     {
-        for (int k = 0; k < launches; k++)
+        // 1. random gradients; the default's norm
+        Tensor::manual_seed(0);
+        Tensor gradient_tensor = Tensor::randn({1000003}).to(dtype_val);
+        Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS}); // row 0: the block sums; row 1, value 0: blocks done
+        GradNorm grad_norm_kernel_val(block_sums_tensor);
+        Tensor grad_norm_tensor = Tensor::zeros({1});
+        grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor);
+        float usual_norm_val = grad_norm_tensor.item();
+
+        // 2. each block size: within TOLERANCE of the default's, the same bits twice, the counter back to 0
+        for (int threads_per_block_val : block_sizes_list)
         {
-            blocks = block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(norm);
-            total_ms[k][1] += gpu_milliseconds(norm_bf16);
+            grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor, threads_per_block_val);
+            float norm_val = grad_norm_tensor.item();
+            ASSERT_NEAR(norm_val, usual_norm_val, TOLERANCE * usual_norm_val);
+            grad_norm_kernel_val.compute(gradient_tensor, grad_norm_tensor, threads_per_block_val);
+            ASSERT_EQ(grad_norm_tensor.item(), norm_val);
+            ASSERT_EQ(block_sums_tensor[1][0].item(), 0.0f);
         }
     }
-
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {}, fastest_threads[2] = {}, launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   float4s per thread    float    GB/s     bf16    GB/s   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[2];
-        for (int j = 0; j < 2; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-
-        // One norm with this launch in each dtype, against the usual launch's.
-        norm();
-        norm_bf16();
-        bool same = fabs(grad_norm.item() - usual_norm) <= TOLERANCE * usual_norm &&
-                    fabs(grad_norm_bf16.item() - usual_norm_bf16) <= TOLERANCE * usual_norm_bf16;
-        if (same)
-            launches_with_the_same_result++;
-
-        size_t threads_launched = (size_t)blocks * threads;
-        int float4s_per_thread = (int)((n / 4 + threads_launched - 1) / threads_launched); // the most
-        double float_gb_per_second = (double)n * sizeof(float) / times[0] / 1e6;
-        double bf16_gb_per_second = (double)n * sizeof(nv_bfloat16) / times[1] / 1e6;
-        const char *usual = blocks == GRAD_NORM_BLOCKS && threads == GRAD_NORM_THREADS
-                                ? "   <- what GradNorm::compute launches"
-                                : "";
-        printf("                  %6d   %7d   %18d   %6.3f   %5.0f   %6.3f   %5.0f   %-11s%s\n", blocks, threads,
-               float4s_per_thread, times[0], float_gb_per_second, times[1], bf16_gb_per_second, same ? "yes" : "NO",
-               usual);
-    }
-    printf("    fastest       %5d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0], fastest_ms[0]);
-    printf("    fastest bf16  %5d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1], fastest_ms[1]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+    start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     whole_model_norm_matches_pytorch();
     norm_of_bfloat16_gradients_matches_pytorch();
-    time_20_norms_on_gpt2_small_size();
-    time_20_norms_on_gpt2_small_148_tensors();
 
     computes_the_norm_of_all_gradients_together();
     a_3_and_minus_4_give_5();
@@ -561,8 +368,7 @@ int main(void)
     the_same_values_give_the_same_norm_every_time();
     only_the_values_in_the_view_count();
     changes_nothing_but_the_norm();
-
-    time_the_kernel_with_other_block_and_thread_counts();
+    any_block_size_gives_the_same_norm_within_tolerance();
 
     printf("\nall tests passed\n");
     return 0;

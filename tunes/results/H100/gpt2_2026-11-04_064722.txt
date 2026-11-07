@@ -1,0 +1,10 @@
+From build/h100_full_tests (the H100 PCIe run of 2026-11-04, the code of commit 1397010, when these
+timings were still in tests/test_gpt2.cu).
+2026-11-04 06:47:22  NVIDIA H100 PCIe, 81559 MiB, 570.195.03, 1 GPU(s)
+Build cuda_12.8.r12.8/compiler.35583870_0   torch 2.11.0+cu128
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         7.262        14.446             5.451             11.135
+    PyTorch takes, against mine:                                    0.75x              0.77x
+    input: (double)gpt2_mean_loss(mine.activations) expected: 11.329 +/- 0.05   actual: 11.3287   ok  (line 368)

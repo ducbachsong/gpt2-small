@@ -2,10 +2,10 @@
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
-// Part 1 checks both against PyTorch's cross_entropy, with autograd for the backward, and times them
-// on GPT-2 small's sizes; part 2 checks numbers worked out by hand; part 3 checks that each kernel's
-// registers fit its block; part 4 times each kernel with other block and thread counts. (The C#
-// trainer had no classifier test: TorchSharp's was trusted.)
+// Part 1 checks both against PyTorch's cross_entropy, with autograd for the backward; part 2 checks
+// numbers worked out by hand; part 3 checks that each kernel's registers fit its block, and any block size.
+// The timings are in tunes/tune_classifier.cu.
+// (The C# trainer had no classifier test: TorchSharp's was trusted.)
 #include <torch/types.h>              // torch::cross_entropy_loss, torch::randn, backward(); before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
@@ -16,42 +16,45 @@ static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a f
 // rounding moves a value by up to 2^-8, about 0.4% of it. Twice that.
 static const double BFLOAT16_TOLERANCE = 8e-3;
 
+#define GPT2_VOCAB_SIZE 50257         // GPT-2's real words
+#define GPT2_PADDED_VOCAB_SIZE 50304  // the row length: the words, then padding up to a multiple of 128
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Makes a tensor of `shape` on the GPU holding `values`, given in row order.
-static Tensor tensor_of(const Shape &shape, const std::vector<float> &values)
+/// Makes a tensor of `shape_list` on the GPU holding `values_list`, given in row order.
+static Tensor tensor_of(const Shape &shape_list, const std::vector<float> &values_list)
 {
-    Tensor tensor = Tensor::empty(shape);
-    tensor.copy_from_cpu(values.data());
+    Tensor tensor = Tensor::empty(shape_list);
+    tensor.copy_from_cpu(values_list.data());
     return tensor;
 }
 
-/// Makes an int tensor of `shape` on the GPU holding `values`: the targets.
-static Tensor targets_of(const Shape &shape, const std::vector<int> &values)
+/// Makes an int tensor of `shape_list` on the GPU holding `values_list`: the targets.
+static Tensor targets_of(const Shape &shape_list, const std::vector<int> &values_list)
 {
-    Tensor tensor = Tensor::empty(shape, DType::Int32);
-    tensor.copy_from_cpu(values.data());
+    Tensor tensor = Tensor::empty(shape_list, DType::Int32);
+    tensor.copy_from_cpu(values_list.data());
     return tensor;
 }
 
-/// Makes a tensor of `shape` with random values, mean 0 and standard deviation 1, made by PyTorch on
+/// Makes a tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
 /// the GPU: Tensor::randn makes them on the CPU, which takes minutes for the logits' 206M values.
-static Tensor random_tensor_on_gpu(const Shape &shape)
+static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
-    Tensor tensor = Tensor::empty(shape);
-    torch::Tensor values = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA));
-    cudaCheck(cudaMemcpy(tensor.data(), values.data_ptr<float>(), tensor.numel() * sizeof(float),
+    Tensor tensor = Tensor::empty(shape_list);
+    torch::Tensor values_tensor = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA));
+    cudaCheck(cudaMemcpy(tensor.data(), values_tensor.data_ptr<float>(), tensor.numel() * sizeof(float),
                          cudaMemcpyDeviceToDevice));
     return tensor;
 }
 
-/// Makes an int tensor of `shape` with random targets 0 .. vocab_size - 1, made by PyTorch on the GPU.
-static Tensor random_targets_on_gpu(const Shape &shape, size_t vocab_size)
+/// Makes an int tensor of `shape_list` with random targets 0 .. vocab_size - 1, made by PyTorch on the GPU.
+static Tensor random_targets_on_gpu(const Shape &shape_list, size_t vocab_size_val)
 {
-    Tensor tensor = Tensor::empty(shape, DType::Int32);
-    torch::TensorOptions ints_on_gpu = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA);
-    torch::Tensor values = torch::randint((int64_t)vocab_size, {(int64_t)tensor.numel()}, ints_on_gpu);
-    cudaCheck(cudaMemcpy(tensor.data_ptr<int>(), values.data_ptr<int>(), tensor.numel() * sizeof(int),
+    Tensor tensor = Tensor::empty(shape_list, DType::Int32);
+    torch::TensorOptions ints_on_gpu_val = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA);
+    torch::Tensor values_tensor = torch::randint((int64_t)vocab_size_val, {(int64_t)tensor.numel()}, ints_on_gpu_val);
+    cudaCheck(cudaMemcpy(tensor.data_ptr<int>(), values_tensor.data_ptr<int>(), tensor.numel() * sizeof(int),
                          cudaMemcpyDeviceToDevice));
     return tensor;
 }
@@ -59,60 +62,32 @@ static Tensor random_targets_on_gpu(const Shape &shape, size_t vocab_size)
 /// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
 {
-    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
-    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
+    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    std::vector<int64_t> sizes_list(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
+    return torch::from_blob(tensor.data(), sizes_list, on_gpu_val).clone();
 }
 
 /// Makes a PyTorch copy of my int targets as int64, the type cross_entropy wants its targets in.
-static torch::Tensor pytorch_targets_of(const Tensor &targets)
+static torch::Tensor pytorch_targets_of(const Tensor &targets_tensor)
 {
-    torch::TensorOptions ints_on_gpu = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA);
-    std::vector<int64_t> sizes(targets.shape().begin(), targets.shape().end());
-    return torch::from_blob(targets.data_ptr<int>(), sizes, ints_on_gpu).to(torch::kLong);
+    torch::TensorOptions ints_on_gpu_val = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA);
+    std::vector<int64_t> sizes_list(targets_tensor.shape().begin(), targets_tensor.shape().end());
+    return torch::from_blob(targets_tensor.data_ptr<int>(), sizes_list, ints_on_gpu_val).to(torch::kLong);
 }
 
 /// Gives the first vocab_size columns of pytorch_logits {batch_size, seq_len, padded_vocab_size} as
 /// {rows, vocab_size}: the words, without the padding, the way cross_entropy takes them.
-static torch::Tensor word_logits_of(const torch::Tensor &pytorch_logits, size_t vocab_size)
+static torch::Tensor word_logits_of(const torch::Tensor &pytorch_logits_tensor, size_t vocab_size_val)
 {
-    int64_t rows = pytorch_logits.size(0) * pytorch_logits.size(1);
-    return pytorch_logits.narrow(2, 0, (int64_t)vocab_size).reshape({rows, (int64_t)vocab_size});
+    int64_t rows_val = pytorch_logits_tensor.size(0) * pytorch_logits_tensor.size(1);
+    return pytorch_logits_tensor.narrow(2, 0, (int64_t)vocab_size_val).reshape({rows_val, (int64_t)vocab_size_val});
 }
 
 /// Gives every value of a PyTorch tensor as a CPU list in row order, to compare with mine.
 static std::vector<float> list_of(const torch::Tensor &tensor)
 {
-    torch::Tensor on_cpu = tensor.detach().contiguous().cpu();
-    return std::vector<float>(on_cpu.data_ptr<float>(), on_cpu.data_ptr<float>() + on_cpu.numel());
-}
-
-/// Gives the largest difference between my tensor and a PyTorch tensor of the same values, as a
-/// fraction of the PyTorch tensor's largest value, worked out on the GPU: for tensors too big to copy
-/// to the CPU and compare there.
-static double relative_difference_on_gpu(const Tensor &mine, const torch::Tensor &pytorch)
-{
-    torch::Tensor difference = (pytorch_copy_of(mine).reshape(pytorch.sizes()) - pytorch).abs().max();
-    return difference.item<double>() / pytorch.abs().max().item<double>();
-}
-
-/// Measures how long `run` takes on the GPU, in milliseconds: a mark on the GPU's queue
-/// before it and one after; the GPU writes down the time as it reaches each.
-template <typename Run>
-static float gpu_milliseconds(Run run)
-{
-    cudaEvent_t start, end;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&end));
-    cudaCheck(cudaEventRecord(start));
-    run();
-    cudaCheck(cudaEventRecord(end));
-    cudaCheck(cudaEventSynchronize(end)); // wait until the GPU has passed the second mark
-    float milliseconds = 0.0f;
-    cudaCheck(cudaEventElapsedTime(&milliseconds, start, end));
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(end));
-    return milliseconds;
+    torch::Tensor on_cpu_tensor = tensor.detach().contiguous().cpu();
+    return std::vector<float>(on_cpu_tensor.data_ptr<float>(), on_cpu_tensor.data_ptr<float>() + on_cpu_tensor.numel());
 }
 
 // ══ part 1: mine against PyTorch's ═══════════════════════════════════════════
@@ -121,30 +96,40 @@ static float gpu_milliseconds(Run run)
 /// row (the mean), mine and PyTorch's cross_entropy over the first vocab_size columns with autograd.
 /// Checks that the losses, max_of_each_row, sum_of_each_row and logits_grad agree within TOLERANCE, the padding's
 /// gradient 0 on both sides.
-static void forward_and_backward_match_pytorch(const Shape &logits_shape, size_t vocab_size)
+static void forward_and_backward_match_pytorch(const Shape &logits_shape_list, size_t vocab_size_val)
 {
+    // 1. random logits and targets; mine
     torch::manual_seed(0);
-    size_t batch_size = logits_shape[0], seq_len = logits_shape[1], rows = batch_size * seq_len;
-    Tensor logits = random_tensor_on_gpu(logits_shape);
-    Tensor targets = random_targets_on_gpu({batch_size, seq_len}, vocab_size);
-    Tensor losses = Tensor::zeros({batch_size, seq_len});
-    Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
-    Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
-    Tensor logits_grad = Tensor::zeros(logits_shape);
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
-    classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
+    size_t batch_size_val = logits_shape_list[0];
+    size_t seq_len_val = logits_shape_list[1];
+    size_t rows_val = batch_size_val * seq_len_val;
+    Tensor logits_tensor = random_tensor_on_gpu(logits_shape_list);
+    Tensor targets_tensor = random_targets_on_gpu({batch_size_val, seq_len_val}, vocab_size_val);
+    Tensor losses_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor max_of_each_row_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor sum_of_each_row_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor losses_grad_tensor = Tensor::zeros({batch_size_val, seq_len_val}).fill_(1.0 / rows_val);
+    Tensor logits_grad_tensor = Tensor::zeros(logits_shape_list);
+    classifier_forward(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, logits_tensor, targets_tensor,
+                       vocab_size_val);
+    classifier_backward(logits_grad_tensor, losses_grad_tensor, logits_tensor, targets_tensor, max_of_each_row_tensor,
+                        sum_of_each_row_tensor, vocab_size_val);
 
-    torch::Tensor pytorch_logits = pytorch_copy_of(logits).requires_grad_(true);
-    torch::Tensor word_logits = word_logits_of(pytorch_logits, vocab_size);
-    torch::Tensor pytorch_losses = torch::cross_entropy_loss(word_logits, pytorch_targets_of(targets).reshape({-1}),
-                                                             {}, at::Reduction::None);
-    pytorch_losses.backward(pytorch_copy_of(losses_grad).reshape({-1}));
-    torch::Tensor pytorch_max_of_each_row = std::get<0>(word_logits.max(1));
-    torch::Tensor pytorch_sum_of_each_row = (word_logits - pytorch_max_of_each_row.unsqueeze(1)).exp().sum(1);
-    ASSERT_NEAR(losses.tolist(), list_of(pytorch_losses), TOLERANCE);
-    ASSERT_NEAR(max_of_each_row.tolist(), list_of(pytorch_max_of_each_row), TOLERANCE);
-    ASSERT_NEAR(sum_of_each_row.tolist(), list_of(pytorch_sum_of_each_row), TOLERANCE);
-    ASSERT_NEAR(logits_grad.tolist(), list_of(pytorch_logits.grad()), TOLERANCE);
+    // 2. PyTorch's cross_entropy over the words, with autograd; its row maxes and sums
+    torch::Tensor pytorch_logits_tensor = pytorch_copy_of(logits_tensor).requires_grad_(true);
+    torch::Tensor word_logits_tensor = word_logits_of(pytorch_logits_tensor, vocab_size_val);
+    torch::Tensor pytorch_losses_tensor = torch::cross_entropy_loss(
+        word_logits_tensor, pytorch_targets_of(targets_tensor).reshape({-1}), {}, at::Reduction::None);
+    pytorch_losses_tensor.backward(pytorch_copy_of(losses_grad_tensor).reshape({-1}));
+    torch::Tensor pytorch_max_of_each_row_tensor = std::get<0>(word_logits_tensor.max(1));
+    torch::Tensor pytorch_sum_of_each_row_tensor =
+        (word_logits_tensor - pytorch_max_of_each_row_tensor.unsqueeze(1)).exp().sum(1);
+
+    // 3. check
+    ASSERT_NEAR(losses_tensor.tolist(), list_of(pytorch_losses_tensor), TOLERANCE);
+    ASSERT_NEAR(max_of_each_row_tensor.tolist(), list_of(pytorch_max_of_each_row_tensor), TOLERANCE);
+    ASSERT_NEAR(sum_of_each_row_tensor.tolist(), list_of(pytorch_sum_of_each_row_tensor), TOLERANCE);
+    ASSERT_NEAR(logits_grad_tensor.tolist(), list_of(pytorch_logits_tensor.grad()), TOLERANCE);
 }
 
 static void matches_pytorch_on_gpt2_rows(void)
@@ -154,7 +139,7 @@ static void matches_pytorch_on_gpt2_rows(void)
     // row's 12,576 float4s; float4 12,564 holds the last word and 3 padding columns. Random logits and
     // targets: the losses (about log(50257) = 10.8 each, as random logits guess about evenly),
     // max_of_each_row, sum_of_each_row and logits_grad equal PyTorch's within 1e-5.
-    forward_and_backward_match_pytorch({2, 8, 50304}, 50257);
+    forward_and_backward_match_pytorch({2, 8, GPT2_PADDED_VOCAB_SIZE}, GPT2_VOCAB_SIZE);
 }
 
 static void matches_pytorch_with_a_small_vocabulary(void)
@@ -172,88 +157,41 @@ static void forward_and_backward_in_bfloat16(void)
     // max_of_each_row and sum_of_each_row are PyTorch's float cross_entropy of the same values within 1e-5:
     // bfloat16 changes only what is read, not the math. logits_grad is rounded once as it is stored: within
     // BFLOAT16_TOLERANCE. The 47 padding columns get 0 exactly.
+
+    // 1. random logits in bfloat16 and targets; mine
     torch::manual_seed(0);
-    size_t batch_size = 2, seq_len = 8, rows = batch_size * seq_len, vocab_size = 50257;
-    Shape logits_shape = {batch_size, seq_len, 50304};
-    Tensor logits = random_tensor_on_gpu(logits_shape).to(DType::BFloat16);
-    Tensor targets = random_targets_on_gpu({batch_size, seq_len}, vocab_size);
-    Tensor losses = Tensor::zeros({batch_size, seq_len});
-    Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
-    Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
-    Tensor logits_grad = Tensor::zeros(logits_shape, DType::BFloat16);
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
-    classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
+    size_t batch_size_val = 2;
+    size_t seq_len_val = 8;
+    size_t rows_val = batch_size_val * seq_len_val;
+    size_t vocab_size_val = GPT2_VOCAB_SIZE;
+    Shape logits_shape_list = {batch_size_val, seq_len_val, GPT2_PADDED_VOCAB_SIZE};
+    Tensor logits_tensor = random_tensor_on_gpu(logits_shape_list).to(DType::BFloat16);
+    Tensor targets_tensor = random_targets_on_gpu({batch_size_val, seq_len_val}, vocab_size_val);
+    Tensor losses_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor max_of_each_row_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor sum_of_each_row_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor losses_grad_tensor = Tensor::zeros({batch_size_val, seq_len_val}).fill_(1.0 / rows_val);
+    Tensor logits_grad_tensor = Tensor::zeros(logits_shape_list, DType::BFloat16);
+    classifier_forward(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, logits_tensor, targets_tensor,
+                       vocab_size_val);
+    classifier_backward(logits_grad_tensor, losses_grad_tensor, logits_tensor, targets_tensor, max_of_each_row_tensor,
+                        sum_of_each_row_tensor, vocab_size_val);
 
-    torch::Tensor pytorch_logits = pytorch_copy_of(logits.to(DType::Float32)).requires_grad_(true);
-    torch::Tensor word_logits = word_logits_of(pytorch_logits, vocab_size);
-    torch::Tensor pytorch_losses = torch::cross_entropy_loss(word_logits, pytorch_targets_of(targets).reshape({-1}),
-                                                             {}, at::Reduction::None);
-    pytorch_losses.backward(pytorch_copy_of(losses_grad).reshape({-1}));
-    torch::Tensor pytorch_max_of_each_row = std::get<0>(word_logits.max(1));
-    torch::Tensor pytorch_sum_of_each_row = (word_logits - pytorch_max_of_each_row.unsqueeze(1)).exp().sum(1);
-    ASSERT_NEAR(losses.tolist(), list_of(pytorch_losses), TOLERANCE);
-    ASSERT_NEAR(max_of_each_row.tolist(), list_of(pytorch_max_of_each_row), TOLERANCE);
-    ASSERT_NEAR(sum_of_each_row.tolist(), list_of(pytorch_sum_of_each_row), TOLERANCE);
-    ASSERT_NEAR(logits_grad.to(DType::Float32).tolist(), list_of(pytorch_logits.grad()), BFLOAT16_TOLERANCE);
-}
+    // 2. PyTorch's, in float on the same values
+    torch::Tensor pytorch_logits_tensor = pytorch_copy_of(logits_tensor.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor word_logits_tensor = word_logits_of(pytorch_logits_tensor, vocab_size_val);
+    torch::Tensor pytorch_losses_tensor = torch::cross_entropy_loss(
+        word_logits_tensor, pytorch_targets_of(targets_tensor).reshape({-1}), {}, at::Reduction::None);
+    pytorch_losses_tensor.backward(pytorch_copy_of(losses_grad_tensor).reshape({-1}));
+    torch::Tensor pytorch_max_of_each_row_tensor = std::get<0>(word_logits_tensor.max(1));
+    torch::Tensor pytorch_sum_of_each_row_tensor =
+        (word_logits_tensor - pytorch_max_of_each_row_tensor.unsqueeze(1)).exp().sum(1);
 
-static void time_20_steps_on_gpt2_small_size(void)
-{
-    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's sizes, batch_size = 4 rows of
-    // seq_len = 1024 tokens, padded_vocab_size = 50304: logits of 206M floats, 824 MB. Mine against
-    // PyTorch's cross_entropy (mean) and autograd. My forward reads the logits once: at a T4's 320 GB/s
-    // at least 2.58 ms. My backward reads them once and writes logits_grad: 2 x 824 MB, at least
-    // 5.15 ms. PyTorch's forward includes copying the 50257 word columns out of the padded rows (narrow,
-    // then reshape), as a PyTorch user would write it. Both sides write the gradient over each step; at
-    // the end they must agree.
-    torch::manual_seed(0);
-    size_t batch_size = 4, seq_len = 1024, vocab_size = 50257, padded_vocab_size = 50304;
-    size_t rows = batch_size * seq_len;
-    Tensor logits = random_tensor_on_gpu({batch_size, seq_len, padded_vocab_size});
-    Tensor targets = random_targets_on_gpu({batch_size, seq_len}, vocab_size);
-    Tensor losses = Tensor::zeros({batch_size, seq_len});
-    Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
-    Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
-    Tensor logits_grad = Tensor::zeros({batch_size, seq_len, padded_vocab_size});
-
-    torch::Tensor pytorch_logits = pytorch_copy_of(logits).requires_grad_(true);
-    torch::Tensor pytorch_targets = pytorch_targets_of(targets).reshape({-1});
-    torch::Tensor pytorch_losses, pytorch_loss;
-
-    // Steps 1 and 2 do first-time work, so the averages are of 3..20: in step 1 CUDA loads each side's
-    // kernels.
-    double totals[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int t = 1; t <= 20; t++)
-    {
-        float times[4];
-        times[0] = gpu_milliseconds([&] { classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size); });
-        times[1] = gpu_milliseconds([&] {
-            classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
-        });
-        times[2] = gpu_milliseconds([&] {
-            pytorch_losses = torch::cross_entropy_loss(word_logits_of(pytorch_logits, vocab_size), pytorch_targets,
-                                                       {}, at::Reduction::None);
-            pytorch_loss = pytorch_losses.mean();
-        });
-        pytorch_logits.mutable_grad() = torch::Tensor(); // the gradient written, as mine, not added onto
-        times[3] = gpu_milliseconds([&] { pytorch_loss.backward(); });
-        if (t <= 2)
-            continue;
-        for (int column = 0; column < 4; column++)
-            totals[column] += times[column];
-    }
-    double logits_gb = (double)logits.numel() * sizeof(float) / 1e9;     // 0.824 GB
-    double moved_gb[2] = {logits_gb, 2 * logits_gb};
-    print_test_name(__func__);
-    printf("    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward\n");
-    printf("        ms                    %10.3f   %11.3f   %15.3f   %16.3f\n", totals[0] / 18, totals[1] / 18,
-           totals[2] / 18, totals[3] / 18);
-    printf("        GB/s                  %10.1f   %11.1f\n", moved_gb[0] / (totals[0] / 18 / 1e3),
-           moved_gb[1] / (totals[1] / 18 / 1e3));
-    printf("    PyTorch takes, against mine:                          %14.2fx   %15.2fx\n", totals[2] / totals[0],
-           totals[3] / totals[1]);
-    ASSERT_NEAR(relative_difference_on_gpu(losses, pytorch_losses), 0.0, TOLERANCE);
-    ASSERT_NEAR(relative_difference_on_gpu(logits_grad, pytorch_logits.grad()), 0.0, TOLERANCE);
+    // 3. check: the forward's float results within TOLERANCE, logits_grad within one rounding
+    ASSERT_NEAR(losses_tensor.tolist(), list_of(pytorch_losses_tensor), TOLERANCE);
+    ASSERT_NEAR(max_of_each_row_tensor.tolist(), list_of(pytorch_max_of_each_row_tensor), TOLERANCE);
+    ASSERT_NEAR(sum_of_each_row_tensor.tolist(), list_of(pytorch_sum_of_each_row_tensor), TOLERANCE);
+    ASSERT_NEAR(logits_grad_tensor.to(DType::Float32).tolist(), list_of(pytorch_logits_tensor.grad()), BFLOAT16_TOLERANCE);
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
@@ -268,27 +206,48 @@ static void time_20_steps_on_gpt2_small_size(void)
 
 static const std::vector<float> GRAD_OF_1_2_3_4_TARGET_3 = {0.0320586f, 0.0871443f, 0.2368828f, -0.3560857f};
 
+/// The forward's three results for a few rows, all 0 at first.
+struct RowResults
+{
+    Tensor losses_tensor;
+    Tensor max_of_each_row_tensor;
+    Tensor sum_of_each_row_tensor;
+};
+
+/// Makes the forward's results for `shape_list` rows, all 0.
+static RowResults zero_row_results(const Shape &shape_list)
+{
+    return {Tensor::zeros(shape_list), Tensor::zeros(shape_list), Tensor::zeros(shape_list)};
+}
+
 static void forward_of_1_2_3_4(void)
 {
     // Expect: the row 1 2 3 4, target 3: loss 0.4401897, max_of_each_row 4 exactly, sum_of_each_row 1.5530018.
-    Tensor logits = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets_of({1, 1}, {3}), 4);
-    ASSERT_NEAR(losses.tolist()[0], 0.4401897, 1e-6);
-    ASSERT_EQ(max_of_each_row.tolist(), std::vector<float>({4}));
-    ASSERT_NEAR(sum_of_each_row.tolist()[0], 1.5530018, 1e-6);
+    // 1. the forward
+    RowResults results_val = zero_row_results({1, 1});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       tensor_of({1, 1, 4}, {1, 2, 3, 4}), targets_of({1, 1}, {3}), 4);
+    // 2. check
+    ASSERT_NEAR(results_val.losses_tensor.tolist()[0], 0.4401897, 1e-6);
+    ASSERT_EQ(results_val.max_of_each_row_tensor.tolist(), std::vector<float>({4}));
+    ASSERT_NEAR(results_val.sum_of_each_row_tensor.tolist()[0], 1.5530018, 1e-6);
 }
 
 static void backward_of_1_2_3_4(void)
 {
     // Expect: the row 1 2 3 4, target 3, losses_grad 1: the grad above, within 1e-6. It pushes the
     // target's logit up (-0.36: the loss falls as it rises) and every other logit down, each by its prob.
-    Tensor logits = tensor_of({1, 1, 4}, {1, 2, 3, 4}), targets = targets_of({1, 1}, {3});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    Tensor logits_grad = Tensor::zeros({1, 1, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, Tensor::ones({1, 1}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_NEAR(logits_grad.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
+    // 1. the forward, then the backward
+    Tensor logits_tensor = tensor_of({1, 1, 4}, {1, 2, 3, 4});
+    Tensor targets_tensor = targets_of({1, 1}, {3});
+    RowResults results_val = zero_row_results({1, 1});
+    Tensor logits_grad_tensor = Tensor::zeros({1, 1, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, Tensor::ones({1, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_NEAR(logits_grad_tensor.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
 }
 
 static void equal_logits_give_log_of_the_vocabulary_size(void)
@@ -296,14 +255,19 @@ static void equal_logits_give_log_of_the_vocabulary_size(void)
     // Expect: the row 0 0 0 0, target 1: every prob is 1 / 4, so the loss is log(4) = 1.3862944, the
     // loss of an even guess (for GPT-2's 50257 words, log(50257) = 10.82, where training starts).
     // sum_of_each_row is 4 and the grad 0.25 -0.75 0.25 0.25, both exactly: e^0 = 1, and 1 / 4 has no rounding.
-    Tensor logits = Tensor::zeros({1, 1, 4}), targets = targets_of({1, 1}, {1});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    Tensor logits_grad = Tensor::zeros({1, 1, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, Tensor::ones({1, 1}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_NEAR(losses.tolist()[0], 1.3862944, 1e-6);
-    ASSERT_EQ(sum_of_each_row.tolist(), std::vector<float>({4}));
-    ASSERT_EQ(logits_grad.tolist(), std::vector<float>({0.25f, -0.75f, 0.25f, 0.25f}));
+    // 1. the forward, then the backward
+    Tensor logits_tensor = Tensor::zeros({1, 1, 4});
+    Tensor targets_tensor = targets_of({1, 1}, {1});
+    RowResults results_val = zero_row_results({1, 1});
+    Tensor logits_grad_tensor = Tensor::zeros({1, 1, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, Tensor::ones({1, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_NEAR(results_val.losses_tensor.tolist()[0], 1.3862944, 1e-6);
+    ASSERT_EQ(results_val.sum_of_each_row_tensor.tolist(), std::vector<float>({4}));
+    ASSERT_EQ(logits_grad_tensor.tolist(), std::vector<float>({0.25f, -0.75f, 0.25f, 0.25f}));
 }
 
 static void large_logits_do_not_overflow(void)
@@ -311,15 +275,20 @@ static void large_logits_do_not_overflow(void)
     // Expect: the row 1000 1001 1002 1003, target 3. exp(1003) is infinity in a float, but the kernels
     // take exp(logit - row_max), exp(-3) .. exp(0), so sum_of_each_row, loss and grad are those of 1 2 3 4:
     // adding the same number to every logit changes no prob. max_of_each_row is 1003.
-    Tensor logits = tensor_of({1, 1, 4}, {1000, 1001, 1002, 1003}), targets = targets_of({1, 1}, {3});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    Tensor logits_grad = Tensor::zeros({1, 1, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, Tensor::ones({1, 1}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_EQ(max_of_each_row.tolist(), std::vector<float>({1003}));
-    ASSERT_NEAR(sum_of_each_row.tolist()[0], 1.5530018, 1e-6);
-    ASSERT_NEAR(losses.tolist()[0], 0.4401897, 1e-6);
-    ASSERT_NEAR(logits_grad.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
+    // 1. the forward, then the backward
+    Tensor logits_tensor = tensor_of({1, 1, 4}, {1000, 1001, 1002, 1003});
+    Tensor targets_tensor = targets_of({1, 1}, {3});
+    RowResults results_val = zero_row_results({1, 1});
+    Tensor logits_grad_tensor = Tensor::zeros({1, 1, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, Tensor::ones({1, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_EQ(results_val.max_of_each_row_tensor.tolist(), std::vector<float>({1003}));
+    ASSERT_NEAR(results_val.sum_of_each_row_tensor.tolist()[0], 1.5530018, 1e-6);
+    ASSERT_NEAR(results_val.losses_tensor.tolist()[0], 0.4401897, 1e-6);
+    ASSERT_NEAR(logits_grad_tensor.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
 }
 
 static void padding_columns_are_left_out_and_get_grad_0(void)
@@ -332,17 +301,22 @@ static void padding_columns_are_left_out_and_get_grad_0(void)
     //     grad  = -0.9883438 0.0316849 0.0861285 0.2341217 0.6364086, then 0 0 0 exactly
     //
     // Float4 1 holds word 4 and padding 5, 6, 7: the padding is left out inside one float4.
-    Tensor logits = tensor_of({1, 1, 8}, {1, 2, 3, 4, 5, 100, 100, 100}), targets = targets_of({1, 1}, {0});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    Tensor logits_grad = Tensor::ones({1, 1, 8});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 5);
-    classifier_backward(logits_grad, Tensor::ones({1, 1}), logits, targets, max_of_each_row, sum_of_each_row, 5);
-    ASSERT_EQ(max_of_each_row.tolist(), std::vector<float>({5}));
-    ASSERT_NEAR(losses.tolist()[0], 4.4519144, 1e-6);
-    std::vector<float> grad = logits_grad.tolist();
-    ASSERT_NEAR(std::vector<float>(grad.begin(), grad.begin() + 5),
+    // 1. the forward, then the backward, logits_grad from 1s
+    Tensor logits_tensor = tensor_of({1, 1, 8}, {1, 2, 3, 4, 5, 100, 100, 100});
+    Tensor targets_tensor = targets_of({1, 1}, {0});
+    RowResults results_val = zero_row_results({1, 1});
+    Tensor logits_grad_tensor = Tensor::ones({1, 1, 8});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 5);
+    classifier_backward(logits_grad_tensor, Tensor::ones({1, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 5);
+    // 2. check: the words' grads, then the padding's 0s
+    ASSERT_EQ(results_val.max_of_each_row_tensor.tolist(), std::vector<float>({5}));
+    ASSERT_NEAR(results_val.losses_tensor.tolist()[0], 4.4519144, 1e-6);
+    std::vector<float> grad_list = logits_grad_tensor.tolist();
+    ASSERT_NEAR(std::vector<float>(grad_list.begin(), grad_list.begin() + 5),
                 std::vector<float>({-0.9883438f, 0.0316849f, 0.0861285f, 0.2341217f, 0.6364086f}), 1e-6);
-    ASSERT_EQ(std::vector<float>(grad.begin() + 5, grad.end()), std::vector<float>({0, 0, 0}));
+    ASSERT_EQ(std::vector<float>(grad_list.begin() + 5, grad_list.end()), std::vector<float>({0, 0, 0}));
 }
 
 static void a_sure_right_answer_costs_0_and_a_sure_wrong_one_costs_20(void)
@@ -354,14 +328,19 @@ static void a_sure_right_answer_costs_0_and_a_sure_wrong_one_costs_20(void)
     //     row 1, target 0:  loss = log(1) - (0 - 20)  = 20    grad about -1 0 1 0
     //
     // Both losses exactly. A wrong guess made with certainty costs the most, and gets the largest push.
-    Tensor logits = tensor_of({1, 2, 4}, {0, 0, 20, 0, 0, 0, 20, 0}), targets = targets_of({1, 2}, {2, 0});
-    Tensor losses = Tensor::zeros({1, 2}), max_of_each_row = Tensor::zeros({1, 2}), sum_of_each_row = Tensor::zeros({1, 2});
-    Tensor logits_grad = Tensor::zeros({1, 2, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, Tensor::ones({1, 2}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_EQ(losses.tolist(), std::vector<float>({0, 20}));
-    ASSERT_NEAR(logits_grad[0][0].tolist(), std::vector<float>({0, 0, 0, 0}), 1e-6);
-    ASSERT_NEAR(logits_grad[0][1].tolist(), std::vector<float>({-1, 0, 1, 0}), 1e-6);
+    // 1. the forward, then the backward
+    Tensor logits_tensor = tensor_of({1, 2, 4}, {0, 0, 20, 0, 0, 0, 20, 0});
+    Tensor targets_tensor = targets_of({1, 2}, {2, 0});
+    RowResults results_val = zero_row_results({1, 2});
+    Tensor logits_grad_tensor = Tensor::zeros({1, 2, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, Tensor::ones({1, 2}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_EQ(results_val.losses_tensor.tolist(), std::vector<float>({0, 20}));
+    ASSERT_NEAR(logits_grad_tensor[0][0].tolist(), std::vector<float>({0, 0, 0, 0}), 1e-6);
+    ASSERT_NEAR(logits_grad_tensor[0][1].tolist(), std::vector<float>({-1, 0, 1, 0}), 1e-6);
 }
 
 static void each_row_uses_its_own_target(void)
@@ -370,14 +349,19 @@ static void each_row_uses_its_own_target(void)
     //
     //     row 0, target 3:  loss 0.4401897                         grad 0.0320586 0.0871443 0.2368828 -0.3560857
     //     row 1, target 0:  loss 0.4401897 + (4 - 1) = 3.4401897   grad -0.9679414 0.0871443 0.2368828 0.6439143
-    Tensor logits = tensor_of({2, 1, 4}, {1, 2, 3, 4, 1, 2, 3, 4}), targets = targets_of({2, 1}, {3, 0});
-    Tensor losses = Tensor::zeros({2, 1}), max_of_each_row = Tensor::zeros({2, 1}), sum_of_each_row = Tensor::zeros({2, 1});
-    Tensor logits_grad = Tensor::zeros({2, 1, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, Tensor::ones({2, 1}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_NEAR(losses.tolist(), std::vector<float>({0.4401897f, 3.4401897f}), 1e-6);
-    ASSERT_NEAR(logits_grad[0][0].tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
-    ASSERT_NEAR(logits_grad[1][0].tolist(), std::vector<float>({-0.9679414f, 0.0871443f, 0.2368828f, 0.6439143f}),
+    // 1. the forward, then the backward
+    Tensor logits_tensor = tensor_of({2, 1, 4}, {1, 2, 3, 4, 1, 2, 3, 4});
+    Tensor targets_tensor = targets_of({2, 1}, {3, 0});
+    RowResults results_val = zero_row_results({2, 1});
+    Tensor logits_grad_tensor = Tensor::zeros({2, 1, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, Tensor::ones({2, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_NEAR(results_val.losses_tensor.tolist(), std::vector<float>({0.4401897f, 3.4401897f}), 1e-6);
+    ASSERT_NEAR(logits_grad_tensor[0][0].tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
+    ASSERT_NEAR(logits_grad_tensor[1][0].tolist(), std::vector<float>({-0.9679414f, 0.0871443f, 0.2368828f, 0.6439143f}),
                 1e-6);
 }
 
@@ -386,13 +370,18 @@ static void losses_grad_scales_each_row_on_its_own(void)
     // Expect: two rows of 1 2 3 4, target 3, losses_grad 1 and 0.25: row 0's grad is the one above, row
     // 1's a quarter of it, 0.0080147 0.0217861 0.0592207 -0.0890214. In training every row gets the
     // same, 1 / rows, for the mean.
-    Tensor logits = tensor_of({2, 1, 4}, {1, 2, 3, 4, 1, 2, 3, 4}), targets = targets_of({2, 1}, {3, 3});
-    Tensor losses = Tensor::zeros({2, 1}), max_of_each_row = Tensor::zeros({2, 1}), sum_of_each_row = Tensor::zeros({2, 1});
-    Tensor logits_grad = Tensor::zeros({2, 1, 4});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits_grad, tensor_of({2, 1}, {1, 0.25f}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_NEAR(logits_grad[0][0].tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
-    ASSERT_NEAR(logits_grad[1][0].tolist(), std::vector<float>({0.0080147f, 0.0217861f, 0.0592207f, -0.0890214f}),
+    // 1. the forward, then the backward with losses_grad 1 and 0.25
+    Tensor logits_tensor = tensor_of({2, 1, 4}, {1, 2, 3, 4, 1, 2, 3, 4});
+    Tensor targets_tensor = targets_of({2, 1}, {3, 3});
+    RowResults results_val = zero_row_results({2, 1});
+    Tensor logits_grad_tensor = Tensor::zeros({2, 1, 4});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_grad_tensor, tensor_of({2, 1}, {1, 0.25f}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_NEAR(logits_grad_tensor[0][0].tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
+    ASSERT_NEAR(logits_grad_tensor[1][0].tolist(), std::vector<float>({0.0080147f, 0.0217861f, 0.0592207f, -0.0890214f}),
                 1e-6);
 }
 
@@ -402,24 +391,30 @@ static void each_row_of_logits_grad_adds_up_to_0(void)
     // up to 1, and the target takes 1 away: each row of logits_grad adds up to 0, within 1e-5 (50257
     // rounded probs added). Raising every logit of a row by the same amount changes no prob, so the loss
     // cannot move that way.
+    // 1. random logits; the forward, then the backward
     torch::manual_seed(0);
-    size_t padded_vocab_size = 50304, vocab_size = 50257;
-    Tensor logits = random_tensor_on_gpu({2, 3, padded_vocab_size});
-    Tensor targets = random_targets_on_gpu({2, 3}, vocab_size);
-    Tensor losses = Tensor::zeros({2, 3}), max_of_each_row = Tensor::zeros({2, 3}), sum_of_each_row = Tensor::zeros({2, 3});
-    Tensor logits_grad = Tensor::zeros({2, 3, padded_vocab_size});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
-    classifier_backward(logits_grad, Tensor::ones({2, 3}), logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
-    std::vector<float> grad = logits_grad.tolist();
-    std::vector<float> row_sums(6, 0.0f);
-    for (size_t row = 0; row < 6; row++)
+    size_t padded_vocab_size_val = GPT2_PADDED_VOCAB_SIZE;
+    size_t vocab_size_val = GPT2_VOCAB_SIZE;
+    Tensor logits_tensor = random_tensor_on_gpu({2, 3, padded_vocab_size_val});
+    Tensor targets_tensor = random_targets_on_gpu({2, 3}, vocab_size_val);
+    RowResults results_val = zero_row_results({2, 3});
+    Tensor logits_grad_tensor = Tensor::zeros({2, 3, padded_vocab_size_val});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, vocab_size_val);
+    classifier_backward(logits_grad_tensor, Tensor::ones({2, 3}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, vocab_size_val);
+    // 2. each row's sum, in double
+    std::vector<float> grad_list = logits_grad_tensor.tolist();
+    std::vector<float> row_sums_list(6, 0.0f);
+    for (size_t row_index_val = 0; row_index_val < 6; row_index_val++)
     {
-        double sum = 0.0;
-        for (size_t column = 0; column < padded_vocab_size; column++)
-            sum += grad[row * padded_vocab_size + column];
-        row_sums[row] = (float)sum;
+        double sum_val = 0.0;
+        for (size_t column_val = 0; column_val < padded_vocab_size_val; column_val++)
+            sum_val += grad_list[row_index_val * padded_vocab_size_val + column_val];
+        row_sums_list[row_index_val] = (float)sum_val;
     }
-    ASSERT_NEAR(row_sums, std::vector<float>(6, 0.0f), 1e-5);
+    // 3. check
+    ASSERT_NEAR(row_sums_list, std::vector<float>(6, 0.0f), 1e-5);
 }
 
 static void logits_grad_can_be_the_logits_themselves(void)
@@ -427,24 +422,32 @@ static void logits_grad_can_be_the_logits_themselves(void)
     // Expect: the row 1 2 3 4, target 3, with the logits tensor passed as logits_grad too: the logits
     // become their gradient, the same as GRAD_OF_1_2_3_4_TARGET_3, since each thread reads its float4
     // before it writes it.
-    Tensor logits = tensor_of({1, 1, 4}, {1, 2, 3, 4}), targets = targets_of({1, 1}, {3});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, 4);
-    classifier_backward(logits, Tensor::ones({1, 1}), logits, targets, max_of_each_row, sum_of_each_row, 4);
-    ASSERT_NEAR(logits.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
+    // 1. the forward, then the backward into the logits
+    Tensor logits_tensor = tensor_of({1, 1, 4}, {1, 2, 3, 4});
+    Tensor targets_tensor = targets_of({1, 1}, {3});
+    RowResults results_val = zero_row_results({1, 1});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_tensor, 4);
+    classifier_backward(logits_tensor, Tensor::ones({1, 1}), logits_tensor, targets_tensor,
+                        results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor, 4);
+    // 2. check
+    ASSERT_NEAR(logits_tensor.tolist(), GRAD_OF_1_2_3_4_TARGET_3, 1e-6);
 }
 
 static void forward_leaves_the_logits_as_they_are(void)
 {
     // Expect: after classifier_forward on the row 1 2 3 4, the logits are still 1 2 3 4, exactly: the
     // validation loss can be worked out with the logits kept, for sampling.
-    Tensor logits = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor losses = Tensor::zeros({1, 1}), max_of_each_row = Tensor::zeros({1, 1}), sum_of_each_row = Tensor::zeros({1, 1});
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets_of({1, 1}, {3}), 4);
-    ASSERT_EQ(logits.tolist(), std::vector<float>({1, 2, 3, 4}));
+    // 1. the forward
+    Tensor logits_tensor = tensor_of({1, 1, 4}, {1, 2, 3, 4});
+    RowResults results_val = zero_row_results({1, 1});
+    classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor, results_val.sum_of_each_row_tensor,
+                       logits_tensor, targets_of({1, 1}, {3}), 4);
+    // 2. check
+    ASSERT_EQ(logits_tensor.tolist(), std::vector<float>({1, 2, 3, 4}));
 }
 
-// ══ part 3: the kernels fit their launch ══════════════════════════════════════
+// ══ part 3: the kernels fit their launch, and any block size works ═══════════
 
 static void every_kernel_fits_its_block(void)
 {
@@ -456,256 +459,79 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread: at most 64 for 1024 threads (a T4 has 65,536)
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)classifier_forward_kernel<float>,
-                             (const void *)classifier_backward_kernel<float>};
-    const char *names[] = {"classifier_forward_kernel", "classifier_backward_kernel"};
-    int threads[] = {CLASSIFIER_FORWARD_THREADS_PER_BLOCK, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK};
-    for (int k = 0; k < 2; k++)
+    const void *kernels_list[] = {(const void *)classifier_forward_kernel<float>,
+                                  (const void *)classifier_backward_kernel<float>};
+    const char *names_list[] = {"classifier_forward_kernel", "classifier_backward_kernel"};
+    int threads_list[] = {CLASSIFIER_FORWARD_THREADS_PER_BLOCK, CLASSIFIER_BACKWARD_THREADS_PER_BLOCK};
+    for (int kernel_index_val = 0; kernel_index_val < 2; kernel_index_val++)
     {
-        cudaFuncAttributes attributes;
-        cudaCheck(cudaFuncGetAttributes(&attributes, kernels[k]));
+        // 1. what the compiler wrote down
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, kernels_list[kernel_index_val]));
         print_test_name(__func__);
-        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n", names[k],
-               attributes.numRegs, attributes.maxThreadsPerBlock, attributes.localSizeBytes);
-        ASSERT_EQ(attributes.maxThreadsPerBlock >= threads[k], true);
-        ASSERT_EQ(attributes.localSizeBytes, (size_t)0);
+        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n",
+               names_list[kernel_index_val], attributes_val.numRegs, attributes_val.maxThreadsPerBlock,
+               attributes_val.localSizeBytes);
+        // 2. check
+        ASSERT_EQ(attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val], true);
+        ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
     }
 }
 
-// ══ part 4: other block and thread counts ═════════════════════════════════════
-
-/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
-/// run while its clock is still rising from idle.
-template <typename Run>
-static void warm_up_gpu(Run run)
+static void any_block_size_gives_the_same_result(void)
 {
-    float total = 0.0f;
-    while (total < 1000.0f)
-        total += gpu_milliseconds(run);
-}
-
-static void time_each_kernel_with_other_block_and_thread_counts(void)
-{
-    // Prints the time of the forward and the backward on GPT-2 small's sizes (4096 rows of 50304), in float
-    // and in bfloat16, each for 9 block counts x 4 thread counts, each the average of 20 runs: the 7 picked on
-    // a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4
-    // they repeat 40 and 80). Each kernel's 36 launches take turns: 20 rounds, each timing every launch once (in float, then in bfloat16). One
-    // launch's 20 runs in a row would all land in the same stretch of the test, and a T4's clock can drift
-    // as it heats up (the first launch timed would get the fastest clock); taking turns gives every launch
-    // runs from early, middle and late alike. Run 1 is counted too: warm_up_gpu has already done the
-    // first-time work. The kernels are launched here directly, <<<blocks, threads>>>, instead of through
-    // classifier_forward and classifier_backward, which always launch 4096 x 256 (one row per block; 4096 x
-    // 1024 before this sweep picked 256) and CLASSIFIER_BACKWARD_BLOCKS x CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
-    // (40,960 x 128, 10 float4s per thread: an H100 PCIe's pick; a T4's was 201,216 x 256, one float4 per
-    // thread). A bfloat16 row is 98 KB instead of 196 KB, and a bfloat16 float4
-    // one 8-byte read instead of 16: the best launch may differ.
-    //
-    // Expect: every forward launch gives the usual losses, max_of_each_row and sum_of_each_row of its dtype
-    // within TOLERANCE, not to the last bit: another thread count adds each row's exps in another order (in
-    // float either way). Every backward launch gives the usual logits_grad of its dtype to the last bit: each
-    // value is worked out alone, from the same numbers. A T4 runs at most 1024 threads per SM, 40,960 in all.
-    torch::manual_seed(0);
-    size_t batch_size = 4, seq_len = 1024, vocab_size = 50257, padded_vocab_size = 50304;
-    size_t rows = batch_size * seq_len;
-    Tensor logits = random_tensor_on_gpu({batch_size, seq_len, padded_vocab_size});
-    Tensor targets = random_targets_on_gpu({batch_size, seq_len}, vocab_size);
-    Tensor losses = Tensor::zeros({batch_size, seq_len});
-    Tensor max_of_each_row = Tensor::zeros({batch_size, seq_len}), sum_of_each_row = Tensor::zeros({batch_size, seq_len});
-    Tensor losses_grad = Tensor::zeros({batch_size, seq_len}).fill_(1.0 / rows);
-    Tensor logits_grad = Tensor::zeros({batch_size, seq_len, padded_vocab_size});
-    // The same logits in bfloat16, with results of their own (losses, the row maxes and sums are float in both).
-    Tensor logits_bf16 = logits.to(DType::BFloat16);
-    Tensor losses_bf16 = Tensor::zeros({batch_size, seq_len});
-    Tensor max_of_each_row_bf16 = Tensor::zeros({batch_size, seq_len});
-    Tensor sum_of_each_row_bf16 = Tensor::zeros({batch_size, seq_len});
-    Tensor logits_grad_bf16 = Tensor::zeros({batch_size, seq_len, padded_vocab_size}, DType::BFloat16);
-
-    // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
-    classifier_forward(losses, max_of_each_row, sum_of_each_row, logits, targets, vocab_size);
-    classifier_backward(logits_grad, losses_grad, logits, targets, max_of_each_row, sum_of_each_row, vocab_size);
-    classifier_forward(losses_bf16, max_of_each_row_bf16, sum_of_each_row_bf16, logits_bf16, targets, vocab_size);
-    classifier_backward(logits_grad_bf16, losses_grad, logits_bf16, targets, max_of_each_row_bf16,
-                        sum_of_each_row_bf16, vocab_size);
-    torch::Tensor usual_losses = pytorch_copy_of(losses);
-    torch::Tensor usual_max_of_each_row = pytorch_copy_of(max_of_each_row), usual_sum_of_each_row = pytorch_copy_of(sum_of_each_row);
-    torch::Tensor usual_logits_grad = pytorch_copy_of(logits_grad);
-    torch::Tensor usual_losses_bf16 = pytorch_copy_of(losses_bf16);
-    torch::Tensor usual_max_of_each_row_bf16 = pytorch_copy_of(max_of_each_row_bf16);
-    torch::Tensor usual_sum_of_each_row_bf16 = pytorch_copy_of(sum_of_each_row_bf16);
-    torch::Tensor usual_logits_grad_bf16 = pytorch_copy_of(logits_grad_bf16.to(DType::Float32));
-    int one_float4_per_thread_blocks = (int)((logits.numel() / 4 + 256 - 1) / 256);   // 201,216 of 256 threads
-
-    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loops
-    auto forward = [&] {
-        classifier_forward_kernel<float><<<blocks, threads>>>(losses.data(), max_of_each_row.data(),
-                                                              sum_of_each_row.data(), logits.data(),
-                                                              targets.data_ptr<int>(), rows, vocab_size,
-                                                              padded_vocab_size);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward = [&] {
-        classifier_backward_kernel<float><<<blocks, threads>>>(logits_grad.data(), losses_grad.data(), logits.data(),
-                                                               targets.data_ptr<int>(), max_of_each_row.data(),
-                                                               sum_of_each_row.data(), rows, vocab_size,
-                                                               padded_vocab_size);
-        cudaCheck(cudaGetLastError());
-    };
-    auto forward_bf16 = [&] {
-        classifier_forward_kernel<nv_bfloat16><<<blocks, threads>>>(losses_bf16.data(), max_of_each_row_bf16.data(),
-                                                                    sum_of_each_row_bf16.data(),
-                                                                    logits_bf16.data_ptr<nv_bfloat16>(),
-                                                                    targets.data_ptr<int>(), rows, vocab_size,
-                                                                    padded_vocab_size);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward_bf16 = [&] {
-        classifier_backward_kernel<nv_bfloat16><<<blocks, threads>>>(
-            logits_grad_bf16.data_ptr<nv_bfloat16>(), losses_grad.data(), logits_bf16.data_ptr<nv_bfloat16>(),
-            targets.data_ptr<int>(), max_of_each_row_bf16.data(), sum_of_each_row_bf16.data(), rows, vocab_size,
-            padded_vocab_size);
-        cudaCheck(cudaGetLastError());
-    };
-    blocks = (int)rows;
-    threads = CLASSIFIER_FORWARD_THREADS_PER_BLOCK;
-    warm_up_gpu(forward);
-
-    // The forward: losses, max_of_each_row and sum_of_each_row within TOLERANCE of the usual launch's.
-    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
-    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
-    int forward_block_counts[] = {40, 80, 160, 320, 640, 1280, 4096, sms, 2 * sms};
-    int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 9 * 4, rounds = 20;
-    float total_ms[launches][2] = {}; // launch k is block count number k / 4 x thread_counts[k % 4]; [0] float, [1] bf16
-    for (int round = 1; round <= rounds; round++)
+    // Expect: {2, 8, 50304} random logits, in float and in bfloat16, both launchers called with
+    // threads_per_block 32, 128, 512 and 1024 (one warp up to MAX_THREADS_PER_BLOCK). The forward gives the
+    // defaults' losses, max_of_each_row and sum_of_each_row within TOLERANCE, not to the last bit: another
+    // block size adds each row's exps in another order. The backward, from the default forward's row maxes
+    // and sums, gives the default's logits_grad to the last bit: each value is worked out alone.
+    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    DType dtypes_list[] = {DType::Float32, DType::BFloat16};
+    for (DType dtype_val : dtypes_list)
     {
-        for (int k = 0; k < launches; k++)
+        // 1. random logits and targets; the defaults' results
+        torch::manual_seed(0);
+        size_t batch_size_val = 2;
+        size_t seq_len_val = 8;
+        size_t rows_val = batch_size_val * seq_len_val;
+        Shape logits_shape_list = {batch_size_val, seq_len_val, GPT2_PADDED_VOCAB_SIZE};
+        Tensor logits_tensor = random_tensor_on_gpu(logits_shape_list).to(dtype_val);
+        Tensor targets_tensor = random_targets_on_gpu({batch_size_val, seq_len_val}, GPT2_VOCAB_SIZE);
+        Tensor losses_grad_tensor = Tensor::zeros({batch_size_val, seq_len_val}).fill_(1.0 / rows_val);
+        RowResults usual_val = zero_row_results({batch_size_val, seq_len_val});
+        Tensor usual_logits_grad_tensor = Tensor::zeros(logits_shape_list, dtype_val);
+        classifier_forward(usual_val.losses_tensor, usual_val.max_of_each_row_tensor, usual_val.sum_of_each_row_tensor,
+                           logits_tensor, targets_tensor, GPT2_VOCAB_SIZE);
+        classifier_backward(usual_logits_grad_tensor, losses_grad_tensor, logits_tensor, targets_tensor,
+                            usual_val.max_of_each_row_tensor, usual_val.sum_of_each_row_tensor, GPT2_VOCAB_SIZE);
+
+        // 2. each block size, against the defaults'
+        for (int threads_per_block_val : block_sizes_list)
         {
-            blocks = forward_block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(forward);
-            total_ms[k][1] += gpu_milliseconds(forward_bf16);
+            RowResults results_val = zero_row_results({batch_size_val, seq_len_val});
+            Tensor logits_grad_tensor = Tensor::zeros(logits_shape_list, dtype_val);
+            classifier_forward(results_val.losses_tensor, results_val.max_of_each_row_tensor,
+                               results_val.sum_of_each_row_tensor, logits_tensor, targets_tensor, GPT2_VOCAB_SIZE,
+                               threads_per_block_val);
+            classifier_backward(logits_grad_tensor, losses_grad_tensor, logits_tensor, targets_tensor,
+                                usual_val.max_of_each_row_tensor, usual_val.sum_of_each_row_tensor, GPT2_VOCAB_SIZE,
+                                threads_per_block_val);
+            ASSERT_NEAR(results_val.losses_tensor.tolist(), usual_val.losses_tensor.tolist(), TOLERANCE);
+            ASSERT_NEAR(results_val.max_of_each_row_tensor.tolist(), usual_val.max_of_each_row_tensor.tolist(), TOLERANCE);
+            ASSERT_NEAR(results_val.sum_of_each_row_tensor.tolist(), usual_val.sum_of_each_row_tensor.tolist(), TOLERANCE);
+            ASSERT_EQ(logits_grad_tensor.to(DType::Float32).tolist(), usual_logits_grad_tensor.to(DType::Float32).tolist());
         }
     }
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {}, fastest_threads[2] = {}, launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    forward, time in ms:    blocks   threads   rows per block    float     bf16   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = forward_block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[2];
-        for (int j = 0; j < 2; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-        for (const Tensor *tensor : {&losses, &max_of_each_row, &sum_of_each_row, &losses_bf16, &max_of_each_row_bf16,
-                                     &sum_of_each_row_bf16})
-            tensor->zero_();
-        forward();
-        forward_bf16();
-        bool same = relative_difference_on_gpu(losses, usual_losses) <= TOLERANCE &&
-                    relative_difference_on_gpu(max_of_each_row, usual_max_of_each_row) <= TOLERANCE &&
-                    relative_difference_on_gpu(sum_of_each_row, usual_sum_of_each_row) <= TOLERANCE &&
-                    relative_difference_on_gpu(losses_bf16, usual_losses_bf16) <= TOLERANCE &&
-                    relative_difference_on_gpu(max_of_each_row_bf16, usual_max_of_each_row_bf16) <= TOLERANCE &&
-                    relative_difference_on_gpu(sum_of_each_row_bf16, usual_sum_of_each_row_bf16) <= TOLERANCE;
-        if (same)
-            launches_with_the_same_result++;
-        int rows_per_block = (int)((rows + blocks - 1) / blocks); // the most any block takes
-        const char *usual = blocks == (int)rows && threads == CLASSIFIER_FORWARD_THREADS_PER_BLOCK
-                                ? "   <- what classifier_forward launches"
-                                : "";
-        printf("                            %6d   %7d   %14d   %6.3f   %6.3f   %-11s%s\n", blocks, threads,
-               rows_per_block, times[0], times[1], same ? "yes" : "NO", usual);
-    }
-    printf("    fastest forward        %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0],
-           fastest_ms[0]);
-    printf("    fastest bf16 forward   %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1],
-           fastest_ms[1]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
-
-    // The backward: logits_grad equal to the usual launch's, to the last bit. It reads the usual
-    // forward's max_of_each_row and sum_of_each_row, which the last forwards above wrote again within
-    // TOLERANCE, so put those back first, in both dtypes.
-    cudaCheck(cudaMemcpy(max_of_each_row.data(), usual_max_of_each_row.data_ptr<float>(), rows * sizeof(float),
-                         cudaMemcpyDeviceToDevice));
-    cudaCheck(cudaMemcpy(sum_of_each_row.data(), usual_sum_of_each_row.data_ptr<float>(), rows * sizeof(float),
-                         cudaMemcpyDeviceToDevice));
-    cudaCheck(cudaMemcpy(max_of_each_row_bf16.data(), usual_max_of_each_row_bf16.data_ptr<float>(),
-                         rows * sizeof(float), cudaMemcpyDeviceToDevice));
-    cudaCheck(cudaMemcpy(sum_of_each_row_bf16.data(), usual_sum_of_each_row_bf16.data_ptr<float>(),
-                         rows * sizeof(float), cudaMemcpyDeviceToDevice));
-    int backward_block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks, sms, 2 * sms};
-    for (int k = 0; k < launches; k++)
-        total_ms[k][0] = total_ms[k][1] = 0.0f;
-    for (int round = 1; round <= rounds; round++)
-    {
-        for (int k = 0; k < launches; k++)
-        {
-            blocks = backward_block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(backward);
-            total_ms[k][1] += gpu_milliseconds(backward_bf16);
-        }
-    }
-    fastest_ms[0] = fastest_ms[1] = 1e9f;
-    launches_with_the_same_result = 0;
-    printf("    backward, time in ms:   blocks   threads   float4s per thread    float     bf16   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = backward_block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[2];
-        for (int j = 0; j < 2; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-        logits_grad.zero_();
-        logits_grad_bf16.zero_();
-        backward();
-        backward_bf16();
-        bool same = torch::equal(pytorch_copy_of(logits_grad), usual_logits_grad) &&
-                    torch::equal(pytorch_copy_of(logits_grad_bf16.to(DType::Float32)), usual_logits_grad_bf16);
-        if (same)
-            launches_with_the_same_result++;
-        size_t threads_launched = (size_t)blocks * threads;
-        int float4s_per_thread = (int)((logits.numel() / 4 + threads_launched - 1) / threads_launched); // the most
-        const char *usual = blocks == CLASSIFIER_BACKWARD_BLOCKS && threads == CLASSIFIER_BACKWARD_THREADS_PER_BLOCK
-                                ? "   <- what classifier_backward launches"
-                            : blocks == one_float4_per_thread_blocks && threads == 256
-                                ? "   <- one float4 per thread: a T4's pick, what it launched before"
-                                : "";
-        printf("                            %6d   %7d   %18d   %6.3f   %6.3f   %-11s%s\n", blocks, threads,
-               float4s_per_thread, times[0], times[1], same ? "yes" : "NO", usual);
-    }
-    printf("    fastest backward       %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0],
-           fastest_ms[0]);
-    printf("    fastest bf16 backward  %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1],
-           fastest_ms[1]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+    start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     matches_pytorch_on_gpt2_rows();
     matches_pytorch_with_a_small_vocabulary();
     forward_and_backward_in_bfloat16();
-    time_20_steps_on_gpt2_small_size();
 
     forward_of_1_2_3_4();
     backward_of_1_2_3_4();
@@ -720,8 +546,7 @@ int main(void)
     forward_leaves_the_logits_as_they_are();
 
     every_kernel_fits_its_block();
-
-    time_each_kernel_with_other_block_and_thread_counts();
+    any_block_size_gives_the_same_result();
 
     printf("\nall tests passed\n");
     return 0;

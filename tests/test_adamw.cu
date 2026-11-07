@@ -1,175 +1,207 @@
-// test_adamw.cu — tests for llmc/optimizer.cuh (AdamW) and llmc/kernels/adamw.cuh. Every
-// check prints its test case, input, expected and actual value, and ok; the first FAIL
-// stops the program.
+// test_adamw.cu — tests for llmc/kernels/adamw.cuh (AdamW all in float) and llmc/optimizer.cuh's AdamW on a
+// float model. A bfloat16 model: test_adamw_bf16.cu; 8-bit m and v: test_adamw_8bit.cu. Every check prints its
+// test case, input, expected and actual value, and ok; the first FAIL stops the program.
+// The timings are in tunes/tune_adamw.cu.
 //
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; only the headers needed, not <torch/torch.h>
 #include <torch/utils.h>              // torch::NoGradGuard
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update, which part 2 calls directly
+#include "../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update, which the tests call directly
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
+static const double STEPS_TOLERANCE = TOLERANCE;   // the common tests' after several steps
 
 // ── helpers: my side ──────────────────────────────────────────────────────────
 
 /// Works out the norm of all the gradients on the CPU, for clipping: every value of every
-static float cpu_grad_norm(const std::vector<std::vector<float>> &param_grads)
+/// tensor as one long list.
+static float cpu_grad_norm(const std::vector<std::vector<float>> &param_grads_list)
 {
-    double sum_squares = 0.0;
-    for (const std::vector<float> &tensor_grads : param_grads)
-        for (float g : tensor_grads)
-            sum_squares += (double)g * g;
-    return (float)sqrt(sum_squares);
+    double sum_squares_val = 0.0;
+    for (const std::vector<float> &tensor_grads_list : param_grads_list)
+        for (float g_val : tensor_grads_list)
+            sum_squares_val += (double)g_val * g_val;
+    return (float)sqrt(sum_squares_val);
 }
 
-/// Makes random values from Tensor::randn, times `scale`, as a CPU list: the same numbers
-static std::vector<float> random_values(const Shape &shape, float scale = 1.0f)
+/// Makes random values from Tensor::randn, times `scale_val`, as a CPU list: the same numbers
+/// for both sides of a test.
+static std::vector<float> random_values(const Shape &shape_list, float scale_val = 1.0f)
 {
-    std::vector<float> numbers = Tensor::randn(shape).tolist();
-    for (float &number : numbers)
-        number *= scale;
-    return numbers;
-}
-
-/// Makes a tensor of `shape` with random values, mean 0 and standard deviation `scale`, made by PyTorch
-/// on the GPU: Tensor::randn makes them on the CPU, which takes minutes for GPT-2 small's 124M values.
-static Tensor random_tensor_on_gpu(const Shape &shape, float scale)
-{
-    Tensor tensor = Tensor::empty(shape);
-    torch::Tensor values = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA)) * scale;
-    cudaCheck(cudaMemcpy(tensor.data(), values.data_ptr<float>(), tensor.numel() * sizeof(float),
-                         cudaMemcpyDeviceToDevice));
-    return tensor;
+    std::vector<float> numbers_list = Tensor::randn(shape_list).tolist();
+    for (float &number_val : numbers_list)
+        number_val *= scale_val;
+    return numbers_list;
 }
 
 /// Gives every value of my AdamW's parameters, one tensor after the other, to compare
-static std::vector<float> all_my_adamw_values(const AdamW &my_adamw)
+/// with PyTorch's.
+static std::vector<float> all_my_adamw_values(const AdamW &my_adamw_val)
 {
-    std::vector<float> values;
-    for (int k = 0; k < my_adamw.num_params(); k++)
+    std::vector<float> values_list;
+    for (int param_index_val = 0; param_index_val < my_adamw_val.num_params(); param_index_val++)
     {
-        std::vector<float> tensor_values = my_adamw.param(k).tolist();
-        values.insert(values.end(), tensor_values.begin(), tensor_values.end());
+        std::vector<float> tensor_values_list = my_adamw_val.param(param_index_val).tolist();
+        values_list.insert(values_list.end(), tensor_values_list.begin(), tensor_values_list.end());
     }
-    return values;
+    return values_list;
 }
 
 // ── helpers: PyTorch's side ───────────────────────────────────────────────────
 
-/// Makes a new GPU tensor of this shape from values in row order: the tests' CPU lists
-static torch::Tensor to_gpu(const std::vector<float> &row_values, torch::IntArrayRef shape)
+/// Makes a new GPU tensor of this shape from values in row order: the tests' CPU lists.
+static torch::Tensor to_gpu(const std::vector<float> &row_values_list, torch::IntArrayRef shape_list)
 {
-    return torch::tensor(row_values).reshape(shape).to(torch::kCUDA);
+    return torch::tensor(row_values_list).reshape(shape_list).to(torch::kCUDA);
 }
 
 /// Makes one PyTorch parameter on the GPU from a test's values and shape. requires_grad:
-static torch::Tensor pytorch_param(const std::vector<float> &values, const Shape &shape)
+/// it gets a .grad, as an optimizer's parameters do.
+static torch::Tensor pytorch_param(const std::vector<float> &values_list, const Shape &shape_list)
 {
-    std::vector<int64_t> sizes(shape.begin(), shape.end());
-    return to_gpu(values, sizes).requires_grad_(true);
+    std::vector<int64_t> sizes_list(shape_list.begin(), shape_list.end());
+    return to_gpu(values_list, sizes_list).requires_grad_(true);
 }
 
 /// Makes AdamW's m (or v) for each of these parameters: zeros of the same shape, as
-static std::vector<torch::Tensor> zeros_like_each(const std::vector<torch::Tensor> &params)
+/// PyTorch's AdamW starts them.
+static std::vector<torch::Tensor> zeros_like_each(const std::vector<torch::Tensor> &params_list)
 {
-    std::vector<torch::Tensor> zeros;
-    for (const torch::Tensor &param : params)
-        zeros.push_back(torch::zeros_like(param));
-    return zeros;
+    std::vector<torch::Tensor> zeros_list;
+    for (const torch::Tensor &param_tensor : params_list)
+        zeros_list.push_back(torch::zeros_like(param_tensor));
+    return zeros_list;
 }
 
-/// Makes a step count of 0 for each of `count` parameters: one float on the GPU each, as
-static std::vector<torch::Tensor> zero_step_counts(size_t count)
+/// Makes a step count of 0 for each of `count_val` parameters: one float on the GPU each, as
+/// fused AdamW keeps them.
+static std::vector<torch::Tensor> zero_step_counts(size_t count_val)
 {
-    std::vector<torch::Tensor> steps;
-    for (size_t k = 0; k < count; k++)
-        steps.push_back(torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA)));
-    return steps;
+    std::vector<torch::Tensor> steps_list;
+    for (size_t index_val = 0; index_val < count_val; index_val++)
+        steps_list.push_back(torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA)));
+    return steps_list;
 }
 
 /// Does one step of PyTorch's fused AdamW on one param group, from the gradient each
-static void pytorch_adamw_step(std::vector<torch::Tensor> &params, std::vector<torch::Tensor> &m,
-                               std::vector<torch::Tensor> &v, std::vector<torch::Tensor> &steps,
-                               double weight_decay, const AdamWConfig &config)
+/// parameter holds.
+static void pytorch_adamw_step(std::vector<torch::Tensor> &params_list, std::vector<torch::Tensor> &m_list,
+                               std::vector<torch::Tensor> &v_list, std::vector<torch::Tensor> &steps_list,
+                               double weight_decay_val, const AdamWConfig &config_val)
 {
-    torch::NoGradGuard no_grad; // the update is not part of the graph, as in Python
-    std::vector<torch::Tensor> grads;
-    for (const torch::Tensor &param : params)
-        grads.push_back(param.grad());
-    at::_foreach_add_(steps, at::Scalar(1.0)); // step t = t + 1
-    at::_fused_adamw_(params, grads, m, v, at::TensorList(), // no amsgrad state
-                      steps, config.learning_rate, config.beta1, config.beta2, weight_decay, config.eps,
-                      /*amsgrad=*/false, /*maximize=*/false);
+    torch::NoGradGuard no_grad_val; // the update is not part of the graph, as in Python
+    std::vector<torch::Tensor> grads_list;
+    for (const torch::Tensor &param_tensor : params_list)
+        grads_list.push_back(param_tensor.grad());
+    at::_foreach_add_(steps_list, at::Scalar(1.0)); // step t = t + 1
+    at::_fused_adamw_(params_list, grads_list, m_list, v_list, at::TensorList(), // no amsgrad state
+                      steps_list, config_val.learning_rate, config_val.beta1, config_val.beta2, weight_decay_val,
+                      config_val.eps, /*amsgrad=*/false, /*maximize=*/false);
 }
 
 /// Gives a PyTorch tensor's values in row order on the CPU, to compare with mine.
 static std::vector<float> values_of(const torch::Tensor &tensor)
 {
-    torch::Tensor flat = tensor.detach().to(torch::kCPU).reshape(-1).contiguous();
-    return std::vector<float>(flat.data_ptr<float>(), flat.data_ptr<float>() + flat.numel());
-}
-
-/// Makes a PyTorch copy of a float tensor of mine, on the GPU: to keep a result and compare a later one
-/// with it there, without moving 124M values to the CPU.
-static torch::Tensor pytorch_copy_of(const Tensor &tensor)
-{
-    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
-    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
+    torch::Tensor flat_tensor = tensor.detach().to(torch::kCPU).reshape(-1).contiguous();
+    return std::vector<float>(flat_tensor.data_ptr<float>(), flat_tensor.data_ptr<float>() + flat_tensor.numel());
 }
 
 /// Gives every value of these PyTorch tensors, one tensor after the other.
-static std::vector<float> all_values_of(const std::vector<torch::Tensor> &tensors)
+static std::vector<float> all_values_of(const std::vector<torch::Tensor> &tensors_list)
 {
-    std::vector<float> values;
-    for (const torch::Tensor &tensor : tensors)
+    std::vector<float> values_list;
+    for (const torch::Tensor &tensor : tensors_list)
     {
-        std::vector<float> tensor_values = values_of(tensor);
-        values.insert(values.end(), tensor_values.begin(), tensor_values.end());
+        std::vector<float> tensor_values_list = values_of(tensor);
+        values_list.insert(values_list.end(), tensor_values_list.begin(), tensor_values_list.end());
     }
-    return values;
+    return values_list;
 }
 
-// ══ part 1: my AdamW against PyTorch's fused AdamW ════════════════════════════
+/// The float kernel's tensors for `count` values, all 0: what the common tests step, with adamw_update.
+struct KernelState
+{
+    Tensor params_tensor;
+    Tensor grads_tensor;
+    Tensor m_tensor;
+    Tensor v_tensor;
+    Tensor grad_norm_tensor;
+    explicit KernelState(size_t count_val)
+        : params_tensor(Tensor::zeros({count_val})), grads_tensor(Tensor::zeros({count_val})),
+          m_tensor(Tensor::zeros({count_val})), v_tensor(Tensor::zeros({count_val})), grad_norm_tensor(Tensor::zeros({1}))
+    {
+    }
+    void set_params(const std::vector<float> &values_list) const { params_tensor.copy_from_cpu(values_list.data()); }
+    void set_grads(const std::vector<float> &values_list) const { grads_tensor.copy_from_cpu(values_list.data()); }
+    void set_grad_norm(float norm_val) const { grad_norm_tensor.copy_from_cpu(&norm_val); }
+    std::vector<float> param_values() const { return params_tensor.tolist(); }
+    std::vector<float> grad_values() const { return grads_tensor.tolist(); }
+    std::vector<float> m_values() const { return m_tensor.tolist(); }
+    std::vector<float> v_values() const { return v_tensor.tolist(); }
+    /// Takes one step t on the first `count_val` values, the first `decayed_count_val` of them decayed, at this
+    /// block size (the default if not given).
+    void step(const AdamWConfig &config_val, size_t count_val, size_t decayed_count_val, int t_val,
+              int threads_per_block_val = ADAMW_THREADS_PER_BLOCK) const
+    {
+        adamw_update(params_tensor.data(), grads_tensor.data(), m_tensor.data(), v_tensor.data(), count_val,
+                     decayed_count_val, grad_norm_tensor.data(), config_val.max_norm, config_val.learning_rate,
+                     config_val.beta1, config_val.beta2, config_val.eps, config_val.weight_decay, t_val,
+                     threads_per_block_val);
+    }
+};
+
+/// One PyTorch param group to step alongside the kernel: the parameters, and fused AdamW's m, v and step counts.
+struct PytorchGroup
+{
+    std::vector<torch::Tensor> params_list;
+    std::vector<torch::Tensor> m_list;
+    std::vector<torch::Tensor> v_list;
+    std::vector<torch::Tensor> steps_list;
+    explicit PytorchGroup(const std::vector<torch::Tensor> &group_params_list)
+        : params_list(group_params_list), m_list(zeros_like_each(group_params_list)),
+          v_list(zeros_like_each(group_params_list)), steps_list(zero_step_counts(group_params_list.size()))
+    {
+    }
+    /// Takes one fused AdamW step, with this weight decay.
+    void step(double weight_decay_val, const AdamWConfig &config_val)
+    {
+        pytorch_adamw_step(params_list, m_list, v_list, steps_list, weight_decay_val, config_val);
+    }
+};
+
+// ══ common: the same tests in test_adamw.cu, test_adamw_bf16.cu and test_adamw_8bit.cu ═══════════
+// Each steps this file's kernel through KernelState. PyTorch gets the start values and gradients as the kernel
+// holds them (rounded to bfloat16 in a bfloat16 kernel), so the expected numbers are the same in all three.
 
 static void one_step_matches_pytorch(void)
 {
-    // Expect: one step on a 2x2 weight {0.5, -1, 2, 0} with gradient {0.1, -0.2, 0.3, 0.05},
-    // lr 0.01, weight decay 0.1: each of my AdamW's 4 values equals PyTorch's (about 0.4895,
-    // -0.989, 1.988, -0.01).
-    AdamWConfig config;
-    config.learning_rate = 1e-2;
-    std::vector<float> weight_values = {0.5f, -1.0f, 2.0f, 0.0f};
-    std::vector<float> weight_grad = {0.1f, -0.2f, 0.3f, 0.05f};
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    // PyTorch's: the weight, and its m, v and step count, all kept here between steps
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {2, 2})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    // 1. my AdamW, step 1
-    my_adamw.grad(0).copy_from_cpu(weight_grad.data());
-    my_adamw.step();
-    // 2. PyTorch, the same gradient
-    pytorch_params[0].mutable_grad() = to_gpu(weight_grad, pytorch_params[0].sizes());
-    pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-    // 3. compare
-    std::vector<float> my_weight = my_adamw.param(0).tolist();
-    std::vector<float> pytorch_weight = values_of(pytorch_params[0]);
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(my_weight[i], pytorch_weight[i], 1e-6);
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(pytorch_weight, weight_values, 1e-3);
+    // Expect: one step on a 2x2 weight {0.5, -1, 2, 0} with gradient {0.1, -0.2, 0.3, 0.05}, lr 0.01, weight
+    // decay 0.1: each value equals PyTorch's (about 0.4895, -0.989, 1.988, -0.01), within 1e-6 of the largest.
+    // Step 1 works in float before anything is stored, so every kernel matches this closely.
+    // 1. the kernel and PyTorch, from the same start
+    AdamWConfig config_val;
+    config_val.learning_rate = 1e-2f;
+    KernelState state_val(4);
+    state_val.set_params({0.5f, -1.0f, 2.0f, 0.0f});
+    state_val.set_grads({0.1f, -0.2f, 0.3f, 0.05f});
+    std::vector<float> start_values_list = state_val.param_values();
+    PytorchGroup pytorch_val({pytorch_param(start_values_list, {2, 2})});
+    // 2. one step each
+    state_val.step(config_val, 4, 4, 1);
+    pytorch_val.params_list[0].mutable_grad() = to_gpu(state_val.grad_values(), pytorch_val.params_list[0].sizes());
+    pytorch_val.step(config_val.weight_decay, config_val);
+    // 3. check; PyTorch really trained: its weight moved far more than the difference allowed
+    ASSERT_NEAR(state_val.param_values(), values_of(pytorch_val.params_list[0]), 1e-6);
+    ASSERT_FAR(values_of(pytorch_val.params_list[0]), start_values_list, 1e-3);
 }
 
 static void many_steps_match_pytorch(void)
 {
-    // Expect: 10 steps on a 2x2 weight, a new gradient each step (some values 0), lr 0.003:
-    // my AdamW equals PyTorch's after every step, so m and v carry over the same way.
-    static float grads_per_step[10][4] = {
+    // Expect: 10 steps on a 2x2 weight, a new gradient each step (some values 0), lr 0.003: the kernel equals
+    // PyTorch's after every step, within STEPS_TOLERANCE of the largest value, so m and v carry over the same way.
+    static float grads_per_step_list[10][4] = {
         {0.3f, -0.2f, 1.0f, 0.01f}, // step 1
         {-0.1f, 0.4f, 0.9f, -0.02f},
         {0.25f, -0.15f, 0.8f, 0.03f},
@@ -181,90 +213,240 @@ static void many_steps_match_pytorch(void)
         {0.5f, -0.1f, 0.2f, -0.08f},
         {-0.3f, 0.05f, 0.1f, 0.09f}, // step 10
     };
-    AdamWConfig config;
-    config.learning_rate = 3e-3;
-    std::vector<float> weight_values = {0.8f, -0.5f, 1.2f, 0.3f};
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {2, 2})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    for (int t = 1; t <= 10; t++)
+    // 1. the kernel and PyTorch, from the same start
+    AdamWConfig config_val;
+    config_val.learning_rate = 3e-3f;
+    KernelState state_val(4);
+    state_val.set_params({0.8f, -0.5f, 1.2f, 0.3f});
+    std::vector<float> start_values_list = state_val.param_values();
+    PytorchGroup pytorch_val({pytorch_param(start_values_list, {2, 2})});
+    // 2. ten steps, compared after each
+    for (int t_val = 1; t_val <= 10; t_val++)
     {
-        std::vector<float> step_grad(grads_per_step[t - 1], grads_per_step[t - 1] + 4);
-        // 1. my AdamW, step t
-        my_adamw.grad(0).copy_from_cpu(step_grad.data());
-        my_adamw.step();
-        // 2. PyTorch, the same gradient
-        pytorch_params[0].mutable_grad() = to_gpu(step_grad, pytorch_params[0].sizes());
-        pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-        // 3. compare
-        ASSERT_NEAR(my_adamw.param(0).tolist(), values_of(pytorch_params[0]), TOLERANCE);
+        state_val.set_grads(std::vector<float>(grads_per_step_list[t_val - 1], grads_per_step_list[t_val - 1] + 4));
+        state_val.step(config_val, 4, 4, t_val);
+        pytorch_val.params_list[0].mutable_grad() = to_gpu(state_val.grad_values(), pytorch_val.params_list[0].sizes());
+        pytorch_val.step(config_val.weight_decay, config_val);
+        ASSERT_NEAR(state_val.param_values(), values_of(pytorch_val.params_list[0]), STEPS_TOLERANCE);
     }
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(values_of(pytorch_params[0]), weight_values, 1e-3);
+    // 3. PyTorch really trained
+    ASSERT_FAR(values_of(pytorch_val.params_list[0]), start_values_list, 1e-3);
 }
+
+/// Steps the kernel and PyTorch twice on a 2x2 weight {0.5, -1, 2, 0.25} with these two gradients, lr 0.01 and
+/// this max_norm (PyTorch clips with clip_grad_norm_ when `pytorch_clips_val`), and checks they agree after each.
+static void two_clipped_steps_match_pytorch(const std::vector<float> (&grads_per_step_list)[2], float max_norm_val,
+                                            bool pytorch_clips_val)
+{
+    // 1. the kernel and PyTorch, from the same start
+    AdamWConfig config_val;
+    config_val.learning_rate = 1e-2f;
+    config_val.max_norm = max_norm_val;
+    KernelState state_val(4);
+    state_val.set_params({0.5f, -1.0f, 2.0f, 0.25f});
+    std::vector<float> start_values_list = state_val.param_values();
+    PytorchGroup pytorch_val({pytorch_param(start_values_list, {2, 2})});
+    // 2. two steps, compared after each
+    for (int t_val = 1; t_val <= 2; t_val++)
+    {
+        // the kernel: the gradient, and its norm for the clipping
+        state_val.set_grads(grads_per_step_list[t_val - 1]);
+        state_val.set_grad_norm(cpu_grad_norm({state_val.grad_values()}));
+        state_val.step(config_val, 4, 4, t_val);
+        // PyTorch, the same gradient, clipped by clip_grad_norm_
+        pytorch_val.params_list[0].mutable_grad() = to_gpu(state_val.grad_values(), pytorch_val.params_list[0].sizes());
+        if (pytorch_clips_val)
+            torch::nn::utils::clip_grad_norm_(pytorch_val.params_list, config_val.max_norm);
+        pytorch_val.step(config_val.weight_decay, config_val);
+        ASSERT_NEAR(state_val.param_values(), values_of(pytorch_val.params_list[0]), STEPS_TOLERANCE);
+    }
+    // 3. PyTorch really trained
+    ASSERT_FAR(values_of(pytorch_val.params_list[0]), start_values_list, 1e-3);
+}
+
+static void clip_scales_large_gradients_down_to_max_norm(void)
+{
+    // Expect: two steps on a 2x2 weight with max_norm 1. Step 1's gradient (norm 0.38) is not clipped; step 2's
+    // {1, 2, 3, 4} has norm sqrt(30) = 5.48 > 1, so both sides divide it by 5.48 first. The kernel equals
+    // PyTorch's after each step, within STEPS_TOLERANCE.
+    const std::vector<float> grads_per_step_list[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {1.0f, 2.0f, 3.0f, 4.0f}};
+    two_clipped_steps_match_pytorch(grads_per_step_list, 1.0f, true);
+}
+
+static void clip_leaves_small_gradients_alone(void)
+{
+    // Expect: the same two steps, but step 2's gradient {0.3, 0, 0.4, 0} has norm 0.5 < 1: not clipped. The
+    // kernel equals PyTorch's after each step, within STEPS_TOLERANCE.
+    const std::vector<float> grads_per_step_list[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {0.3f, 0.0f, 0.4f, 0.0f}};
+    two_clipped_steps_match_pytorch(grads_per_step_list, 1.0f, true);
+}
+
+static void max_norm_0_turns_clipping_off(void)
+{
+    // Expect: step 2's gradient has norm sqrt(30), but max_norm is 0: PyTorch does not clip, and neither may the
+    // kernel, though grad_norm holds 5.48. The kernel equals PyTorch's after each step, within STEPS_TOLERANCE.
+    const std::vector<float> grads_per_step_list[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {1.0f, 2.0f, 3.0f, 4.0f}};
+    two_clipped_steps_match_pytorch(grads_per_step_list, 0.0f, false);
+}
+
+static void first_step_moves_each_value_by_about_the_learning_rate(void)
+{
+    // Expect: at t = 1, m̂ = g and v̂ = g², so the step is lr g / |g| = ±lr, whatever the size of g. 4 values of 1,
+    // gradients {1000, 0.001, -5, -0.3}, lr 0.05, no weight decay: 1 - 0.05 where g > 0, 1 + 0.05 where g < 0.
+    // 1. one step
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.05f;
+    config_val.weight_decay = 0.0f;
+    KernelState state_val(4);
+    state_val.set_params({1.0f, 1.0f, 1.0f, 1.0f});
+    state_val.set_grads({1000.0f, 0.001f, -5.0f, -0.3f});
+    state_val.step(config_val, 4, 4, 1);
+    // 2. check
+    std::vector<float> values_list = state_val.param_values();
+    std::vector<float> expected_list = {0.95f, 0.95f, 1.05f, 1.05f};
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(values_list[i_val], expected_list[i_val], 1e-4);
+}
+
+static void only_the_values_before_decayed_count_decay(void)
+{
+    // Expect: the kernel's border. 8 values {2, 4, 6, 8, 2, 4, 6, 8}, decayed_count 4, no gradients, lr 0.5,
+    // weight decay 0.1: the first 4 x 0.95 = {1.9, 3.8, 5.7, 7.6}, the last 4 not moved.
+    // 1. one step, gradients all 0
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.5f;
+    config_val.weight_decay = 0.1f;
+    KernelState state_val(8);
+    state_val.set_params({2, 4, 6, 8, 2, 4, 6, 8});
+    state_val.step(config_val, 8, 4, 1);
+    // 2. check
+    std::vector<float> values_list = state_val.param_values();
+    std::vector<float> expected_list = {1.9f, 3.8f, 5.7f, 7.6f, 2, 4, 6, 8};
+    for (size_t i_val = 0; i_val < 8; i_val++)
+        ASSERT_NEAR(values_list[i_val], expected_list[i_val], 1e-6);
+}
+
+static void nothing_past_a_tensors_end_changes(void)
+{
+    // Expect: a launch covers at least one block of 256 threads x 4 values, far more than 8. A step on the
+    // first 8 of 16 values leaves the last 8's params, m and v as they were: params {10 .. 17}, m and v 0.
+    // 1. 16 values; a step on the first 8 only
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.1f;
+    config_val.weight_decay = 0.0f;
+    KernelState state_val(16);
+    std::vector<float> values_list = sample_data(8);
+    std::vector<float> last_values_list = {10, 11, 12, 13, 14, 15, 16, 17};
+    values_list.insert(values_list.end(), last_values_list.begin(), last_values_list.end());
+    state_val.set_params(values_list);
+    state_val.set_grads(std::vector<float>(16, 1.0f));
+    state_val.step(config_val, 8, 0, 1);
+    // 2. check the last 8
+    std::vector<float> params_list = state_val.param_values();
+    std::vector<float> m_list = state_val.m_values();
+    std::vector<float> v_list = state_val.v_values();
+    ASSERT_EQ(std::vector<float>(params_list.begin() + 8, params_list.end()), last_values_list);
+    ASSERT_EQ(std::vector<float>(m_list.begin() + 8, m_list.end()), std::vector<float>(8, 0.0f));
+    ASSERT_EQ(std::vector<float>(v_list.begin() + 8, v_list.end()), std::vector<float>(8, 0.0f));
+}
+
+static void any_block_size_gives_the_same_bits(void)
+{
+    // Expect: (new) 10,000 random values, the first 8,000 decayed, 3 steps with clipping; the update launched
+    // with threads_per_block 32, 128, 512 and 1024 (one warp up to MAX_THREADS_PER_BLOCK) gives the same params,
+    // m and v as the default block size, to the last bit after every step: each value is worked out alone.
+    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    // 1. random start values and gradients for 3 steps
+    Tensor::manual_seed(0);
+    AdamWConfig config_val;
+    config_val.learning_rate = 1e-2f;
+    config_val.max_norm = 1.0f;
+    size_t count_val = 10000;
+    size_t decayed_count_val = 8000;
+    std::vector<float> start_values_list = random_values({count_val}, 0.02f);
+    std::vector<std::vector<float>> grads_per_step_list;
+    for (int t_val = 1; t_val <= 3; t_val++)
+        grads_per_step_list.push_back(random_values({count_val}));
+    // 2. the default block size: 3 steps, each step's params, m and v kept
+    std::vector<std::vector<float>> usual_params_list, usual_m_list, usual_v_list;
+    KernelState usual_val(count_val);
+    usual_val.set_params(start_values_list);
+    for (int t_val = 1; t_val <= 3; t_val++)
+    {
+        usual_val.set_grads(grads_per_step_list[t_val - 1]);
+        usual_val.set_grad_norm(cpu_grad_norm({grads_per_step_list[t_val - 1]}));
+        usual_val.step(config_val, count_val, decayed_count_val, t_val);
+        usual_params_list.push_back(usual_val.param_values());
+        usual_m_list.push_back(usual_val.m_values());
+        usual_v_list.push_back(usual_val.v_values());
+    }
+    // 3. each other block size, from the same start, against the default's after every step
+    for (int threads_per_block_val : block_sizes_list)
+    {
+        KernelState state_val(count_val);
+        state_val.set_params(start_values_list);
+        for (int t_val = 1; t_val <= 3; t_val++)
+        {
+            state_val.set_grads(grads_per_step_list[t_val - 1]);
+            state_val.set_grad_norm(cpu_grad_norm({grads_per_step_list[t_val - 1]}));
+            state_val.step(config_val, count_val, decayed_count_val, t_val, threads_per_block_val);
+            ASSERT_EQ(state_val.param_values(), usual_params_list[t_val - 1]);
+            ASSERT_EQ(state_val.m_values(), usual_m_list[t_val - 1]);
+            ASSERT_EQ(state_val.v_values(), usual_v_list[t_val - 1]);
+        }
+    }
+}
+
+// ══ part 1: my AdamW against PyTorch's fused AdamW ════════════════════════════
 
 static void large_random_weight_matches_pytorch(void)
 {
     // Expect: a 256x256 random weight, 100 steps of random gradients, every 7th of them tiny
     // (x 1e-6, where eps matters): my AdamW equals PyTorch's after every step.
+    // 1. my AdamW and PyTorch's, from the same random weight
     Tensor::manual_seed(0);
-    AdamWConfig config;
-    std::vector<float> weight_values = random_values({256, 256});
-    AdamW my_adamw({{256, 256}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {256, 256})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    for (int t = 1; t <= 100; t++)
+    AdamWConfig config_val;
+    std::vector<float> weight_values_list = random_values({256, 256});
+    AdamW my_adamw_val({{256, 256}}, config_val);
+    my_adamw_val.param(0).copy_from_cpu(weight_values_list.data());
+    PytorchGroup pytorch_val({pytorch_param(weight_values_list, {256, 256})});
+    // 2. 100 steps, compared after each
+    for (int t_val = 1; t_val <= 100; t_val++)
     {
-        std::vector<float> step_grad = random_values({256, 256}, t % 7 == 1 ? 1e-6f : 1.0f);
-        // 1. my AdamW, step t
-        my_adamw.grad(0).copy_from_cpu(step_grad.data());
-        my_adamw.step();
-        // 2. PyTorch, the same gradient
-        pytorch_params[0].mutable_grad() = to_gpu(step_grad, pytorch_params[0].sizes());
-        pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-        // 3. compare
-        ASSERT_NEAR(my_adamw.param(0).tolist(), values_of(pytorch_params[0]), TOLERANCE);
+        std::vector<float> step_grad_list = random_values({256, 256}, t_val % 7 == 1 ? 1e-6f : 1.0f);
+        my_adamw_val.grad(0).copy_from_cpu(step_grad_list.data());
+        my_adamw_val.step();
+        pytorch_val.params_list[0].mutable_grad() = to_gpu(step_grad_list, pytorch_val.params_list[0].sizes());
+        pytorch_val.step(config_val.weight_decay, config_val);
+        ASSERT_NEAR(my_adamw_val.param(0).tolist(), values_of(pytorch_val.params_list[0]), TOLERANCE);
     }
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(values_of(pytorch_params[0]), weight_values, 1e-3);
+    // 3. PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides
+    ASSERT_FAR(values_of(pytorch_val.params_list[0]), weight_values_list, 1e-3);
 }
 
 static void bias_matches_pytorch_without_decay(void)
 {
     // Expect: weight decay 0.1, but a bias (1-D) is in PyTorch's group without weight decay,
     // and my AdamW does not decay it either: one step, each of its 4 values equals PyTorch's.
-    AdamWConfig config;
-    config.learning_rate = 5e-2;
-    std::vector<float> bias_values = {0.7f, -0.7f, 1.4f, 0.0f};
-    std::vector<float> bias_grad = {0.2f, -0.2f, 0.1f, 0.3f};
-    AdamW my_adamw({{4}}, config);
-    my_adamw.param(0).copy_from_cpu(bias_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(bias_values, {4})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    // 1. my AdamW, step 1
-    my_adamw.grad(0).copy_from_cpu(bias_grad.data());
-    my_adamw.step();
-    // 2. PyTorch, the same gradient; a bias is in the group with weight decay 0
-    pytorch_params[0].mutable_grad() = to_gpu(bias_grad, pytorch_params[0].sizes());
-    pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, 0.0, config);
-    // 3. compare
-    std::vector<float> my_bias = my_adamw.param(0).tolist();
-    std::vector<float> pytorch_bias = values_of(pytorch_params[0]);
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(my_bias[i], pytorch_bias[i], 1e-6);
-    // PyTorch really trained: its bias moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(pytorch_bias, bias_values, 1e-3);
+    // 1. my AdamW and PyTorch's, from the same bias
+    AdamWConfig config_val;
+    config_val.learning_rate = 5e-2;
+    std::vector<float> bias_values_list = {0.7f, -0.7f, 1.4f, 0.0f};
+    std::vector<float> bias_grad_list = {0.2f, -0.2f, 0.1f, 0.3f};
+    AdamW my_adamw_val({{4}}, config_val);
+    my_adamw_val.param(0).copy_from_cpu(bias_values_list.data());
+    PytorchGroup pytorch_val({pytorch_param(bias_values_list, {4})});
+    // 2. one step each; a bias is in PyTorch's group with weight decay 0
+    my_adamw_val.grad(0).copy_from_cpu(bias_grad_list.data());
+    my_adamw_val.step();
+    pytorch_val.params_list[0].mutable_grad() = to_gpu(bias_grad_list, pytorch_val.params_list[0].sizes());
+    pytorch_val.step(0.0, config_val);
+    // 3. compare; PyTorch really trained
+    std::vector<float> my_bias_list = my_adamw_val.param(0).tolist();
+    std::vector<float> pytorch_bias_list = values_of(pytorch_val.params_list[0]);
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(my_bias_list[i_val], pytorch_bias_list[i_val], 1e-6);
+    ASSERT_FAR(pytorch_bias_list, bias_values_list, 1e-3);
 }
 
 static void mixed_parameters_match_pytorch(void)
@@ -272,157 +454,42 @@ static void mixed_parameters_match_pytorch(void)
     // Expect: 2-D, 3-D and 1-D tensors, {3, 4}, {2, 2, 3}, {4}, {8} (matrices first, as
     // AdamW needs), 20 steps with weight decay: every tensor equals PyTorch's after every
     // step. (C#'s sizes 5 and 7 became 4 and 8: the kernel needs a multiple of 4.)
+    // 1. random tensors; my AdamW, and PyTorch's two param groups of the same tensors
     Tensor::manual_seed(1);
-    AdamWConfig config;
-    std::vector<Shape> param_shapes = {{3, 4}, {2, 2, 3}, {4}, {8}};
-    std::vector<std::vector<float>> param_values;
-    for (const Shape &shape : param_shapes)
-        param_values.push_back(random_values(shape));
-    AdamW my_adamw(param_shapes, config);
-    for (int k = 0; k < 4; k++)
-        my_adamw.param(k).copy_from_cpu(param_values[k].data());
-    // PyTorch's: the 4 tensors, then its two param groups of the same tensors, each with
-    // its own m, v and step counts
-    std::vector<torch::Tensor> pytorch_params;
-    for (int k = 0; k < 4; k++)
-        pytorch_params.push_back(pytorch_param(param_values[k], param_shapes[k]));
-    std::vector<torch::Tensor> pytorch_matrices = {pytorch_params[0], pytorch_params[1]};
-    std::vector<torch::Tensor> matrices_m = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_v = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_steps = zero_step_counts(pytorch_matrices.size());
-    std::vector<torch::Tensor> pytorch_rest = {pytorch_params[2], pytorch_params[3]};
-    std::vector<torch::Tensor> rest_m = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_v = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_steps = zero_step_counts(pytorch_rest.size());
-
-    for (int t = 1; t <= 20; t++)
+    AdamWConfig config_val;
+    std::vector<Shape> param_shapes_list = {{3, 4}, {2, 2, 3}, {4}, {8}};
+    std::vector<std::vector<float>> param_values_list;
+    for (const Shape &shape_list : param_shapes_list)
+        param_values_list.push_back(random_values(shape_list));
+    AdamW my_adamw_val(param_shapes_list, config_val);
+    for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+        my_adamw_val.param(param_index_val).copy_from_cpu(param_values_list[param_index_val].data());
+    std::vector<torch::Tensor> pytorch_params_list;
+    for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+        pytorch_params_list.push_back(pytorch_param(param_values_list[param_index_val], param_shapes_list[param_index_val]));
+    PytorchGroup matrices_val({pytorch_params_list[0], pytorch_params_list[1]});
+    PytorchGroup rest_val({pytorch_params_list[2], pytorch_params_list[3]});
+    // 2. 20 steps, compared tensor by tensor after each
+    for (int t_val = 1; t_val <= 20; t_val++)
     {
-        std::vector<std::vector<float>> param_grads;
-        for (const Shape &shape : param_shapes)
-            param_grads.push_back(random_values(shape));
-        // 1. my AdamW, step t
-        for (int k = 0; k < 4; k++)
-            my_adamw.grad(k).copy_from_cpu(param_grads[k].data());
-        my_adamw.step();
-        // 2. PyTorch, the same gradients; one step for each param group
-        for (int k = 0; k < 4; k++)
-            pytorch_params[k].mutable_grad() = to_gpu(param_grads[k], pytorch_params[k].sizes());
-        pytorch_adamw_step(pytorch_matrices, matrices_m, matrices_v, matrices_steps, config.weight_decay, config);
-        pytorch_adamw_step(pytorch_rest, rest_m, rest_v, rest_steps, 0.0, config);
-        // 3. compare, tensor by tensor
-        for (int k = 0; k < 4; k++)
-            ASSERT_NEAR(my_adamw.param(k).tolist(), values_of(pytorch_params[k]), TOLERANCE);
+        std::vector<std::vector<float>> param_grads_list;
+        for (const Shape &shape_list : param_shapes_list)
+            param_grads_list.push_back(random_values(shape_list));
+        for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+            my_adamw_val.grad(param_index_val).copy_from_cpu(param_grads_list[param_index_val].data());
+        my_adamw_val.step();
+        for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+            pytorch_params_list[param_index_val].mutable_grad() =
+                to_gpu(param_grads_list[param_index_val], pytorch_params_list[param_index_val].sizes());
+        matrices_val.step(config_val.weight_decay, config_val);
+        rest_val.step(0.0, config_val);
+        for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+            ASSERT_NEAR(my_adamw_val.param(param_index_val).tolist(), values_of(pytorch_params_list[param_index_val]),
+                        TOLERANCE);
     }
-    // PyTorch really trained each tensor: each moved far more than the 1e-5 we allow between the sides.
-    for (int k = 0; k < 4; k++)
-        ASSERT_FAR(values_of(pytorch_params[k]), param_values[k], 1e-3);
-}
-
-static void clip_scales_large_gradients_down_to_max_norm(void)
-{
-    // Expect: two steps on a 2x2 weight with max_norm 1. Step 1's gradient (norm 0.38) is not
-    // clipped; step 2's {1, 2, 3, 4} has norm sqrt(30) = 5.48 > 1, so both sides divide it by
-    // 5.48 first. Step 2 shows it: at step 1 Adam ignores the gradient's size. My AdamW equals
-    // PyTorch's after each step.
-    AdamWConfig config;
-    config.learning_rate = 1e-2;
-    config.max_norm = 1.0;
-    std::vector<float> weight_values = {0.5f, -1.0f, 2.0f, 0.25f};
-    std::vector<float> grads_per_step[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {1.0f, 2.0f, 3.0f, 4.0f}};
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {2, 2})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    for (int t = 1; t <= 2; t++)
-    {
-        const std::vector<float> &step_grad = grads_per_step[t - 1];
-        // 1. my AdamW, step t: the gradient, and its norm for the clipping
-        my_adamw.grad(0).copy_from_cpu(step_grad.data());
-        float grad_norm = cpu_grad_norm({step_grad});
-        my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        my_adamw.step();
-        // 2. PyTorch, the same gradient, clipped by PyTorch's clip_grad_norm_
-        pytorch_params[0].mutable_grad() = to_gpu(step_grad, pytorch_params[0].sizes());
-        torch::nn::utils::clip_grad_norm_(pytorch_params, config.max_norm);
-        pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-        // 3. compare
-        ASSERT_NEAR(my_adamw.param(0).tolist(), values_of(pytorch_params[0]), TOLERANCE);
-    }
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(values_of(pytorch_params[0]), weight_values, 1e-3);
-}
-
-static void clip_leaves_small_gradients_alone(void)
-{
-    // Expect: the same two steps, but step 2's gradient {0.3, 0, 0.4, 0} has norm 0.5 < 1:
-    // not clipped. My AdamW equals PyTorch's after each step.
-    AdamWConfig config;
-    config.learning_rate = 1e-2;
-    config.max_norm = 1.0;
-    std::vector<float> weight_values = {0.5f, -1.0f, 2.0f, 0.25f};
-    std::vector<float> grads_per_step[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {0.3f, 0.0f, 0.4f, 0.0f}};
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {2, 2})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    for (int t = 1; t <= 2; t++)
-    {
-        const std::vector<float> &step_grad = grads_per_step[t - 1];
-        // 1. my AdamW, step t: the gradient, and its norm for the clipping
-        my_adamw.grad(0).copy_from_cpu(step_grad.data());
-        float grad_norm = cpu_grad_norm({step_grad});
-        my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        my_adamw.step();
-        // 2. PyTorch, the same gradient, clipped by PyTorch's clip_grad_norm_
-        pytorch_params[0].mutable_grad() = to_gpu(step_grad, pytorch_params[0].sizes());
-        torch::nn::utils::clip_grad_norm_(pytorch_params, config.max_norm);
-        pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-        // 3. compare
-        ASSERT_NEAR(my_adamw.param(0).tolist(), values_of(pytorch_params[0]), TOLERANCE);
-    }
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(values_of(pytorch_params[0]), weight_values, 1e-3);
-}
-
-static void max_norm_0_turns_clipping_off(void)
-{
-    // Expect: (new) step 2's gradient has norm sqrt(30), but max_norm is 0: PyTorch does not
-    // clip, and neither may our kernel, though grad_norm holds 5.48. My AdamW equals PyTorch's
-    // after each step.
-    AdamWConfig config;
-    config.learning_rate = 1e-2;
-    config.max_norm = 0.0;
-    std::vector<float> weight_values = {0.5f, -1.0f, 2.0f, 0.25f};
-    std::vector<float> grads_per_step[2] = {{0.1f, -0.2f, 0.3f, 0.05f}, {1.0f, 2.0f, 3.0f, 4.0f}};
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).copy_from_cpu(weight_values.data());
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(weight_values, {2, 2})};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-
-    for (int t = 1; t <= 2; t++)
-    {
-        const std::vector<float> &step_grad = grads_per_step[t - 1];
-        // 1. my AdamW, step t: the gradient, and its norm, which max_norm 0 must ignore
-        my_adamw.grad(0).copy_from_cpu(step_grad.data());
-        float grad_norm = cpu_grad_norm({step_grad});
-        my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        my_adamw.step();
-        // 2. PyTorch, the same gradient, not clipped: max_norm 0 means no clip_grad_norm_
-        pytorch_params[0].mutable_grad() = to_gpu(step_grad, pytorch_params[0].sizes());
-        pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-        // 3. compare
-        ASSERT_NEAR(my_adamw.param(0).tolist(), values_of(pytorch_params[0]), TOLERANCE);
-    }
-    // PyTorch really trained: its weight moved far more than the 1e-5 we allow between the sides.
-    ASSERT_FAR(values_of(pytorch_params[0]), weight_values, 1e-3);
+    // 3. PyTorch really trained each tensor
+    for (int param_index_val = 0; param_index_val < 4; param_index_val++)
+        ASSERT_FAR(values_of(pytorch_params_list[param_index_val]), param_values_list[param_index_val], 1e-3);
 }
 
 static void whole_model_matches_pytorch_with_clipping(void)
@@ -431,11 +498,12 @@ static void whole_model_matches_pytorch_with_clipping(void)
     // 20 steps with clipping at 1: odd steps get big gradients (norm about 67, clipped), even
     // steps small ones (about 0.07, left alone). After every step, all 4464 of my AdamW's
     // values (every tensor, one after the other, as PyTorch's tensors are) equal PyTorch's.
+    // 1. the shapes, random values; my AdamW, and PyTorch's two param groups (the 6 matrices, the other 10)
     Tensor::manual_seed(0);
-    AdamWConfig config;
-    config.learning_rate = 1e-2;
-    config.max_norm = 1.0;
-    std::vector<Shape> param_shapes = {
+    AdamWConfig config_val;
+    config_val.learning_rate = 1e-2;
+    config_val.max_norm = 1.0;
+    std::vector<Shape> param_shapes_list = {
         // the 6 matrices: 4224 values
         {64, 16}, // wte: vocab 64
         {8, 16},  // wpe: sequence 8
@@ -447,195 +515,71 @@ static void whole_model_matches_pytorch_with_clipping(void)
         {16}, {16}, {48}, {16}, {16}, {16}, {64}, {16}, // ln1w, ln1b, qkvb, attprojb, ln2w, ln2b, fcb, fcprojb
         {16}, {16},                                     // lnfw, lnfb
     };
-    int num_params = (int)param_shapes.size();
-    int num_matrices = 6;
-    std::vector<std::vector<float>> param_values;
-    for (const Shape &shape : param_shapes)
-        param_values.push_back(random_values(shape, 0.02f));
-    AdamW my_adamw(param_shapes, config);
-    for (int k = 0; k < num_params; k++)
-        my_adamw.param(k).copy_from_cpu(param_values[k].data());
-    // PyTorch's: the 16 tensors, then its two param groups of the same tensors (the 6
-    // matrices, the other 10), each with its own m, v and step counts
-    std::vector<torch::Tensor> pytorch_params;
-    for (int k = 0; k < num_params; k++)
-        pytorch_params.push_back(pytorch_param(param_values[k], param_shapes[k]));
-    std::vector<torch::Tensor> pytorch_matrices(pytorch_params.begin(), pytorch_params.begin() + num_matrices);
-    std::vector<torch::Tensor> matrices_m = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_v = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_steps = zero_step_counts(pytorch_matrices.size());
-    std::vector<torch::Tensor> pytorch_rest(pytorch_params.begin() + num_matrices, pytorch_params.end());
-    std::vector<torch::Tensor> rest_m = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_v = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_steps = zero_step_counts(pytorch_rest.size());
-
-    for (int t = 1; t <= 20; t++)
+    int num_params_val = (int)param_shapes_list.size();
+    int num_matrices_val = 6;
+    std::vector<std::vector<float>> param_values_list;
+    for (const Shape &shape_list : param_shapes_list)
+        param_values_list.push_back(random_values(shape_list, 0.02f));
+    AdamW my_adamw_val(param_shapes_list, config_val);
+    for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
+        my_adamw_val.param(param_index_val).copy_from_cpu(param_values_list[param_index_val].data());
+    std::vector<torch::Tensor> pytorch_params_list;
+    for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
+        pytorch_params_list.push_back(pytorch_param(param_values_list[param_index_val], param_shapes_list[param_index_val]));
+    PytorchGroup matrices_val(std::vector<torch::Tensor>(pytorch_params_list.begin(), pytorch_params_list.begin() + num_matrices_val));
+    PytorchGroup rest_val(std::vector<torch::Tensor>(pytorch_params_list.begin() + num_matrices_val, pytorch_params_list.end()));
+    // 2. 20 steps, compared after each
+    for (int t_val = 1; t_val <= 20; t_val++)
     {
-        std::vector<std::vector<float>> param_grads;
-        for (const Shape &shape : param_shapes)
-            param_grads.push_back(random_values(shape, t % 2 == 1 ? 1.0f : 1e-3f));
-        // 1. my AdamW, step t: the gradients, and their norm for the clipping
-        for (int k = 0; k < num_params; k++)
-            my_adamw.grad(k).copy_from_cpu(param_grads[k].data());
-        float grad_norm = cpu_grad_norm(param_grads);
-        my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        my_adamw.step();
-        // 2. PyTorch, the same gradients, clipped by PyTorch's clip_grad_norm_ (all 16
-        //    together); one step for each param group
-        for (int k = 0; k < num_params; k++)
-            pytorch_params[k].mutable_grad() = to_gpu(param_grads[k], pytorch_params[k].sizes());
-        torch::nn::utils::clip_grad_norm_(pytorch_params, config.max_norm);
-        pytorch_adamw_step(pytorch_matrices, matrices_m, matrices_v, matrices_steps, config.weight_decay, config);
-        pytorch_adamw_step(pytorch_rest, rest_m, rest_v, rest_steps, 0.0, config);
-        // 3. compare every value at once
-        ASSERT_NEAR(all_my_adamw_values(my_adamw), all_values_of(pytorch_params), TOLERANCE);
+        std::vector<std::vector<float>> param_grads_list;
+        for (const Shape &shape_list : param_shapes_list)
+            param_grads_list.push_back(random_values(shape_list, t_val % 2 == 1 ? 1.0f : 1e-3f));
+        // my AdamW: the gradients, and their norm for the clipping
+        for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
+            my_adamw_val.grad(param_index_val).copy_from_cpu(param_grads_list[param_index_val].data());
+        float grad_norm_val = cpu_grad_norm(param_grads_list);
+        my_adamw_val.grad_norm().copy_from_cpu(&grad_norm_val);
+        my_adamw_val.step();
+        // PyTorch: the same gradients, clipped by clip_grad_norm_ (all 16 together); one step for each param group
+        for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
+            pytorch_params_list[param_index_val].mutable_grad() =
+                to_gpu(param_grads_list[param_index_val], pytorch_params_list[param_index_val].sizes());
+        torch::nn::utils::clip_grad_norm_(pytorch_params_list, config_val.max_norm);
+        matrices_val.step(config_val.weight_decay, config_val);
+        rest_val.step(0.0, config_val);
+        // compare every value at once
+        ASSERT_NEAR(all_my_adamw_values(my_adamw_val), all_values_of(pytorch_params_list), TOLERANCE);
     }
-    // PyTorch really trained the model: its values moved far more than the 1e-5 we allow.
-    std::vector<float> all_start_values;
-    for (const std::vector<float> &tensor_values : param_values)
-        all_start_values.insert(all_start_values.end(), tensor_values.begin(), tensor_values.end());
-    ASSERT_FAR(all_values_of(pytorch_params), all_start_values, 1e-3);
-}
-
-// ══ time: my AdamW against PyTorch's fused AdamW ══════════════════════════════
-
-/// Measures how long `run` takes on the GPU, in milliseconds: a mark on the GPU's queue
-/// before it and one after; the GPU writes down the time as it reaches each.
-template <typename Run>
-static float gpu_milliseconds(Run run)
-{
-    cudaEvent_t start, end;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&end));
-    cudaCheck(cudaEventRecord(start));
-    run();
-    cudaCheck(cudaEventRecord(end));
-    cudaCheck(cudaEventSynchronize(end)); // wait until the GPU has passed the second mark
-    float milliseconds = 0.0f;
-    cudaCheck(cudaEventElapsedTime(&milliseconds, start, end));
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(end));
-    return milliseconds;
-}
-
-/// Times 20 AdamW updates on a matrix and a bias of these shapes, both on the GPU, and
-/// prints a table under `test`'s name:
-///
-///     my AdamW   AdamW::step: one launch of adamw_update
-///     PyTorch    fused: per param group (2 here), +1 on the step counts, then _fused_adamw_
-///
-/// The update does not care about layers, only about how many values there are and the 2
-/// groups (matrices, 1-D), so a matrix and a bias are enough. Only the update is timed:
-/// the gradients are set once, before (PyTorch's clipped by clip_grad_norm_), and all 20
-/// updates use them. Each update reads p, g, m, v and writes p, m, v: 7 x 4 bytes per
-/// value. Checks at the end that my AdamW still equals PyTorch's: both did the same work.
-static void time_20_updates(const char *test, const std::vector<Shape> &param_shapes)
-{
-    Tensor::manual_seed(0);
-    AdamWConfig config;
-    config.max_norm = 1.0;
-    std::vector<std::vector<float>> param_values, param_grads;
-    for (const Shape &shape : param_shapes)
-    {
-        param_values.push_back(random_values(shape, 0.02f));
-        param_grads.push_back(random_values(shape));
-    }
-    // my AdamW, its gradients and their norm
-    AdamW my_adamw(param_shapes, config);
-    for (int k = 0; k < 2; k++)
-    {
-        my_adamw.param(k).copy_from_cpu(param_values[k].data());
-        my_adamw.grad(k).copy_from_cpu(param_grads[k].data());
-    }
-    float grad_norm = cpu_grad_norm(param_grads);
-    my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-    // PyTorch's: the matrix and the bias, each its own param group, their gradients clipped
-    std::vector<torch::Tensor> pytorch_params;
-    for (int k = 0; k < 2; k++)
-    {
-        pytorch_params.push_back(pytorch_param(param_values[k], param_shapes[k]));
-        pytorch_params[k].mutable_grad() = to_gpu(param_grads[k], pytorch_params[k].sizes());
-    }
-    torch::nn::utils::clip_grad_norm_(pytorch_params, config.max_norm);
-    std::vector<torch::Tensor> pytorch_matrices = {pytorch_params[0]};
-    std::vector<torch::Tensor> matrices_m = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_v = zeros_like_each(pytorch_matrices);
-    std::vector<torch::Tensor> matrices_steps = zero_step_counts(1);
-    std::vector<torch::Tensor> pytorch_rest = {pytorch_params[1]};
-    std::vector<torch::Tensor> rest_m = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_v = zeros_like_each(pytorch_rest);
-    std::vector<torch::Tensor> rest_steps = zero_step_counts(1);
-
-    // Step 1 does first-time work (CUDA loads each side's kernels), so the average is of 2..20.
-    print_test_name(test);
-    printf("    time of one update, in ms:   step   my AdamW   PyTorch fused\n");
-    double my_total = 0.0, pytorch_total = 0.0;
-    for (int t = 1; t <= 20; t++)
-    {
-        float my_ms = gpu_milliseconds([&] { my_adamw.step(); });
-        float pytorch_ms = gpu_milliseconds([&] {
-            pytorch_adamw_step(pytorch_matrices, matrices_m, matrices_v, matrices_steps, config.weight_decay, config);
-            pytorch_adamw_step(pytorch_rest, rest_m, rest_v, rest_steps, 0.0, config);
-        });
-        printf("                                 %4d   %8.3f   %13.3f\n", t, my_ms, pytorch_ms);
-        if (t == 1)
-            continue;
-        my_total += my_ms;
-        pytorch_total += pytorch_ms;
-    }
-    printf("    average of steps 2..20:             %8.3f   %13.3f   PyTorch takes %.2fx as long\n",
-           my_total / 19, pytorch_total / 19, pytorch_total / my_total);
-    ASSERT_NEAR(all_my_adamw_values(my_adamw), all_values_of(pytorch_params), TOLERANCE);
-}
-
-static void time_20_updates_on_gpt2_small_size(void)
-{
-    // Prints the times on as many values as GPT-2 small has: 162,030 x 768 + 768 =
-    // 124,439,040 + 768 = 124,439,808. Each update moves 7 x 124,439,808 x 4 bytes = 3.5 GB:
-    // at a T4's 320 GB/s, at least 10.9 ms.
-    time_20_updates(__func__, {{162030, 768}, {768}});
+    // 3. PyTorch really trained the model
+    std::vector<float> all_start_values_list;
+    for (const std::vector<float> &tensor_values_list : param_values_list)
+        all_start_values_list.insert(all_start_values_list.end(), tensor_values_list.begin(), tensor_values_list.end());
+    ASSERT_FAR(all_values_of(pytorch_params_list), all_start_values_list, 1e-3);
 }
 
 // ══ part 2: rules worked out by hand ══════════════════════════════════════════
 // My AdamW starts with every value 0, gradients too: a test that wants 0 gradients leaves
 // them as they are.
 
-static void first_step_moves_each_value_by_about_the_learning_rate(void)
-{
-    // Expect: at t = 1, m̂ = g and v̂ = g², so the step is lr g / |g| = ±lr, whatever the size
-    // of g. A 2x2 of 1s, gradients {1000, 0.001, -5, -0.3}, lr 0.05, no weight decay:
-    // 1 - 0.05 where g > 0, 1 + 0.05 where g < 0.
-    AdamWConfig config;
-    config.learning_rate = 0.05;
-    config.weight_decay = 0.0;
-    AdamW my_adamw({{2, 2}}, config);
-    my_adamw.param(0).fill_(1);
-    std::vector<float> weight_grad = {1000.0f, 0.001f, -5.0f, -0.3f};
-    my_adamw.grad(0).copy_from_cpu(weight_grad.data());
-    my_adamw.step();
-    std::vector<float> weight = my_adamw.param(0).tolist();
-    std::vector<float> expected = {0.95f, 0.95f, 1.05f, 1.05f};
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(weight[i], expected[i], 1e-4);
-}
-
 static void weight_decay_shrinks_matrices_but_not_biases(void)
 {
     // Expect: every gradient 0, so the only change is weight decay: the 2x2 weight
     // {2, -4, 6, 8} x (1 - 0.5 x 0.1) = x 0.95, the bias {2, -4, 6, 8} not at all.
-    AdamWConfig config;
-    config.learning_rate = 0.5;
-    config.weight_decay = 0.1;
-    AdamW my_adamw({{2, 2}, {4}}, config);
-    std::vector<float> start_values = {2.0f, -4.0f, 6.0f, 8.0f};
-    my_adamw.param(0).copy_from_cpu(start_values.data()); // weight
-    my_adamw.param(1).copy_from_cpu(start_values.data()); // bias
-    my_adamw.step();                                      // gradients: all 0
-    std::vector<float> weight = my_adamw.param(0).tolist();
-    std::vector<float> expected = {1.9f, -3.8f, 5.7f, 7.6f};
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(weight[i], expected[i], 1e-6);
-    ASSERT_EQ(my_adamw.param(1).tolist(), start_values);
+    // 1. one step, gradients all 0
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.5;
+    config_val.weight_decay = 0.1;
+    AdamW my_adamw_val({{2, 2}, {4}}, config_val);
+    std::vector<float> start_values_list = {2.0f, -4.0f, 6.0f, 8.0f};
+    my_adamw_val.param(0).copy_from_cpu(start_values_list.data()); // weight
+    my_adamw_val.param(1).copy_from_cpu(start_values_list.data()); // bias
+    my_adamw_val.step();
+    // 2. check
+    std::vector<float> weight_list = my_adamw_val.param(0).tolist();
+    std::vector<float> expected_list = {1.9f, -3.8f, 5.7f, 7.6f};
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(weight_list[i_val], expected_list[i_val], 1e-6);
+    ASSERT_EQ(my_adamw_val.param(1).tolist(), start_values_list);
 }
 
 static void a_parameter_the_loss_did_not_use_only_decays(void)
@@ -643,24 +587,26 @@ static void a_parameter_the_loss_did_not_use_only_decays(void)
     // Expect: a 0 gradient keeps m at 0, so the Adam part is 0 and only weight decay is left:
     // x (1 - 0.1 x 0.1) = x 0.99. unused {5, 6, 7, 8} -> {4.95, 5.94, 6.93, 7.92}; used
     // {1, 2, 3, 4} with gradient 1 also moves by -lr = -0.1: {0.89, 1.88, 2.87, 3.86}.
-    AdamWConfig config;
-    config.learning_rate = 0.1;
-    config.weight_decay = 0.1;
-    AdamW my_adamw({{2, 2}, {2, 2}}, config);
-    std::vector<float> used_start = {1.0f, 2.0f, 3.0f, 4.0f};
-    std::vector<float> unused_start = {5.0f, 6.0f, 7.0f, 8.0f};
-    my_adamw.param(0).copy_from_cpu(used_start.data());
-    my_adamw.param(1).copy_from_cpu(unused_start.data());
-    my_adamw.grad(0).fill_(1); // the unused one's gradient stays 0
-    my_adamw.step();
-    std::vector<float> used = my_adamw.param(0).tolist();
-    std::vector<float> unused = my_adamw.param(1).tolist();
-    std::vector<float> expected_used = {0.89f, 1.88f, 2.87f, 3.86f};
-    std::vector<float> expected_unused = {4.95f, 5.94f, 6.93f, 7.92f};
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(unused[i], expected_unused[i], 1e-5);
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(used[i], expected_used[i], 1e-5);
+    // 1. one step; the unused one's gradient stays 0
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.1;
+    config_val.weight_decay = 0.1;
+    AdamW my_adamw_val({{2, 2}, {2, 2}}, config_val);
+    std::vector<float> used_start_list = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> unused_start_list = {5.0f, 6.0f, 7.0f, 8.0f};
+    my_adamw_val.param(0).copy_from_cpu(used_start_list.data());
+    my_adamw_val.param(1).copy_from_cpu(unused_start_list.data());
+    my_adamw_val.grad(0).fill_(1);
+    my_adamw_val.step();
+    // 2. check
+    std::vector<float> used_list = my_adamw_val.param(0).tolist();
+    std::vector<float> unused_list = my_adamw_val.param(1).tolist();
+    std::vector<float> expected_used_list = {0.89f, 1.88f, 2.87f, 3.86f};
+    std::vector<float> expected_unused_list = {4.95f, 5.94f, 6.93f, 7.92f};
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(unused_list[i_val], expected_unused_list[i_val], 1e-5);
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(used_list[i_val], expected_used_list[i_val], 1e-5);
 }
 
 static void weight_decay_follows_the_shape_not_the_order(void)
@@ -669,106 +615,28 @@ static void weight_decay_follows_the_shape_not_the_order(void)
     // no gradients, lr 0.5, weight decay 0.1: the weights x 0.95, the biases not moved. The
     // shape decides: {1, 4} has one row but is 2-D, a matrix; {8} has as many values as a
     // 2x4 but is 1-D. (C# gave them mixed; AdamW needs the matrices first, so here they are.)
-    AdamWConfig config;
-    config.learning_rate = 0.5;
-    config.weight_decay = 0.1;
-    std::vector<float> four_values = {2, 4, 6, 8};
-    std::vector<float> eight_values = {2, 4, 6, 8, 10, 12, 14, 16};
-    AdamW my_adamw({{1, 4}, {2, 2}, {4}, {8}}, config);
-    my_adamw.param(0).copy_from_cpu(four_values.data());
-    my_adamw.param(1).copy_from_cpu(four_values.data());
-    my_adamw.param(2).copy_from_cpu(four_values.data());
-    my_adamw.param(3).copy_from_cpu(eight_values.data());
-    my_adamw.step(); // gradients: all 0
-    std::vector<float> weight1 = my_adamw.param(0).tolist();
-    std::vector<float> weight2 = my_adamw.param(1).tolist();
-    std::vector<float> shrunk = {1.9f, 3.8f, 5.7f, 7.6f};
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(weight1[i], shrunk[i], 1e-6);
-    for (size_t i = 0; i < 4; i++)
-        ASSERT_NEAR(weight2[i], shrunk[i], 1e-6);
-    ASSERT_EQ(my_adamw.param(2).tolist(), four_values);
-    ASSERT_EQ(my_adamw.param(3).tolist(), eight_values);
-}
-
-static void only_the_values_before_decayed_count_decay(void)
-{
-    // Expect: (new) the kernel's border. 8 values {2, 4, 6, 8, 2, 4, 6, 8}, decayed_count 4,
-    // no gradients, lr 0.5, weight decay 0.1: the first 4 x 0.95 = {1.9, 3.8, 5.7, 7.6}, the
-    // last 4 not moved.
-    AdamWConfig config;
-    AdamW my_adamw({{8}}, config);
-    std::vector<float> start_values = {2, 4, 6, 8, 2, 4, 6, 8};
-    my_adamw.param(0).copy_from_cpu(start_values.data());
-    const Tensor &param = my_adamw.param(0);
-    const Tensor &grad = my_adamw.grad(0);
-    const Tensor &m = my_adamw.m(0);
-    const Tensor &v = my_adamw.v(0);
-    adamw_update(param.data(), grad.data(), m.data(), v.data(), 8, 4, my_adamw.grad_norm().data(), 0.0f, 0.5f, 0.9f,
-                 0.95f, 1e-8f, 0.1f, 1);
-    std::vector<float> param_values = param.tolist();
-    std::vector<float> expected = {1.9f, 3.8f, 5.7f, 7.6f, 2, 4, 6, 8};
-    for (size_t i = 0; i < 8; i++)
-        ASSERT_NEAR(param_values[i], expected[i], 1e-6);
-}
-
-static void bfloat16_params_and_grads_match_pytorch(void)
-{
-    // Expect: (new) one step of adamw_update on a {32, 32} weight in bfloat16, values about GPT-2's
-    // (normal, std 0.02), with bfloat16 gradients (std 1); m and v float. PyTorch's fused AdamW, in float, on
-    // the same values: m and v, worked out in float from the same numbers, within 1e-5; the weight is
-    // PyTorch's rounded to bfloat16, which moves a value by up to 2^-8 (0.4%) of it: within twice that of the
-    // largest value, 8e-3. And the step is not lost to the rounding: each value moves by about lr = 1e-3, more
-    // than the 2^-8 x 0.08 = 3.1e-4 that a bfloat16 near the largest value rounds by, so the weight is far from
-    // where it started: 1e-3 / 0.08 = 1.25e-2, more than 8e-3.
-    Tensor::manual_seed(0);
-    AdamWConfig config;
-    config.learning_rate = 1e-3f;
-    Shape shape = {32, 32};
-    Tensor param = Tensor::empty(shape), grad = Tensor::empty(shape);
-    param.copy_from_cpu(random_values(shape, 0.02f).data());
-    grad.copy_from_cpu(random_values(shape, 1.0f).data());
-    param = param.to(DType::BFloat16);
-    grad = grad.to(DType::BFloat16);
-    Tensor m = Tensor::zeros(shape), v = Tensor::zeros(shape), grad_norm = Tensor::zeros({1});
-    std::vector<float> start_values = param.to(DType::Float32).tolist(), grad_values = grad.to(DType::Float32).tolist();
-    adamw_update(param.data_ptr<nv_bfloat16>(), grad.data_ptr<nv_bfloat16>(), m.data(), v.data(), param.numel(),
-                 param.numel(), grad_norm.data(), 0.0f, config.learning_rate, config.beta1, config.beta2, config.eps,
-                 config.weight_decay, 1);
-
-    std::vector<torch::Tensor> pytorch_params = {pytorch_param(start_values, shape)};
-    std::vector<torch::Tensor> pytorch_m = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_v = zeros_like_each(pytorch_params);
-    std::vector<torch::Tensor> pytorch_steps = zero_step_counts(pytorch_params.size());
-    pytorch_params[0].mutable_grad() = to_gpu(grad_values, pytorch_params[0].sizes());
-    pytorch_adamw_step(pytorch_params, pytorch_m, pytorch_v, pytorch_steps, config.weight_decay, config);
-    ASSERT_NEAR(m.tolist(), values_of(pytorch_m[0]), TOLERANCE);
-    ASSERT_NEAR(v.tolist(), values_of(pytorch_v[0]), TOLERANCE);
-    ASSERT_NEAR(param.to(DType::Float32).tolist(), values_of(pytorch_params[0]), 8e-3);
-    ASSERT_FAR(param.to(DType::Float32).tolist(), start_values, 8e-3);
-}
-
-static void nothing_past_a_tensors_end_changes(void)
-{
-    // Expect: (new) a launch covers at least one block of 256 threads x 4 values, far more than a tensor of 8.
-    // adamw_update on tensor 0 of two 8-value tensors side by side leaves tensor 1's p, m
-    // and v as they were: p {10..17}, m and v all 0.
-    AdamWConfig config;
-    AdamW my_adamw({{8}, {8}}, config);
-    std::vector<float> tensor1_values = {10, 11, 12, 13, 14, 15, 16, 17};
-    my_adamw.param(0).copy_from_cpu(sample_data(8).data());
-    my_adamw.param(1).copy_from_cpu(tensor1_values.data());
-    my_adamw.grad(0).fill_(1);
-    my_adamw.grad(1).fill_(1);
-    const Tensor &param = my_adamw.param(0); // tensor 0 only
-    const Tensor &grad = my_adamw.grad(0);
-    const Tensor &m = my_adamw.m(0);
-    const Tensor &v = my_adamw.v(0);
-    adamw_update(param.data(), grad.data(), m.data(), v.data(), param.numel(), 0, my_adamw.grad_norm().data(), 0.0f,
-                 0.1f, config.beta1, config.beta2, config.eps, 0.0f, 1);
-    ASSERT_EQ(my_adamw.param(1).tolist(), tensor1_values); // tensor 1: untouched
-    ASSERT_EQ(my_adamw.m(1).tolist(), std::vector<float>(8, 0.0f));
-    ASSERT_EQ(my_adamw.v(1).tolist(), std::vector<float>(8, 0.0f));
+    // 1. one step, gradients all 0
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.5;
+    config_val.weight_decay = 0.1;
+    std::vector<float> four_values_list = {2, 4, 6, 8};
+    std::vector<float> eight_values_list = {2, 4, 6, 8, 10, 12, 14, 16};
+    AdamW my_adamw_val({{1, 4}, {2, 2}, {4}, {8}}, config_val);
+    my_adamw_val.param(0).copy_from_cpu(four_values_list.data());
+    my_adamw_val.param(1).copy_from_cpu(four_values_list.data());
+    my_adamw_val.param(2).copy_from_cpu(four_values_list.data());
+    my_adamw_val.param(3).copy_from_cpu(eight_values_list.data());
+    my_adamw_val.step();
+    // 2. check: the weights shrunk, the biases not
+    std::vector<float> weight1_list = my_adamw_val.param(0).tolist();
+    std::vector<float> weight2_list = my_adamw_val.param(1).tolist();
+    std::vector<float> shrunk_list = {1.9f, 3.8f, 5.7f, 7.6f};
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(weight1_list[i_val], shrunk_list[i_val], 1e-6);
+    for (size_t i_val = 0; i_val < 4; i_val++)
+        ASSERT_NEAR(weight2_list[i_val], shrunk_list[i_val], 1e-6);
+    ASSERT_EQ(my_adamw_val.param(2).tolist(), four_values_list);
+    ASSERT_EQ(my_adamw_val.param(3).tolist(), eight_values_list);
 }
 
 static void step_leaves_the_gradients_as_they_are(void)
@@ -776,18 +644,20 @@ static void step_leaves_the_gradients_as_they_are(void)
     // Expect: C#'s Step zeroed the gradients (StepLeavesTheGradientsAtZero); our kernel only
     // reads them (const float*), so after a step with clipping they are still {1, 2, 3, 4}
     // and {5, 6, 7, 8}. The trainer zeroes them itself before the next backward.
-    AdamWConfig config;
-    config.learning_rate = 0.1;
-    config.max_norm = 1.0;
-    AdamW my_adamw({{2, 2}, {4}}, config);
-    std::vector<std::vector<float>> param_grads = {{1, 2, 3, 4}, {5, 6, 7, 8}};
-    my_adamw.grad(0).copy_from_cpu(param_grads[0].data());
-    my_adamw.grad(1).copy_from_cpu(param_grads[1].data());
-    float grad_norm = cpu_grad_norm(param_grads); // sqrt(204) = 14.3 > 1: clipped
-    my_adamw.grad_norm().copy_from_cpu(&grad_norm);
-    my_adamw.step();
-    ASSERT_EQ(my_adamw.grad(0).tolist(), param_grads[0]);
-    ASSERT_EQ(my_adamw.grad(1).tolist(), param_grads[1]);
+    // 1. one step with clipping
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.1;
+    config_val.max_norm = 1.0;
+    AdamW my_adamw_val({{2, 2}, {4}}, config_val);
+    std::vector<std::vector<float>> param_grads_list = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    my_adamw_val.grad(0).copy_from_cpu(param_grads_list[0].data());
+    my_adamw_val.grad(1).copy_from_cpu(param_grads_list[1].data());
+    float grad_norm_val = cpu_grad_norm(param_grads_list); // sqrt(204) = 14.3 > 1: clipped
+    my_adamw_val.grad_norm().copy_from_cpu(&grad_norm_val);
+    my_adamw_val.step();
+    // 2. check
+    ASSERT_EQ(my_adamw_val.grad(0).tolist(), param_grads_list[0]);
+    ASSERT_EQ(my_adamw_val.grad(1).tolist(), param_grads_list[1]);
 }
 
 static void adamw_counts_the_matrices_and_the_steps(void)
@@ -799,25 +669,27 @@ static void adamw_counts_the_matrices_and_the_steps(void)
     // right after the 24 parameter values. m and v start on 16 bytes, as the kernel's
     // float4 loads need (grad_norm, 1 value, before them would put them 4 bytes off), and
     // at 0. steps_taken is 0 before the first step and 2 after two.
-    AdamWConfig config;
-    AdamW my_adamw({{2, 4}, {1, 4}, {8}, {4}}, config);
-    ASSERT_EQ(my_adamw.decayed_count(), (size_t)12);       // 2 x 4 + 1 x 4
-    ASSERT_EQ(my_adamw.buffer().num_groups(), 5);          // params, grads, m, v, grad_norm
-    ASSERT_EQ(my_adamw.buffer().num_tensors(), 17);        // 4 x 4 + 1
-    ASSERT_EQ(my_adamw.buffer().numel(), (size_t)97);      // 4 x 24 + 1
-    ASSERT_EQ(my_adamw.param(0).shape(), Shape({2, 4}));
-    ASSERT_EQ(my_adamw.grad(0).data() == my_adamw.param(0).data() + 24, true);
-    ASSERT_EQ((size_t)my_adamw.m(0).data() % 16, (size_t)0);
-    ASSERT_EQ((size_t)my_adamw.v(0).data() % 16, (size_t)0);
-    for (int k = 0; k < 4; k++)
+    // 1. the counts and the layout
+    AdamWConfig config_val;
+    AdamW my_adamw_val({{2, 4}, {1, 4}, {8}, {4}}, config_val);
+    ASSERT_EQ(my_adamw_val.decayed_count(), (size_t)12);       // 2 x 4 + 1 x 4
+    ASSERT_EQ(my_adamw_val.buffer().num_groups(), 5);          // params, grads, m, v, grad_norm
+    ASSERT_EQ(my_adamw_val.buffer().num_tensors(), 17);        // 4 x 4 + 1
+    ASSERT_EQ(my_adamw_val.buffer().numel(), (size_t)97);      // 4 x 24 + 1
+    ASSERT_EQ(my_adamw_val.param(0).shape(), Shape({2, 4}));
+    ASSERT_EQ(my_adamw_val.grad(0).data() == my_adamw_val.param(0).data() + 24, true);
+    ASSERT_EQ((size_t)my_adamw_val.m(0).data() % sizeof(float4), (size_t)0);
+    ASSERT_EQ((size_t)my_adamw_val.v(0).data() % sizeof(float4), (size_t)0);
+    for (int param_index_val = 0; param_index_val < 4; param_index_val++)
     {
-        ASSERT_EQ(my_adamw.m(k).tolist(), std::vector<float>(my_adamw.m(k).numel(), 0.0f));
-        ASSERT_EQ(my_adamw.v(k).tolist(), std::vector<float>(my_adamw.v(k).numel(), 0.0f));
+        ASSERT_EQ(my_adamw_val.m(param_index_val).tolist(), std::vector<float>(my_adamw_val.m(param_index_val).numel(), 0.0f));
+        ASSERT_EQ(my_adamw_val.v(param_index_val).tolist(), std::vector<float>(my_adamw_val.v(param_index_val).numel(), 0.0f));
     }
-    ASSERT_EQ(my_adamw.steps_taken(), 0);
-    my_adamw.step(); // gradients: all 0
-    my_adamw.step();
-    ASSERT_EQ(my_adamw.steps_taken(), 2);
+    // 2. the steps counted
+    ASSERT_EQ(my_adamw_val.steps_taken(), 0);
+    my_adamw_val.step(); // gradients: all 0
+    my_adamw_val.step();
+    ASSERT_EQ(my_adamw_val.steps_taken(), 2);
 }
 
 static void set_learning_rate_is_used_from_the_next_step(void)
@@ -825,357 +697,49 @@ static void set_learning_rate_is_used_from_the_next_step(void)
     // Expect: (new) 4 values of 1, gradient 1 every step, no weight decay. With the same gradient every step
     // m̂ = 1 and v̂ = 1, so each step moves each value by exactly its learning rate: 1 - 0.05 = 0.95 after step
     // 1 at lr 0.05; then set_learning_rate(0.01), and step 2 moves it by 0.01: 0.94.
-    AdamWConfig config;
-    config.learning_rate = 0.05f;
-    config.weight_decay = 0.0f;
-    AdamW my_adamw({{4}}, config);
-    my_adamw.param(0).fill_(1);
-    my_adamw.grad(0).fill_(1);
-    ASSERT_EQ(my_adamw.learning_rate(), 0.05f);
-    my_adamw.step();
-    ASSERT_NEAR(my_adamw.param(0).tolist(), std::vector<float>(4, 0.95f), 1e-6);
-    my_adamw.set_learning_rate(0.01f);
-    ASSERT_EQ(my_adamw.learning_rate(), 0.01f);
-    my_adamw.step();
-    ASSERT_NEAR(my_adamw.param(0).tolist(), std::vector<float>(4, 0.94f), 1e-6);
-}
-
-static void bfloat16_adamw_keeps_a_float_master(void)
-{
-    // Expect: (new) adamw_counts_the_matrices_and_the_steps's params, for a bfloat16 model. The model's params
-    // and grads are bfloat16, in a buffer of their own: grad 0 starts right after the 24 params (48 bytes).
-    // The float buffer has 4 groups, the master params, m, v and grad_norm: 3 x 24 + 1 = 73 values; the
-    // master on 16 bytes, as the kernel's float4 loads need. decayed_count is still 12. After filling param 0
-    // with 0 .. 7 (each exact in bfloat16), copy_params_to_master gives master_param 0 the same values.
-    AdamWConfig config;
-    AdamW my_adamw({{2, 4}, {1, 4}, {8}, {4}}, config, DType::BFloat16);
-    ASSERT_EQ(my_adamw.dtype() == DType::BFloat16, true);
-    ASSERT_EQ(my_adamw.param(0).dtype() == DType::BFloat16, true);
-    ASSERT_EQ(my_adamw.grad(0).dtype() == DType::BFloat16, true);
-    ASSERT_EQ(my_adamw.master_param(0).dtype() == DType::Float32, true);
-    ASSERT_EQ(my_adamw.param(0).shape(), Shape({2, 4}));
-    ASSERT_EQ(my_adamw.master_param(0).shape(), Shape({2, 4}));
-    ASSERT_EQ((const void *)my_adamw.grad(0).data_ptr<nv_bfloat16>(),
-              (const void *)(my_adamw.param(0).data_ptr<nv_bfloat16>() + 24));
-    ASSERT_EQ(my_adamw.all_params().numel(), (size_t)24);
-    ASSERT_EQ(my_adamw.buffer().num_groups(), 4);          // master params, m, v, grad_norm
-    ASSERT_EQ(my_adamw.buffer().numel(), (size_t)73);      // 3 x 24 + 1
-    ASSERT_EQ((size_t)my_adamw.master_param(0).data() % 16, (size_t)0);
-    ASSERT_EQ(my_adamw.decayed_count(), (size_t)12);
-    Tensor values = Tensor::empty({2, 4});
-    values.copy_from_cpu(sample_data(8).data());
-    my_adamw.param(0).copy_(values);
-    my_adamw.copy_params_to_master();
-    ASSERT_EQ(my_adamw.master_param(0).tolist(), sample_data(8));
-}
-
-static void bfloat16_master_steps_match_float_steps(void)
-{
-    // Expect: (new) a {4, 8} weight and an {8} bias, the same values in a float AdamW and a bfloat16 one (each
-    // value rounded to bfloat16 first, so both start equal), 10 steps of the same random gradients (bfloat16,
-    // given to the float one as floats), lr 0.01, clipping at 1. The bfloat16 one's master does the same
-    // float math on the same numbers as the float one's params: equal, allowed 1e-6. Its model params are
-    // that master rounded to bfloat16, to the last bit.
-    Tensor::manual_seed(0);
-    AdamWConfig config;
-    config.learning_rate = 1e-2f;
-    config.max_norm = 1.0f;
-    std::vector<Shape> shapes = {{4, 8}, {8}};
-    AdamW float_adamw(shapes, config), bfloat16_adamw(shapes, config, DType::BFloat16);
-    for (int k = 0; k < 2; k++)
-    {
-        Tensor values = Tensor::empty(shapes[k]);
-        values.copy_from_cpu(random_values(shapes[k], 0.5f).data());
-        bfloat16_adamw.param(k).copy_(values);                // rounded
-        float_adamw.param(k).copy_(bfloat16_adamw.param(k));  // the rounded values, as floats
-    }
-    bfloat16_adamw.copy_params_to_master();
-    for (int t = 1; t <= 10; t++)
-    {
-        std::vector<std::vector<float>> grads;
-        for (int k = 0; k < 2; k++)
-        {
-            Tensor values = Tensor::empty(shapes[k]);
-            values.copy_from_cpu(random_values(shapes[k], 1.0f).data());
-            bfloat16_adamw.grad(k).copy_(values);
-            float_adamw.grad(k).copy_(bfloat16_adamw.grad(k));
-            grads.push_back(float_adamw.grad(k).tolist());
-        }
-        float grad_norm = cpu_grad_norm(grads);                 // about sqrt(40) = 6.3 > 1: clipped
-        float_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        bfloat16_adamw.grad_norm().copy_from_cpu(&grad_norm);
-        float_adamw.step();
-        bfloat16_adamw.step();
-        std::vector<float> master = bfloat16_adamw.buffer().group(0).tolist();   // group 0: the master params
-        ASSERT_NEAR(master, float_adamw.all_params().tolist(), 1e-6);
-        ASSERT_EQ(bfloat16_adamw.all_params().to(DType::Float32).tolist(),
-                  bfloat16_adamw.buffer().group(0).to(DType::BFloat16).to(DType::Float32).tolist());
-    }
-}
-
-static void a_small_update_adds_up_in_the_master(void)
-{
-    // Expect: (new) a LayerNorm weight of 1, gradient 1 every step, lr 6e-4, no weight decay: each step moves
-    // it by exactly 6e-4. The bfloat16 numbers next to 1 are 0.99609375 below and 1.0078125 above, so
-    // 1 - 6e-4 = 0.9994 rounds back to 1.
-    //
-    //     after 10 steps    float master                 bfloat16 param               without a master
-    //                       1 - 10 x 6e-4 = 0.994        0.9921875 (nearest 0.994)    1: every step lost
-    //
-    // 0.994 is 0.0018 from 0.9921875 and 0.0021 from 0.99609375. "Without a master" is adamw_update straight on
-    // bfloat16 params, as AdamW did before it kept one.
-    AdamWConfig config;
-    config.learning_rate = 6e-4f;
-    config.weight_decay = 0.0f;
-    AdamW my_adamw({{4}}, config, DType::BFloat16);
-    my_adamw.param(0).fill_(1);
-    my_adamw.copy_params_to_master();
-    Tensor alone = Tensor::ones({4}, DType::BFloat16), alone_grad = Tensor::ones({4}, DType::BFloat16);
-    Tensor m = Tensor::zeros({4}), v = Tensor::zeros({4}), grad_norm = Tensor::zeros({1});
-    for (int t = 1; t <= 10; t++)
-    {
-        my_adamw.grad(0).fill_(1);
-        my_adamw.step();
-        adamw_update(alone.data_ptr<nv_bfloat16>(), alone_grad.data_ptr<nv_bfloat16>(), m.data(), v.data(), 4, 0,
-                     grad_norm.data(), 0.0f, config.learning_rate, config.beta1, config.beta2, config.eps, 0.0f, t);
-    }
-    ASSERT_NEAR(my_adamw.master_param(0).tolist(), std::vector<float>(4, 0.994f), 1e-5);
-    ASSERT_EQ(my_adamw.param(0).to(DType::Float32).tolist(), std::vector<float>(4, 0.9921875f));
-    ASSERT_EQ(alone.to(DType::Float32).tolist(), std::vector<float>(4, 1.0f));
-}
-
-static void ranks_each_update_their_own_slice(void)
-{
-    // Expect: (new) a {3, 4} weight and a {4} bias: 16 values, decayed_count 12. On 2 GPUs each updates 8: rank 0
-    // values 0 .. 7 (all decayed), rank 1 values 8 .. 15 (8 .. 11 decayed: the border inside its slice). Rank 1's
-    // float buffer holds its master, m and v for 8 values, and grad_norm: 3 x 8 + 1 = 25. One bfloat16 AdamW and
-    // ranks 0 and 1 of 2 get the same params and the same (already averaged) grads, 3 steps. Right after a step,
-    // rank 0's values 8 .. 15 are still the old ones: rank 1 updated them. Put together as the all-gather does
-    // (each rank's slice copied to the other), both equal the one AdamW's params, to the last bit: each value
-    // had the same float math.
-    AdamWConfig config;
-    config.learning_rate = 1e-2f;
-    std::vector<Shape> shapes = {{3, 4}, {4}};
-    AdamW one(shapes, config, DType::BFloat16);
-    AdamW rank0(shapes, config, DType::BFloat16, 0, 2), rank1(shapes, config, DType::BFloat16, 1, 2);
-    ASSERT_EQ(rank1.slice_start(), (size_t)8);
-    ASSERT_EQ(rank1.slice_size(), (size_t)8);
-    ASSERT_EQ(rank1.buffer().numel(), (size_t)25);
-    ASSERT_EQ(rank1.decayed_count(), (size_t)12);
-    Tensor::manual_seed(0);
-    Tensor values = Tensor::empty({16});
-    values.copy_from_cpu(random_values({16}, 0.5f).data());
-    for (AdamW *adamw : {&one, &rank0, &rank1})
-    {
-        adamw->all_params().copy_(values);                      // rounded to bfloat16
-        adamw->copy_params_to_master();
-    }
-    for (int t = 1; t <= 3; t++)
-    {
-        Tensor grads = Tensor::empty({16});
-        grads.copy_from_cpu(random_values({16}, 1.0f).data());
-        std::vector<float> rank0_before = rank0.all_params().to(DType::Float32).tolist();
-        for (AdamW *adamw : {&one, &rank0, &rank1})
-        {
-            adamw->all_grads().copy_(grads);
-            adamw->step();
-        }
-        std::vector<float> rank0_after = rank0.all_params().to(DType::Float32).tolist();
-        ASSERT_EQ(std::vector<float>(rank0_after.begin() + 8, rank0_after.end()),
-                  std::vector<float>(rank0_before.begin() + 8, rank0_before.end()));
-        rank0.all_params().narrow(0, 8, 8).copy_(rank1.all_params().narrow(0, 8, 8));   // the all-gather, by hand
-        rank1.all_params().narrow(0, 0, 8).copy_(rank0.all_params().narrow(0, 0, 8));
-        ASSERT_EQ(rank0.all_params().to(DType::Float32).tolist(), one.all_params().to(DType::Float32).tolist());
-        ASSERT_EQ(rank1.all_params().to(DType::Float32).tolist(), one.all_params().to(DType::Float32).tolist());
-    }
-}
-
-// ══ part 3: other block and thread counts ═════════════════════════════════════
-
-/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
-/// run while its clock is still rising from idle.
-template <typename Run>
-static void warm_up_gpu(Run run)
-{
-    float total = 0.0f;
-    while (total < 1000.0f)
-        total += gpu_milliseconds(run);
-}
-
-static void time_the_kernel_with_other_block_and_thread_counts(void)
-{
-    // Prints the time of one update on as many values as GPT-2 small has, 124,439,808 (the matrices'
-    // 124,439,040 decayed, then 768), with params and grads in float and in bfloat16 (m and v float in
-    // both), for 9 block counts x 4 thread counts, each the average of 20 runs: the 7 picked on a T4, then
-    // this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4, 40
-    // again and 80). The 36 launches take turns:
-    // 20 rounds, each timing every launch once (in float, then in bfloat16). One launch's 20 runs in a row
-    // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
-    // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
-    // late alike. The kernel is launched here directly, <<<blocks, threads>>>, instead of through
-    // adamw_update, which launches one float4 per thread: 121,524 x ADAMW_THREADS_PER_BLOCK (256). A T4's
-    // sweep had picked 40 x 128 (6077 float4s per thread; 14.2 ms there against 14.6), but on an H100 PCIe
-    // in bfloat16 it took 5.98 ms against 1.50 for one float4 per thread. Each update reads p, g, m, v and
-    // writes p, m, v: in float 7 x 4 = 28 bytes per value, 3.5 GB, so at a T4's 320 GB/s at least 10.9 ms;
-    // in bfloat16 2 + 2 + 2 + 16 = 22 bytes per value, 2.7 GB, at least 8.6 ms (at an H100 PCIe's 2.0 TB/s,
-    // 1.37 ms). A T4 runs at most 1024 threads per SM, 40,960 in all.
-    //
-    // Each run changes p, m and v, so before each check of the result they are put back: p from a kept
-    // copy, m and v to 0. Expect: every launch gives the same p, m and v as the usual one of its dtype, to
-    // the last bit: each value is worked out alone, from the same numbers.
-    torch::manual_seed(0);
-    AdamWConfig config;
-    config.max_norm = 1.0;
-    size_t n = 124439808, decayed_count = 124439040;
-    Tensor params = random_tensor_on_gpu({n}, 0.02f), grads = random_tensor_on_gpu({n}, 1.0f);
-    Tensor start_params = Tensor::empty({n});
-    cudaCheck(cudaMemcpy(start_params.data(), params.data(), n * sizeof(float), cudaMemcpyDeviceToDevice));
-    Tensor m = Tensor::zeros({n}), v = Tensor::zeros({n}), grad_norm = Tensor::empty({1});
-    float norm = pytorch_copy_of(grads).norm().item<float>(); // about sqrt(124M) = 11,155: clipped
-    grad_norm.copy_from_cpu(&norm);
-    // The same params and grads in bfloat16, with an m and a v of their own; the same grad_norm.
-    Tensor params_bf16 = params.to(DType::BFloat16), grads_bf16 = grads.to(DType::BFloat16);
-    Tensor start_params_bf16 = params_bf16.clone();
-    Tensor m_bf16 = Tensor::zeros({n}), v_bf16 = Tensor::zeros({n});
-
-    // Step t = 1's numbers, worked out as adamw_update does.
-    int t = 1;
-    float step_size = config.learning_rate / (1.0f - powf(config.beta1, (float)t));
-    float inverse_sqrt_bias_correction2 = 1.0f / sqrtf(1.0f - powf(config.beta2, (float)t));
-    float weight_decay_factor = 1.0f - config.learning_rate * config.weight_decay;
-
-    // The usual launch's results, kept on the GPU as PyTorch tensors to compare each launch with.
-    adamw_update(params.data(), grads.data(), m.data(), v.data(), n, decayed_count, grad_norm.data(), config.max_norm,
-                 config.learning_rate, config.beta1, config.beta2, config.eps, config.weight_decay, t);
-    adamw_update(params_bf16.data_ptr<nv_bfloat16>(), grads_bf16.data_ptr<nv_bfloat16>(), m_bf16.data(),
-                 v_bf16.data(), n, decayed_count, grad_norm.data(), config.max_norm, config.learning_rate, config.beta1,
-                 config.beta2, config.eps, config.weight_decay, t);
-    torch::Tensor usual_params = pytorch_copy_of(params), usual_m = pytorch_copy_of(m), usual_v = pytorch_copy_of(v);
-    torch::Tensor usual_params_bf16 = pytorch_copy_of(params_bf16.to(DType::Float32));
-    torch::Tensor usual_m_bf16 = pytorch_copy_of(m_bf16), usual_v_bf16 = pytorch_copy_of(v_bf16);
-    int one_float4_per_thread_blocks = (int)CEIL_DIV(n / 4, 256); // 121,524
-
-    int blocks = 0, threads = 0; // the launch the 2 below use, set by the loop
-    auto update = [&] {
-        adamw_kernel<float><<<blocks, threads>>>(params.data(), grads.data(), m.data(), v.data(), n, decayed_count,
-                                                 grad_norm.data(), config.max_norm, weight_decay_factor, config.beta1,
-                                                 config.beta2, config.eps, step_size, inverse_sqrt_bias_correction2,
-                                                 nullptr);
-        cudaCheck(cudaGetLastError());
-    };
-    auto update_bf16 = [&] {
-        adamw_kernel<nv_bfloat16><<<blocks, threads>>>(params_bf16.data_ptr<nv_bfloat16>(),
-                                                       grads_bf16.data_ptr<nv_bfloat16>(), m_bf16.data(),
-                                                       v_bf16.data(), n, decayed_count, grad_norm.data(),
-                                                       config.max_norm, weight_decay_factor, config.beta1,
-                                                       config.beta2, config.eps, step_size,
-                                                       inverse_sqrt_bias_correction2, nullptr);
-        cudaCheck(cudaGetLastError());
-    };
-    blocks = one_float4_per_thread_blocks;
-    threads = ADAMW_THREADS_PER_BLOCK;
-    warm_up_gpu(update);
-
-    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
-    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
-    int block_counts[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks, sms, 2 * sms};
-    int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 9 * 4, rounds = 20;
-    float total_ms[launches][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] float, [1] bf16
-    for (int round = 1; round <= rounds; round++)
-    {
-        for (int k = 0; k < launches; k++)
-        {
-            blocks = block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(update);
-            total_ms[k][1] += gpu_milliseconds(update_bf16);
-        }
-    }
-
-    float fastest_ms[2] = {1e9f, 1e9f};
-    int fastest_blocks[2] = {}, fastest_threads[2] = {}, launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   float4s per thread    float     bf16   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[2];
-        for (int j = 0; j < 2; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-
-        // One update from the start with this launch in each dtype, against the usual launch's.
-        cudaCheck(cudaMemcpy(params.data(), start_params.data(), n * sizeof(float), cudaMemcpyDeviceToDevice));
-        params_bf16.copy_(start_params_bf16);
-        for (const Tensor *tensor : {&m, &v, &m_bf16, &v_bf16})
-            tensor->zero_();
-        update();
-        update_bf16();
-        bool same = torch::equal(pytorch_copy_of(params), usual_params) &&
-                    torch::equal(pytorch_copy_of(m), usual_m) && torch::equal(pytorch_copy_of(v), usual_v) &&
-                    torch::equal(pytorch_copy_of(params_bf16.to(DType::Float32)), usual_params_bf16) &&
-                    torch::equal(pytorch_copy_of(m_bf16), usual_m_bf16) &&
-                    torch::equal(pytorch_copy_of(v_bf16), usual_v_bf16);
-        if (same)
-            launches_with_the_same_result++;
-
-        size_t threads_launched = (size_t)blocks * threads;
-        int float4s_per_thread = (int)((n / 4 + threads_launched - 1) / threads_launched); // the most
-        const char *usual = blocks == one_float4_per_thread_blocks && threads == ADAMW_THREADS_PER_BLOCK
-                                ? "   <- what adamw_update launches: one float4 per thread"
-                            : blocks == 40 && threads == 128
-                                ? "   <- a T4's pick, what it launched before"
-                                : "";
-        printf("                  %6d   %7d   %18d   %6.3f   %6.3f   %-11s%s\n", blocks, threads, float4s_per_thread,
-               times[0], times[1], same ? "yes" : "NO", usual);
-    }
-    printf("    fastest       %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[0], fastest_threads[0],
-           fastest_ms[0]);
-    printf("    fastest bf16  %6d blocks x %4d threads: %.3f ms\n", fastest_blocks[1], fastest_threads[1],
-           fastest_ms[1]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
+    // 1. step 1 at lr 0.05
+    AdamWConfig config_val;
+    config_val.learning_rate = 0.05f;
+    config_val.weight_decay = 0.0f;
+    AdamW my_adamw_val({{4}}, config_val);
+    my_adamw_val.param(0).fill_(1);
+    my_adamw_val.grad(0).fill_(1);
+    ASSERT_EQ(my_adamw_val.learning_rate(), 0.05f);
+    my_adamw_val.step();
+    ASSERT_NEAR(my_adamw_val.param(0).tolist(), std::vector<float>(4, 0.95f), 1e-6);
+    // 2. step 2 at lr 0.01
+    my_adamw_val.set_learning_rate(0.01f);
+    ASSERT_EQ(my_adamw_val.learning_rate(), 0.01f);
+    my_adamw_val.step();
+    ASSERT_NEAR(my_adamw_val.param(0).tolist(), std::vector<float>(4, 0.94f), 1e-6);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+    start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     one_step_matches_pytorch();
     many_steps_match_pytorch();
-    large_random_weight_matches_pytorch();
-    bias_matches_pytorch_without_decay();
-    mixed_parameters_match_pytorch();
     clip_scales_large_gradients_down_to_max_norm();
     clip_leaves_small_gradients_alone();
     max_norm_0_turns_clipping_off();
-    whole_model_matches_pytorch_with_clipping();
-    time_20_updates_on_gpt2_small_size();
-
     first_step_moves_each_value_by_about_the_learning_rate();
+    only_the_values_before_decayed_count_decay();
+    nothing_past_a_tensors_end_changes();
+    any_block_size_gives_the_same_bits();
+
+    large_random_weight_matches_pytorch();
+    bias_matches_pytorch_without_decay();
+    mixed_parameters_match_pytorch();
+    whole_model_matches_pytorch_with_clipping();
+
     weight_decay_shrinks_matrices_but_not_biases();
     a_parameter_the_loss_did_not_use_only_decays();
     weight_decay_follows_the_shape_not_the_order();
-    only_the_values_before_decayed_count_decay();
-    bfloat16_params_and_grads_match_pytorch();
-    nothing_past_a_tensors_end_changes();
     step_leaves_the_gradients_as_they_are();
     adamw_counts_the_matrices_and_the_steps();
     set_learning_rate_is_used_from_the_next_step();
-    bfloat16_adamw_keeps_a_float_master();
-    bfloat16_master_steps_match_float_steps();
-    a_small_update_adds_up_in_the_master();
-    ranks_each_update_their_own_slice();
-
-    time_the_kernel_with_other_block_and_thread_counts();
 
     printf("\nall tests passed\n");
     return 0;

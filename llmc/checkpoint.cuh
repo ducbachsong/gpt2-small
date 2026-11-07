@@ -1,28 +1,12 @@
-// checkpoint.cuh — saving a training run every N steps, and going on from the last save in a new process: a run
-// that outlives its machine (a session that ends, a crash) loses at most N steps. A checkpoint is a folder, one
-// file per rank, and a file `latest` naming the newest one that every rank finished writing:
-//
+// checkpoint.cuh — saves a run every N steps, and goes on from the last save in a new process. A checkpoint
+// is a folder, one file per rank, and `latest` names the newest one every rank finished:
 //     checkpoint_dir/
 //         step_00001000/   rank_0.bin  rank_1.bin  ...  rank_7.bin
-//         step_00002000/   rank_0.bin  rank_1.bin  ...  rank_7.bin
-//         latest           "step_00002000"
-//
-// rank_R.bin is what rank R needs to go on, and nothing more:
-//
-//     header           32 int64s: [0] 20241103, a checkpoint file   [1] 1, the version   [2] steps done
-//                      [3] the run's total steps   [4] world size   [5] rank   [6] dtype, 0 float or 1 bfloat16
-//                      [7] slice start   [8] slice size   [9] the train loader's file   [10] its position
-//                      [11] its epoch; the rest 0
-//     master params    slice size floats: this rank's float params (optimizer.cuh)
-//     m, v             slice size floats each: AdamW's
-//
-// so 12 bytes per value of the slice: GPT-2 small on 1 GPU 1.49 GB, on 8 GPUs 187 MB per rank. Not saved: the
-// bfloat16 params (each rank rounds its master again, then they all-gather, as after a step), the grads (zero
-// at every step), the val loader (reset at every val loss).
-//
-// Saving never spoils the last good checkpoint: each rank writes rank_R.bin.partial and renames it when it is
-// whole, all ranks wait for each other, and only then rank 0 points `latest` at the new folder, the same way,
-// and deletes all but the newest `keep` folders.
+//         latest           "step_00001000"
+// rank_R.bin: a header of 32 int64s ([0] magic, [1] version, [2] steps done, [3] total steps, [4] world size,
+// [5] rank, [6] dtype 0 float / 1 bfloat16, [7] slice start, [8] slice size, [9..11] the train loader's file,
+// position, epoch), then the slice's master params, m and v as floats: 12 bytes per value.
+// Each file is written as .partial and renamed when whole; `latest` moves only after every rank is done.
 #ifndef CHECKPOINT_CUH
 #define CHECKPOINT_CUH
 
@@ -56,16 +40,22 @@ std::string checkpoint_rank_file(const std::string& path, int rank);
 
 // ── saving and going on ───────────────────────────────────────────────────────
 
-/// Saves where training is after steps_done steps into checkpoint_dir/step_<steps_done>/: each rank its own
-/// file. Every rank calls it at the same step. Then rank 0 points `latest` at it and deletes all but the newest
-/// `keep` checkpoints. The folders are made if needed.
+/// Saves this rank's file into checkpoint_dir/step_<steps_done>/; then rank 0 points `latest` at it and deletes
+/// all but the newest `keep`. Every rank calls it at the same step.
+///
+///   checkpoint_dir             made if needed
+///   steps_done, total_steps    where the run is, and its length
+///   optimizer                  the master, m and v of this slice
+///   train_loader               its place
+///   distributed                to wait for every rank
+///   keep                       how many checkpoints to keep
 inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, int total_steps, const AdamW& optimizer,
                             const DataLoader& train_loader, const Distributed& distributed, int keep) {
     namespace fs = std::filesystem;
     std::string folder = checkpoint_dir + "/" + checkpoint_folder_name(steps_done);
     fs::create_directories(folder);
 
-    // 1. this rank's file, written whole under another name, then renamed
+    // 1. this rank's file, as .partial, then renamed
     int64_t header[CHECKPOINT_HEADER_INTS] = {};
     header[0] = CHECKPOINT_MAGIC, header[1] = CHECKPOINT_VERSION, header[2] = steps_done, header[3] = total_steps;
     header[4] = optimizer.world_size(), header[5] = optimizer.rank();
@@ -81,7 +71,7 @@ inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, i
     std::vector<float> values(optimizer.slice_size());
     for (const Tensor& state : {optimizer.master_slice(), optimizer.m_slice(), optimizer.v_slice()}) {
         if (!written) break;
-        state.copy_to_cpu(values.data());
+        state.to(DType::Float32).copy_to_cpu(values.data());     // bfloat16 m, v: saved as floats, exactly
         written = fwrite(values.data(), sizeof(float), values.size(), file) == values.size();
     }
     if (file != nullptr && fclose(file) != 0) written = false;
@@ -90,7 +80,7 @@ inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, i
         exit(EXIT_FAILURE);
     }
 
-    // 2. once every rank's file is whole: `latest`, then the old checkpoints go
+    // 2. once every rank is done: `latest`, then the old checkpoints go
     distributed.barrier();
     if (distributed.rank() != 0) return;
     std::string latest = checkpoint_dir + "/latest";
@@ -100,7 +90,7 @@ inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, i
         fprintf(stderr, "error: cannot write %s\n", latest.c_str());
         exit(EXIT_FAILURE);
     }
-    std::vector<std::string> folders;                       // step_00000001 .. : the names sort as the steps do
+    std::vector<std::string> folders;                       // the names sort as the steps do
     for (const fs::directory_entry& entry : fs::directory_iterator(checkpoint_dir))
         if (entry.is_directory() && entry.path().filename().string().rfind("step_", 0) == 0)
             folders.push_back(entry.path().filename().string());
@@ -108,10 +98,13 @@ inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, i
     for (size_t k = 0; k + keep < folders.size(); k++) fs::remove_all(checkpoint_dir + "/" + folders[k]);
 }
 
-/// Puts training back where a checkpoint saved it, and gives the steps done then: this rank's master, m and v,
-/// the step count, the train loader's place, and all the bfloat16 params (each rank rounds its master into its
-/// slice, then they all-gather). `path` is a checkpoint folder, or a checkpoint_dir: then the one `latest` names.
-/// Stops if the checkpoint is of another run: checkpoint_problem says how.
+/// Puts training back where a checkpoint left it (master, m, v, step count, loader, bfloat16 params) and gives
+/// the steps done. Stops if it is another run's.
+///
+///   path                       a checkpoint folder, or a checkpoint_dir (then the one `latest` names)
+///   total_steps                this run's length
+///   optimizer, train_loader    filled in
+///   distributed                for the all-gather of the params
 inline int checkpoint_load(const std::string& path, int total_steps, AdamW& optimizer, DataLoader& train_loader,
                            const Distributed& distributed) {
     std::string problem = checkpoint_problem(path, total_steps, optimizer);
@@ -125,10 +118,13 @@ inline int checkpoint_load(const std::string& path, int total_steps, AdamW& opti
     bool read = file != nullptr && fread(header, sizeof(int64_t), CHECKPOINT_HEADER_INTS, file) ==
                                        CHECKPOINT_HEADER_INTS;
     std::vector<float> values(optimizer.slice_size());
+    Tensor floats = Tensor::empty({optimizer.slice_size()});
     for (const Tensor& state : {optimizer.master_slice(), optimizer.m_slice(), optimizer.v_slice()}) {
         if (!read) break;
         read = fread(values.data(), sizeof(float), values.size(), file) == values.size();
-        if (read) state.copy_from_cpu(values.data());
+        if (!read) break;
+        floats.copy_from_cpu(values.data());
+        state.copy_(floats);                                      // bfloat16 m, v: exact, saved from bfloat16
     }
     if (file != nullptr) fclose(file);
     if (!read) {
@@ -137,16 +133,17 @@ inline int checkpoint_load(const std::string& path, int total_steps, AdamW& opti
     }
     int steps_done = (int)header[2];
     optimizer.set_steps_taken(steps_done);
-    if (optimizer.dtype() == DType::BFloat16)              // the model's params from the master, as a step leaves them
+    if (optimizer.dtype() == DType::BFloat16)              // the model's params from the master
         optimizer.all_params().narrow(0, optimizer.slice_start(), optimizer.slice_size()).copy_(optimizer.master_slice());
     distributed.all_gather(optimizer.all_params());
     train_loader.seek((int)header[9], (size_t)header[10], (int)header[11]);
     return steps_done;
 }
 
-/// Tells what is wrong with going on from this checkpoint with this optimizer and run length, or "" if
-/// nothing: no file for this rank, not a checkpoint file, or one of another run (another world size, dtype,
-/// model size or number of total steps, which the learning rate schedule depends on).
+/// Gives what is wrong with going on from this checkpoint, or "": no file, not a checkpoint, or another run's
+/// (total steps, world size, dtype or slice).
+///
+///   path, total_steps, optimizer   as in checkpoint_load
 inline std::string checkpoint_problem(const std::string& path, int total_steps, const AdamW& optimizer) {
     std::string file_path = checkpoint_rank_file(path, optimizer.rank());
     FILE* file = fopen(file_path.c_str(), "rb");
@@ -175,16 +172,19 @@ inline std::string checkpoint_problem(const std::string& path, int total_steps, 
 
 // ── for both ──────────────────────────────────────────────────────────────────
 
-/// Gives a checkpoint folder's name: step_ and the steps done in 8 digits, so the names sort as the steps do:
-/// checkpoint_folder_name(1000) is "step_00001000".
+/// Gives a checkpoint folder's name, in 8 digits so the names sort: 1000 -> "step_00001000".
+///
+///   steps_done   the step it was saved at
 inline std::string checkpoint_folder_name(int steps_done) {
     char name[32];
     snprintf(name, sizeof(name), "step_%08d", steps_done);
     return name;
 }
 
-/// Gives the path of rank's file in a checkpoint: path/rank_<rank>.bin if path is a checkpoint folder; if it is
-/// a checkpoint_dir with a `latest` file, the same in the folder `latest` names.
+/// Gives the path of rank's file: path/rank_<rank>.bin, or in the folder `latest` names if path has one.
+///
+///   path   a checkpoint folder or a checkpoint_dir
+///   rank   whose file
 inline std::string checkpoint_rank_file(const std::string& path, int rank) {
     std::string folder = path;
     FILE* latest = fopen((path + "/latest").c_str(), "r");

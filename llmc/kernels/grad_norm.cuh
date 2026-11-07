@@ -1,155 +1,138 @@
-// grad_norm.cuh — the norm of all the gradients together, as if they were one long list:
+// grad_norm.cuh — the norm of all the gradients together, as one long list:
+//     grad_norm = sqrt(sum of every g²)
+// The gradients are float or bfloat16 (T); the squares are added in float.
 #ifndef GRAD_NORM_CUH
 #define GRAD_NORM_CUH
 
-#include "cuda_common.h"             // cudaCheck only: the adding up is written out in the kernel, below
-#include "../tensor.cuh"             // compute takes views: each knows its address and its numel
+#include "cuda_common.h"             // cudaCheck, check_threads_per_block, block_reduce_sum
+#include "../tensor.cuh"
 
-// The gradients may be float or bfloat16; the kernel is a template on that dtype, T. It reads 4 values at a
-// time either way (for bfloat16, one 8-byte read that load4 turns into 4 floats) and adds the squares in
-// float. block_sums and grad_norm are always float.
-
-#define GRAD_NORM_BLOCKS 512        // blocks in the launch: each writes one block sum
-#define GRAD_NORM_THREADS 1024      // threads per block
+#define GRAD_NORM_BLOCKS 512                     // blocks in the launch: each writes one block sum
+#define GRAD_NORM_THREADS MAX_THREADS_PER_BLOCK  // the default block size
 
 class GradNorm {
 public:
     // ── making it ───────────────────────────────────────────────────────────────
-    explicit GradNorm(const Tensor& block_sums);                        // {2, 512}: the block sums, then the counter
+    explicit GradNorm(const Tensor& block_sums_tensor);                 // {2, GRAD_NORM_BLOCKS}: the block sums, then the counter
 
     // ── the norm ────────────────────────────────────────────────────────────────
-    void compute(const Tensor& grads, const Tensor& grad_norm) const;  // grad_norm (1 value) = sqrt(sum of every grad²)
+    // grad_norm (1 value) = sqrt(sum of every grad²)
+    void compute(const Tensor& grads_tensor, const Tensor& grad_norm_tensor,
+                 int threads_per_block_val = GRAD_NORM_THREADS) const;
 
 private:
-    Tensor block_sums_;                  // row 0 of the {2, 512}: each block's sum of squares
-    Tensor blocks_done_;                 // row 1, value 0: how many blocks have written their sum; 0 between computes
+    Tensor block_sums_tensor_;           // row 0: each block's sum of squares
+    Tensor blocks_done_tensor_;          // row 1, value 0: blocks that have written their sum; 0 between computes
 };
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
-/// Makes a GradNorm that keeps its block sums and its counter in one {2, 512} view of the flat buffer: it allocates
-/// nothing. Row 0 holds the 512 block sums; value 0 of row 1 is the counter of blocks done (the other 511 of row 1
-/// are not used: 2 x 512 = 1024 values keeps whatever follows in the buffer on 16 bytes). The counter must start at
-/// 0 (a new buffer is all 0); each compute puts it back to 0. Stops if the view is not {2, 512}.
-inline GradNorm::GradNorm(const Tensor& block_sums) {
-    if (block_sums.shape() != Shape({2, GRAD_NORM_BLOCKS})) {
+/// Makes a GradNorm on a {2, GRAD_NORM_BLOCKS} view of the flat buffer; it allocates nothing.
+///
+///   block_sums_tensor   row 0: the GRAD_NORM_BLOCKS block sums; row 1, value 0: the counter, 0 at the start
+inline GradNorm::GradNorm(const Tensor& block_sums_tensor) {
+    if (block_sums_tensor.shape() != Shape({2, GRAD_NORM_BLOCKS})) {
         fprintf(stderr, "error: GradNorm needs block sums of shape {2, %d}, but got %zu values\n", GRAD_NORM_BLOCKS,
-                block_sums.numel());
+                block_sums_tensor.numel());
         exit(EXIT_FAILURE);
     }
-    block_sums_ = block_sums[0];         // the 512 block sums
-    blocks_done_ = block_sums[1][0];     // the counter: one value
+    block_sums_tensor_ = block_sums_tensor[0];
+    blocks_done_tensor_ = block_sums_tensor[1][0];
 }
 
 // ── the norm ──────────────────────────────────────────────────────────────────
 
-// The kernel compute launches, declared here so compute can call it; its code follows it.
 template <typename T>
-__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const T* grads,
-                                         size_t grads_numel);
+__global__ void compute_grad_norm_kernel(float* grad_norm_ptr, float* block_sums_ptr, float* blocks_done_ptr,
+                                         const T* grads_ptr, size_t grads_numel_val);
 
-/// Works out the norm of every value in `grads` and writes it into `grad_norm`, both views of the flat buffer, with
-inline void GradNorm::compute(const Tensor& grads, const Tensor& grad_norm) const {
-    if (grad_norm.numel() != 1) {
-        fprintf(stderr, "error: GradNorm writes 1 value, but grad_norm has %zu\n", grad_norm.numel());
+/// Writes the norm of all of grads into grad_norm: checks, then launches compute_grad_norm_kernel.
+///
+///   grads_tensor            every gradient, float or bfloat16, starting on a whole float4
+///   grad_norm_tensor        1 float: the result
+///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///                           GRAD_NORM_THREADS. Another size adds the squares in another order, so the last bits
+///                           can change; the same size gives the same bits every run.
+inline void GradNorm::compute(const Tensor& grads_tensor, const Tensor& grad_norm_tensor, int threads_per_block_val) const {
+    // 1. check the launch and the tensors; any of them wrong: stop with an error
+    // block size: whole warps, for block_reduce_sum; at most MAX_THREADS_PER_BLOCK
+    check_threads_per_block(threads_per_block_val, "GradNorm");
+    // grad_norm: one value
+    if (grad_norm_tensor.numel() != 1) {
+        fprintf(stderr, "error: GradNorm writes 1 value, but grad_norm has %zu\n", grad_norm_tensor.numel());
         exit(EXIT_FAILURE);
     }
-    if (grads.dtype() != DType::Float32 && grads.dtype() != DType::BFloat16) {
+    // types: float or bfloat16
+    if (grads_tensor.dtype() != DType::Float32 && grads_tensor.dtype() != DType::BFloat16) {
         fprintf(stderr, "error: GradNorm needs grads float or bfloat16\n");
         exit(EXIT_FAILURE);
     }
-    // Off 4 values, the GPU stops with "misaligned address" at some later call, far from the cause.
-    size_t four_values = 4 * grads.element_size();                      // 16 bytes for float, 8 for bfloat16
-    if ((size_t)grads.data_ptr() % four_values != 0) {
-        fprintf(stderr, "error: GradNorm reads grads 4 values at a time, so they must start on %zu bytes; got %p\n",
-                four_values, grads.data_ptr());
+    // addresses: a float4 load needs a start on a whole float4
+    size_t float4_bytes_val = VALUES_PER_FLOAT4 * grads_tensor.element_size();
+    if ((size_t)grads_tensor.data_ptr() % float4_bytes_val != 0) {
+        fprintf(stderr, "error: GradNorm reads grads %d values at a time, so they must start on %zu bytes; got %p\n",
+                VALUES_PER_FLOAT4, float4_bytes_val, grads_tensor.data_ptr());
         exit(EXIT_FAILURE);
     }
-    if (grads.dtype() == DType::BFloat16)
-        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, GRAD_NORM_THREADS>>>(
-            grad_norm.data(), block_sums_.data(), blocks_done_.data(), grads.data_ptr<nv_bfloat16>(), grads.numel());
+    // 2. launch: GRAD_NORM_BLOCKS blocks, one block sum each
+    if (grads_tensor.dtype() == DType::BFloat16)
+        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, threads_per_block_val>>>(
+            grad_norm_tensor.data(), block_sums_tensor_.data(), blocks_done_tensor_.data(),
+            grads_tensor.data_ptr<nv_bfloat16>(), grads_tensor.numel());
     else
-        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, GRAD_NORM_THREADS>>>(
-            grad_norm.data(), block_sums_.data(), blocks_done_.data(), grads.data(), grads.numel());
+        compute_grad_norm_kernel<<<GRAD_NORM_BLOCKS, threads_per_block_val>>>(
+            grad_norm_tensor.data(), block_sums_tensor_.data(), blocks_done_tensor_.data(), grads_tensor.data(),
+            grads_tensor.numel());
     cudaCheck(cudaGetLastError());
 }
 
-/// Works out the norm of the grads_numel gradients, the whole process in one kernel:
+/// Works out the norm in one kernel: each block adds its share of squares, and the last block to finish adds
+/// the block sums in a fixed order and writes the square root, so the same launch gives the same norm every
+/// run, to the last bit.
 ///
-///     1. every thread adds the squares of its share, 4 floats per load (float4, a grid stride)
-///     2. every block adds its 1024 sums; thread 0 writes the block sum and counts its block as done
-///     3. the block that finishes last (the count reaches 512) adds the 512 block sums and writes the square root
-///
-/// A block adds 1024 numbers in two rounds of 32 (steps 2 and 3 both): each warp adds its 32 with shuffles, the 32
-/// warp totals go to shared memory, then each warp adds those 32 the same way. Blocks cannot wait for each other, so
-/// the counter tells the last one that every block sum is written. The last block adds block_sums[0 .. 511] in that
-/// order whichever block it is: the same norm every run, to the last bit.
-///
-/// The numbers above are GradNorm::compute's launch, GRAD_NORM_BLOCKS x GRAD_NORM_THREADS. The kernel reads its
-/// launch from gridDim and blockDim, so test_grad_norm can time it with others: a block of fewer than 32 warps
-/// leaves the warp totals it has no warp for as 0, and with more blocks than threads each thread of the last block
-/// adds several block sums. block_sums must hold one per block.
+///   grad_norm_ptr     1 float: the result
+///   block_sums_ptr    one per block
+///   blocks_done_ptr   the counter of blocks done: 0 at the start, put back to 0 at the end
+///   grads_ptr         the gradients, float or bfloat16 (T)
+///   grads_numel_val   how many
 template <typename T>
-__global__ void compute_grad_norm_kernel(float* grad_norm, float* block_sums, float* blocks_done, const T* grads,
-                                         size_t grads_numel) {
-    __shared__ float warp_totals[32];           // one per warp, shared by the whole block: used in steps 2 and 3
-    __shared__ bool is_last_block;              // one per block: did this block finish last?
-    int thread_in_warp = threadIdx.x % 32, warp = threadIdx.x / 32, warps_in_block = blockDim.x / 32;
+__global__ void compute_grad_norm_kernel(float* grad_norm_ptr, float* block_sums_ptr, float* blocks_done_ptr,
+                                         const T* grads_ptr, size_t grads_numel_val) {
+    __shared__ bool is_last_block_val;          // did this block finish last?
 
-    // 1. this thread's squares. The grads are read as float4s: group g is values 4g .. 4g + 3, one 16-byte load, so
-    //    each request brings 4 floats instead of 1 and memory stays busier. Thread t takes groups t, t + 524,288,
-    //    t + 2 x 524,288, ... (the jump: every thread launched). GPT-2 small's 124,439,808 values are 31,109,952
-    //    groups: 59.3 rounds, so each thread reads 59 or 60 float4s.
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t groups = grads_numel / 4;                                    // whole float4s; 0 .. 3 values are left over
-    float sum = 0.0f;
-    for (size_t g = thread_number; g < groups; g += (size_t)gridDim.x * blockDim.x) {
-        float4 v = load4(grads + 4 * g);
-        sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    // 1. this thread's squares: float4s thread_index, + every thread launched, ...
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t float4_count_val = grads_numel_val / VALUES_PER_FLOAT4;      // whole float4s
+    float sum_val = 0.0f;
+    for (size_t index_val = thread_index_val; index_val < float4_count_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        float4 g_val = read4_as_float(grads_ptr + VALUES_PER_FLOAT4 * index_val);
+        sum_val += g_val.x * g_val.x + g_val.y * g_val.y + g_val.z * g_val.z + g_val.w * g_val.w;
     }
-    //    The 0 .. 3 values after the last whole float4 (grads_numel not a multiple of 4): one each for threads 0 .. 2.
-    size_t leftover = groups * 4 + thread_number;
-    if (leftover < grads_numel) sum += to_float(grads[leftover]) * to_float(grads[leftover]);
+    //    the 0 .. VALUES_PER_FLOAT4 - 1 values left after the last float4: one each for the first threads
+    size_t leftover_index_val = float4_count_val * VALUES_PER_FLOAT4 + thread_index_val;
+    if (leftover_index_val < grads_numel_val)
+        sum_val += to_float(grads_ptr[leftover_index_val]) * to_float(grads_ptr[leftover_index_val]);
 
-    // 2. this block's 1024 sums, added.
-    //    Round 1: each warp adds its 32 sums: every thread takes the value of the thread `offset` away,
-    //    32 → 16 → 8 → 4 → 2 → 1; then each thread holds its warp's total.
-    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    if (thread_in_warp == 0) warp_totals[warp] = sum;
-    __syncthreads();                            // wait until all 32 warps have written theirs
-    //    Round 2: each thread reads one of the 32 warp totals, and each warp adds them the same way: the block sum.
-    float block_total = thread_in_warp < warps_in_block ? warp_totals[thread_in_warp] : 0.0f;
-    for (int offset = 16; offset > 0; offset /= 2) block_total += __shfl_xor_sync(0xffffffff, block_total, offset);
-    //    Thread 0 writes the block sum, then counts the block as done.
+    // 2. this block's sum; thread 0 writes it, then counts the block done
+    float block_total_val = block_reduce_sum(sum_val);
     if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = block_total;
+        block_sums_ptr[blockIdx.x] = block_total_val;
         __threadfence();                        // the block sum reaches GPU memory before the count goes up
-        float done_before = atomicAdd(blocks_done, 1.0f);   // +1, one block at a time; gives the count before it
-        is_last_block = done_before == (float)(gridDim.x - 1);   // 511 before this one: every other block is done
+        float done_before_val = atomicAdd(blocks_done_ptr, 1.0f);
+        is_last_block_val = done_before_val == (float)(gridDim.x - 1);
     }
-    __syncthreads();                            // every thread sees is_last_block, and is done reading warp_totals
-    if (!is_last_block) return;
+    __syncthreads();
+    if (!is_last_block_val) return;
 
-    // 3. only the last block: all 512 block sums are in GPU memory (the blocks that wrote them have returned; what
-    //    they wrote stays). threadIdx.x is not tied to any block here: it is just a number 0 .. 1023, used as an index
-    //    to pick up the sums. Threads 0 .. 511 each take block_sums[threadIdx.x]; threads 512 .. 1023 have no slot and
-    //    take 0, which adds nothing (one read per thread covers all 512, as 1024 threads >= 512 sums). Then the block
-    //    adds the 1024 values in the same two rounds. volatile: read the sums from GPU memory, not from an old copy
-    //    in this SM's cache. (With more blocks than threads, thread t also takes block sums t + 1024, t + 2048, ...)
-    float total = 0.0f;
-    for (size_t b = threadIdx.x; b < gridDim.x; b += blockDim.x) total += ((volatile float*)block_sums)[b];
-    //    Round 1: each warp adds its 32.
-    for (int offset = 16; offset > 0; offset /= 2) total += __shfl_xor_sync(0xffffffff, total, offset);
-    if (thread_in_warp == 0) warp_totals[warp] = total;
-    __syncthreads();                            // wait until all 32 warps have written theirs
-    //    Round 2: each warp adds the 32 warp totals: the sum of every square.
-    float all_blocks_total = thread_in_warp < warps_in_block ? warp_totals[thread_in_warp] : 0.0f;
-    for (int offset = 16; offset > 0; offset /= 2)
-        all_blocks_total += __shfl_xor_sync(0xffffffff, all_blocks_total, offset);
-    //    Thread 0 writes the square root, the norm, and sets the counter back to 0.
+    // 3. last block only: add every block sum the same way. volatile: read GPU memory, not an old cached copy.
+    float total_val = 0.0f;
+    for (size_t block_index_val = threadIdx.x; block_index_val < gridDim.x; block_index_val += blockDim.x)
+        total_val += reinterpret_cast<volatile float*>(block_sums_ptr)[block_index_val];
+    float all_blocks_total_val = block_reduce_sum(total_val);
+    // 4. the square root; the counter back to 0, ready for the next compute
     if (threadIdx.x == 0) {
-        *grad_norm = sqrtf(all_blocks_total);
-        *blocks_done = 0.0f;                    // ready for the next compute
+        *grad_norm_ptr = sqrtf(all_blocks_total_val);
+        *blocks_done_ptr = 0.0f;
     }
 }
 

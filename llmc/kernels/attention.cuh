@@ -1,134 +1,111 @@
-// attention.cuh — causal self-attention, GPT-2's way for each token to take in what the tokens before it
-// say. The qkv linear gives every token a query (what it looks for), a key (what it offers) and a value
-// (what it passes on), for each of num_heads heads. In each head, each token scores every earlier token
-// (and itself), turns the scores into weights that add up to 1, and takes that mix of their values:
-//
-//     F1   split    query, key, value  = qkv's three parts, each cut into heads of head_size columns
+// attention.cuh — causal self-attention: each token mixes the values of the tokens up to it, per head:
+//     F1   split    query, key, value  = qkv's three parts, cut into heads of head_size columns
 //     F2   scores   score[t][j]        = query[t] · key[j] / sqrt(head_size)
-//     F3   mask     only j <= t: a token cannot see the tokens after it
-//     F4   softmax  weight[t][j]       = exp(score[t][j] - row_max) / row_sum, over j <= t
-//     F5   mix      head_output[t]     = sum over j <= t of weight[t][j] * value[j]
+//     F3   mask     only j <= t
+//     F4   softmax  weight[t][j]       = exp(score[t][j] - row_max) / row_sum
+//     F5   mix      head_output[t]     = sum over j <= t of weight[t][j] · value[j]
 //     F6   merge    output             = the heads side by side again
+//     backward:
+//     B1   head_outputs_grad   = output_grad cut into heads
+//     B2   weights_grad[t][j]  = head_outputs_grad[t] · value[j]
+//     B3   value_grad[j]       = sum over t >= j of weight[t][j] · head_outputs_grad[t]
+//     B4-6 scores_grad[t][j]  = weight[t][j] · (weights_grad[t][j] - row_dot[t])
+//                                row_dot[t] = sum over j of weight[t][j] · weights_grad[t][j]
+//     B7   query_grad[t]       = sum over j <= t of scores_grad[t][j] · key[j] / sqrt(head_size)
+//     B8   key_grad[j]         = sum over t >= j of scores_grad[t][j] · query[t] / sqrt(head_size)
+//     B9   qkv_grad            = query_grad, key_grad, value_grad put back together
 //
-//     qkv, qkv_grad                {batch_size, seq_len, 3 * embed_dim}             {4, 1024, 2304}
-//     output, output_grad          {batch_size, seq_len, embed_dim}                 {4, 1024, 768}
-//     query, key, value            {batch_size, num_heads, seq_len, head_size}      {4, 12, 1024, 64}, kept for backward
-//     weights                      {batch_size, num_heads, seq_len, seq_len}        {4, 12, 1024, 1024}, kept for backward
-//     head_outputs, head_outputs_grad, query_grad, key_grad, value_grad   as query, scratch: used only inside a call
-//     weights_grad                 as weights, scratch
+//     qkv, qkv_grad          {batch_size, seq_len, 3 · embed_dim}          {4, 1024, 2304}
+//     output, output_grad    {batch_size, seq_len, embed_dim}              {4, 1024, 768}
+//     query, key, value      {batch_size, num_heads, seq_len, head_size}   {4, 12, 1024, 64}: kept for backward
+//     weights                {batch_size, num_heads, seq_len, seq_len}     {4, 12, 1024, 1024}: kept for backward
+//     head_outputs, the other _grads: scratch, used only inside a call
+// The products (F2, F5, B2, B3, B7, B8) are cuBLAS batched products, one per (batch, head). All float or all
+// bfloat16 (T); sums in float. Math: https://ducbachsong.github.io/posts/attention-backward/
 //
-// embed_dim = num_heads * head_size (768 = 12 * 64). The numbers of heads and head_size come from query's
-// shape. weights is 201 MB for GPT-2 small: one float for every pair of tokens in every head.
-//
-// Backward, with output_grad the gradient arriving from the layer above (the attention's output linear):
-//
-//     B1   head_outputs_grad   = output_grad cut into heads again                       (F6 undone)
-//     B2   weights_grad[t][j]  = head_outputs_grad[t] · value[j]                        (F5, for weights)
-//     B3   value_grad[j]       = sum over t >= j of weight[t][j] * head_outputs_grad[t]  (F5, for value)
-//     B4-B6 scores_grad[t][j]  = weight[t][j] * (weights_grad[t][j] - row_dot[t])       (F4, softmax: C1)
-//                                row_dot[t] = sum over j <= t of weight[t][j] * weights_grad[t][j]; 0 above
-//     B7   query_grad[t]       = sum over j <= t of scores_grad[t][j] * key[j] / sqrt(head_size)    (F2)
-//     B8   key_grad[j]         = sum over t >= j of scores_grad[t][j] * query[t] / sqrt(head_size)  (F2)
-//     B9   qkv_grad            = query_grad, key_grad, value_grad put back together     (F1 undone)
-//
-// The math is in the note https://ducbachsong.github.io/posts/attention-backward/. The comments name its
-// steps (F1..F6 forward, B1..B9 backward, C1 and C2 rebuilt) and sections. Its letters for the names here:
-//
-//     q, k, v = query, key, value   s = scores   a = weights   y = head_outputs   d = head_size
-//     dy = head_outputs_grad   da = weights_grad   ds = scores_grad   dq, dk, dv = query_grad, key_grad, value_grad
-//
-// The note's example, one head of 3 tokens with head_size 4, q = [2,0,0,0] [0,2,0,0] [2,2,0,0],
-// k = [1,0,0,0] [0,1,0,0] [1,1,0,0] and v = [1,0,0,0] [0,1,0,0] [0,0,1,0], gives the weights
-//
-//     token 0:   1           0           0
-//     token 1:   0.2689414   0.7310586   0
-//     token 2:   0.2119416   0.2119416   0.5761169
-//
-// and, v being one 1 per row, head outputs that are those rows with a 0 after them.
-//
-// F2, F5, B2, B3, B7 and B8 are matrix products, one per (batch, head): 48 at once for GPT-2 small, made by
-// cuBLAS's strided batched product (note 6). F4 and B4-B6 are a kernel each, one warp per row of weights;
-// F1, F6, B1 and B9 only move values, one float4 per thread. A name ending in 4 is one float4 of that tensor.
-//
-// The tensors are all float or all bfloat16. The kernels are templates on that dtype, T, and the six products
-// are told it (attention_product: CUDA_R_16BF for bfloat16). A float4 is 4 neighbouring values either way:
-// for bfloat16, one 8-byte read that load4 (tensor.cuh) turns into 4 floats, and store4 rounds back. The
-// softmax and every product sum in float; each result is rounded to the tensors' dtype once, as it is stored.
-//
-// ── flash attention (attention_flash_forward, attention_flash_backward) ──
-//
-// The same math without the weights tensor: training's way, in bfloat16 (FlashAttention-2, Dao 2023). The
-// steps above write 201 MB of weights per block at {4, 1024} and read them back several times; flash attention
-// keeps them in registers, 64 queries x 64 keys at a time, and never stores them. One block of 4 warps takes
-// 64 queries of one head (16 per warp) and walks the keys 64 at a time, up to its own (the mask):
-//
-//     scores  = query tile · key tileᵀ / sqrt(64)       tensor cores: mma.sync, bfloat16 in, float out
-//     row_max, row_sum updated as in classifier.cuh's online softmax, the output so far scaled to the new max
-//     output += exp(scores - row_max) · value tile        tensor cores again
-//
-// and at the end divides by row_sum and keeps one number per row, logsumexp = row_max + log(row_sum), so the
-// backward can make any weight again: weight[t][j] = exp(score[t][j] - logsumexp[t]). 196 KB for {4, 12, 1024}
-// instead of 201 MB. The backward makes the weights again tile by tile, from logsumexp, and runs B2 .. B8 on
-// each tile; row_dot (B4-B6) is worked out first from output and output_grad: sum over j of a[t][j] da[t][j]
-// = sum over c of output[t][c] output_grad[t][c] (F5 put into it). Two kernels, so no two blocks add onto the
-// same gradient: one per 64 keys for key_grad and value_grad, one per 64 queries for query_grad (it makes the
-// scores a second time). Both write straight into qkv_grad's three parts.
-//
-// It needs bfloat16 (the tensor cores' inputs), head_size 64, seq_len a multiple of 64 and an sm_80 GPU or later
-// (A100, H100): attention_flash_fits tells. Elsewhere the steps above run; in float they are the exact
-// reference the tests check flash attention against.
+// Flash attention (attention_flash_forward / _backward): the same math without storing the weights
+// (FlashAttention-2). A block of FLASH_WARPS warps takes FLASH_TILE queries and walks the keys FLASH_TILE at a
+// time on the tensor cores, with classifier.cuh's online softmax; it keeps logsumexp = row_max + log(row_sum)
+// per row, from which the backward makes the weights again. Needs bfloat16, head_size FLASH_HEAD_SIZE, seq_len a
+// multiple of FLASH_TILE, sm_80 or later. Its block size is fixed by the tiles (one warp per FLASH_MMA_M rows),
+// so its tile kernels take no block size.
 #ifndef ATTENTION_CUH
 #define ATTENTION_CUH
 
 #include <cublas_v2.h>
-#include "cuda_common.h"             // cudaCheck only: the rest is written out below
-#include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
+#include "cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_sum
+#include "../tensor.cuh"
 
-#define ATTENTION_THREADS_PER_BLOCK 256           // F1, F6, B1, B9: one float4 per thread
-// The softmax launches are the fastest in bfloat16, the dtype training runs in (test_attention's sweep on an
-// H100 PCIe), both one warp per row: 8 warps a block, 6144 blocks for GPT-2 small's 49,152 rows of weights.
-#define ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK 256   // F4: 0.150 ms, against 1.163 with 80 x 128
-#define ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK 256  // B4-B6: 0.133 ms, against 0.705 with 80 x 128 (a T4's
-                                                  // pick, 154 rows a warp: 1.097 ms there against 1.193)
+#define ATTENTION_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)                    // F1, F6, B1, B9's default: one float4 per thread
+#define ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)    // F4's default: one warp per row; fastest in bfloat16 on an H100
+#define ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)   // B4-B6's default: the same
+#define ATTENTION_ROW_DOT_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)            // flash row_dot's default: one warp per row
 
 // ── forward and backward ──────────────────────────────────────────────────────
-void attention_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                       const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv);
-void attention_backward(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query, const Tensor& key,
-                        const Tensor& value, const Tensor& weights, const Tensor& head_outputs_grad,
-                        const Tensor& weights_grad, const Tensor& query_grad, const Tensor& key_grad,
-                        const Tensor& value_grad);
+void attention_forward(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                       const Tensor& value_tensor, const Tensor& weights_tensor, const Tensor& head_outputs_tensor,
+                       const Tensor& qkv_tensor, int threads_per_block_val = ATTENTION_THREADS_PER_BLOCK,
+                       int softmax_threads_per_block_val = ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK);
+void attention_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor, const Tensor& query_tensor,
+                        const Tensor& key_tensor, const Tensor& value_tensor, const Tensor& weights_tensor,
+                        const Tensor& head_outputs_grad_tensor, const Tensor& weights_grad_tensor,
+                        const Tensor& query_grad_tensor, const Tensor& key_grad_tensor, const Tensor& value_grad_tensor,
+                        int threads_per_block_val = ATTENTION_THREADS_PER_BLOCK,
+                        int softmax_threads_per_block_val = ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK);
 
-// ── flash attention: bfloat16, head_size 64, seq_len a multiple of 64, sm_80 or later ──
-#define FLASH_TILE 64                    // queries per block (4 warps x 16), and keys per step
-#define FLASH_HEAD_SIZE 64               // the only head_size the kernels take: GPT-2's
-#define FLASH_THREADS 128                // 4 warps
-#define FLASH_TILE_STRIDE 72             // a tile row in shared memory: 64 values and 8 unused, so that the 8
-                                         // rows a warp reads at once start in different memory banks
-bool attention_flash_fits(DType dtype, size_t seq_len, size_t head_size);
-void attention_flash_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                             const Tensor& logsumexp, const Tensor& qkv);
-void attention_flash_backward(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& output,
-                              const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& logsumexp,
-                              const Tensor& row_dot);
+// ── flash attention: bfloat16, head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE, sm_80 or later ──
+// mma.sync m16n8k16, the tensor-core product the kernels are built on: C {M, N} += A {M, K} · B {K, N}
+#define FLASH_MMA_M 16                   // rows of A and C: one warp's rows
+#define FLASH_MMA_N 8                    // columns of B and C
+#define FLASH_MMA_K 16                   // columns of A, rows of B
+#define FLASH_A_REGISTERS 4              // a thread's part of an A tile: 4 registers of 2 bfloat16s
+#define FLASH_B_REGISTERS 2              // of a B tile: 2 registers
+#define FLASH_C_VALUES 4                 // of a C tile: 4 floats
+#define FLASH_GROUP_LANES 4              // lanes that share a row of a tile in mma's layout
+#define FLASH_THREAD_ROWS 2              // rows of a C tile one thread holds: group and group + FLASH_MMA_M / 2
+#define FLASH_WARPS 4                                       // warps in a block
+#define FLASH_TILE (FLASH_WARPS * FLASH_MMA_M)              // queries per block, and keys per step: 64
+#define FLASH_HEAD_SIZE 64                                  // the only head_size the kernels take: GPT-2's
+#define FLASH_THREADS (FLASH_WARPS * THREADS_PER_WARP)      // the block size
+#define FLASH_K_STEPS (FLASH_HEAD_SIZE / FLASH_MMA_K)       // A tiles across a head row: 4
+#define FLASH_HEAD_N_TILES (FLASH_HEAD_SIZE / FLASH_MMA_N)  // C tiles across a head row: 8
+#define FLASH_TILE_N_TILES (FLASH_TILE / FLASH_MMA_N)       // C tiles across a tile of keys or queries: 8
+#define FLASH_TILE_K_STEPS (FLASH_TILE / FLASH_MMA_K)       // A tiles across a tile of keys or queries: 4
+#define FLASH_LOAD_VALUES (sizeof(uint4) / sizeof(nv_bfloat16))   // bfloat16s per 16-byte load: 8
+#define FLASH_TILE_STRIDE (FLASH_HEAD_SIZE + FLASH_LOAD_VALUES)   // a tile row in shared memory: one spare load, for different banks
+static_assert(FLASH_MMA_K == 2 * FLASH_MMA_N, "two C tiles side by side make one A tile");
+static_assert(FLASH_HEAD_SIZE == 2 * THREADS_PER_WARP, "row_dot: each lane takes 2 values of a head row");
+bool attention_flash_fits(DType dtype_val, size_t seq_len_val, size_t head_size_val);
+void attention_flash_forward(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                             const Tensor& value_tensor, const Tensor& logsumexp_tensor, const Tensor& qkv_tensor,
+                             int threads_per_block_val = ATTENTION_THREADS_PER_BLOCK);
+void attention_flash_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor, const Tensor& output_tensor,
+                              const Tensor& query_tensor, const Tensor& key_tensor, const Tensor& value_tensor,
+                              const Tensor& logsumexp_tensor, const Tensor& row_dot_tensor,
+                              int threads_per_block_val = ATTENTION_ROW_DOT_THREADS_PER_BLOCK);
 
 // ── for both ──────────────────────────────────────────────────────────────────
 cublasHandle_t attention_cublas();
-void attention_product(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
-                       const Tensor& a, int lda, long long stride_a, const Tensor& b, int ldb, long long stride_b,
-                       const Tensor& c, int ldc, long long stride_c, int batch);
-__device__ __forceinline__ size_t attention_merged_index(size_t index, size_t num_heads, size_t seq_len,
-                                                         size_t head_float4s, size_t row_float4s);
-int attention_blocks(size_t total, int threads_per_block, size_t per_thread);
-void attention_check_shapes(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                            const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv);
-void attention_flash_check_shapes(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                                  const Tensor& logsumexp, const Tensor& qkv);
+void attention_product(cublasOperation_t op_a_val, cublasOperation_t op_b_val, int m_val, int n_val, int k_val,
+                       float alpha_val, const Tensor& a_tensor, int lda_val, long long stride_a_val,
+                       const Tensor& b_tensor, int ldb_val, long long stride_b_val, const Tensor& c_tensor, int ldc_val,
+                       long long stride_c_val, int batch_val);
+__device__ __forceinline__ size_t attention_merged_index(size_t index_val, size_t num_heads_val, size_t seq_len_val,
+                                                         size_t head_float4s_val, size_t row_float4s_val);
+int attention_blocks(size_t total_val, int threads_per_block_val, size_t per_thread_val);
+void attention_check_shapes(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                            const Tensor& value_tensor, const Tensor& weights_tensor, const Tensor& head_outputs_tensor,
+                            const Tensor& qkv_tensor);
+void attention_flash_check_shapes(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                  const Tensor& value_tensor, const Tensor& logsumexp_tensor, const Tensor& qkv_tensor);
 
-/// Stops with a message if a cuBLAS call did not succeed, naming the file and line of the call.
-static inline void attention_cublas_check(cublasStatus_t status, const char* file, int line) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cuBLAS error at %s:%d: %s\n", file, line, cublasGetStatusString(status));
+/// Stops with the file and line if a cuBLAS call failed.
+///
+///   status_val            what the call returned
+///   file_ptr, line_val    where the call is
+static inline void attention_cublas_check(cublasStatus_t status_val, const char* file_ptr, int line_val) {
+    if (status_val != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cuBLAS error at %s:%d: %s\n", file_ptr, line_val, cublasGetStatusString(status_val));
         exit(EXIT_FAILURE);
     }
 }
@@ -138,955 +115,1193 @@ static inline void attention_cublas_check(cublasStatus_t status, const char* fil
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
-// What attention_forward calls, declared here so it can call them; their code follows it.
 template <typename Value>
-void attention_forward_in(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                          const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv);
+void attention_forward_in(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                          const Tensor& value_tensor, const Tensor& weights_tensor, const Tensor& head_outputs_tensor,
+                          const Tensor& qkv_tensor, int threads_per_block_val, int softmax_threads_per_block_val);
 template <typename T>
-__global__ void attention_split_qkv_kernel(T* query, T* key, T* value, const T* qkv, size_t total_float4s,
-                                           size_t num_heads, size_t seq_len, size_t head_float4s);
+__global__ void attention_split_qkv_kernel(T* query_ptr, T* key_ptr, T* value_ptr, const T* qkv_ptr,
+                                           size_t total_float4s_val, size_t num_heads_val, size_t seq_len_val,
+                                           size_t head_float4s_val);
 template <typename T>
-__global__ void attention_softmax_forward_kernel(T* weights, size_t rows, size_t seq_len);
+__global__ void attention_softmax_forward_kernel(T* weights_ptr, size_t rows_val, size_t seq_len_val);
 template <typename T>
-__global__ void attention_merge_heads_kernel(T* output, const T* head_outputs, size_t total_float4s,
-                                             size_t num_heads, size_t seq_len, size_t head_float4s);
+__global__ void attention_merge_heads_kernel(T* output_ptr, const T* head_outputs_ptr, size_t total_float4s_val,
+                                             size_t num_heads_val, size_t seq_len_val, size_t head_float4s_val);
 
-/// Writes output = causal self-attention of qkv, and keeps query, key, value and weights for the backward.
-/// head_outputs is scratch. The shapes are those of the head comment; num_heads and head_size are read from
-/// query. The six steps F1..F6 run one after the other on the GPU's queue:
+/// Writes output = causal self-attention of qkv, keeping query, key, value and weights for the backward:
+/// checks, then runs F1..F6.
 ///
-///     step       how                                   GPT-2 small, {4, 1024} tokens, 12 heads of 64
-///     F1         attention_split_qkv_kernel            786,432 float4s of query (and key, value), 3072 blocks
-///     F2         cuBLAS, 48 products {1024, 64} · {64, 1024}, scaled by 1 / sqrt(64) = 0.125
-///     F3, F4     attention_softmax_forward_kernel      49,152 rows of weights, 6144 blocks of 8 warps: one row each
-///     F5         cuBLAS, 48 products {1024, 1024} · {1024, 64}
-///     F6         attention_merge_heads_kernel          786,432 float4s, 3072 blocks
-inline void attention_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                              const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
-    attention_check_shapes(output, query, key, value, weights, head_outputs, qkv);
-    if (qkv.dtype() == DType::BFloat16)
-        attention_forward_in<nv_bfloat16>(output, query, key, value, weights, head_outputs, qkv);
+///   output_tensor                         {batch_size, seq_len, embed_dim}
+///   query_tensor, key_tensor, value_tensor {batch_size, num_heads, seq_len, head_size}: written; num_heads and
+///                                         head_size come from here
+///   weights_tensor                        {batch_size, num_heads, seq_len, seq_len}: written
+///   head_outputs_tensor                   as query: scratch
+///   qkv_tensor                            {batch_size, seq_len, 3 · embed_dim}: the qkv linear's output
+///   threads_per_block_val                 F1 and F6's block size: whole warps, at most MAX_THREADS_PER_BLOCK; not
+///                                         given: ATTENTION_THREADS_PER_BLOCK
+///   softmax_threads_per_block_val         F4's: the same; not given: ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK.
+///                                         Any sizes give the same bits; only the time changes.
+inline void attention_forward(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                              const Tensor& value_tensor, const Tensor& weights_tensor, const Tensor& head_outputs_tensor,
+                              const Tensor& qkv_tensor, int threads_per_block_val, int softmax_threads_per_block_val) {
+    // 1. check the launches and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "attention");
+    check_threads_per_block(softmax_threads_per_block_val, "attention's softmax");
+    attention_check_shapes(output_tensor, query_tensor, key_tensor, value_tensor, weights_tensor, head_outputs_tensor,
+                           qkv_tensor);
+    // 2. F1..F6 in the tensors' type
+    if (qkv_tensor.dtype() == DType::BFloat16)
+        attention_forward_in<nv_bfloat16>(output_tensor, query_tensor, key_tensor, value_tensor, weights_tensor,
+                                          head_outputs_tensor, qkv_tensor, threads_per_block_val,
+                                          softmax_threads_per_block_val);
     else
-        attention_forward_in<float>(output, query, key, value, weights, head_outputs, qkv);
+        attention_forward_in<float>(output_tensor, query_tensor, key_tensor, value_tensor, weights_tensor,
+                                    head_outputs_tensor, qkv_tensor, threads_per_block_val, softmax_threads_per_block_val);
 }
 
-/// attention_forward's six steps, the tensors' values being Value: float or nv_bfloat16. The tensors are
-/// already checked. (Value, not T: T is seq_len here, as in the note.)
+/// Runs attention_forward's six steps on checked tensors.
+///
+///   Value                  float or nv_bfloat16 (not T: T is seq_len here)
+///   the others             as in attention_forward
 template <typename Value>
-inline void attention_forward_in(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                                 const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
-    size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
-    size_t heads_in_batch = query.size(0) * num_heads, rows = heads_in_batch * seq_len;   // 48 heads, 49,152 rows
-    size_t total_float4s = query.numel() / 4, head_float4s = head_size / 4;
-    int T = (int)seq_len, d = (int)head_size;
-    float scale = 1.0f / sqrtf((float)head_size);
-    long long head_values = (long long)T * d, head_weights = (long long)T * T;   // the stride from head to head
+inline void attention_forward_in(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                 const Tensor& value_tensor, const Tensor& weights_tensor,
+                                 const Tensor& head_outputs_tensor, const Tensor& qkv_tensor, int threads_per_block_val,
+                                 int softmax_threads_per_block_val) {
+    // the sizes, and each head's stride for the batched products
+    size_t num_heads_val = query_tensor.size(1);
+    size_t seq_len_val = query_tensor.size(2);
+    size_t head_size_val = query_tensor.size(3);
+    size_t heads_in_batch_val = query_tensor.size(0) * num_heads_val;                     // 48 heads
+    size_t rows_val = heads_in_batch_val * seq_len_val;                                   // 49,152 rows
+    size_t total_float4s_val = query_tensor.numel() / VALUES_PER_FLOAT4;
+    size_t head_float4s_val = head_size_val / VALUES_PER_FLOAT4;
+    int seq_len_int_val = (int)seq_len_val;
+    int head_size_int_val = (int)head_size_val;
+    float scale_val = 1.0f / sqrtf((float)head_size_val);
+    long long head_values_val = (long long)seq_len_int_val * head_size_int_val;   // the stride from head to head
+    long long head_weights_val = (long long)seq_len_int_val * seq_len_int_val;
+    int float4_blocks_val = attention_blocks(total_float4s_val, threads_per_block_val, 1);
 
-    // F1: query, key, value, each head's rows next to each other, as the batched products read them
-    attention_split_qkv_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
-                                 ATTENTION_THREADS_PER_BLOCK>>>(
-        query.data_ptr<Value>(), key.data_ptr<Value>(), value.data_ptr<Value>(), qkv.data_ptr<Value>(), total_float4s,
-        num_heads, seq_len, head_float4s);
+    // F1: query, key, value, each head's rows together
+    attention_split_qkv_kernel<<<float4_blocks_val, threads_per_block_val>>>(
+        query_tensor.data_ptr<Value>(), key_tensor.data_ptr<Value>(), value_tensor.data_ptr<Value>(),
+        qkv_tensor.data_ptr<Value>(), total_float4s_val, num_heads_val, seq_len_val, head_float4s_val);
     cudaCheck(cudaGetLastError());
 
-    // F2: scores = scale · query · keyᵀ, {T, T} per head, into weights. cuBLAS reads by columns (see
-    // linear_cublas.cuh), so it is asked for scoresᵀ = key · queryᵀ: key's memory, read by columns, is keyᵀ
-    // {d, T}, turned round (OP_T) it is key {T, d}; query's memory read by columns is queryᵀ {d, T}, as is.
-    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, scale, key, d, head_values, query, d, head_values, weights,
-                      T, head_weights, (int)heads_in_batch);
+    // F2: scores = scale · query · keyᵀ into weights; cuBLAS reads by columns, so asked for scoresᵀ = key · queryᵀ
+    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, seq_len_int_val, seq_len_int_val, head_size_int_val, scale_val,
+                      key_tensor, head_size_int_val, head_values_val, query_tensor, head_size_int_val, head_values_val,
+                      weights_tensor, seq_len_int_val, head_weights_val, (int)heads_in_batch_val);
 
-    // F3, F4: the mask and the softmax, in place: weights holds the scores before, the weights after
-    attention_softmax_forward_kernel<<<attention_blocks(rows, ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK, 32),
-                                       ATTENTION_SOFTMAX_FORWARD_THREADS_PER_BLOCK>>>(weights.data_ptr<Value>(), rows,
-                                                                                     seq_len);
+    // F3, F4: the mask and the softmax, in place, one warp per row
+    attention_softmax_forward_kernel<<<attention_blocks(rows_val, softmax_threads_per_block_val, THREADS_PER_WARP),
+                                       softmax_threads_per_block_val>>>(weights_tensor.data_ptr<Value>(), rows_val,
+                                                                        seq_len_val);
     cudaCheck(cudaGetLastError());
 
-    // F5: head_outputs = weights · value, {T, d} per head; asked for as head_outputsᵀ = valueᵀ · weightsᵀ,
-    // which are value's and weights' memory read by columns, both as is.
-    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, 1.0f, value, d, head_values, weights, T, head_weights,
-                      head_outputs, d, head_values, (int)heads_in_batch);
+    // F5: head_outputs = weights · value, asked for as head_outputsᵀ = valueᵀ · weightsᵀ
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, head_size_int_val, seq_len_int_val, seq_len_int_val, 1.0f, value_tensor,
+                      head_size_int_val, head_values_val, weights_tensor, seq_len_int_val, head_weights_val,
+                      head_outputs_tensor, head_size_int_val, head_values_val, (int)heads_in_batch_val);
 
-    // F6: the heads side by side again, one row of embed_dim per token
-    attention_merge_heads_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
-                                   ATTENTION_THREADS_PER_BLOCK>>>(
-        output.data_ptr<Value>(), head_outputs.data_ptr<Value>(), total_float4s, num_heads, seq_len, head_float4s);
+    // F6: the heads side by side again
+    attention_merge_heads_kernel<<<float4_blocks_val, threads_per_block_val>>>(
+        output_tensor.data_ptr<Value>(), head_outputs_tensor.data_ptr<Value>(), total_float4s_val, num_heads_val,
+        seq_len_val, head_float4s_val);
     cudaCheck(cudaGetLastError());
 }
 
-/// F1: copies qkv's three parts into query, key and value, one float4 of each per thread. Float4 n of query
-/// is (batch, head, token, the n-th 4 columns of the head), and the same float4 of qkv's row (batch, token)
-/// is in its query part; key's and value's are embed_dim and 2 embed_dim floats further along that row.
+/// F1: copies qkv's three parts into query, key and value, one float4 of each per thread.
+///
+///   query_ptr, key_ptr, value_ptr   {batch_size, num_heads, seq_len, head_size}, float or bfloat16 (T)
+///   qkv_ptr                         {batch_size, seq_len, 3 · embed_dim}
+///   total_float4s_val               query's values / VALUES_PER_FLOAT4
+///   num_heads_val, seq_len_val      query's shape
+///   head_float4s_val                head_size / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void attention_split_qkv_kernel(T* query, T* key, T* value, const T* qkv, size_t total_float4s,
-                                           size_t num_heads, size_t seq_len, size_t head_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t embed_float4s = num_heads * head_float4s;                       // 768 / 4 = 192
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
-        size_t query_part = attention_merged_index(index, num_heads, seq_len, head_float4s, 3 * embed_float4s);
-        store4(query + 4 * index, load4(qkv + 4 * query_part));
-        store4(key + 4 * index, load4(qkv + 4 * (query_part + embed_float4s)));
-        store4(value + 4 * index, load4(qkv + 4 * (query_part + 2 * embed_float4s)));
+__global__ void attention_split_qkv_kernel(T* query_ptr, T* key_ptr, T* value_ptr, const T* qkv_ptr,
+                                           size_t total_float4s_val, size_t num_heads_val, size_t seq_len_val,
+                                           size_t head_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t embed_float4s_val = num_heads_val * head_float4s_val;           // 768 / 4 = 192
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        // 1. where the query part sits in qkv; key and value follow it, embed_dim apart
+        size_t query_part_val = attention_merged_index(index_val, num_heads_val, seq_len_val, head_float4s_val,
+                                                       3 * embed_float4s_val);
+        // 2. copy all three
+        write4_from_float(query_ptr + VALUES_PER_FLOAT4 * index_val, read4_as_float(qkv_ptr + VALUES_PER_FLOAT4 * query_part_val));
+        write4_from_float(key_ptr + VALUES_PER_FLOAT4 * index_val,
+                          read4_as_float(qkv_ptr + VALUES_PER_FLOAT4 * (query_part_val + embed_float4s_val)));
+        write4_from_float(value_ptr + VALUES_PER_FLOAT4 * index_val,
+                          read4_as_float(qkv_ptr + VALUES_PER_FLOAT4 * (query_part_val + 2 * embed_float4s_val)));
     }
 }
 
-/// F3, F4: turns each row of scores into weights, in place, one warp per row. Row r is token r % seq_len's
-/// row of its head: it may look at columns 0 .. token (F3), and the columns after are set to 0, so F5's
-/// product, which reads the whole row, adds nothing from them.
+/// F3, F4: turns each row of scores into weights in place, one warp per row, with classifier.cuh's online
+/// softmax. Columns after the row's token are set to 0.
 ///
-/// row_max and row_sum come from one read of the row, the online softmax of classifier.cuh: each thread
-/// keeps the largest score it has seen and the sum of exp(score - that largest), over columns
-/// thread_in_warp, + 32, ...; then the 32 pairs are put together with shuffles. A second read writes
-/// exp(score - row_max) / row_sum. Each thread writes only the columns it read.
+///   weights_ptr    the scores before, the weights after, float or bfloat16 (T)
+///   rows_val       batch_size x num_heads x seq_len
+///   seq_len_val    the row length
 template <typename T>
-__global__ void attention_softmax_forward_kernel(T* weights, size_t rows, size_t seq_len) {
-    int thread_in_warp = threadIdx.x % 32;
-    size_t warp_number = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    size_t warps_launched = (size_t)gridDim.x * blockDim.x / 32;
-    for (size_t row = warp_number; row < rows; row += warps_launched) {
-        size_t token = row % seq_len;                    // the query's token: it sees columns 0 .. token
-        T* row_weights = weights + row * seq_len;
+__global__ void attention_softmax_forward_kernel(T* weights_ptr, size_t rows_val, size_t seq_len_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    size_t warp_index_val = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / THREADS_PER_WARP;   // which warp of all launched
+    size_t warps_launched_val = (size_t)gridDim.x * blockDim.x / THREADS_PER_WARP;
+    // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
+    for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
+        size_t token_val = row_index_val % seq_len_val;     // the query's token: it sees columns 0 .. token
+        T* row_weights_ptr = weights_ptr + row_index_val * seq_len_val;
 
         // 1. this thread's (max, sum), over its columns up to token
-        float thread_max = -FLT_MAX, thread_sum = 0.0f;
-        for (size_t column = thread_in_warp; column <= token; column += 32) {
-            float score = to_float(row_weights[column]);
-            float new_max = fmaxf(thread_max, score);
-            thread_sum = thread_sum * expf(thread_max - new_max) + expf(score - new_max);
-            thread_max = new_max;
+        float thread_max_val = -FLT_MAX;
+        float thread_sum_val = 0.0f;
+        for (size_t column_val = lane_index_val; column_val <= token_val; column_val += THREADS_PER_WARP) {
+            float score_val = to_float(row_weights_ptr[column_val]);
+            float new_max_val = fmaxf(thread_max_val, score_val);
+            thread_sum_val = thread_sum_val * expf(thread_max_val - new_max_val) + expf(score_val - new_max_val);
+            thread_max_val = new_max_val;
         }
 
-        // 2. the row's: every thread adds the part of the thread `offset` away, 16, 8, 4, 2, 1; a thread with
-        //    no columns (token < 31) brings (-FLT_MAX, 0), which adds 0
-        float row_max = thread_max, row_sum = thread_sum;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float other_max = __shfl_xor_sync(0xffffffff, row_max, offset);
-            float other_sum = __shfl_xor_sync(0xffffffff, row_sum, offset);
-            float new_max = fmaxf(row_max, other_max);   // each sum moved onto the larger max, then added
-            row_sum = row_sum * expf(row_max - new_max) + other_sum * expf(other_max - new_max);
-            row_max = new_max;
+        // 2. the row's: log2(THREADS_PER_WARP) swaps; a thread with no columns brings (-FLT_MAX, 0), which adds 0
+        float row_max_val = thread_max_val;
+        float row_sum_val = thread_sum_val;
+        for (int offset_val = THREADS_PER_WARP / 2; offset_val > 0; offset_val /= 2) {
+            float other_max_val = __shfl_xor_sync(WARP_ALL_LANES, row_max_val, offset_val);
+            float other_sum_val = __shfl_xor_sync(WARP_ALL_LANES, row_sum_val, offset_val);
+            float new_max_val = fmaxf(row_max_val, other_max_val);
+            row_sum_val = row_sum_val * expf(row_max_val - new_max_val) + other_sum_val * expf(other_max_val - new_max_val);
+            row_max_val = new_max_val;
         }
 
-        // 3. the weights: F4 for the columns it sees, 0 for the ones after (F3)
-        float one_over_row_sum = 1.0f / row_sum;
-        for (size_t column = thread_in_warp; column < seq_len; column += 32)
-            row_weights[column] = from_float<T>(
-                column <= token ? expf(to_float(row_weights[column]) - row_max) * one_over_row_sum : 0.0f);
+        // 3. the weights, 0 after the token
+        float one_over_row_sum_val = 1.0f / row_sum_val;
+        for (size_t column_val = lane_index_val; column_val < seq_len_val; column_val += THREADS_PER_WARP)
+            row_weights_ptr[column_val] = from_float<T>(
+                column_val <= token_val ? expf(to_float(row_weights_ptr[column_val]) - row_max_val) * one_over_row_sum_val
+                                        : 0.0f);
     }
 }
 
-/// F6: copies head_outputs into output, one float4 per thread: float4 n of head_outputs (batch, head, token,
-/// columns) goes to row (batch, token) of output, at the head's place in it.
+/// F6: copies head_outputs into output, one float4 per thread, each head at its place in the row.
+///
+///   output_ptr                   {batch_size, seq_len, embed_dim}, float or bfloat16 (T)
+///   head_outputs_ptr             {batch_size, num_heads, seq_len, head_size}
+///   total_float4s_val            head_outputs' values / VALUES_PER_FLOAT4
+///   num_heads_val, seq_len_val   head_outputs' shape
+///   head_float4s_val             head_size / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void attention_merge_heads_kernel(T* output, const T* head_outputs, size_t total_float4s,
-                                             size_t num_heads, size_t seq_len, size_t head_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t embed_float4s = num_heads * head_float4s;
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x)
-        store4(output + 4 * attention_merged_index(index, num_heads, seq_len, head_float4s, embed_float4s),
-               load4(head_outputs + 4 * index));
+__global__ void attention_merge_heads_kernel(T* output_ptr, const T* head_outputs_ptr, size_t total_float4s_val,
+                                             size_t num_heads_val, size_t seq_len_val, size_t head_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t embed_float4s_val = num_heads_val * head_float4s_val;
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x)
+        write4_from_float(output_ptr + VALUES_PER_FLOAT4 * attention_merged_index(index_val, num_heads_val, seq_len_val,
+                                                                                  head_float4s_val, embed_float4s_val),
+                          read4_as_float(head_outputs_ptr + VALUES_PER_FLOAT4 * index_val));
 }
 
 // ── backward ──────────────────────────────────────────────────────────────────
 
-// What attention_backward calls, declared here so it can call them; their code follows it.
 template <typename Value>
-void attention_backward_in(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query, const Tensor& key,
-                           const Tensor& value, const Tensor& weights, const Tensor& head_outputs_grad,
-                           const Tensor& weights_grad, const Tensor& query_grad, const Tensor& key_grad,
-                           const Tensor& value_grad);
+void attention_backward_in(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor, const Tensor& query_tensor,
+                           const Tensor& key_tensor, const Tensor& value_tensor, const Tensor& weights_tensor,
+                           const Tensor& head_outputs_grad_tensor, const Tensor& weights_grad_tensor,
+                           const Tensor& query_grad_tensor, const Tensor& key_grad_tensor,
+                           const Tensor& value_grad_tensor, int threads_per_block_val, int softmax_threads_per_block_val);
 template <typename T>
-__global__ void attention_split_heads_kernel(T* head_outputs_grad, const T* output_grad, size_t total_float4s,
-                                             size_t num_heads, size_t seq_len, size_t head_float4s);
+__global__ void attention_split_heads_kernel(T* head_outputs_grad_ptr, const T* output_grad_ptr, size_t total_float4s_val,
+                                             size_t num_heads_val, size_t seq_len_val, size_t head_float4s_val);
 template <typename T>
-__global__ void attention_softmax_backward_kernel(T* weights_grad, const T* weights, size_t rows, size_t seq_len);
+__global__ void attention_softmax_backward_kernel(T* weights_grad_ptr, const T* weights_ptr, size_t rows_val,
+                                                  size_t seq_len_val);
 template <typename T>
-__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad, const T* query_grad, const T* key_grad,
-                                                const T* value_grad, size_t total_float4s, size_t num_heads,
-                                                size_t seq_len, size_t head_float4s);
+__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad_ptr, const T* query_grad_ptr, const T* key_grad_ptr,
+                                                const T* value_grad_ptr, size_t total_float4s_val, size_t num_heads_val,
+                                                size_t seq_len_val, size_t head_float4s_val);
 
-/// Writes qkv_grad, the gradient of the qkv linear's output, from output_grad and what the forward kept:
-/// query, key, value and weights. qkv_grad is written over: qkv is read by the attention alone. The other
-/// five are scratch, with the shapes of the head comment; weights_grad holds da after B2 and ds after B6.
-/// The nine steps:
+/// Writes qkv_grad (written over): checks, then runs B1..B9.
 ///
-///     step       how                                   what
-///     B1         attention_split_heads_kernel          head_outputs_grad, output_grad cut into heads
-///     B2         cuBLAS, 48 x {T, d} · {d, T}           weights_grad = head_outputs_grad · valueᵀ
-///     B3         cuBLAS, 48 x {T, T}ᵀ · {T, d}          value_grad = weightsᵀ · head_outputs_grad
-///     B4-B6      attention_softmax_backward_kernel     weights_grad becomes scores_grad, in place: C1
-///     B7         cuBLAS, 48 x {T, T} · {T, d}           query_grad = scores_grad · key / sqrt(d)
-///     B8         cuBLAS, 48 x {T, T}ᵀ · {T, d}          key_grad = scores_gradᵀ · query / sqrt(d)
-///     B9         attention_merge_qkv_grad_kernel       qkv_grad, the three put back together
-inline void attention_backward(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query, const Tensor& key,
-                               const Tensor& value, const Tensor& weights, const Tensor& head_outputs_grad,
-                               const Tensor& weights_grad, const Tensor& query_grad, const Tensor& key_grad,
-                               const Tensor& value_grad) {
-    attention_check_shapes(output_grad, query, key, value, weights, head_outputs_grad, qkv_grad);
-    attention_check_shapes(output_grad, query_grad, key_grad, value_grad, weights_grad, head_outputs_grad, qkv_grad);
-    if (qkv_grad.dtype() == DType::BFloat16)
-        attention_backward_in<nv_bfloat16>(qkv_grad, output_grad, query, key, value, weights, head_outputs_grad,
-                                           weights_grad, query_grad, key_grad, value_grad);
+///   qkv_grad_tensor                     {batch_size, seq_len, 3 · embed_dim}: the result
+///   output_grad_tensor                  {batch_size, seq_len, embed_dim}: the gradient from the output linear
+///   query_tensor, key_tensor,
+///   value_tensor, weights_tensor        the forward's
+///   head_outputs_grad_tensor            as query: scratch
+///   weights_grad_tensor                 as weights: scratch, weights_grad after B2, scores_grad after B6
+///   query_grad_tensor, key_grad_tensor,
+///   value_grad_tensor                   as query: scratch
+///   threads_per_block_val               B1 and B9's block size: whole warps, at most MAX_THREADS_PER_BLOCK; not
+///                                       given: ATTENTION_THREADS_PER_BLOCK
+///   softmax_threads_per_block_val       B4-B6's: the same; not given: ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK.
+///                                       Any sizes give the same bits; only the time changes.
+inline void attention_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor, const Tensor& query_tensor,
+                               const Tensor& key_tensor, const Tensor& value_tensor, const Tensor& weights_tensor,
+                               const Tensor& head_outputs_grad_tensor, const Tensor& weights_grad_tensor,
+                               const Tensor& query_grad_tensor, const Tensor& key_grad_tensor,
+                               const Tensor& value_grad_tensor, int threads_per_block_val,
+                               int softmax_threads_per_block_val) {
+    // 1. check the launches and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "attention");
+    check_threads_per_block(softmax_threads_per_block_val, "attention's softmax");
+    attention_check_shapes(output_grad_tensor, query_tensor, key_tensor, value_tensor, weights_tensor,
+                           head_outputs_grad_tensor, qkv_grad_tensor);
+    attention_check_shapes(output_grad_tensor, query_grad_tensor, key_grad_tensor, value_grad_tensor,
+                           weights_grad_tensor, head_outputs_grad_tensor, qkv_grad_tensor);
+    // 2. B1..B9 in the tensors' type
+    if (qkv_grad_tensor.dtype() == DType::BFloat16)
+        attention_backward_in<nv_bfloat16>(qkv_grad_tensor, output_grad_tensor, query_tensor, key_tensor, value_tensor,
+                                           weights_tensor, head_outputs_grad_tensor, weights_grad_tensor,
+                                           query_grad_tensor, key_grad_tensor, value_grad_tensor, threads_per_block_val,
+                                           softmax_threads_per_block_val);
     else
-        attention_backward_in<float>(qkv_grad, output_grad, query, key, value, weights, head_outputs_grad,
-                                     weights_grad, query_grad, key_grad, value_grad);
+        attention_backward_in<float>(qkv_grad_tensor, output_grad_tensor, query_tensor, key_tensor, value_tensor,
+                                     weights_tensor, head_outputs_grad_tensor, weights_grad_tensor, query_grad_tensor,
+                                     key_grad_tensor, value_grad_tensor, threads_per_block_val,
+                                     softmax_threads_per_block_val);
 }
 
-/// attention_backward's nine steps, the tensors' values being Value: float or nv_bfloat16. The tensors are
-/// already checked.
+/// Runs attention_backward's nine steps on checked tensors.
+///
+///   Value        float or nv_bfloat16
+///   the others   as in attention_backward
 template <typename Value>
-inline void attention_backward_in(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& query,
-                                  const Tensor& key, const Tensor& value, const Tensor& weights,
-                                  const Tensor& head_outputs_grad, const Tensor& weights_grad,
-                                  const Tensor& query_grad, const Tensor& key_grad, const Tensor& value_grad) {
-    size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
-    size_t heads_in_batch = query.size(0) * num_heads, rows = heads_in_batch * seq_len;
-    size_t total_float4s = query.numel() / 4, head_float4s = head_size / 4;
-    int T = (int)seq_len, d = (int)head_size;
-    float scale = 1.0f / sqrtf((float)head_size);
-    long long head_values = (long long)T * d, head_weights = (long long)T * T;   // the stride from head to head
+inline void attention_backward_in(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
+                                  const Tensor& query_tensor, const Tensor& key_tensor, const Tensor& value_tensor,
+                                  const Tensor& weights_tensor, const Tensor& head_outputs_grad_tensor,
+                                  const Tensor& weights_grad_tensor, const Tensor& query_grad_tensor,
+                                  const Tensor& key_grad_tensor, const Tensor& value_grad_tensor,
+                                  int threads_per_block_val, int softmax_threads_per_block_val) {
+    // the sizes, and each head's stride for the batched products
+    size_t num_heads_val = query_tensor.size(1);
+    size_t seq_len_val = query_tensor.size(2);
+    size_t head_size_val = query_tensor.size(3);
+    size_t heads_in_batch_val = query_tensor.size(0) * num_heads_val;
+    size_t rows_val = heads_in_batch_val * seq_len_val;
+    size_t total_float4s_val = query_tensor.numel() / VALUES_PER_FLOAT4;
+    size_t head_float4s_val = head_size_val / VALUES_PER_FLOAT4;
+    int seq_len_int_val = (int)seq_len_val;
+    int head_size_int_val = (int)head_size_val;
+    float scale_val = 1.0f / sqrtf((float)head_size_val);
+    long long head_values_val = (long long)seq_len_int_val * head_size_int_val;   // the stride from head to head
+    long long head_weights_val = (long long)seq_len_int_val * seq_len_int_val;
+    int float4_blocks_val = attention_blocks(total_float4s_val, threads_per_block_val, 1);
 
-    // B1: output_grad cut into heads, as F1 cut qkv
-    attention_split_heads_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
-                                   ATTENTION_THREADS_PER_BLOCK>>>(
-        head_outputs_grad.data_ptr<Value>(), output_grad.data_ptr<Value>(), total_float4s, num_heads, seq_len,
-        head_float4s);
+    // B1: output_grad cut into heads
+    attention_split_heads_kernel<<<float4_blocks_val, threads_per_block_val>>>(
+        head_outputs_grad_tensor.data_ptr<Value>(), output_grad_tensor.data_ptr<Value>(), total_float4s_val,
+        num_heads_val, seq_len_val, head_float4s_val);
     cudaCheck(cudaGetLastError());
 
-    // B2: weights_grad = head_outputs_grad · valueᵀ, asked for as its turned-round, value · head_outputs_gradᵀ:
-    // F2's form, value and head_outputs_grad in place of key and query
-    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, T, T, d, 1.0f, value, d, head_values, head_outputs_grad, d,
-                      head_values, weights_grad, T, head_weights, (int)heads_in_batch);
+    // B2: weights_grad = head_outputs_grad · valueᵀ, asked for turned round, as F2
+    attention_product(CUBLAS_OP_T, CUBLAS_OP_N, seq_len_int_val, seq_len_int_val, head_size_int_val, 1.0f, value_tensor,
+                      head_size_int_val, head_values_val, head_outputs_grad_tensor, head_size_int_val, head_values_val,
+                      weights_grad_tensor, seq_len_int_val, head_weights_val, (int)heads_in_batch_val);
 
-    // B3: value_grad = weightsᵀ · head_outputs_grad, asked for as value_gradᵀ = head_outputs_gradᵀ · weights:
-    // head_outputs_grad's memory as is, weights' turned round
-    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, 1.0f, head_outputs_grad, d, head_values, weights, T,
-                      head_weights, value_grad, d, head_values, (int)heads_in_batch);
+    // B3: value_grad = weightsᵀ · head_outputs_grad, asked for as value_gradᵀ = head_outputs_gradᵀ · weights
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, head_size_int_val, seq_len_int_val, seq_len_int_val, 1.0f,
+                      head_outputs_grad_tensor, head_size_int_val, head_values_val, weights_tensor, seq_len_int_val,
+                      head_weights_val, value_grad_tensor, head_size_int_val, head_values_val, (int)heads_in_batch_val);
 
-    // B4-B6: the softmax's backward, in place: weights_grad holds da before, ds after
-    attention_softmax_backward_kernel<<<attention_blocks(rows, ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK, 32),
-                                        ATTENTION_SOFTMAX_BACKWARD_THREADS_PER_BLOCK>>>(
-        weights_grad.data_ptr<Value>(), weights.data_ptr<Value>(), rows, seq_len);
+    // B4-B6: the softmax's backward, in place, one warp per row
+    attention_softmax_backward_kernel<<<attention_blocks(rows_val, softmax_threads_per_block_val, THREADS_PER_WARP),
+                                        softmax_threads_per_block_val>>>(
+        weights_grad_tensor.data_ptr<Value>(), weights_tensor.data_ptr<Value>(), rows_val, seq_len_val);
     cudaCheck(cudaGetLastError());
 
-    // B7: query_grad = scale · scores_grad · key, asked for as query_gradᵀ = keyᵀ · scores_gradᵀ, both as is
-    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, d, T, T, scale, key, d, head_values, weights_grad, T, head_weights,
-                      query_grad, d, head_values, (int)heads_in_batch);
+    // B7: query_grad = scale · scores_grad · key, asked for as query_gradᵀ = keyᵀ · scores_gradᵀ
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_N, head_size_int_val, seq_len_int_val, seq_len_int_val, scale_val,
+                      key_tensor, head_size_int_val, head_values_val, weights_grad_tensor, seq_len_int_val,
+                      head_weights_val, query_grad_tensor, head_size_int_val, head_values_val, (int)heads_in_batch_val);
 
-    // B8: key_grad = scale · scores_gradᵀ · query, asked for as key_gradᵀ = queryᵀ · scores_grad: query's memory
-    // as is, scores_grad's turned round
-    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, d, T, T, scale, query, d, head_values, weights_grad, T, head_weights,
-                      key_grad, d, head_values, (int)heads_in_batch);
+    // B8: key_grad = scale · scores_gradᵀ · query, asked for as key_gradᵀ = queryᵀ · scores_grad
+    attention_product(CUBLAS_OP_N, CUBLAS_OP_T, head_size_int_val, seq_len_int_val, seq_len_int_val, scale_val,
+                      query_tensor, head_size_int_val, head_values_val, weights_grad_tensor, seq_len_int_val,
+                      head_weights_val, key_grad_tensor, head_size_int_val, head_values_val, (int)heads_in_batch_val);
 
-    // B9: the three gradients put back into qkv_grad's three parts, as F1 took them out
-    attention_merge_qkv_grad_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
-                                      ATTENTION_THREADS_PER_BLOCK>>>(
-        qkv_grad.data_ptr<Value>(), query_grad.data_ptr<Value>(), key_grad.data_ptr<Value>(),
-        value_grad.data_ptr<Value>(), total_float4s, num_heads, seq_len, head_float4s);
+    // B9: the three gradients into qkv_grad's three parts
+    attention_merge_qkv_grad_kernel<<<float4_blocks_val, threads_per_block_val>>>(
+        qkv_grad_tensor.data_ptr<Value>(), query_grad_tensor.data_ptr<Value>(), key_grad_tensor.data_ptr<Value>(),
+        value_grad_tensor.data_ptr<Value>(), total_float4s_val, num_heads_val, seq_len_val, head_float4s_val);
     cudaCheck(cudaGetLastError());
 }
 
 /// B1: copies output_grad into head_outputs_grad, one float4 per thread: F6 the other way round.
+///
+///   head_outputs_grad_ptr        {batch_size, num_heads, seq_len, head_size}, float or bfloat16 (T)
+///   output_grad_ptr              {batch_size, seq_len, embed_dim}
+///   total_float4s_val            head_outputs_grad's values / VALUES_PER_FLOAT4
+///   num_heads_val, seq_len_val   head_outputs_grad's shape
+///   head_float4s_val             head_size / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void attention_split_heads_kernel(T* head_outputs_grad, const T* output_grad, size_t total_float4s,
-                                             size_t num_heads, size_t seq_len, size_t head_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t embed_float4s = num_heads * head_float4s;
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x)
-        store4(head_outputs_grad + 4 * index,
-               load4(output_grad + 4 * attention_merged_index(index, num_heads, seq_len, head_float4s, embed_float4s)));
+__global__ void attention_split_heads_kernel(T* head_outputs_grad_ptr, const T* output_grad_ptr, size_t total_float4s_val,
+                                             size_t num_heads_val, size_t seq_len_val, size_t head_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t embed_float4s_val = num_heads_val * head_float4s_val;
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x)
+        write4_from_float(head_outputs_grad_ptr + VALUES_PER_FLOAT4 * index_val,
+                          read4_as_float(output_grad_ptr + VALUES_PER_FLOAT4 * attention_merged_index(
+                                                               index_val, num_heads_val, seq_len_val, head_float4s_val,
+                                                               embed_float4s_val)));
 }
 
-/// B4-B6: turns each row of weights_grad (da) into scores_grad (ds), in place, one warp per row, as the
-/// forward walks the rows (note C1):
+/// B4-B6: turns each row of weights_grad into scores_grad in place, one warp per row:
+///     scores_grad = weight · (weights_grad - row_dot), 0 after the row's token
 ///
-///     ds[t][j] = a[t][j] * (da[t][j] - row_dot)      row_dot = sum over j <= t of a[t][j] * da[t][j]
-///
-/// for the columns token t sees, and 0 for the ones after: their weights were 0, so are their gradients.
-/// One read for row_dot, added up across the warp with shuffles; a second read writes ds. Each thread writes
-/// only the columns it read.
+///   weights_grad_ptr   weights_grad before, scores_grad after, float or bfloat16 (T)
+///   weights_ptr        the forward's
+///   rows_val           batch_size x num_heads x seq_len
+///   seq_len_val        the row length
 template <typename T>
-__global__ void attention_softmax_backward_kernel(T* weights_grad, const T* weights, size_t rows, size_t seq_len) {
-    int thread_in_warp = threadIdx.x % 32;
-    size_t warp_number = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    size_t warps_launched = (size_t)gridDim.x * blockDim.x / 32;
-    for (size_t row = warp_number; row < rows; row += warps_launched) {
-        size_t token = row % seq_len;
-        T* row_grad = weights_grad + row * seq_len;
-        const T* row_weights = weights + row * seq_len;
+__global__ void attention_softmax_backward_kernel(T* weights_grad_ptr, const T* weights_ptr, size_t rows_val,
+                                                  size_t seq_len_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    size_t warp_index_val = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / THREADS_PER_WARP;   // which warp of all launched
+    size_t warps_launched_val = (size_t)gridDim.x * blockDim.x / THREADS_PER_WARP;
+    // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
+    for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
+        size_t token_val = row_index_val % seq_len_val;
+        T* row_grad_ptr = weights_grad_ptr + row_index_val * seq_len_val;
+        const T* row_weights_ptr = weights_ptr + row_index_val * seq_len_val;
 
         // 1. row_dot: this thread's part, then the warp's
-        float row_dot = 0.0f;
-        for (size_t column = thread_in_warp; column <= token; column += 32)
-            row_dot += to_float(row_weights[column]) * to_float(row_grad[column]);
-        for (int offset = 16; offset > 0; offset /= 2)
-            row_dot += __shfl_xor_sync(0xffffffff, row_dot, offset);
+        float row_dot_val = 0.0f;
+        for (size_t column_val = lane_index_val; column_val <= token_val; column_val += THREADS_PER_WARP)
+            row_dot_val += to_float(row_weights_ptr[column_val]) * to_float(row_grad_ptr[column_val]);
+        row_dot_val = warp_reduce_sum(row_dot_val);
 
-        // 2. ds: C1 for the columns token sees, 0 for the ones after
-        for (size_t column = thread_in_warp; column < seq_len; column += 32)
-            row_grad[column] = from_float<T>(
-                column <= token ? to_float(row_weights[column]) * (to_float(row_grad[column]) - row_dot) : 0.0f);
+        // 2. scores_grad, 0 after the token
+        for (size_t column_val = lane_index_val; column_val < seq_len_val; column_val += THREADS_PER_WARP)
+            row_grad_ptr[column_val] = from_float<T>(
+                column_val <= token_val
+                    ? to_float(row_weights_ptr[column_val]) * (to_float(row_grad_ptr[column_val]) - row_dot_val)
+                    : 0.0f);
     }
 }
 
-/// B9: copies query_grad, key_grad and value_grad into qkv_grad's three parts, one float4 of each per thread:
-/// F1 the other way round.
+/// B9: copies query_grad, key_grad and value_grad into qkv_grad's three parts: F1 the other way round.
+///
+///   qkv_grad_ptr                                      {batch_size, seq_len, 3 · embed_dim}, float or bfloat16 (T)
+///   query_grad_ptr, key_grad_ptr, value_grad_ptr      {batch_size, num_heads, seq_len, head_size}
+///   total_float4s_val                                 query_grad's values / VALUES_PER_FLOAT4
+///   num_heads_val, seq_len_val                        query_grad's shape
+///   head_float4s_val                                  head_size / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad, const T* query_grad, const T* key_grad,
-                                                const T* value_grad, size_t total_float4s, size_t num_heads,
-                                                size_t seq_len, size_t head_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t embed_float4s = num_heads * head_float4s;
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
-        size_t query_part = attention_merged_index(index, num_heads, seq_len, head_float4s, 3 * embed_float4s);
-        store4(qkv_grad + 4 * query_part, load4(query_grad + 4 * index));
-        store4(qkv_grad + 4 * (query_part + embed_float4s), load4(key_grad + 4 * index));
-        store4(qkv_grad + 4 * (query_part + 2 * embed_float4s), load4(value_grad + 4 * index));
+__global__ void attention_merge_qkv_grad_kernel(T* qkv_grad_ptr, const T* query_grad_ptr, const T* key_grad_ptr,
+                                                const T* value_grad_ptr, size_t total_float4s_val, size_t num_heads_val,
+                                                size_t seq_len_val, size_t head_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t embed_float4s_val = num_heads_val * head_float4s_val;
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        // 1. where the query part sits in qkv_grad; key and value follow it, embed_dim apart
+        size_t query_part_val = attention_merged_index(index_val, num_heads_val, seq_len_val, head_float4s_val,
+                                                       3 * embed_float4s_val);
+        // 2. copy all three
+        write4_from_float(qkv_grad_ptr + VALUES_PER_FLOAT4 * query_part_val,
+                          read4_as_float(query_grad_ptr + VALUES_PER_FLOAT4 * index_val));
+        write4_from_float(qkv_grad_ptr + VALUES_PER_FLOAT4 * (query_part_val + embed_float4s_val),
+                          read4_as_float(key_grad_ptr + VALUES_PER_FLOAT4 * index_val));
+        write4_from_float(qkv_grad_ptr + VALUES_PER_FLOAT4 * (query_part_val + 2 * embed_float4s_val),
+                          read4_as_float(value_grad_ptr + VALUES_PER_FLOAT4 * index_val));
     }
 }
 
 // ── flash attention ───────────────────────────────────────────────────────────
 
-// What the two below call, declared here so they can call them; their code follows them.
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_forward_kernel(nv_bfloat16* output, float* logsumexp, const nv_bfloat16* query, const nv_bfloat16* key,
-                               const nv_bfloat16* value, int num_heads, int seq_len, float scale);
-__global__ void attention_flash_row_dot_kernel(float* row_dot, const nv_bfloat16* output_grad,
-                                               const nv_bfloat16* output, int num_heads, int seq_len, size_t rows);
+attention_flash_forward_kernel(nv_bfloat16* output_ptr, float* logsumexp_ptr, const nv_bfloat16* query_ptr,
+                               const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr, int num_heads_val,
+                               int seq_len_val, float scale_val);
+__global__ void attention_flash_row_dot_kernel(float* row_dot_ptr, const nv_bfloat16* output_grad_ptr,
+                                               const nv_bfloat16* output_ptr, int num_heads_val, int seq_len_val,
+                                               size_t rows_val);
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_key_grad_kernel(nv_bfloat16* qkv_grad, const nv_bfloat16* output_grad, const nv_bfloat16* query,
-                                const nv_bfloat16* key, const nv_bfloat16* value, const float* logsumexp,
-                                const float* row_dot, int num_heads, int seq_len, float scale);
+attention_flash_key_grad_kernel(nv_bfloat16* qkv_grad_ptr, const nv_bfloat16* output_grad_ptr, const nv_bfloat16* query_ptr,
+                                const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr, const float* logsumexp_ptr,
+                                const float* row_dot_ptr, int num_heads_val, int seq_len_val, float scale_val);
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_query_grad_kernel(nv_bfloat16* qkv_grad, const nv_bfloat16* output_grad, const nv_bfloat16* query,
-                                  const nv_bfloat16* key, const nv_bfloat16* value, const float* logsumexp,
-                                  const float* row_dot, int num_heads, int seq_len, float scale);
+attention_flash_query_grad_kernel(nv_bfloat16* qkv_grad_ptr, const nv_bfloat16* output_grad_ptr,
+                                  const nv_bfloat16* query_ptr, const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr,
+                                  const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
+                                  int seq_len_val, float scale_val);
 
-/// Tells if flash attention can run these tensors here: bfloat16, head_size 64, seq_len a multiple of 64, and
-/// a GPU of compute capability 8.0 or more (its bfloat16 tensor-core instruction). The GPU is asked once.
-inline bool attention_flash_fits(DType dtype, size_t seq_len, size_t head_size) {
-    static int major = [] {
-        int device = 0, value = 0;
-        cudaCheck(cudaGetDevice(&device));
-        cudaCheck(cudaDeviceGetAttribute(&value, cudaDevAttrComputeCapabilityMajor, device));
-        return value;
+/// Tells if flash attention can run here: bfloat16, head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE,
+/// sm_80 or later.
+///
+///   dtype_val, seq_len_val, head_size_val   the tensors'
+inline bool attention_flash_fits(DType dtype_val, size_t seq_len_val, size_t head_size_val) {
+    static int major_val = [] {
+        int device_val = 0;
+        int value_val = 0;
+        cudaCheck(cudaGetDevice(&device_val));
+        cudaCheck(cudaDeviceGetAttribute(&value_val, cudaDevAttrComputeCapabilityMajor, device_val));
+        return value_val;
     }();
-    return dtype == DType::BFloat16 && head_size == FLASH_HEAD_SIZE && seq_len % FLASH_TILE == 0 && major >= 8;
+    return dtype_val == DType::BFloat16 && head_size_val == FLASH_HEAD_SIZE && seq_len_val % FLASH_TILE == 0 &&
+           major_val >= 8;
 }
 
-/// Writes output = causal self-attention of qkv, as attention_forward, but by flash attention: F1 splits qkv
-/// into query, key and value (kept for the backward, as there), then one kernel does F2 .. F6 a tile at a time
-/// and keeps logsumexp {batch_size, num_heads, seq_len} (float) in place of the weights. One block per 64
-/// queries of a head: {4, 1024} tokens, 12 heads: 16 x 48 = 768 blocks of 128 threads.
-inline void attention_flash_forward(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                                    const Tensor& logsumexp, const Tensor& qkv) {
-    attention_flash_check_shapes(output, query, key, value, logsumexp, qkv);
-    size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
-    size_t total_float4s = query.numel() / 4, head_float4s = head_size / 4;
-    attention_split_qkv_kernel<<<attention_blocks(total_float4s, ATTENTION_THREADS_PER_BLOCK, 1),
-                                 ATTENTION_THREADS_PER_BLOCK>>>(
-        query.data_ptr<nv_bfloat16>(), key.data_ptr<nv_bfloat16>(), value.data_ptr<nv_bfloat16>(),
-        qkv.data_ptr<nv_bfloat16>(), total_float4s, num_heads, seq_len, head_float4s);
+/// Writes output as attention_forward, by flash attention: F1, then one kernel for F2..F6, one block per
+/// FLASH_TILE queries of a head.
+///
+///   output_tensor, query_tensor, key_tensor,
+///   value_tensor, qkv_tensor               as in attention_forward, bfloat16
+///   logsumexp_tensor                       {batch_size, num_heads, seq_len} float: kept in place of the weights
+///   threads_per_block_val                  F1's block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///                                          ATTENTION_THREADS_PER_BLOCK. The tile kernel's is always FLASH_THREADS.
+inline void attention_flash_forward(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                    const Tensor& value_tensor, const Tensor& logsumexp_tensor, const Tensor& qkv_tensor,
+                                    int threads_per_block_val) {
+    // 1. check the launch and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "flash attention");
+    attention_flash_check_shapes(output_tensor, query_tensor, key_tensor, value_tensor, logsumexp_tensor, qkv_tensor);
+    size_t num_heads_val = query_tensor.size(1);
+    size_t seq_len_val = query_tensor.size(2);
+    size_t head_size_val = query_tensor.size(3);
+    size_t total_float4s_val = query_tensor.numel() / VALUES_PER_FLOAT4;
+    size_t head_float4s_val = head_size_val / VALUES_PER_FLOAT4;
+    // 2. F1: query, key, value, each head's rows together
+    attention_split_qkv_kernel<<<attention_blocks(total_float4s_val, threads_per_block_val, 1), threads_per_block_val>>>(
+        query_tensor.data_ptr<nv_bfloat16>(), key_tensor.data_ptr<nv_bfloat16>(), value_tensor.data_ptr<nv_bfloat16>(),
+        qkv_tensor.data_ptr<nv_bfloat16>(), total_float4s_val, num_heads_val, seq_len_val, head_float4s_val);
     cudaCheck(cudaGetLastError());
-    dim3 grid((unsigned)(seq_len / FLASH_TILE), (unsigned)(query.size(0) * num_heads));
-    attention_flash_forward_kernel<<<grid, FLASH_THREADS>>>(
-        output.data_ptr<nv_bfloat16>(), logsumexp.data(), query.data_ptr<nv_bfloat16>(), key.data_ptr<nv_bfloat16>(),
-        value.data_ptr<nv_bfloat16>(), (int)num_heads, (int)seq_len, 1.0f / sqrtf((float)head_size));
-    cudaCheck(cudaGetLastError());
-}
-
-/// Writes qkv_grad, as attention_backward, by flash attention, from output_grad and what the forward kept:
-/// output (the merged heads), query, key, value and logsumexp. row_dot {batch_size, num_heads, seq_len} (float)
-/// is scratch. Three kernels: row_dot (one warp per row), then key_grad and value_grad (one block per 64 keys),
-/// then query_grad (one block per 64 queries), each writing its part of qkv_grad over what was there.
-inline void attention_flash_backward(const Tensor& qkv_grad, const Tensor& output_grad, const Tensor& output,
-                                     const Tensor& query, const Tensor& key, const Tensor& value,
-                                     const Tensor& logsumexp, const Tensor& row_dot) {
-    attention_flash_check_shapes(output_grad, query, key, value, logsumexp, qkv_grad);
-    attention_flash_check_shapes(output, query, key, value, row_dot, qkv_grad);
-    size_t num_heads = query.size(1), seq_len = query.size(2), head_size = query.size(3);
-    size_t rows = query.size(0) * num_heads * seq_len;                  // 49,152 for {4, 12, 1024}
-    float scale = 1.0f / sqrtf((float)head_size);
-    attention_flash_row_dot_kernel<<<attention_blocks(rows, 256, 32), 256>>>(
-        row_dot.data(), output_grad.data_ptr<nv_bfloat16>(), output.data_ptr<nv_bfloat16>(), (int)num_heads,
-        (int)seq_len, rows);
-    cudaCheck(cudaGetLastError());
-    dim3 grid((unsigned)(seq_len / FLASH_TILE), (unsigned)(query.size(0) * num_heads));
-    attention_flash_key_grad_kernel<<<grid, FLASH_THREADS>>>(
-        qkv_grad.data_ptr<nv_bfloat16>(), output_grad.data_ptr<nv_bfloat16>(), query.data_ptr<nv_bfloat16>(),
-        key.data_ptr<nv_bfloat16>(), value.data_ptr<nv_bfloat16>(), logsumexp.data(), row_dot.data(),
-        (int)num_heads, (int)seq_len, scale);
-    cudaCheck(cudaGetLastError());
-    attention_flash_query_grad_kernel<<<grid, FLASH_THREADS>>>(
-        qkv_grad.data_ptr<nv_bfloat16>(), output_grad.data_ptr<nv_bfloat16>(), query.data_ptr<nv_bfloat16>(),
-        key.data_ptr<nv_bfloat16>(), value.data_ptr<nv_bfloat16>(), logsumexp.data(), row_dot.data(),
-        (int)num_heads, (int)seq_len, scale);
+    // 3. F2..F6: one block per FLASH_TILE queries of each head
+    dim3 grid_val((unsigned)(seq_len_val / FLASH_TILE), (unsigned)(query_tensor.size(0) * num_heads_val));
+    attention_flash_forward_kernel<<<grid_val, FLASH_THREADS>>>(
+        output_tensor.data_ptr<nv_bfloat16>(), logsumexp_tensor.data(), query_tensor.data_ptr<nv_bfloat16>(),
+        key_tensor.data_ptr<nv_bfloat16>(), value_tensor.data_ptr<nv_bfloat16>(), (int)num_heads_val, (int)seq_len_val,
+        1.0f / sqrtf((float)head_size_val));
     cudaCheck(cudaGetLastError());
 }
 
-// The tensor-core instruction and the moves around it. mma.sync m16n8k16 multiplies a {16, 16} tile A by a
-// {16, 8} tile B and adds the {16, 8} product onto C, the 32 threads of a warp each holding a part of every
-// tile. Thread `lane` holds, with group = lane / 4 and pair = 2 (lane % 4):
-//
+/// Writes qkv_grad as attention_backward, by flash attention: row_dot (one warp per row), then key_grad and
+/// value_grad (one block per FLASH_TILE keys), then query_grad (one block per FLASH_TILE queries).
+///
+///   qkv_grad_tensor                       the result, written over
+///   output_grad_tensor                    the gradient from the output linear
+///   output_tensor, query_tensor, key_tensor,
+///   value_tensor, logsumexp_tensor        the forward's
+///   row_dot_tensor                        {batch_size, num_heads, seq_len} float: scratch
+///   threads_per_block_val                 row_dot's block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///                                         ATTENTION_ROW_DOT_THREADS_PER_BLOCK. The tile kernels' is always FLASH_THREADS.
+inline void attention_flash_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
+                                     const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                     const Tensor& value_tensor, const Tensor& logsumexp_tensor,
+                                     const Tensor& row_dot_tensor, int threads_per_block_val) {
+    // 1. check the launch and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "flash attention");
+    attention_flash_check_shapes(output_grad_tensor, query_tensor, key_tensor, value_tensor, logsumexp_tensor, qkv_grad_tensor);
+    attention_flash_check_shapes(output_tensor, query_tensor, key_tensor, value_tensor, row_dot_tensor, qkv_grad_tensor);
+    size_t num_heads_val = query_tensor.size(1);
+    size_t seq_len_val = query_tensor.size(2);
+    size_t head_size_val = query_tensor.size(3);
+    size_t rows_val = query_tensor.size(0) * num_heads_val * seq_len_val;     // 49,152 for {4, 12, 1024}
+    float scale_val = 1.0f / sqrtf((float)head_size_val);
+    // 2. row_dot, one warp per row
+    attention_flash_row_dot_kernel<<<attention_blocks(rows_val, threads_per_block_val, THREADS_PER_WARP),
+                                     threads_per_block_val>>>(
+        row_dot_tensor.data(), output_grad_tensor.data_ptr<nv_bfloat16>(), output_tensor.data_ptr<nv_bfloat16>(),
+        (int)num_heads_val, (int)seq_len_val, rows_val);
+    cudaCheck(cudaGetLastError());
+    // 3. key_grad and value_grad, then query_grad: one block per tile of each head
+    dim3 grid_val((unsigned)(seq_len_val / FLASH_TILE), (unsigned)(query_tensor.size(0) * num_heads_val));
+    attention_flash_key_grad_kernel<<<grid_val, FLASH_THREADS>>>(
+        qkv_grad_tensor.data_ptr<nv_bfloat16>(), output_grad_tensor.data_ptr<nv_bfloat16>(),
+        query_tensor.data_ptr<nv_bfloat16>(), key_tensor.data_ptr<nv_bfloat16>(), value_tensor.data_ptr<nv_bfloat16>(),
+        logsumexp_tensor.data(), row_dot_tensor.data(), (int)num_heads_val, (int)seq_len_val, scale_val);
+    cudaCheck(cudaGetLastError());
+    attention_flash_query_grad_kernel<<<grid_val, FLASH_THREADS>>>(
+        qkv_grad_tensor.data_ptr<nv_bfloat16>(), output_grad_tensor.data_ptr<nv_bfloat16>(),
+        query_tensor.data_ptr<nv_bfloat16>(), key_tensor.data_ptr<nv_bfloat16>(), value_tensor.data_ptr<nv_bfloat16>(),
+        logsumexp_tensor.data(), row_dot_tensor.data(), (int)num_heads_val, (int)seq_len_val, scale_val);
+    cudaCheck(cudaGetLastError());
+}
+
+// mma.sync m16n8k16: C {16, 8} += A {16, 16} · B {16, 8}, each of a warp's 32 threads holding a part of
+// every tile. The layout is the instruction's own, fixed for 32 lanes. Thread `lane`, with
+// group = lane / FLASH_GROUP_LANES and pair = 2 (lane % FLASH_GROUP_LANES), holds:
 //     A (bfloat16)   4 registers of 2 values: (group, pair .. pair+1), (group+8, ..), (group, pair+8 ..), (group+8, pair+8 ..)
 //     B (bfloat16)   2 registers of 2 values: rows (pair .. pair+1, column group), rows (pair+8 .. pair+9, column group)
 //     C (float)      4 values: (group, pair), (group, pair+1), (group+8, pair), (group+8, pair+1)
-//
-// A C tile two of which sit side by side (columns 0-7 and 8-15) holds exactly the values an A tile wants of
-// the same 16 columns: so the scores, once turned into weights, go into the next product without a move.
+// Two C tiles side by side hold exactly an A tile's values: weights go into the next product with no move.
 
-/// C += A · B on the tensor cores, one {16, 16} · {16, 8} step for the whole warp (see above).
-__device__ __forceinline__ void flash_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+/// C += A · B on the tensor cores, for the whole warp.
+///
+///   c_ptr              this thread's FLASH_C_VALUES floats of C
+///   a_ptr              this thread's FLASH_A_REGISTERS registers of A
+///   b0_val, b1_val     this thread's FLASH_B_REGISTERS registers of B
+__device__ __forceinline__ void flash_mma(float* c_ptr, const uint32_t* a_ptr, uint32_t b0_val, uint32_t b1_val) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                 : "+f"(c_ptr[0]), "+f"(c_ptr[1]), "+f"(c_ptr[2]), "+f"(c_ptr[3])
+                 : "r"(a_ptr[0]), "r"(a_ptr[1]), "r"(a_ptr[2]), "r"(a_ptr[3]), "r"(b0_val), "r"(b1_val));
 #endif
 }
 
-/// Two floats as one register of two bfloat16s, the first in the low half: an A or B register.
-__device__ __forceinline__ uint32_t flash_pack(float low, float high) {
-    nv_bfloat162 both = __floats2bfloat162_rn(low, high);
-    return *reinterpret_cast<uint32_t*>(&both);
+/// Gives two floats as one register of two bfloat16s, rounded: an A or B register.
+///
+///   low_val, high_val   the first goes in the low half
+__device__ __forceinline__ uint32_t flash_pack(float low_val, float high_val) {
+    nv_bfloat162 both_val = __floats2bfloat162_rn(low_val, high_val);
+    return *reinterpret_cast<uint32_t*>(&both_val);
 }
 
-/// Two bfloat16s from shared memory as one register, the first in the low half.
-__device__ __forceinline__ uint32_t flash_pack(nv_bfloat16 low, nv_bfloat16 high) {
-    return (uint32_t)__bfloat16_as_ushort(low) | ((uint32_t)__bfloat16_as_ushort(high) << 16);
+/// Gives two bfloat16s as one register.
+///
+///   low_val, high_val   the first goes in the low half
+__device__ __forceinline__ uint32_t flash_pack(nv_bfloat16 low_val, nv_bfloat16 high_val) {
+    return (uint32_t)__bfloat16_as_ushort(low_val) | ((uint32_t)__bfloat16_as_ushort(high_val) << 16);
 }
 
-/// Copies a {64, 64} tile into shared memory, rows FLASH_TILE_STRIDE apart: 64 rows of `source`, each
-/// `row_stride` values after the last (64 for query, key, value; embed_dim for output and output_grad, whose
-/// rows hold every head). 8 values (16 bytes) per load, 4 loads per thread.
-__device__ __forceinline__ void flash_load_tile(nv_bfloat16* tile, const nv_bfloat16* source, size_t row_stride) {
-    for (int piece = threadIdx.x; piece < FLASH_TILE * FLASH_HEAD_SIZE / 8; piece += FLASH_THREADS) {
-        int row = piece / 8, column = (piece % 8) * 8;
-        *reinterpret_cast<uint4*>(tile + row * FLASH_TILE_STRIDE + column) =
-            *reinterpret_cast<const uint4*>(source + row * row_stride + column);
+/// Copies a {FLASH_TILE, FLASH_HEAD_SIZE} tile into shared memory, 16 bytes per load.
+///
+///   tile_ptr         shared memory, rows FLASH_TILE_STRIDE apart
+///   source_ptr       the tile's first value in GPU memory
+///   row_stride_val   values from row to row: FLASH_HEAD_SIZE for query, key, value; embed_dim for output and
+///                    output_grad
+__device__ __forceinline__ void flash_load_tile(nv_bfloat16* tile_ptr, const nv_bfloat16* source_ptr, size_t row_stride_val) {
+    const int loads_per_row_val = FLASH_HEAD_SIZE / FLASH_LOAD_VALUES;
+    for (int piece_val = threadIdx.x; piece_val < FLASH_TILE * loads_per_row_val; piece_val += FLASH_THREADS) {
+        int row_val = piece_val / loads_per_row_val;
+        int column_val = (piece_val % loads_per_row_val) * FLASH_LOAD_VALUES;
+        *reinterpret_cast<uint4*>(tile_ptr + row_val * FLASH_TILE_STRIDE + column_val) =
+            *reinterpret_cast<const uint4*>(source_ptr + row_val * row_stride_val + column_val);
     }
 }
 
-/// Reads this warp's A tile from a tile in shared memory: rows first_row .. + 15, columns first_column .. + 15.
-__device__ __forceinline__ void flash_load_a(uint32_t* a, const nv_bfloat16* tile, int first_row, int first_column) {
-    int lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    const nv_bfloat16* top = tile + (first_row + group) * FLASH_TILE_STRIDE + first_column + pair;
-    const nv_bfloat16* bottom = top + 8 * FLASH_TILE_STRIDE;
-    a[0] = *reinterpret_cast<const uint32_t*>(top);
-    a[1] = *reinterpret_cast<const uint32_t*>(bottom);
-    a[2] = *reinterpret_cast<const uint32_t*>(top + 8);
-    a[3] = *reinterpret_cast<const uint32_t*>(bottom + 8);
+/// Reads this warp's A tile from shared memory.
+///
+///   a_ptr                              this thread's FLASH_A_REGISTERS registers
+///   tile_ptr                           the tile in shared memory
+///   first_row_val, first_column_val    the A tile's {FLASH_MMA_M, FLASH_MMA_K} corner
+__device__ __forceinline__ void flash_load_a(uint32_t* a_ptr, const nv_bfloat16* tile_ptr, int first_row_val,
+                                             int first_column_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    const nv_bfloat16* top_ptr = tile_ptr + (first_row_val + group_val) * FLASH_TILE_STRIDE + first_column_val + pair_val;
+    const nv_bfloat16* bottom_ptr = top_ptr + (FLASH_MMA_M / 2) * FLASH_TILE_STRIDE;
+    a_ptr[0] = *reinterpret_cast<const uint32_t*>(top_ptr);
+    a_ptr[1] = *reinterpret_cast<const uint32_t*>(bottom_ptr);
+    a_ptr[2] = *reinterpret_cast<const uint32_t*>(top_ptr + FLASH_MMA_K / 2);
+    a_ptr[3] = *reinterpret_cast<const uint32_t*>(bottom_ptr + FLASH_MMA_K / 2);
 }
 
-/// Reads a B tile whose 8 columns are rows of a tile in shared memory (B = that tile turned round, as keyᵀ in
-/// query · keyᵀ): B's rows first_k .. + 15 are the tile's columns, B's columns first_n .. + 7 its rows.
-__device__ __forceinline__ void flash_load_b_turned(uint32_t* b, const nv_bfloat16* tile, int first_n, int first_k) {
-    int lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    const nv_bfloat16* at = tile + (first_n + group) * FLASH_TILE_STRIDE + first_k + pair;
-    b[0] = *reinterpret_cast<const uint32_t*>(at);
-    b[1] = *reinterpret_cast<const uint32_t*>(at + 8);
+/// Reads a B tile that is a tile in shared memory turned round (as keyᵀ in query · keyᵀ).
+///
+///   b_ptr                      this thread's FLASH_B_REGISTERS registers
+///   tile_ptr                   the tile in shared memory
+///   first_n_val, first_k_val   B's first column (a tile row) and first row (a tile column)
+__device__ __forceinline__ void flash_load_b_turned(uint32_t* b_ptr, const nv_bfloat16* tile_ptr, int first_n_val,
+                                                    int first_k_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    const nv_bfloat16* at_ptr = tile_ptr + (first_n_val + group_val) * FLASH_TILE_STRIDE + first_k_val + pair_val;
+    b_ptr[0] = *reinterpret_cast<const uint32_t*>(at_ptr);
+    b_ptr[1] = *reinterpret_cast<const uint32_t*>(at_ptr + FLASH_MMA_K / 2);
 }
 
-/// Reads a B tile that is a part of a tile in shared memory as it is (as value in weights · value): B's rows
-/// first_k .. + 15 are the tile's rows, B's columns first_n .. + 7 its columns.
-__device__ __forceinline__ void flash_load_b(uint32_t* b, const nv_bfloat16* tile, int first_n, int first_k) {
-    int lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    const nv_bfloat16* at = tile + (first_k + pair) * FLASH_TILE_STRIDE + first_n + group;
-    b[0] = flash_pack(at[0], at[FLASH_TILE_STRIDE]);
-    b[1] = flash_pack(at[8 * FLASH_TILE_STRIDE], at[9 * FLASH_TILE_STRIDE]);
+/// Reads a B tile that is a tile in shared memory as it is (as value in weights · value).
+///
+///   b_ptr                      this thread's FLASH_B_REGISTERS registers
+///   tile_ptr                   the tile in shared memory
+///   first_n_val, first_k_val   B's first column and first row
+__device__ __forceinline__ void flash_load_b(uint32_t* b_ptr, const nv_bfloat16* tile_ptr, int first_n_val, int first_k_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    const nv_bfloat16* at_ptr = tile_ptr + (first_k_val + pair_val) * FLASH_TILE_STRIDE + first_n_val + group_val;
+    b_ptr[0] = flash_pack(at_ptr[0], at_ptr[FLASH_TILE_STRIDE]);
+    b_ptr[1] = flash_pack(at_ptr[(FLASH_MMA_K / 2) * FLASH_TILE_STRIDE], at_ptr[(FLASH_MMA_K / 2 + 1) * FLASH_TILE_STRIDE]);
 }
 
-/// Turns two C tiles side by side (columns 2 step .. 2 step + 15 of a {16, 64} product) into the A tile of the
-/// same 16 columns, rounding to bfloat16: the scores, made weights, go on into the next product.
-__device__ __forceinline__ void flash_c_to_a(uint32_t* a, float (*c)[4], int step) {
-    a[0] = flash_pack(c[2 * step][0], c[2 * step][1]);
-    a[1] = flash_pack(c[2 * step][2], c[2 * step][3]);
-    a[2] = flash_pack(c[2 * step + 1][0], c[2 * step + 1][1]);
-    a[3] = flash_pack(c[2 * step + 1][2], c[2 * step + 1][3]);
+/// Turns two C tiles side by side into the A tile of the same FLASH_MMA_K columns, rounded to bfloat16.
+///
+///   a_ptr      this thread's FLASH_A_REGISTERS registers of A
+///   c_ptr      the {FLASH_MMA_M, FLASH_TILE} product: FLASH_TILE_N_TILES C tiles
+///   step_val   which FLASH_MMA_K columns: C tiles 2 step and 2 step + 1
+__device__ __forceinline__ void flash_c_to_a(uint32_t* a_ptr, float (*c_ptr)[FLASH_C_VALUES], int step_val) {
+    a_ptr[0] = flash_pack(c_ptr[2 * step_val][0], c_ptr[2 * step_val][1]);
+    a_ptr[1] = flash_pack(c_ptr[2 * step_val][2], c_ptr[2 * step_val][3]);
+    a_ptr[2] = flash_pack(c_ptr[2 * step_val + 1][0], c_ptr[2 * step_val + 1][1]);
+    a_ptr[3] = flash_pack(c_ptr[2 * step_val + 1][2], c_ptr[2 * step_val + 1][3]);
 }
 
-/// F2 .. F6 for 64 queries of one head (blockIdx.y = batch x num_heads + head; the last query tiles, the
-/// longest rows, go first). Each warp keeps its 16 query rows in registers and walks the keys 64 at a time up
-/// to its own: scores, the mask on the last tile, the online softmax (each thread holds 2 rows, group and
-/// group + 8, of 16 columns each; the 4 threads of a group share a row and add up with 2 shuffles), output +=
-/// weights · value. Writes output into the merged {batch_size, seq_len, embed_dim} at the head's columns, and
-/// logsumexp per row.
+/// F2..F6 for FLASH_TILE queries of one head (the longest rows first). Each warp keeps its FLASH_MMA_M query rows
+/// in registers and walks the keys FLASH_TILE at a time up to its own: scores, the mask, the online softmax,
+/// output += weights · value.
+///
+///   output_ptr                    {batch_size, seq_len, embed_dim}: the head's columns written
+///   logsumexp_ptr                 one float per row: written
+///   query_ptr, key_ptr, value_ptr {batch_size, num_heads, seq_len, FLASH_HEAD_SIZE}
+///   num_heads_val, seq_len_val    query's shape
+///   scale_val                     1 / sqrt(FLASH_HEAD_SIZE)
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_forward_kernel(nv_bfloat16* output, float* logsumexp, const nv_bfloat16* query, const nv_bfloat16* key,
-                               const nv_bfloat16* value, int num_heads, int seq_len, float scale) {
+attention_flash_forward_kernel(nv_bfloat16* output_ptr, float* logsumexp_ptr, const nv_bfloat16* query_ptr,
+                               const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr, int num_heads_val,
+                               int seq_len_val, float scale_val) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ __align__(16) nv_bfloat16 query_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 key_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 value_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    int query_block = gridDim.x - 1 - blockIdx.x;
-    size_t head_start = (size_t)blockIdx.y * seq_len * FLASH_HEAD_SIZE;  // this head's first value in query
-    int warp_first_token = query_block * FLASH_TILE + warp * 16;
+    __shared__ __align__(16) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    int warp_index_val = threadIdx.x / THREADS_PER_WARP;
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    int query_block_val = gridDim.x - 1 - blockIdx.x;
+    size_t head_start_val = (size_t)blockIdx.y * seq_len_val * FLASH_HEAD_SIZE;   // this head's first value in query
+    int warp_first_token_val = query_block_val * FLASH_TILE + warp_index_val * FLASH_MMA_M;
 
-    flash_load_tile(query_tile, query + head_start + (size_t)query_block * FLASH_TILE * FLASH_HEAD_SIZE,
+    // 1. this warp's query rows into registers: FLASH_K_STEPS A tiles across the head row
+    flash_load_tile(query_tile_list, query_ptr + head_start_val + (size_t)query_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                     FLASH_HEAD_SIZE);
     __syncthreads();
-    uint32_t query_a[4][4];                                         // this warp's 16 rows, 4 steps of 16 columns
+    uint32_t query_a_list[FLASH_K_STEPS][FLASH_A_REGISTERS];
 #pragma unroll
-    for (int step = 0; step < 4; step++) flash_load_a(query_a[step], query_tile, warp * 16, step * 16);
+    for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++)
+        flash_load_a(query_a_list[step_val], query_tile_list, warp_index_val * FLASH_MMA_M, step_val * FLASH_MMA_K);
 
-    float out[8][4] = {};                                           // {16, 64}: 8 C tiles of 8 columns
-    float row_max[2] = {-INFINITY, -INFINITY}, row_sum[2] = {0.0f, 0.0f};   // rows group, group + 8
-    for (int key_block = 0; key_block <= query_block; key_block++) {
+    float output_list[FLASH_HEAD_N_TILES][FLASH_C_VALUES] = {};    // {FLASH_MMA_M, FLASH_HEAD_SIZE}: C tiles
+    // rows group, group + FLASH_MMA_M / 2
+    float row_max_list[FLASH_THREAD_ROWS] = {-INFINITY, -INFINITY};
+    float row_sum_list[FLASH_THREAD_ROWS] = {0.0f, 0.0f};
+    // 2. walk the key tiles up to this block's own
+    for (int key_block_val = 0; key_block_val <= query_block_val; key_block_val++) {
         __syncthreads();                                            // every warp is done with the last tiles
-        flash_load_tile(key_tile, key + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE,
+        flash_load_tile(key_tile_list, key_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                         FLASH_HEAD_SIZE);
-        flash_load_tile(value_tile, value + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE,
+        flash_load_tile(value_tile_list, value_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                         FLASH_HEAD_SIZE);
         __syncthreads();
 
-        // F2: scores {16, 64} = query rows · key tileᵀ, scaled
-        float score[8][4];
+        // F2: scores {FLASH_MMA_M, FLASH_TILE} = query rows · key tileᵀ, scaled
+        float score_list[FLASH_TILE_N_TILES][FLASH_C_VALUES];
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            score[n][0] = score[n][1] = score[n][2] = score[n][3] = 0.0f;
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++) {
+            score_list[n_val][0] = score_list[n_val][1] = score_list[n_val][2] = score_list[n_val][3] = 0.0f;
 #pragma unroll
-            for (int step = 0; step < 4; step++) {
-                uint32_t b[2];
-                flash_load_b_turned(b, key_tile, n * 8, step * 16);
-                flash_mma(score[n], query_a[step], b[0], b[1]);
+            for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b_turned(b_list, key_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(score_list[n_val], query_a_list[step_val], b_list[0], b_list[1]);
             }
         }
         // F3: the mask, on the tile of the warp's own tokens only; then each row's largest score
-        float tile_max[2] = {-INFINITY, -INFINITY};
+        float tile_max_list[FLASH_THREAD_ROWS] = {-INFINITY, -INFINITY};
 #pragma unroll
-        for (int n = 0; n < 8; n++)
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int token = warp_first_token + group + (i >= 2 ? 8 : 0);
-                int key_token = key_block * FLASH_TILE + n * 8 + pair + (i & 1);
-                score[n][i] = key_token <= token ? score[n][i] * scale : -INFINITY;
-                tile_max[i / 2] = fmaxf(tile_max[i / 2], score[n][i]);
+            for (int i_val = 0; i_val < FLASH_C_VALUES; i_val++) {
+                int token_val = warp_first_token_val + group_val + (i_val / 2) * (FLASH_MMA_M / 2);
+                int key_token_val = key_block_val * FLASH_TILE + n_val * FLASH_MMA_N + pair_val + (i_val & 1);
+                score_list[n_val][i_val] = key_token_val <= token_val ? score_list[n_val][i_val] * scale_val : -INFINITY;
+                tile_max_list[i_val / 2] = fmaxf(tile_max_list[i_val / 2], score_list[n_val][i_val]);
             }
-        // F4: the online softmax: the new max, the output and sum so far moved onto it, then the weights
+        // F4: the online softmax: the new max (over the group's FLASH_GROUP_LANES lanes), the output and sum moved
+        // onto it, then the weights
 #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            tile_max[r] = fmaxf(tile_max[r], __shfl_xor_sync(0xffffffff, tile_max[r], 1));
-            tile_max[r] = fmaxf(tile_max[r], __shfl_xor_sync(0xffffffff, tile_max[r], 2));
-            float new_max = fmaxf(row_max[r], tile_max[r]);         // finite: every row sees key 0
-            float correction = __expf(row_max[r] - new_max);        // 0 on the first tile
-            row_max[r] = new_max;
-            row_sum[r] *= correction;
+        for (int r_val = 0; r_val < FLASH_THREAD_ROWS; r_val++) {
+            tile_max_list[r_val] = fmaxf(tile_max_list[r_val], __shfl_xor_sync(WARP_ALL_LANES, tile_max_list[r_val], 1));
+            tile_max_list[r_val] = fmaxf(tile_max_list[r_val], __shfl_xor_sync(WARP_ALL_LANES, tile_max_list[r_val], 2));
+            float new_max_val = fmaxf(row_max_list[r_val], tile_max_list[r_val]);   // finite: every row sees key 0
+            float correction_val = __expf(row_max_list[r_val] - new_max_val);     // 0 on the first tile
+            row_max_list[r_val] = new_max_val;
+            row_sum_list[r_val] *= correction_val;
 #pragma unroll
-            for (int n = 0; n < 8; n++) out[n][2 * r] *= correction, out[n][2 * r + 1] *= correction;
+            for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++)
+                output_list[n_val][2 * r_val] *= correction_val, output_list[n_val][2 * r_val + 1] *= correction_val;
         }
 #pragma unroll
-        for (int n = 0; n < 8; n++)
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++)
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                score[n][i] = __expf(score[n][i] - row_max[i / 2]); // a masked score gives 0
-                row_sum[i / 2] += score[n][i];
+            for (int i_val = 0; i_val < FLASH_C_VALUES; i_val++) {
+                score_list[n_val][i_val] = __expf(score_list[n_val][i_val] - row_max_list[i_val / 2]);   // a masked score gives 0
+                row_sum_list[i_val / 2] += score_list[n_val][i_val];
             }
         // F5: output += weights · value tile, the weights straight from the score registers
 #pragma unroll
-        for (int step = 0; step < 4; step++) {
-            uint32_t a[4];
-            flash_c_to_a(a, score, step);
+        for (int step_val = 0; step_val < FLASH_TILE_K_STEPS; step_val++) {
+            uint32_t a_list[FLASH_A_REGISTERS];
+            flash_c_to_a(a_list, score_list, step_val);
 #pragma unroll
-            for (int n = 0; n < 8; n++) {
-                uint32_t b[2];
-                flash_load_b(b, value_tile, n * 8, step * 16);
-                flash_mma(out[n], a, b[0], b[1]);
+            for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b(b_list, value_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(output_list[n_val], a_list, b_list[0], b_list[1]);
             }
         }
     }
 
-    // F6: divide by the row sums (each thread holds a quarter of its rows' sum), write the head's columns of
-    // each token's row of output, and logsumexp
-    int batch = blockIdx.y / num_heads, head = blockIdx.y % num_heads, embed_dim = num_heads * FLASH_HEAD_SIZE;
+    // 3. F6: divide by the row sums, write the head's columns of output, and logsumexp
+    int batch_val = blockIdx.y / num_heads_val;
+    int head_val = blockIdx.y % num_heads_val;
+    int embed_dim_val = num_heads_val * FLASH_HEAD_SIZE;
 #pragma unroll
-    for (int r = 0; r < 2; r++) {
-        row_sum[r] += __shfl_xor_sync(0xffffffff, row_sum[r], 1);
-        row_sum[r] += __shfl_xor_sync(0xffffffff, row_sum[r], 2);
-        int token = warp_first_token + group + 8 * r;
-        nv_bfloat16* row = output + ((size_t)batch * seq_len + token) * embed_dim + head * FLASH_HEAD_SIZE;
-        float one_over_sum = 1.0f / row_sum[r];
+    for (int r_val = 0; r_val < FLASH_THREAD_ROWS; r_val++) {
+        row_sum_list[r_val] += __shfl_xor_sync(WARP_ALL_LANES, row_sum_list[r_val], 1);
+        row_sum_list[r_val] += __shfl_xor_sync(WARP_ALL_LANES, row_sum_list[r_val], 2);
+        int token_val = warp_first_token_val + group_val + (FLASH_MMA_M / 2) * r_val;
+        nv_bfloat16* row_ptr = output_ptr + ((size_t)batch_val * seq_len_val + token_val) * embed_dim_val + head_val * FLASH_HEAD_SIZE;
+        float one_over_sum_val = 1.0f / row_sum_list[r_val];
 #pragma unroll
-        for (int n = 0; n < 8; n++)
-            *reinterpret_cast<nv_bfloat162*>(row + n * 8 + pair) =
-                __floats2bfloat162_rn(out[n][2 * r] * one_over_sum, out[n][2 * r + 1] * one_over_sum);
-        if (lane % 4 == 0) logsumexp[(size_t)blockIdx.y * seq_len + token] = row_max[r] + logf(row_sum[r]);
+        for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++)
+            *reinterpret_cast<nv_bfloat162*>(row_ptr + n_val * FLASH_MMA_N + pair_val) = __floats2bfloat162_rn(
+                output_list[n_val][2 * r_val] * one_over_sum_val, output_list[n_val][2 * r_val + 1] * one_over_sum_val);
+        if (lane_index_val % FLASH_GROUP_LANES == 0)
+            logsumexp_ptr[(size_t)blockIdx.y * seq_len_val + token_val] = row_max_list[r_val] + logf(row_sum_list[r_val]);
     }
 #endif
 }
 
-/// The backward's row_dot, one warp per row of a head: sum over its 64 columns of output_grad x output, both
-/// read from the merged {batch_size, seq_len, embed_dim} rows, 2 columns per thread.
-__global__ void attention_flash_row_dot_kernel(float* row_dot, const nv_bfloat16* output_grad,
-                                               const nv_bfloat16* output, int num_heads, int seq_len, size_t rows) {
-    int lane = threadIdx.x % 32;
-    size_t warp_number = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    size_t warps_launched = (size_t)gridDim.x * blockDim.x / 32;
-    for (size_t row = warp_number; row < rows; row += warps_launched) {
-        size_t head_number = row / seq_len, token = row % seq_len;      // head_number = batch x num_heads + head
-        size_t batch = head_number / num_heads, head = head_number % num_heads;
-        size_t at = (batch * seq_len + token) * num_heads * FLASH_HEAD_SIZE + head * FLASH_HEAD_SIZE + 2 * lane;
-        float2 grad = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_grad + at));
-        float2 out = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output + at));
-        float dot = grad.x * out.x + grad.y * out.y;
-        for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor_sync(0xffffffff, dot, offset);
-        if (lane == 0) row_dot[row] = dot;
+/// Works out row_dot = sum over the head's FLASH_HEAD_SIZE columns of output_grad · output, one warp per row.
+///
+///   row_dot_ptr                   one float per row: written
+///   output_grad_ptr, output_ptr   {batch_size, seq_len, embed_dim}
+///   num_heads_val, seq_len_val    the shape
+///   rows_val                      batch_size x num_heads x seq_len
+__global__ void attention_flash_row_dot_kernel(float* row_dot_ptr, const nv_bfloat16* output_grad_ptr,
+                                               const nv_bfloat16* output_ptr, int num_heads_val, int seq_len_val,
+                                               size_t rows_val) {
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    size_t warp_index_val = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / THREADS_PER_WARP;   // which warp of all launched
+    size_t warps_launched_val = (size_t)gridDim.x * blockDim.x / THREADS_PER_WARP;
+    // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
+    for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
+        // 1. where the row is: which (batch, head), which token; each lane takes 2 neighbouring columns
+        size_t head_index_val = row_index_val / seq_len_val;                    // batch x num_heads + head
+        size_t token_val = row_index_val % seq_len_val;
+        size_t batch_val = head_index_val / num_heads_val;
+        size_t head_val = head_index_val % num_heads_val;
+        size_t at_val = (batch_val * seq_len_val + token_val) * num_heads_val * FLASH_HEAD_SIZE + head_val * FLASH_HEAD_SIZE +
+                        2 * lane_index_val;
+        // 2. this lane's part of the dot, then the warp's
+        float2 grad_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_grad_ptr + at_val));
+        float2 out_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_ptr + at_val));
+        float dot_val = grad_val.x * out_val.x + grad_val.y * out_val.y;
+        dot_val = warp_reduce_sum(dot_val);
+        if (lane_index_val == 0) row_dot_ptr[row_index_val] = dot_val;
     }
 }
 
-/// key_grad and value_grad for 64 keys of one head (blockIdx.x; the first ones, seen by the most queries,
-/// first). Each warp keeps its 16 keys and their values in registers and walks the queries 64 at a time from
-/// its own tile on (an earlier query sees none of these keys), making each tile of weights again, turned
-/// round so the warp's keys are its rows:
+/// Works out key_grad and value_grad for FLASH_TILE keys of one head. Each warp keeps its FLASH_MMA_M keys and
+/// values in registers and walks the queries FLASH_TILE at a time from its own tile on, making the weights again,
+/// turned round:
+///     weightsᵀ       = exp(key rows · query tileᵀ / sqrt(head_size) - logsumexp)    0 where query < key
+///     value_grad    += weightsᵀ · output_grad tile                                  B3
+///     weights_gradᵀ  = value rows · output_grad tileᵀ                               B2
+///     scores_gradᵀ   = weightsᵀ (weights_gradᵀ - row_dot)                           B4-B6
+///     key_grad      += scores_gradᵀ · query tile                                    B8
 ///
-///     weightsᵀ  = exp(key rows · query tileᵀ / sqrt(64) - logsumexp[query])     0 where query < key
-///     value_grad += weightsᵀ · output_grad tile                                   B3
-///     weights_gradᵀ = value rows · output_grad tileᵀ                               B2
-///     scores_gradᵀ = weightsᵀ (weights_gradᵀ - row_dot[query])                     B4-B6
-///     key_grad  += scores_gradᵀ · query tile, / sqrt(64) at the end                B8
-///
-/// Writes both into qkv_grad's key and value parts, the head's columns of each token's row.
+///   qkv_grad_ptr                            the key and value parts written
+///   output_grad_ptr                         {batch_size, seq_len, embed_dim}
+///   query_ptr, key_ptr, value_ptr           {batch_size, num_heads, seq_len, FLASH_HEAD_SIZE}
+///   logsumexp_ptr, row_dot_ptr              one float per row
+///   num_heads_val, seq_len_val, scale_val   the shape, and 1 / sqrt(FLASH_HEAD_SIZE)
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_key_grad_kernel(nv_bfloat16* qkv_grad, const nv_bfloat16* output_grad, const nv_bfloat16* query,
-                                const nv_bfloat16* key, const nv_bfloat16* value, const float* logsumexp,
-                                const float* row_dot, int num_heads, int seq_len, float scale) {
+attention_flash_key_grad_kernel(nv_bfloat16* qkv_grad_ptr, const nv_bfloat16* output_grad_ptr, const nv_bfloat16* query_ptr,
+                                const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr, const float* logsumexp_ptr,
+                                const float* row_dot_ptr, int num_heads_val, int seq_len_val, float scale_val) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ __align__(16) nv_bfloat16 key_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 value_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 query_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 grad_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ float logsumexp_tile[FLASH_TILE], row_dot_tile[FLASH_TILE];
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    int key_block = blockIdx.x;
-    int batch = blockIdx.y / num_heads, head = blockIdx.y % num_heads, embed_dim = num_heads * FLASH_HEAD_SIZE;
-    size_t head_start = (size_t)blockIdx.y * seq_len * FLASH_HEAD_SIZE;
-    int warp_first_key = key_block * FLASH_TILE + warp * 16;
+    __shared__ __align__(16) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 grad_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ float logsumexp_tile_list[FLASH_TILE];
+    __shared__ float row_dot_tile_list[FLASH_TILE];
+    int warp_index_val = threadIdx.x / THREADS_PER_WARP;
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    int key_block_val = blockIdx.x;
+    int batch_val = blockIdx.y / num_heads_val;
+    int head_val = blockIdx.y % num_heads_val;
+    int embed_dim_val = num_heads_val * FLASH_HEAD_SIZE;
+    size_t head_start_val = (size_t)blockIdx.y * seq_len_val * FLASH_HEAD_SIZE;
+    int warp_first_key_val = key_block_val * FLASH_TILE + warp_index_val * FLASH_MMA_M;
 
-    flash_load_tile(key_tile, key + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE, FLASH_HEAD_SIZE);
-    flash_load_tile(value_tile, value + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE,
+    // 1. this warp's keys, and their values, into registers
+    flash_load_tile(key_tile_list, key_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
+                    FLASH_HEAD_SIZE);
+    flash_load_tile(value_tile_list, value_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                     FLASH_HEAD_SIZE);
     __syncthreads();
-    uint32_t key_a[4][4], value_a[4][4];                            // this warp's 16 keys, and their values
+    uint32_t key_a_list[FLASH_K_STEPS][FLASH_A_REGISTERS];
+    uint32_t value_a_list[FLASH_K_STEPS][FLASH_A_REGISTERS];
 #pragma unroll
-    for (int step = 0; step < 4; step++) {
-        flash_load_a(key_a[step], key_tile, warp * 16, step * 16);
-        flash_load_a(value_a[step], value_tile, warp * 16, step * 16);
+    for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+        flash_load_a(key_a_list[step_val], key_tile_list, warp_index_val * FLASH_MMA_M, step_val * FLASH_MMA_K);
+        flash_load_a(value_a_list[step_val], value_tile_list, warp_index_val * FLASH_MMA_M, step_val * FLASH_MMA_K);
     }
 
-    float key_grad[8][4] = {}, value_grad[8][4] = {};
-    for (int query_block = key_block; query_block < seq_len / FLASH_TILE; query_block++) {
+    // 2. walk the query tiles from this block's own on
+    float key_grad_list[FLASH_HEAD_N_TILES][FLASH_C_VALUES] = {};
+    float value_grad_list[FLASH_HEAD_N_TILES][FLASH_C_VALUES] = {};
+    for (int query_block_val = key_block_val; query_block_val < seq_len_val / FLASH_TILE; query_block_val++) {
         __syncthreads();
-        flash_load_tile(query_tile, query + head_start + (size_t)query_block * FLASH_TILE * FLASH_HEAD_SIZE,
+        flash_load_tile(query_tile_list, query_ptr + head_start_val + (size_t)query_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                         FLASH_HEAD_SIZE);
-        flash_load_tile(grad_tile,
-                        output_grad + ((size_t)batch * seq_len + query_block * FLASH_TILE) * embed_dim +
-                            head * FLASH_HEAD_SIZE,
-                        embed_dim);
+        flash_load_tile(grad_tile_list,
+                        output_grad_ptr + ((size_t)batch_val * seq_len_val + query_block_val * FLASH_TILE) * embed_dim_val +
+                            head_val * FLASH_HEAD_SIZE,
+                        embed_dim_val);
         if (threadIdx.x < FLASH_TILE) {
-            size_t row = (size_t)blockIdx.y * seq_len + query_block * FLASH_TILE + threadIdx.x;
-            logsumexp_tile[threadIdx.x] = logsumexp[row];
-            row_dot_tile[threadIdx.x] = row_dot[row];
+            size_t row_index_val = (size_t)blockIdx.y * seq_len_val + query_block_val * FLASH_TILE + threadIdx.x;
+            logsumexp_tile_list[threadIdx.x] = logsumexp_ptr[row_index_val];
+            row_dot_tile_list[threadIdx.x] = row_dot_ptr[row_index_val];
         }
         __syncthreads();
 
-        // the weights, turned round: {16 keys, 64 queries}
-        float weight[8][4];
+        // the weights, turned round: {FLASH_MMA_M keys, FLASH_TILE queries}
+        float weight_list[FLASH_TILE_N_TILES][FLASH_C_VALUES];
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            weight[n][0] = weight[n][1] = weight[n][2] = weight[n][3] = 0.0f;
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++) {
+            weight_list[n_val][0] = weight_list[n_val][1] = weight_list[n_val][2] = weight_list[n_val][3] = 0.0f;
 #pragma unroll
-            for (int step = 0; step < 4; step++) {
-                uint32_t b[2];
-                flash_load_b_turned(b, query_tile, n * 8, step * 16);
-                flash_mma(weight[n], key_a[step], b[0], b[1]);
+            for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b_turned(b_list, query_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(weight_list[n_val], key_a_list[step_val], b_list[0], b_list[1]);
             }
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int key_token = warp_first_key + group + (i >= 2 ? 8 : 0);
-                int column = n * 8 + pair + (i & 1), token = query_block * FLASH_TILE + column;
-                weight[n][i] = token >= key_token ? __expf(weight[n][i] * scale - logsumexp_tile[column]) : 0.0f;
+            for (int i_val = 0; i_val < FLASH_C_VALUES; i_val++) {
+                int key_token_val = warp_first_key_val + group_val + (i_val / 2) * (FLASH_MMA_M / 2);
+                int column_val = n_val * FLASH_MMA_N + pair_val + (i_val & 1);
+                int token_val = query_block_val * FLASH_TILE + column_val;
+                weight_list[n_val][i_val] = token_val >= key_token_val
+                                                ? __expf(weight_list[n_val][i_val] * scale_val - logsumexp_tile_list[column_val])
+                                                : 0.0f;
             }
         }
         // B3: value_grad += weightsᵀ · output_grad tile
 #pragma unroll
-        for (int step = 0; step < 4; step++) {
-            uint32_t a[4];
-            flash_c_to_a(a, weight, step);
+        for (int step_val = 0; step_val < FLASH_TILE_K_STEPS; step_val++) {
+            uint32_t a_list[FLASH_A_REGISTERS];
+            flash_c_to_a(a_list, weight_list, step_val);
 #pragma unroll
-            for (int n = 0; n < 8; n++) {
-                uint32_t b[2];
-                flash_load_b(b, grad_tile, n * 8, step * 16);
-                flash_mma(value_grad[n], a, b[0], b[1]);
+            for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b(b_list, grad_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(value_grad_list[n_val], a_list, b_list[0], b_list[1]);
             }
         }
         // B2, B4-B6: weights_gradᵀ = value rows · output_grad tileᵀ, then scores_gradᵀ in its place
-        float score_grad[8][4];
+        float score_grad_list[FLASH_TILE_N_TILES][FLASH_C_VALUES];
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            score_grad[n][0] = score_grad[n][1] = score_grad[n][2] = score_grad[n][3] = 0.0f;
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++) {
+            score_grad_list[n_val][0] = score_grad_list[n_val][1] = score_grad_list[n_val][2] = score_grad_list[n_val][3] = 0.0f;
 #pragma unroll
-            for (int step = 0; step < 4; step++) {
-                uint32_t b[2];
-                flash_load_b_turned(b, grad_tile, n * 8, step * 16);
-                flash_mma(score_grad[n], value_a[step], b[0], b[1]);
+            for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b_turned(b_list, grad_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(score_grad_list[n_val], value_a_list[step_val], b_list[0], b_list[1]);
             }
 #pragma unroll
-            for (int i = 0; i < 4; i++)
-                score_grad[n][i] = weight[n][i] * (score_grad[n][i] - row_dot_tile[n * 8 + pair + (i & 1)]);
+            for (int i_val = 0; i_val < FLASH_C_VALUES; i_val++)
+                score_grad_list[n_val][i_val] = weight_list[n_val][i_val] *
+                    (score_grad_list[n_val][i_val] - row_dot_tile_list[n_val * FLASH_MMA_N + pair_val + (i_val & 1)]);
         }
         // B8: key_grad += scores_gradᵀ · query tile
 #pragma unroll
-        for (int step = 0; step < 4; step++) {
-            uint32_t a[4];
-            flash_c_to_a(a, score_grad, step);
+        for (int step_val = 0; step_val < FLASH_TILE_K_STEPS; step_val++) {
+            uint32_t a_list[FLASH_A_REGISTERS];
+            flash_c_to_a(a_list, score_grad_list, step_val);
 #pragma unroll
-            for (int n = 0; n < 8; n++) {
-                uint32_t b[2];
-                flash_load_b(b, query_tile, n * 8, step * 16);
-                flash_mma(key_grad[n], a, b[0], b[1]);
+            for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b(b_list, query_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(key_grad_list[n_val], a_list, b_list[0], b_list[1]);
             }
         }
     }
 
-    // into qkv_grad: each token's row is query, key, value parts of embed_dim each
+    // 3. into qkv_grad: each token's row is query, key, value parts of embed_dim each
 #pragma unroll
-    for (int r = 0; r < 2; r++) {
-        int key_token = warp_first_key + group + 8 * r;
-        nv_bfloat16* row = qkv_grad + ((size_t)batch * seq_len + key_token) * 3 * embed_dim + head * FLASH_HEAD_SIZE;
+    for (int r_val = 0; r_val < FLASH_THREAD_ROWS; r_val++) {
+        int key_token_val = warp_first_key_val + group_val + (FLASH_MMA_M / 2) * r_val;
+        nv_bfloat16* row_ptr = qkv_grad_ptr + ((size_t)batch_val * seq_len_val + key_token_val) * 3 * embed_dim_val +
+                               head_val * FLASH_HEAD_SIZE;
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            *reinterpret_cast<nv_bfloat162*>(row + embed_dim + n * 8 + pair) =
-                __floats2bfloat162_rn(key_grad[n][2 * r] * scale, key_grad[n][2 * r + 1] * scale);
-            *reinterpret_cast<nv_bfloat162*>(row + 2 * embed_dim + n * 8 + pair) =
-                __floats2bfloat162_rn(value_grad[n][2 * r], value_grad[n][2 * r + 1]);
+        for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++) {
+            *reinterpret_cast<nv_bfloat162*>(row_ptr + embed_dim_val + n_val * FLASH_MMA_N + pair_val) = __floats2bfloat162_rn(
+                key_grad_list[n_val][2 * r_val] * scale_val, key_grad_list[n_val][2 * r_val + 1] * scale_val);
+            *reinterpret_cast<nv_bfloat162*>(row_ptr + 2 * embed_dim_val + n_val * FLASH_MMA_N + pair_val) =
+                __floats2bfloat162_rn(value_grad_list[n_val][2 * r_val], value_grad_list[n_val][2 * r_val + 1]);
         }
     }
 #endif
 }
 
-/// query_grad for 64 queries of one head (the last ones, which see the most keys, first). Each warp keeps its
-/// 16 query rows and their output_grad rows in registers and walks the keys 64 at a time up to its own,
-/// making the weights again as the forward did:
+/// Works out query_grad for FLASH_TILE queries of one head. Each warp keeps its FLASH_MMA_M query rows and
+/// output_grad rows in registers and walks the keys FLASH_TILE at a time up to its own, making the weights again:
+///     weights        = exp(query rows · key tileᵀ / sqrt(head_size) - logsumexp)    0 where key > query
+///     weights_grad   = output_grad rows · value tileᵀ                               B2
+///     scores_grad    = weights (weights_grad - row_dot)                             B4-B6
+///     query_grad    += scores_grad · key tile                                       B7
 ///
-///     weights    = exp(query rows · key tileᵀ / sqrt(64) - logsumexp[row])     0 where key > query
-///     weights_grad = output_grad rows · value tileᵀ                              B2
-///     scores_grad = weights (weights_grad - row_dot[row])                        B4-B6
-///     query_grad += scores_grad · key tile, / sqrt(64) at the end                B7
-///
-/// Writes it into qkv_grad's query part.
+///   qkv_grad_ptr   the query part written
+///   the others     as in attention_flash_key_grad_kernel
 __global__ void __launch_bounds__(FLASH_THREADS)
-attention_flash_query_grad_kernel(nv_bfloat16* qkv_grad, const nv_bfloat16* output_grad, const nv_bfloat16* query,
-                                  const nv_bfloat16* key, const nv_bfloat16* value, const float* logsumexp,
-                                  const float* row_dot, int num_heads, int seq_len, float scale) {
+attention_flash_query_grad_kernel(nv_bfloat16* qkv_grad_ptr, const nv_bfloat16* output_grad_ptr,
+                                  const nv_bfloat16* query_ptr, const nv_bfloat16* key_ptr, const nv_bfloat16* value_ptr,
+                                  const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
+                                  int seq_len_val, float scale_val) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ __align__(16) nv_bfloat16 query_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 grad_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 key_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    __shared__ __align__(16) nv_bfloat16 value_tile[FLASH_TILE * FLASH_TILE_STRIDE];
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, pair = (lane % 4) * 2;
-    int query_block = gridDim.x - 1 - blockIdx.x;
-    int batch = blockIdx.y / num_heads, head = blockIdx.y % num_heads, embed_dim = num_heads * FLASH_HEAD_SIZE;
-    size_t head_start = (size_t)blockIdx.y * seq_len * FLASH_HEAD_SIZE;
-    int warp_first_token = query_block * FLASH_TILE + warp * 16;
+    __shared__ __align__(16) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 grad_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    __shared__ __align__(16) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_TILE_STRIDE];
+    int warp_index_val = threadIdx.x / THREADS_PER_WARP;
+    int lane_index_val = threadIdx.x % THREADS_PER_WARP;
+    int group_val = lane_index_val / FLASH_GROUP_LANES;
+    int pair_val = (lane_index_val % FLASH_GROUP_LANES) * 2;
+    int query_block_val = gridDim.x - 1 - blockIdx.x;
+    int batch_val = blockIdx.y / num_heads_val;
+    int head_val = blockIdx.y % num_heads_val;
+    int embed_dim_val = num_heads_val * FLASH_HEAD_SIZE;
+    size_t head_start_val = (size_t)blockIdx.y * seq_len_val * FLASH_HEAD_SIZE;
+    int warp_first_token_val = query_block_val * FLASH_TILE + warp_index_val * FLASH_MMA_M;
 
-    flash_load_tile(query_tile, query + head_start + (size_t)query_block * FLASH_TILE * FLASH_HEAD_SIZE,
+    // 1. this warp's rows of query and output_grad into registers, and its rows' logsumexp and row_dot
+    flash_load_tile(query_tile_list, query_ptr + head_start_val + (size_t)query_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                     FLASH_HEAD_SIZE);
-    flash_load_tile(grad_tile,
-                    output_grad + ((size_t)batch * seq_len + query_block * FLASH_TILE) * embed_dim +
-                        head * FLASH_HEAD_SIZE,
-                    embed_dim);
+    flash_load_tile(grad_tile_list,
+                    output_grad_ptr + ((size_t)batch_val * seq_len_val + query_block_val * FLASH_TILE) * embed_dim_val +
+                        head_val * FLASH_HEAD_SIZE,
+                    embed_dim_val);
     __syncthreads();
-    uint32_t query_a[4][4], grad_a[4][4];                           // this warp's 16 rows of each
+    uint32_t query_a_list[FLASH_K_STEPS][FLASH_A_REGISTERS];
+    uint32_t grad_a_list[FLASH_K_STEPS][FLASH_A_REGISTERS];
 #pragma unroll
-    for (int step = 0; step < 4; step++) {
-        flash_load_a(query_a[step], query_tile, warp * 16, step * 16);
-        flash_load_a(grad_a[step], grad_tile, warp * 16, step * 16);
+    for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+        flash_load_a(query_a_list[step_val], query_tile_list, warp_index_val * FLASH_MMA_M, step_val * FLASH_MMA_K);
+        flash_load_a(grad_a_list[step_val], grad_tile_list, warp_index_val * FLASH_MMA_M, step_val * FLASH_MMA_K);
     }
-    float row_logsumexp[2], row_dot_of_row[2];                      // rows group, group + 8
+    // rows group, group + FLASH_MMA_M / 2
+    float row_logsumexp_list[FLASH_THREAD_ROWS];
+    float row_dot_of_row_list[FLASH_THREAD_ROWS];
 #pragma unroll
-    for (int r = 0; r < 2; r++) {
-        size_t row = (size_t)blockIdx.y * seq_len + warp_first_token + group + 8 * r;
-        row_logsumexp[r] = logsumexp[row];
-        row_dot_of_row[r] = row_dot[row];
+    for (int r_val = 0; r_val < FLASH_THREAD_ROWS; r_val++) {
+        size_t row_index_val = (size_t)blockIdx.y * seq_len_val + warp_first_token_val + group_val + (FLASH_MMA_M / 2) * r_val;
+        row_logsumexp_list[r_val] = logsumexp_ptr[row_index_val];
+        row_dot_of_row_list[r_val] = row_dot_ptr[row_index_val];
     }
 
-    float query_grad[8][4] = {};
-    for (int key_block = 0; key_block <= query_block; key_block++) {
+    // 2. walk the key tiles up to this block's own
+    float query_grad_list[FLASH_HEAD_N_TILES][FLASH_C_VALUES] = {};
+    for (int key_block_val = 0; key_block_val <= query_block_val; key_block_val++) {
         __syncthreads();
-        flash_load_tile(key_tile, key + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE,
+        flash_load_tile(key_tile_list, key_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                         FLASH_HEAD_SIZE);
-        flash_load_tile(value_tile, value + head_start + (size_t)key_block * FLASH_TILE * FLASH_HEAD_SIZE,
+        flash_load_tile(value_tile_list, value_ptr + head_start_val + (size_t)key_block_val * FLASH_TILE * FLASH_HEAD_SIZE,
                         FLASH_HEAD_SIZE);
         __syncthreads();
 
-        // the weights {16, 64}, and weights_grad, then scores_grad in its place
-        float weight[8][4], score_grad[8][4];
+        // the weights {FLASH_MMA_M, FLASH_TILE}, and weights_grad, then scores_grad in its place
+        float weight_list[FLASH_TILE_N_TILES][FLASH_C_VALUES];
+        float score_grad_list[FLASH_TILE_N_TILES][FLASH_C_VALUES];
 #pragma unroll
-        for (int n = 0; n < 8; n++) {
-            weight[n][0] = weight[n][1] = weight[n][2] = weight[n][3] = 0.0f;
-            score_grad[n][0] = score_grad[n][1] = score_grad[n][2] = score_grad[n][3] = 0.0f;
+        for (int n_val = 0; n_val < FLASH_TILE_N_TILES; n_val++) {
+            weight_list[n_val][0] = weight_list[n_val][1] = weight_list[n_val][2] = weight_list[n_val][3] = 0.0f;
+            score_grad_list[n_val][0] = score_grad_list[n_val][1] = score_grad_list[n_val][2] = score_grad_list[n_val][3] = 0.0f;
 #pragma unroll
-            for (int step = 0; step < 4; step++) {
-                uint32_t b[2];
-                flash_load_b_turned(b, key_tile, n * 8, step * 16);
-                flash_mma(weight[n], query_a[step], b[0], b[1]);
-                flash_load_b_turned(b, value_tile, n * 8, step * 16);
-                flash_mma(score_grad[n], grad_a[step], b[0], b[1]);
+            for (int step_val = 0; step_val < FLASH_K_STEPS; step_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b_turned(b_list, key_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(weight_list[n_val], query_a_list[step_val], b_list[0], b_list[1]);
+                flash_load_b_turned(b_list, value_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(score_grad_list[n_val], grad_a_list[step_val], b_list[0], b_list[1]);
             }
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int r = i / 2, token = warp_first_token + group + 8 * r;
-                int key_token = key_block * FLASH_TILE + n * 8 + pair + (i & 1);
-                float w = key_token <= token ? __expf(weight[n][i] * scale - row_logsumexp[r]) : 0.0f;
-                score_grad[n][i] = w * (score_grad[n][i] - row_dot_of_row[r]);
+            for (int i_val = 0; i_val < FLASH_C_VALUES; i_val++) {
+                int r_val = i_val / 2;
+                int token_val = warp_first_token_val + group_val + (FLASH_MMA_M / 2) * r_val;
+                int key_token_val = key_block_val * FLASH_TILE + n_val * FLASH_MMA_N + pair_val + (i_val & 1);
+                float w_val = key_token_val <= token_val
+                                  ? __expf(weight_list[n_val][i_val] * scale_val - row_logsumexp_list[r_val])
+                                  : 0.0f;
+                score_grad_list[n_val][i_val] = w_val * (score_grad_list[n_val][i_val] - row_dot_of_row_list[r_val]);
             }
         }
         // B7: query_grad += scores_grad · key tile
 #pragma unroll
-        for (int step = 0; step < 4; step++) {
-            uint32_t a[4];
-            flash_c_to_a(a, score_grad, step);
+        for (int step_val = 0; step_val < FLASH_TILE_K_STEPS; step_val++) {
+            uint32_t a_list[FLASH_A_REGISTERS];
+            flash_c_to_a(a_list, score_grad_list, step_val);
 #pragma unroll
-            for (int n = 0; n < 8; n++) {
-                uint32_t b[2];
-                flash_load_b(b, key_tile, n * 8, step * 16);
-                flash_mma(query_grad[n], a, b[0], b[1]);
+            for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++) {
+                uint32_t b_list[FLASH_B_REGISTERS];
+                flash_load_b(b_list, key_tile_list, n_val * FLASH_MMA_N, step_val * FLASH_MMA_K);
+                flash_mma(query_grad_list[n_val], a_list, b_list[0], b_list[1]);
             }
         }
     }
 
+    // 3. into qkv_grad's query part
 #pragma unroll
-    for (int r = 0; r < 2; r++) {
-        int token = warp_first_token + group + 8 * r;
-        nv_bfloat16* row = qkv_grad + ((size_t)batch * seq_len + token) * 3 * embed_dim + head * FLASH_HEAD_SIZE;
+    for (int r_val = 0; r_val < FLASH_THREAD_ROWS; r_val++) {
+        int token_val = warp_first_token_val + group_val + (FLASH_MMA_M / 2) * r_val;
+        nv_bfloat16* row_ptr = qkv_grad_ptr + ((size_t)batch_val * seq_len_val + token_val) * 3 * embed_dim_val +
+                               head_val * FLASH_HEAD_SIZE;
 #pragma unroll
-        for (int n = 0; n < 8; n++)
-            *reinterpret_cast<nv_bfloat162*>(row + n * 8 + pair) =
-                __floats2bfloat162_rn(query_grad[n][2 * r] * scale, query_grad[n][2 * r + 1] * scale);
+        for (int n_val = 0; n_val < FLASH_HEAD_N_TILES; n_val++)
+            *reinterpret_cast<nv_bfloat162*>(row_ptr + n_val * FLASH_MMA_N + pair_val) = __floats2bfloat162_rn(
+                query_grad_list[n_val][2 * r_val] * scale_val, query_grad_list[n_val][2 * r_val + 1] * scale_val);
     }
 #endif
 }
 
 // ── for both ──────────────────────────────────────────────────────────────────
 
-/// Gives the cuBLAS handle every product uses, making it on the first call (it takes milliseconds) and
-/// keeping it until the program ends. A handle of its own, so this file does not need linear_cublas.cuh.
+/// Gives the cuBLAS handle every product uses, made on the first call and kept.
 inline cublasHandle_t attention_cublas() {
-    static cublasHandle_t handle = [] {
-        cublasHandle_t made;
-        attentionCublasCheck(cublasCreate(&made));
-        return made;
+    static cublasHandle_t handle_ptr = [] {
+        cublasHandle_t made_ptr;
+        attentionCublasCheck(cublasCreate(&made_ptr));
+        return made_ptr;
     }();
-    return handle;
+    return handle_ptr;
 }
 
-/// Makes one of the six products for every head at once, with cuBLAS's strided batched product: C = alpha ·
-/// op(A) · op(B), written over C (beta 0), for `batch` heads, each head's matrix stride_* values after the
-/// last. m x n is C's size as cuBLAS sees it (by columns: see linear_cublas.cuh), k the summed index, ld* how
-/// many values one column takes. Float tensors go to cublasSgemmStridedBatched; bfloat16 tensors to
-/// cublasGemmStridedBatchedEx, told CUDA_R_16BF and to sum in float (CUBLAS_COMPUTE_32F).
-inline void attention_product(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
-                              const Tensor& a, int lda, long long stride_a, const Tensor& b, int ldb,
-                              long long stride_b, const Tensor& c, int ldc, long long stride_c, int batch) {
-    float zero = 0.0f;
-    if (c.dtype() == DType::BFloat16)
-        attentionCublasCheck(cublasGemmStridedBatchedEx(
-            attention_cublas(), op_a, op_b, m, n, k, &alpha, a.data_ptr(), CUDA_R_16BF, lda, stride_a, b.data_ptr(),
-            CUDA_R_16BF, ldb, stride_b, &zero, c.data_ptr(), CUDA_R_16BF, ldc, stride_c, batch, CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT));
-    else
-        attentionCublasCheck(cublasSgemmStridedBatched(attention_cublas(), op_a, op_b, m, n, k, &alpha, a.data(), lda,
-                                                       stride_a, b.data(), ldb, stride_b, &zero, c.data(), ldc,
-                                                       stride_c, batch));
-}
-
-/// Gives where float4 `index` of a per-head tensor {batch_size, num_heads, seq_len, head_size} sits in a
-/// per-token tensor whose rows are row_float4s long and start with the heads side by side: output
-/// (row_float4s = embed_dim / 4) or qkv's query part (3 embed_dim / 4). The same batch, token, head and column.
+/// Makes one product for every head at once: C = alpha · op(A) · op(B), written over C, with cuBLAS's strided
+/// batched product (cublasGemmStridedBatchedEx for bfloat16, sums in float).
 ///
-///     per head:    index = ((batch * num_heads + head) * seq_len + token) * head_float4s + column
-///     per token:   (batch * seq_len + token) * row_float4s + head * head_float4s + column
-__device__ __forceinline__ size_t attention_merged_index(size_t index, size_t num_heads, size_t seq_len,
-                                                         size_t head_float4s, size_t row_float4s) {
-    size_t column = index % head_float4s;
-    size_t token = (index / head_float4s) % seq_len;
-    size_t head = (index / (head_float4s * seq_len)) % num_heads;
-    size_t batch = index / (head_float4s * seq_len * num_heads);
-    return (batch * seq_len + token) * row_float4s + head * head_float4s + column;
+///   op_a_val, op_b_val                          turn A or B round, or not
+///   m_val, n_val, k_val                         C is m x n as cuBLAS sees it (by columns); k the summed index
+///   alpha_val                                   the scale
+///   a_tensor, b_tensor, c_tensor                the tensors
+///   lda_val, ldb_val, ldc_val                   values one column takes
+///   stride_a_val, stride_b_val, stride_c_val    values from one head's matrix to the next
+///   batch_val                                   how many heads
+inline void attention_product(cublasOperation_t op_a_val, cublasOperation_t op_b_val, int m_val, int n_val, int k_val,
+                              float alpha_val, const Tensor& a_tensor, int lda_val, long long stride_a_val,
+                              const Tensor& b_tensor, int ldb_val, long long stride_b_val, const Tensor& c_tensor,
+                              int ldc_val, long long stride_c_val, int batch_val) {
+    float zero_val = 0.0f;
+    if (c_tensor.dtype() == DType::BFloat16)
+        attentionCublasCheck(cublasGemmStridedBatchedEx(
+            attention_cublas(), op_a_val, op_b_val, m_val, n_val, k_val, &alpha_val, a_tensor.data_ptr(), CUDA_R_16BF,
+            lda_val, stride_a_val, b_tensor.data_ptr(), CUDA_R_16BF, ldb_val, stride_b_val, &zero_val,
+            c_tensor.data_ptr(), CUDA_R_16BF, ldc_val, stride_c_val, batch_val, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    else
+        attentionCublasCheck(cublasSgemmStridedBatched(
+            attention_cublas(), op_a_val, op_b_val, m_val, n_val, k_val, &alpha_val, a_tensor.data(), lda_val,
+            stride_a_val, b_tensor.data(), ldb_val, stride_b_val, &zero_val, c_tensor.data(), ldc_val, stride_c_val,
+            batch_val));
 }
 
-/// Gives the number of blocks of threads_per_block for `total` pieces of work, per_thread threads each:
-/// 1 for the float4 kernels, 32 for the two softmax kernels' one warp per row. Rounded up: a part-full last
-/// block.
-inline int attention_blocks(size_t total, int threads_per_block, size_t per_thread) {
-    size_t threads = total * per_thread;
-    return (int)((threads + threads_per_block - 1) / threads_per_block);
+/// Gives where float4 `index_val` of a per-head tensor sits in a per-token tensor:
+///     per head:    index = ((batch · num_heads + head) · seq_len + token) · head_float4s + column
+///     per token:   (batch · seq_len + token) · row_float4s + head · head_float4s + column
+///
+///   index_val                    float4 of {batch_size, num_heads, seq_len, head_size}
+///   num_heads_val, seq_len_val   the shape
+///   head_float4s_val             head_size / VALUES_PER_FLOAT4
+///   row_float4s_val              a per-token row: embed_dim (output) or 3 embed_dim (qkv), / VALUES_PER_FLOAT4
+__device__ __forceinline__ size_t attention_merged_index(size_t index_val, size_t num_heads_val, size_t seq_len_val,
+                                                         size_t head_float4s_val, size_t row_float4s_val) {
+    size_t column_val = index_val % head_float4s_val;
+    size_t token_val = (index_val / head_float4s_val) % seq_len_val;
+    size_t head_val = (index_val / (head_float4s_val * seq_len_val)) % num_heads_val;
+    size_t batch_val = index_val / (head_float4s_val * seq_len_val * num_heads_val);
+    return (batch_val * seq_len_val + token_val) * row_float4s_val + head_val * head_float4s_val + column_val;
 }
 
-/// Stops with a message if the tensors do not fit together, before a kernel reads past one: query, key,
-/// value and head_outputs {batch_size, num_heads, seq_len, head_size}; weights {batch_size, num_heads,
-/// seq_len, seq_len}; output {batch_size, seq_len, num_heads * head_size}; qkv the same with 3 times the
-/// columns; all float or all bfloat16. Also head_size a multiple of 4 and every tensor starting on 4 values
-/// (16 bytes for float, 8 for bfloat16), for the 4-value loads: off that, the GPU stops with "misaligned
-/// address" at some later call, far from the cause. Backward passes output_grad, the gradients and qkv_grad in
-/// the forward's places.
-inline void attention_check_shapes(const Tensor& output, const Tensor& query, const Tensor& key, const Tensor& value,
-                                   const Tensor& weights, const Tensor& head_outputs, const Tensor& qkv) {
-    bool fits = query.dim() == 4 && key.shape() == query.shape() && value.shape() == query.shape() &&
-                head_outputs.shape() == query.shape();
-    if (fits) {
-        size_t batch_size = query.size(0), num_heads = query.size(1), seq_len = query.size(2);
-        size_t embed_dim = num_heads * query.size(3);
-        fits = weights.shape() == Shape({batch_size, num_heads, seq_len, seq_len}) &&
-               output.shape() == Shape({batch_size, seq_len, embed_dim}) &&
-               qkv.shape() == Shape({batch_size, seq_len, 3 * embed_dim});
+/// Gives the blocks for `total_val` pieces of work, rounded up.
+///
+///   total_val               pieces of work: float4s or rows
+///   threads_per_block_val   the launch's
+///   per_thread_val          threads per piece: 1 for a float4, THREADS_PER_WARP for a row (one warp)
+inline int attention_blocks(size_t total_val, int threads_per_block_val, size_t per_thread_val) {
+    size_t threads_val = total_val * per_thread_val;
+    return (int)CEIL_DIV(threads_val, (size_t)threads_per_block_val);
+}
+
+/// Stops with a message unless the tensors fit: the shapes at the top of the file, all float or all bfloat16,
+/// head_size a multiple of VALUES_PER_FLOAT4, each starting on a whole float4.
+///
+///   output_tensor, query_tensor, key_tensor, value_tensor, weights_tensor, head_outputs_tensor, qkv_tensor
+///       forward: these; backward: the grads in their place
+inline void attention_check_shapes(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                   const Tensor& value_tensor, const Tensor& weights_tensor,
+                                   const Tensor& head_outputs_tensor, const Tensor& qkv_tensor) {
+    // shapes: as at the top of the file
+    bool fits_val = query_tensor.dim() == 4 && key_tensor.shape() == query_tensor.shape() &&
+                    value_tensor.shape() == query_tensor.shape() && head_outputs_tensor.shape() == query_tensor.shape();
+    if (fits_val) {
+        size_t batch_size_val = query_tensor.size(0);
+        size_t num_heads_val = query_tensor.size(1);
+        size_t seq_len_val = query_tensor.size(2);
+        size_t embed_dim_val = num_heads_val * query_tensor.size(3);
+        fits_val = weights_tensor.shape() == Shape({batch_size_val, num_heads_val, seq_len_val, seq_len_val}) &&
+                   output_tensor.shape() == Shape({batch_size_val, seq_len_val, embed_dim_val}) &&
+                   qkv_tensor.shape() == Shape({batch_size_val, seq_len_val, 3 * embed_dim_val});
     }
-    if (!fits) {
+    if (!fits_val) {
         fprintf(stderr, "error: attention needs query, key, value and head_outputs {batch_size, num_heads, seq_len, "
                         "head_size}; weights {batch_size, num_heads, seq_len, seq_len}; output {batch_size, seq_len, "
                         "embed_dim} and qkv {batch_size, seq_len, 3 * embed_dim}, embed_dim = num_heads * head_size\n");
         exit(EXIT_FAILURE);
     }
-    const Tensor* all[] = {&output, &query, &key, &value, &weights, &head_outputs, &qkv};
-    DType dtype = qkv.dtype();
-    bool same_dtype = dtype == DType::Float32 || dtype == DType::BFloat16;
-    for (const Tensor* tensor : all) same_dtype = same_dtype && tensor->dtype() == dtype;
-    if (!same_dtype) {
+    // types: all float or all bfloat16
+    const Tensor* all_list[] = {&output_tensor, &query_tensor, &key_tensor, &value_tensor, &weights_tensor,
+                                &head_outputs_tensor, &qkv_tensor};
+    DType dtype_val = qkv_tensor.dtype();
+    bool same_dtype_val = dtype_val == DType::Float32 || dtype_val == DType::BFloat16;
+    for (const Tensor* tensor_ptr : all_list) same_dtype_val = same_dtype_val && tensor_ptr->dtype() == dtype_val;
+    if (!same_dtype_val) {
         fprintf(stderr, "error: attention needs its tensors all float or all bfloat16\n");
         exit(EXIT_FAILURE);
     }
-    size_t four_values = 4 * qkv.element_size();                        // 16 bytes for float, 8 for bfloat16
-    bool aligned = query.size(3) % 4 == 0;
-    for (const Tensor* tensor : all) aligned = aligned && (size_t)tensor->data_ptr() % four_values == 0;
-    if (!aligned) {
-        fprintf(stderr, "error: attention reads 4 values at a time, so head_size must be a multiple of 4 and every "
-                        "tensor must start on %zu bytes; got head_size %zu\n", four_values, query.size(3));
+    // counts and addresses: heads of whole float4s, each tensor starting on one
+    size_t float4_bytes_val = VALUES_PER_FLOAT4 * qkv_tensor.element_size();
+    bool aligned_val = query_tensor.size(3) % VALUES_PER_FLOAT4 == 0;
+    for (const Tensor* tensor_ptr : all_list) aligned_val = aligned_val && (size_t)tensor_ptr->data_ptr() % float4_bytes_val == 0;
+    if (!aligned_val) {
+        fprintf(stderr, "error: attention reads %d values at a time, so head_size must be a multiple of %d and every "
+                        "tensor must start on %zu bytes; got head_size %zu\n",
+                VALUES_PER_FLOAT4, VALUES_PER_FLOAT4, float4_bytes_val, query_tensor.size(3));
         exit(EXIT_FAILURE);
     }
 }
 
-/// Stops with a message if flash attention cannot run these tensors: query, key and value {batch_size,
-/// num_heads, seq_len, 64}, output {batch_size, seq_len, embed_dim} and qkv the same with 3 times the columns,
-/// all bfloat16; logsumexp {batch_size, num_heads, seq_len} float; seq_len a multiple of 64 and a GPU that has
-/// the instruction (attention_flash_fits); every tensor starting on 16 bytes, for the 8-value tile loads. The
-/// backward passes output_grad (or output), the same tensors, row_dot in logsumexp's place and qkv_grad.
-inline void attention_flash_check_shapes(const Tensor& output, const Tensor& query, const Tensor& key,
-                                         const Tensor& value, const Tensor& logsumexp, const Tensor& qkv) {
-    bool fits = query.dim() == 4 && key.shape() == query.shape() && value.shape() == query.shape() &&
-                attention_flash_fits(qkv.dtype(), query.size(2), query.size(3));
-    if (fits) {
-        size_t batch_size = query.size(0), num_heads = query.size(1), seq_len = query.size(2);
-        size_t embed_dim = num_heads * query.size(3);
-        fits = logsumexp.shape() == Shape({batch_size, num_heads, seq_len}) && logsumexp.dtype() == DType::Float32 &&
-               output.shape() == Shape({batch_size, seq_len, embed_dim}) &&
-               qkv.shape() == Shape({batch_size, seq_len, 3 * embed_dim});
-        for (const Tensor* tensor : {&output, &query, &key, &value, &qkv})
-            fits = fits && tensor->dtype() == DType::BFloat16 && (size_t)tensor->data_ptr() % 16 == 0;
+/// Stops with a message unless flash attention can run these tensors: the shapes, bfloat16, logsumexp float,
+/// attention_flash_fits, each starting on a 16-byte load.
+///
+///   output_tensor, query_tensor, key_tensor, value_tensor, qkv_tensor
+///       forward: these; backward: output_grad or output, and qkv_grad
+///   logsumexp_tensor   {batch_size, num_heads, seq_len}; backward: also row_dot
+inline void attention_flash_check_shapes(const Tensor& output_tensor, const Tensor& query_tensor, const Tensor& key_tensor,
+                                         const Tensor& value_tensor, const Tensor& logsumexp_tensor,
+                                         const Tensor& qkv_tensor) {
+    // shapes, types and addresses together
+    bool fits_val = query_tensor.dim() == 4 && key_tensor.shape() == query_tensor.shape() &&
+                    value_tensor.shape() == query_tensor.shape() &&
+                    attention_flash_fits(qkv_tensor.dtype(), query_tensor.size(2), query_tensor.size(3));
+    if (fits_val) {
+        size_t batch_size_val = query_tensor.size(0);
+        size_t num_heads_val = query_tensor.size(1);
+        size_t seq_len_val = query_tensor.size(2);
+        size_t embed_dim_val = num_heads_val * query_tensor.size(3);
+        fits_val = logsumexp_tensor.shape() == Shape({batch_size_val, num_heads_val, seq_len_val}) &&
+                   logsumexp_tensor.dtype() == DType::Float32 &&
+                   output_tensor.shape() == Shape({batch_size_val, seq_len_val, embed_dim_val}) &&
+                   qkv_tensor.shape() == Shape({batch_size_val, seq_len_val, 3 * embed_dim_val});
+        for (const Tensor* tensor_ptr : {&output_tensor, &query_tensor, &key_tensor, &value_tensor, &qkv_tensor})
+            fits_val = fits_val && tensor_ptr->dtype() == DType::BFloat16 && (size_t)tensor_ptr->data_ptr() % sizeof(uint4) == 0;
     }
-    if (!fits) {
-        fprintf(stderr, "error: flash attention needs bfloat16 query, key, value {batch_size, num_heads, seq_len, 64} "
-                        "with seq_len a multiple of 64, output {batch_size, seq_len, embed_dim}, qkv {batch_size, "
+    if (!fits_val) {
+        fprintf(stderr, "error: flash attention needs bfloat16 query, key, value {batch_size, num_heads, seq_len, %d} "
+                        "with seq_len a multiple of %d, output {batch_size, seq_len, embed_dim}, qkv {batch_size, "
                         "seq_len, 3 * embed_dim}, a float logsumexp {batch_size, num_heads, seq_len}, all starting on "
-                        "16 bytes, and a GPU of compute capability 8.0 or more\n");
+                        "%zu bytes, and a GPU of compute capability 8.0 or more\n",
+                FLASH_HEAD_SIZE, FLASH_TILE, sizeof(uint4));
         exit(EXIT_FAILURE);
     }
 }

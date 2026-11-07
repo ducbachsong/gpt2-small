@@ -1,6 +1,4 @@
-// block.cuh — one GPT-2 block: attention, then an MLP, each with a LayerNorm before it and a residual add
-// around it. GPT-2 small stacks 12 of them. Built only from the kernels in kernels/:
-//
+// block.cuh — one GPT-2 block: attention then an MLP, each with a LayerNorm before and a residual add around:
 //     input ─┬─ LayerNorm 1 ─ qkv linear ─ attention ─ attention out linear ─┐
 //            └──────────────────────────────────────────────────────────── + ── residual2
 //     residual2 ─┬─ LayerNorm 2 ─ MLP up linear ─ GELU ─ MLP down linear ─┐
@@ -9,18 +7,8 @@
 //     input, residual2, output       {batch_size, seq_len, embed_dim}        {4, 1024, 768}
 //     qkv                            {batch_size, seq_len, 3 * embed_dim}    {4, 1024, 2304}
 //     mlp_up_output, gelu_output     {batch_size, seq_len, 4 * embed_dim}    {4, 1024, 3072}
-//
-// Backward runs the same steps the other way. The gradient reaches input by two roads, through the
-// attention branch and straight through the residual adds: residual_backward writes input_grad, then
-// LayerNorm 1's backward adds its part onto it.
-//
-// Three structs hold the tensors, so a model of 12 blocks can share what can be shared:
-//
-//     BlockParams        the 12 parameter tensors, or their 12 gradients: views of memory kept elsewhere
-//     BlockActivations   what the forward keeps for the backward: one per block
-//     BlockScratch       what lives only during one call: one for all the blocks
-//
-// The tensors are all float or all bfloat16 (mean and rstd always float); each kernel works in float.
+// BlockParams: the 12 params or grads. BlockActivations: kept for the backward, one per block. BlockScratch:
+// used only inside a call, one for all blocks. All float or all bfloat16 (mean and rstd float).
 #ifndef BLOCK_CUH
 #define BLOCK_CUH
 
@@ -33,18 +21,19 @@
 #include "kernels/linear_cublas.cuh"   // the four linears; kernels/linear.cuh has the same functions
 #include "kernels/residual.cuh"
 
-/// A block's 12 parameter tensors, or their gradients: views of memory kept elsewhere (the optimizer's
-/// buffer). The 4 matrices first, in the order shapes() gives: AdamW decays the matrices and wants them
-/// first. D is embed_dim.
+/// A block's 12 parameter tensors, or their gradients: views of the optimizer's buffer, the 4 matrices first.
+/// D is embed_dim.
 struct BlockParams {
     Tensor qkv_weight;                   // {3D, D}
     Tensor attention_out_weight;         // {D, D}
     Tensor mlp_up_weight;                // {4D, D}
     Tensor mlp_down_weight;              // {D, 4D}
-    Tensor ln1_weight, ln1_bias;         // {D}
+    Tensor ln1_weight;                   // {D}
+    Tensor ln1_bias;                     // {D}
     Tensor qkv_bias;                     // {3D}
     Tensor attention_out_bias;           // {D}
-    Tensor ln2_weight, ln2_bias;         // {D}
+    Tensor ln2_weight;                   // {D}
+    Tensor ln2_bias;                     // {D}
     Tensor mlp_up_bias;                  // {4D}
     Tensor mlp_down_bias;                // {D}
 
@@ -54,19 +43,25 @@ struct BlockParams {
     std::vector<Tensor> tensors() const;                                // the 12, in the same order
 };
 
-/// What the forward keeps for the backward, for one block. mean, rstd and attention_logsumexp are float, the
-/// rest of dtype. With flash attention (bfloat16 on an sm_80 GPU or later: attention_flash_fits) the block keeps
-/// attention_logsumexp, one number per row, instead of attention_weights, one per pair of tokens.
+/// What the forward keeps for the backward, for one block. mean, rstd and attention_logsumexp float, the rest
+/// of dtype. With flash attention, attention_logsumexp in place of attention_weights.
 struct BlockActivations {
     bool flash_attention;                                   // attention_flash_forward and _backward, or the steps
-    Tensor ln1_output, ln1_mean, ln1_rstd;                  // {B, T, D}, {B, T}, {B, T}
-    Tensor query, key, value;                               // {B, NH, T, HS} each
+    Tensor ln1_output;                                      // {B, T, D}
+    Tensor ln1_mean;                                        // {B, T}
+    Tensor ln1_rstd;                                        // {B, T}
+    Tensor query;                                           // {B, NH, T, HS}
+    Tensor key;                                             // {B, NH, T, HS}
+    Tensor value;                                           // {B, NH, T, HS}
     Tensor attention_weights;                               // {B, NH, T, T}; none with flash attention
     Tensor attention_logsumexp;                             // {B, NH, T}: flash attention's, in the weights' place
     Tensor attention_output;                                // {B, T, D}: the heads merged, before the projection
     Tensor residual2;                                       // {B, T, D}: input + the attention branch
-    Tensor ln2_output, ln2_mean, ln2_rstd;                  // {B, T, D}, {B, T}, {B, T}
-    Tensor mlp_up_output, gelu_output;                      // {B, T, 4D} each
+    Tensor ln2_output;                                      // {B, T, D}
+    Tensor ln2_mean;                                        // {B, T}
+    Tensor ln2_rstd;                                        // {B, T}
+    Tensor mlp_up_output;                                   // {B, T, 4D}
+    Tensor gelu_output;                                     // {B, T, 4D}
 
     BlockActivations(size_t batch_size, size_t seq_len, size_t embed_dim, size_t num_heads,
                      DType dtype = DType::Float32);
@@ -77,12 +72,18 @@ struct BlockScratch {
     Tensor branch_output;                                   // {B, T, D}: a branch's output, before its residual add
     Tensor qkv;                                             // {B, T, 3D}: split into query, key, value, then unread
     Tensor head_outputs;                                   // {B, NH, T, HS}: attention's, before the merge; not flash's
-    Tensor residual2_grad, branch_output_grad;              // {B, T, D}
-    Tensor ln_output_grad, attention_output_grad;           // {B, T, D}
-    Tensor gelu_output_grad, mlp_up_output_grad;            // {B, T, 4D}
+    Tensor residual2_grad;                                  // {B, T, D}
+    Tensor branch_output_grad;                              // {B, T, D}
+    Tensor ln_output_grad;                                  // {B, T, D}
+    Tensor attention_output_grad;                           // {B, T, D}
+    Tensor gelu_output_grad;                                // {B, T, 4D}
+    Tensor mlp_up_output_grad;                              // {B, T, 4D}
     Tensor qkv_grad;                                        // {B, T, 3D}
     // the attention steps' scratch (none with flash attention):
-    Tensor head_outputs_grad, query_grad, key_grad, value_grad;   // {B, NH, T, HS}
+    Tensor head_outputs_grad;                                     // {B, NH, T, HS}
+    Tensor query_grad;                                            // {B, NH, T, HS}
+    Tensor key_grad;                                              // {B, NH, T, HS}
+    Tensor value_grad;                                            // {B, NH, T, HS}
     Tensor weights_grad;                                    // {B, NH, T, T}
     // flash attention's (none without):
     Tensor attention_row_dot;                               // {B, NH, T} float
@@ -103,7 +104,9 @@ void block_backward(const Tensor& input_grad, const BlockParams& param_grads, co
 
 // ── BlockParams ───────────────────────────────────────────────────────────────
 
-/// Makes the block's views from 12 tensors in shapes()' order: the 4 matrices, then the 8 vectors.
+/// Makes the block's views.
+///
+///   tensors   12, in shapes()' order: the 4 matrices, then the 8 vectors
 inline BlockParams::BlockParams(const std::vector<Tensor>& tensors) {
     if (tensors.size() != 12) {
         fprintf(stderr, "error: a block has 12 parameter tensors, got %zu\n", tensors.size());
@@ -115,15 +118,16 @@ inline BlockParams::BlockParams(const std::vector<Tensor>& tensors) {
     ln2_weight = tensors[8], ln2_bias = tensors[9], mlp_up_bias = tensors[10], mlp_down_bias = tensors[11];
 }
 
-/// Gives the 12 shapes for embed_dim D, matrices first. For D = 768: the 4 matrices hold 12 D² = 7,077,888
-/// values and the 8 vectors 13 D = 9,984, so 7,087,872 per block.
+/// Gives the 12 shapes, matrices first: 12 D² + 13 D = 7,087,872 values for D = 768.
+///
+///   embed_dim   D
 inline std::vector<Shape> BlockParams::shapes(size_t embed_dim) {
     size_t D = embed_dim;
     return {{3 * D, D}, {D, D}, {4 * D, D}, {D, 4 * D},       // qkv, attention_out, mlp_up, mlp_down weights
             {D}, {D}, {3 * D}, {D}, {D}, {D}, {4 * D}, {D}};  // ln1, qkv b, attention_out b, ln2, mlp_up b, mlp_down b
 }
 
-/// Gives the 12 tensors in shapes()' order, to fill or compare them one by one.
+/// Gives the 12 tensors in shapes()' order.
 inline std::vector<Tensor> BlockParams::tensors() const {
     return {qkv_weight, attention_out_weight, mlp_up_weight, mlp_down_weight, ln1_weight, ln1_bias,
             qkv_bias,   attention_out_bias,   ln2_weight,    ln2_bias,        mlp_up_bias, mlp_down_bias};
@@ -131,12 +135,17 @@ inline std::vector<Tensor> BlockParams::tensors() const {
 
 // ── BlockActivations and BlockScratch ─────────────────────────────────────────
 
-/// Makes a block's kept activations, all 0, for these sizes. head_size = embed_dim / num_heads. With flash
-/// attention, attention_logsumexp in place of attention_weights: at {4, 1024}, 196 KB instead of 101 MB in
-/// bfloat16.
+/// Makes a block's kept activations, all 0.
+///
+///   batch_size, seq_len, embed_dim, num_heads   B, T, D, NH; head_size = D / NH
+///   dtype                                       Float32 or BFloat16
 inline BlockActivations::BlockActivations(size_t batch_size, size_t seq_len, size_t embed_dim, size_t num_heads,
                                           DType dtype) {
-    size_t B = batch_size, T = seq_len, D = embed_dim, NH = num_heads, HS = embed_dim / num_heads;
+    size_t B = batch_size;
+    size_t T = seq_len;
+    size_t D = embed_dim;
+    size_t NH = num_heads;
+    size_t HS = embed_dim / num_heads;
     flash_attention = attention_flash_fits(dtype, T, HS);
     ln1_output = Tensor::zeros({B, T, D}, dtype);
     ln1_mean = Tensor::zeros({B, T}), ln1_rstd = Tensor::zeros({B, T});
@@ -151,12 +160,17 @@ inline BlockActivations::BlockActivations(size_t batch_size, size_t seq_len, siz
     mlp_up_output = Tensor::zeros({B, T, 4 * D}, dtype), gelu_output = Tensor::zeros({B, T, 4 * D}, dtype);
 }
 
-/// Makes the scratch tensors, all 0, for these sizes: big enough for any block of them. With flash attention
-/// (attention_flash_fits, as BlockActivations decides it), attention_row_dot in place of the attention steps'
-/// six: at {4, 1024} in bfloat16, 196 KB instead of 120 MB.
+/// Makes the scratch tensors, all 0: with flash attention, attention_row_dot in place of the attention steps' six.
+///
+///   batch_size, seq_len, embed_dim, num_heads   B, T, D, NH
+///   dtype                                       Float32 or BFloat16
 inline BlockScratch::BlockScratch(size_t batch_size, size_t seq_len, size_t embed_dim, size_t num_heads,
                                   DType dtype) {
-    size_t B = batch_size, T = seq_len, D = embed_dim, NH = num_heads, HS = embed_dim / num_heads;
+    size_t B = batch_size;
+    size_t T = seq_len;
+    size_t D = embed_dim;
+    size_t NH = num_heads;
+    size_t HS = embed_dim / num_heads;
     bool flash_attention = attention_flash_fits(dtype, T, HS);
     branch_output = Tensor::zeros({B, T, D}, dtype);
     qkv = Tensor::zeros({B, T, 3 * D}, dtype);
@@ -177,10 +191,11 @@ inline BlockScratch::BlockScratch(size_t batch_size, size_t seq_len, size_t embe
 
 // ── the block ─────────────────────────────────────────────────────────────────
 
-/// Sets a block's parameters to GPT-2's starting values: the matrices random, mean 0 and std 0.02, the two
-/// projections (attention_out, mlp_down) with std 0.02 / sqrt(2 num_layers), as each adds onto the residual
-/// stream and a model has 2 of them per layer; the biases 0; the LayerNorm weights 1. The random numbers
-/// come from Tensor's generator: Tensor::manual_seed makes them the same every run.
+/// Sets GPT-2's starting values: matrices normal std 0.02, the two projections std 0.02 / sqrt(2 num_layers),
+/// biases 0, LayerNorm weights 1.
+///
+///   params       the block's
+///   num_layers   12 for GPT-2 small
 inline void block_init_params(const BlockParams& params, int num_layers) {
     float projection_std = 0.02f / sqrtf(2.0f * num_layers);
     params.qkv_weight.normal_(0.0f, 0.02f);
@@ -192,9 +207,12 @@ inline void block_init_params(const BlockParams& params, int num_layers) {
     params.ln2_bias.zero_(), params.mlp_up_bias.zero_(), params.mlp_down_bias.zero_();
 }
 
-/// Writes output = the block applied to input, and keeps in activations what the backward needs. input and
-/// output are {batch_size, seq_len, embed_dim}; they must not be the same tensor (the second residual add
-/// reads residual2, not input, but the backward reads input). Ten launches, one per box of the head comment.
+/// Writes output = the block applied to input, keeping what the backward needs.
+///
+///   output, input   {batch_size, seq_len, embed_dim}; not the same tensor (the backward reads input)
+///   params          the block's
+///   activations     kept for the backward
+///   scratch         shared by all blocks
 inline void block_forward(const Tensor& output, const Tensor& input, const BlockParams& params,
                           const BlockActivations& activations, const BlockScratch& scratch) {
     const BlockActivations& a = activations;
@@ -216,19 +234,19 @@ inline void block_forward(const Tensor& output, const Tensor& input, const Block
     residual_forward(output, a.residual2, scratch.branch_output);
 }
 
-/// Writes input_grad, and adds the parameters' gradients onto param_grads, from output_grad and what the
-/// forward read and kept: input, params and activations. param_grads must be 0 before the first backward of
-/// a step (each linear and LayerNorm adds onto them); input_grad is written over. The forward's steps the
-/// other way round, each kernel's backward:
+/// Writes input_grad and adds the parameters' gradients onto param_grads: the forward's steps the other way.
 ///
-///     MLP branch         residual 2 → MLP down linear → GELU → MLP up linear → LayerNorm 2, onto residual2_grad
-///     attention branch   residual 1 → attention out linear → attention → qkv linear → LayerNorm 1, onto input_grad
+///   input_grad                     written over
+///   param_grads                    added onto: 0 before a step's first backward
+///   output_grad                    the gradient from the next block
+///   input, params, activations     the forward's
+///   scratch                        shared by all blocks
 inline void block_backward(const Tensor& input_grad, const BlockParams& param_grads, const Tensor& output_grad,
                            const Tensor& input, const BlockParams& params, const BlockActivations& activations,
                            const BlockScratch& scratch) {
     const BlockActivations& a = activations;
     const BlockScratch& s = scratch;
-    // the MLP branch: residual2's gradient is output_grad (the add), then LayerNorm 2 adds the branch's part
+    // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_backward(s.residual2_grad, s.branch_output_grad, output_grad);
     linear_backward(s.gelu_output_grad, param_grads.mlp_down_weight, param_grads.mlp_down_bias, s.branch_output_grad,
                     a.gelu_output, params.mlp_down_weight);
@@ -237,7 +255,7 @@ inline void block_backward(const Tensor& input_grad, const BlockParams& param_gr
                     a.ln2_output, params.mlp_up_weight);
     layer_norm_backward(s.residual2_grad, param_grads.ln2_weight, param_grads.ln2_bias, s.ln_output_grad,
                         a.residual2, params.ln2_weight, a.ln2_mean, a.ln2_rstd);
-    // the attention branch: input's gradient is residual2's (the add), then LayerNorm 1 adds the branch's part
+    // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_backward(input_grad, s.branch_output_grad, s.residual2_grad);
     linear_backward(s.attention_output_grad, param_grads.attention_out_weight, param_grads.attention_out_bias,
                     s.branch_output_grad, a.attention_output, params.attention_out_weight);

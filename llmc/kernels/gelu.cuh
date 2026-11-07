@@ -1,189 +1,185 @@
-// gelu.cuh — GELU, the activation in GPT-2's MLP: each value on its own goes through a smooth curve
-// that lets positive values through and pushes negative ones toward 0.
-//
-// The math is in the note https://ducbachsong.github.io/posts/gelu-backward/. The comments below name
-// its steps (F1..F5 forward, B1..B7 backward, C1 and C2 rebuilt) and sections. Its letters for the
-// names here:
-//
-//     x = input   y = output   s = inner   h = tanh(inner)   p = 0.5 (1 + h), the gate
-//     β = GELU_SCALE   κ = GELU_CUBE_FACTOR   dy = output_grad   dx = input_grad
-//
-//     inner  = sqrt(2 / pi) * (x + 0.044715 x³)                                     F1: u = x + κx³, F2: s = βu
-//     gelu   = 0.5 x (1 + tanh(inner))         the "tanh" GELU, as GPT-2 and llm.c use
-//                                                                                   F3: h = tanh s, F4: p, F5: y = x · p
-//
-//     x        -10      -3       -1       0      1       3      10
-//     gelu      0       -0.004   -0.159   0      0.841   2.996  10
-//
-//     input, output   any shape, the same for both   in GPT-2, the MLP's middle:   {4, 1024, 3072}
-//
-// GPT-2 runs one in the MLP of each of its 12 blocks, between the two linears:
-//
-//     {4, 1024, 768} ── MLP up ──► {4, 1024, 3072} ── GELU ──► {4, 1024, 3072} ── MLP down ──► {4, 1024, 768}
-//
-// Backward, with output_grad the gradient arriving from the layer above (MLP down's input_grad):
-//
-//     input_grad = output_grad * gelu'(x)                                           C2: dx = dy · gelu'(x)
-//
-// gelu'(x), the slope, by the product rule on 0.5 x times (1 + tanh(inner)), with tanh'(u) = 1 - tanh²(u):
-//
-//     gelu'(x) = 0.5 (1 + tanh(inner))  +  0.5 x (1 - tanh²(inner)) * sqrt(2 / pi) * (1 + 3 * 0.044715 x²)
-//                └ d(0.5 x) times the rest ┘  └ 0.5 x times d(1 + tanh(inner)): tanh' times d(inner)/dx ┘
-//              = p                       +  x · p'(x)                                        C2
-//                B2's part, dx(1)           C1: B1 x, B3 ½, B4 1 - h², B5 β, B6 1 + 3κx²: dx(2)
-//
-// The note's example, x = [1, -1, 2, -2], gives gelu [0.8411920, -0.1588080, 1.9545977, -0.0454023] and
-// gelu' [1.0829641, -0.0829641, 1.0860993, -0.0860993].
-//
-// Every value is worked out on its own, with nothing shared: the simplest kind of kernel. Its time is
-// memory: the forward reads 4 bytes and writes 4 per value, and the tanh is quick next to that (note 7).
-// A name ending in 4 (input4, output_grad4, ...) is one float4 of that tensor: 4 values a thread has.
-//
-// The tensors are all float or all bfloat16; the kernels are templates on that dtype, T. A float4 is 4
-// neighbouring values either way: for bfloat16, one 8-byte read that load4 (tensor.cuh) turns into 4 floats,
-// and store4 rounds back. The tanh and the rest are always worked out in float.
+// gelu.cuh — GELU, the activation in GPT-2's MLP, the "tanh" form GPT-2 and llm.c use:
+//     forward:    y = 0.5 x (1 + tanh(s))       s = sqrt(2 / pi) (x + 0.044715 x³)
+//     backward:   dx = dy · gelu'(x)
+//                 gelu'(x) = 0.5 (1 + tanh(s)) + 0.5 x (1 - tanh²(s)) sqrt(2 / pi) (1 + 3 · 0.044715 x²)
+// input and output any shape, the same for both: {4, 1024, 3072} in GPT-2. All float or all bfloat16 (T);
+// the math is in float. Math: https://ducbachsong.github.io/posts/gelu-backward/
 #ifndef GELU_CUH
 #define GELU_CUH
 
-#include "cuda_common.h"             // cudaCheck only: the rest is written out below
-#include "../tensor.cuh"             // forward and backward take tensors: each knows its shape
+#include "cuda_common.h"             // cudaCheck, check_threads_per_block
+#include "../tensor.cuh"
 
-#define GELU_THREADS_PER_BLOCK 256   // one float4 per thread: {4, 1024, 3072} is 3,145,728 float4s, 12,288 blocks
+#define GELU_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
 #define GELU_SCALE 0.7978845608f     // sqrt(2 / pi)
-#define GELU_CUBE_FACTOR 0.044715f   // how much of x³ goes into inner
+#define GELU_CUBE_FACTOR 0.044715f   // how much of x³ goes into s
 
 // ── forward and backward ──────────────────────────────────────────────────────
-void gelu_forward(const Tensor& output, const Tensor& input);
-void gelu_backward(const Tensor& input_grad, const Tensor& output_grad, const Tensor& input);
+void gelu_forward(const Tensor& output_tensor, const Tensor& input_tensor, int threads_per_block_val = GELU_THREADS_PER_BLOCK);
+void gelu_backward(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor,
+                   int threads_per_block_val = GELU_THREADS_PER_BLOCK);
 
 // ── for both ──────────────────────────────────────────────────────────────────
-__device__ __forceinline__ float gelu_value(float x);
-__device__ __forceinline__ float gelu_slope(float x);
-int gelu_blocks(size_t total_float4s);
-void gelu_check_shapes(const Tensor& output, const Tensor& input);
+__device__ __forceinline__ float gelu_value(float x_val);
+__device__ __forceinline__ float gelu_slope(float x_val);
+int gelu_blocks(size_t total_float4s_val, int threads_per_block_val = GELU_THREADS_PER_BLOCK);
+void gelu_check_shapes(const Tensor& output_tensor, const Tensor& input_tensor);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
-// The kernel gelu_forward launches, declared here so it can call it; its code follows it.
 template <typename T>
-__global__ void gelu_forward_kernel(T* output, const T* input, size_t total_float4s);
+__global__ void gelu_forward_kernel(T* output_ptr, const T* input_ptr, size_t total_float4s_val);
 
-/// Writes output = gelu(input) for every value. output and input have the same shape, any shape whose
-/// number of values is a multiple of 4. One thread per float4: {4, 1024, 3072} is 3,145,728 float4s,
-/// 12,288 blocks of 256 threads.
-inline void gelu_forward(const Tensor& output, const Tensor& input) {
-    gelu_check_shapes(output, input);
-    size_t total_float4s = input.numel() / 4;
-    if (input.dtype() == DType::BFloat16)
-        gelu_forward_kernel<<<gelu_blocks(total_float4s), GELU_THREADS_PER_BLOCK>>>(
-            output.data_ptr<nv_bfloat16>(), input.data_ptr<nv_bfloat16>(), total_float4s);
+/// Writes output = gelu(input): checks, then launches gelu_forward_kernel.
+///
+///   output_tensor           the result, input's shape
+///   input_tensor            any shape, values a multiple of VALUES_PER_FLOAT4
+///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///                           GELU_THREADS_PER_BLOCK. Any size gives the same bits; only the time changes.
+inline void gelu_forward(const Tensor& output_tensor, const Tensor& input_tensor, int threads_per_block_val) {
+    // 1. check the launch and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "GELU");
+    gelu_check_shapes(output_tensor, input_tensor);
+    // 2. launch: one float4 per thread, the blocks rounded up
+    size_t total_float4s_val = input_tensor.numel() / VALUES_PER_FLOAT4;
+    int blocks_val = gelu_blocks(total_float4s_val, threads_per_block_val);
+    if (input_tensor.dtype() == DType::BFloat16)
+        gelu_forward_kernel<<<blocks_val, threads_per_block_val>>>(
+            output_tensor.data_ptr<nv_bfloat16>(), input_tensor.data_ptr<nv_bfloat16>(), total_float4s_val);
     else
-        gelu_forward_kernel<<<gelu_blocks(total_float4s), GELU_THREADS_PER_BLOCK>>>(output.data(), input.data(),
-                                                                                    total_float4s);
+        gelu_forward_kernel<<<blocks_val, threads_per_block_val>>>(output_tensor.data(), input_tensor.data(),
+                                                                    total_float4s_val);
     cudaCheck(cudaGetLastError());
 }
 
-/// Writes output, one float4 at a time. Thread n takes float4s n, n + every thread launched, ... (with the
-/// usual launch, one each). Threads next to each other take float4s next to each other, so a warp reads
-/// 32 x 16 = 512 neighbouring bytes at once.
+/// Works out gelu one float4 at a time: reads input, writes gelu of each value.
+///
+///   output_ptr, input_ptr   as in gelu_forward, float or bfloat16 (T)
+///   total_float4s_val       values / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void gelu_forward_kernel(T* output, const T* input, size_t total_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
-        float4 input4 = load4(input + 4 * index);
-        store4(output + 4 * index, make_float4(gelu_value(input4.x), gelu_value(input4.y), gelu_value(input4.z),
-                                               gelu_value(input4.w)));
+__global__ void gelu_forward_kernel(T* output_ptr, const T* input_ptr, size_t total_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        size_t first_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
+        // 1. read input, to float
+        float4 input_val = read4_as_float(input_ptr + first_val);
+        // 2. gelu of each, written
+        write4_from_float(output_ptr + first_val, make_float4(gelu_value(input_val.x), gelu_value(input_val.y),
+                                                              gelu_value(input_val.z), gelu_value(input_val.w)));
     }
 }
 
 // ── backward ──────────────────────────────────────────────────────────────────
 
-// The kernel gelu_backward launches, declared here so it can call it; its code follows it.
 template <typename T>
-__global__ void gelu_backward_kernel(T* input_grad, const T* output_grad, const T* input, size_t total_float4s);
+__global__ void gelu_backward_kernel(T* input_grad_ptr, const T* output_grad_ptr, const T* input_ptr,
+                                     size_t total_float4s_val);
 
-/// Writes input_grad = output_grad * gelu'(input) for every value, from output_grad and what the forward
-/// read: input. input_grad is written over, not added onto: in GPT-2 it is the gradient of MLP up's
-/// output, which only GELU reads. input_grad may be output_grad itself (each value is read before it is
-/// written, by the same thread), so the trainer can save a {4, 1024, 3072} tensor, 50 MB (note 7). The
-/// shapes are the forward's: input_grad and output_grad as input.
-inline void gelu_backward(const Tensor& input_grad, const Tensor& output_grad, const Tensor& input) {
-    gelu_check_shapes(input_grad, input);
-    gelu_check_shapes(output_grad, input);
-    size_t total_float4s = input.numel() / 4;
-    if (input.dtype() == DType::BFloat16)
-        gelu_backward_kernel<<<gelu_blocks(total_float4s), GELU_THREADS_PER_BLOCK>>>(
-            input_grad.data_ptr<nv_bfloat16>(), output_grad.data_ptr<nv_bfloat16>(), input.data_ptr<nv_bfloat16>(),
-            total_float4s);
+/// Writes input_grad = output_grad · gelu'(input) (written over, not added): checks, then launches
+/// gelu_backward_kernel.
+///
+///   input_grad_tensor       the result; may be output_grad itself
+///   output_grad_tensor      the gradient from the layer above
+///   input_tensor            what the forward read
+///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///                           GELU_THREADS_PER_BLOCK. Any size gives the same bits; only the time changes.
+inline void gelu_backward(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor,
+                          int threads_per_block_val) {
+    // 1. check the launch and the tensors; any of them wrong: stop with an error
+    check_threads_per_block(threads_per_block_val, "GELU");
+    gelu_check_shapes(input_grad_tensor, input_tensor);
+    gelu_check_shapes(output_grad_tensor, input_tensor);
+    // 2. launch: one float4 per thread, the blocks rounded up
+    size_t total_float4s_val = input_tensor.numel() / VALUES_PER_FLOAT4;
+    int blocks_val = gelu_blocks(total_float4s_val, threads_per_block_val);
+    if (input_tensor.dtype() == DType::BFloat16)
+        gelu_backward_kernel<<<blocks_val, threads_per_block_val>>>(
+            input_grad_tensor.data_ptr<nv_bfloat16>(), output_grad_tensor.data_ptr<nv_bfloat16>(),
+            input_tensor.data_ptr<nv_bfloat16>(), total_float4s_val);
     else
-        gelu_backward_kernel<<<gelu_blocks(total_float4s), GELU_THREADS_PER_BLOCK>>>(
-            input_grad.data(), output_grad.data(), input.data(), total_float4s);
+        gelu_backward_kernel<<<blocks_val, threads_per_block_val>>>(
+            input_grad_tensor.data(), output_grad_tensor.data(), input_tensor.data(), total_float4s_val);
     cudaCheck(cudaGetLastError());
 }
 
-/// Writes input_grad, one float4 at a time, as the forward walks output: thread n takes float4s n,
-/// n + every thread launched, ... Each value reads input and output_grad and writes input_grad: 12 bytes,
-/// against the forward's 8. Each value is the note's C2, dx = dy · gelu'(x); the seven steps B1..B7 of
-/// its Section 3 are never run one by one.
+/// Works out input_grad one float4 at a time, as the forward walks.
+///
+///   input_grad_ptr, output_grad_ptr, input_ptr   as in gelu_backward, float or bfloat16 (T)
+///   total_float4s_val                            values / VALUES_PER_FLOAT4
 template <typename T>
-__global__ void gelu_backward_kernel(T* input_grad, const T* output_grad, const T* input, size_t total_float4s) {
-    size_t thread_number = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (size_t index = thread_number; index < total_float4s; index += (size_t)gridDim.x * blockDim.x) {
-        float4 input4 = load4(input + 4 * index), output_grad4 = load4(output_grad + 4 * index);
-        store4(input_grad + 4 * index,
-               make_float4(output_grad4.x * gelu_slope(input4.x), output_grad4.y * gelu_slope(input4.y),
-                           output_grad4.z * gelu_slope(input4.z), output_grad4.w * gelu_slope(input4.w)));
+__global__ void gelu_backward_kernel(T* input_grad_ptr, const T* output_grad_ptr, const T* input_ptr,
+                                     size_t total_float4s_val) {
+    size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // Thread n takes float4s n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        size_t first_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
+        // 1. read input and output_grad, to float
+        float4 input_val = read4_as_float(input_ptr + first_val);
+        float4 output_grad_val = read4_as_float(output_grad_ptr + first_val);
+        // 2. output_grad x gelu'(input), written
+        write4_from_float(input_grad_ptr + first_val,
+               make_float4(output_grad_val.x * gelu_slope(input_val.x), output_grad_val.y * gelu_slope(input_val.y),
+                           output_grad_val.z * gelu_slope(input_val.z), output_grad_val.w * gelu_slope(input_val.w)));
     }
 }
 
 // ── for both ──────────────────────────────────────────────────────────────────
 
-/// Gives gelu(x) for one value: 0.5 x (1 + tanh(inner)). For a large x, tanh is 1 and gelu(x) = x; for a
-/// large negative x, tanh is -1 and gelu(x) = 0.
-__device__ __forceinline__ float gelu_value(float x) {
-    float inner = GELU_SCALE * (x + GELU_CUBE_FACTOR * x * x * x);   // F1, F2: s = β (x + κx³)
-    return 0.5f * x * (1.0f + tanhf(inner));                          // F3, F4, F5: y = x · ½ (1 + tanh s)
+/// Gives gelu(x) = 0.5 x (1 + tanh(s)): about x for a large x, about 0 for a large negative x.
+///
+///   x_val   one input value
+__device__ __forceinline__ float gelu_value(float x_val) {
+    float inner_val = GELU_SCALE * (x_val + GELU_CUBE_FACTOR * x_val * x_val * x_val);   // s
+    return 0.5f * x_val * (1.0f + tanhf(inner_val));
 }
 
-/// Gives gelu'(x) for one value: how much gelu's output moves for each unit its input moves, which the
-/// backward multiplies output_grad by. 1 - tanh² reuses the tanh already worked out; llm.c writes the same
-/// as 1 / cosh², which costs a cosh more (note 7). This is the note's C2 boxed formula, gelu'(x).
-__device__ __forceinline__ float gelu_slope(float x) {
-    float inner = GELU_SCALE * (x + GELU_CUBE_FACTOR * x * x * x);                // F1, F2: s
-    float tanh_inner = tanhf(inner);                                               // F3: h, worked out again, not kept
-    float inner_slope = GELU_SCALE * (1.0f + 3.0f * GELU_CUBE_FACTOR * x * x);    // d(inner) / dx: B5's β times B6's 1 + 3κx²
-    return 0.5f * (1.0f + tanh_inner) +                                            // p: B2's part, dx(1)
-           0.5f * x * (1.0f - tanh_inner * tanh_inner) * inner_slope;              // x · p'(x): C1, dx(2); ½ is B3, 1 - h² B4
+/// Gives gelu'(x), the slope the backward multiplies output_grad by. 1 - tanh² reuses the tanh.
+///
+///   x_val   one input value
+__device__ __forceinline__ float gelu_slope(float x_val) {
+    float inner_val = GELU_SCALE * (x_val + GELU_CUBE_FACTOR * x_val * x_val * x_val);              // s
+    float tanh_inner_val = tanhf(inner_val);
+    float inner_slope_val = GELU_SCALE * (1.0f + 3.0f * GELU_CUBE_FACTOR * x_val * x_val);           // ds / dx
+    return 0.5f * (1.0f + tanh_inner_val) +
+           0.5f * x_val * (1.0f - tanh_inner_val * tanh_inner_val) * inner_slope_val;
 }
 
-/// Gives the number of blocks for one float4 per thread, rounded up: a part-full last block. 45 float4s
-/// is 1 block, 3,145,728 is 12,288.
-inline int gelu_blocks(size_t total_float4s) {
-    return (int)((total_float4s + GELU_THREADS_PER_BLOCK - 1) / GELU_THREADS_PER_BLOCK);
+/// Gives the blocks for one float4 per thread, rounded up: 3,145,728 float4s in blocks of 256 is 12,288.
+///
+///   total_float4s_val       values / VALUES_PER_FLOAT4
+///   threads_per_block_val   the block size; not given: GELU_THREADS_PER_BLOCK
+inline int gelu_blocks(size_t total_float4s_val, int threads_per_block_val) {
+    return (int)CEIL_DIV(total_float4s_val, (size_t)threads_per_block_val);
 }
 
-/// Stops with a message if the tensors do not fit together, before a kernel reads past one: output the
-/// same shape as input, both float or both bfloat16. Also the number of values a multiple of 4 and both
-/// starting on 4 values (16 bytes for float, 8 for bfloat16), for the 4-value loads: off that, the GPU
-/// stops with "misaligned address" at some later call, far from the cause. Backward passes input_grad,
-/// then output_grad, in output's place.
-inline void gelu_check_shapes(const Tensor& output, const Tensor& input) {
-    if (output.shape() != input.shape()) {
+/// Stops with a message unless the tensors fit: same shape, both float or both bfloat16, values a multiple
+/// of VALUES_PER_FLOAT4, both starting on a whole float4 (for the float4 loads).
+///
+///   output_tensor   forward: output; backward: input_grad, then output_grad
+///   input_tensor    input
+inline void gelu_check_shapes(const Tensor& output_tensor, const Tensor& input_tensor) {
+    // shapes: the same
+    if (output_tensor.shape() != input_tensor.shape()) {
         fprintf(stderr, "error: GELU needs output the same shape as input\n");
         exit(EXIT_FAILURE);
     }
-    if ((input.dtype() != DType::Float32 && input.dtype() != DType::BFloat16) || output.dtype() != input.dtype()) {
+    // types: both float or both bfloat16
+    if ((input_tensor.dtype() != DType::Float32 && input_tensor.dtype() != DType::BFloat16) ||
+        output_tensor.dtype() != input_tensor.dtype()) {
         fprintf(stderr, "error: GELU needs its tensors all float or all bfloat16\n");
         exit(EXIT_FAILURE);
     }
-    size_t four_values = 4 * input.element_size();                      // 16 bytes for float, 8 for bfloat16
-    if (input.numel() % 4 != 0 || (size_t)input.data_ptr() % four_values != 0 ||
-        (size_t)output.data_ptr() % four_values != 0) {
-        fprintf(stderr, "error: GELU reads 4 values at a time, so the number of values must be a multiple of 4 and "
+    // counts and addresses: whole float4s, both tensors starting on one
+    size_t float4_bytes_val = VALUES_PER_FLOAT4 * input_tensor.element_size();
+    if (input_tensor.numel() % VALUES_PER_FLOAT4 != 0 || (size_t)input_tensor.data_ptr() % float4_bytes_val != 0 ||
+        (size_t)output_tensor.data_ptr() % float4_bytes_val != 0) {
+        fprintf(stderr, "error: GELU reads %d values at a time, so the number of values must be a multiple of %d and "
                         "input and output must start on %zu bytes; got %zu values, %p, %p\n",
-                four_values, input.numel(), input.data_ptr(), output.data_ptr());
+                VALUES_PER_FLOAT4, VALUES_PER_FLOAT4, float4_bytes_val, input_tensor.numel(), input_tensor.data_ptr(),
+                output_tensor.data_ptr());
         exit(EXIT_FAILURE);
     }
 }

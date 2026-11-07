@@ -60,6 +60,7 @@ struct TrainConfig {
     int val_every = 250;
     int val_batches = 20;                    // on each GPU
     std::string dtype = "bf16";              // bf16 or float
+    std::string moments = "bf16";            // AdamW's m and v with a bf16 model: bf16, or 8bit (m and sqrt(v))
     unsigned long long seed = 42;
     std::string nccl_id_file;                // "": /tmp/gpt2_nccl_id_<TORCHELASTIC_RUN_ID>.bin
     int progress_every = 200;                // a progress line, with the time left
@@ -89,6 +90,8 @@ static void print_usage_and_stop(const char* program, int exit_code) {
     printf("  --val-every N                 %d\n", d.val_every);
     printf("  --val-batches N               %d   on each GPU\n", d.val_batches);
     printf("  --dtype bf16|float            %s\n", d.dtype.c_str());
+    printf("  --moments bf16|8bit           %s   AdamW's m and v, with --dtype bf16; 8bit: no checkpoints yet\n",
+           d.moments.c_str());
     printf("  --seed N                      %llu\n", d.seed);
     printf("  --nccl-id-file PATH           /tmp/gpt2_nccl_id_<TORCHELASTIC_RUN_ID>.bin; several GPUs only\n");
     printf("  --progress-every N            %d   a line with the time left\n", d.progress_every);
@@ -125,6 +128,7 @@ static TrainConfig parse_args(int argc, char** argv) {
         else if (flag == "--val-every") c.val_every = atoi(value);
         else if (flag == "--val-batches") c.val_batches = atoi(value);
         else if (flag == "--dtype") c.dtype = value;
+        else if (flag == "--moments") c.moments = value;
         else if (flag == "--seed") c.seed = strtoull(value, nullptr, 10);
         else if (flag == "--nccl-id-file") c.nccl_id_file = value;
         else if (flag == "--progress-every") c.progress_every = atoi(value);
@@ -139,6 +143,15 @@ static TrainConfig parse_args(int argc, char** argv) {
     }
     if (c.dtype != "bf16" && c.dtype != "float") {
         fprintf(stderr, "error: --dtype is bf16 or float, not %s\n", c.dtype.c_str());
+        exit(EXIT_FAILURE);
+    }
+    if (c.moments != "bf16" && c.moments != "8bit") {
+        fprintf(stderr, "error: --moments is bf16 or 8bit, not %s\n", c.moments.c_str());
+        exit(EXIT_FAILURE);
+    }
+    if (c.moments == "8bit" && (c.dtype != "bf16" || !c.checkpoint_dir.empty() || !c.resume.empty())) {
+        fprintf(stderr, "error: --moments 8bit needs --dtype bf16, and has no checkpoints yet (no --checkpoint-dir "
+                        "or --resume)\n");
         exit(EXIT_FAILURE);
     }
     if ((c.steps < 1 && c.steps != -1) || c.tokens_per_step < 1 || c.val_every < 1 || c.val_batches < 1 ||
@@ -225,10 +238,12 @@ static float val_loss(DataLoader& val_loader, const Tensor& token_ids, const Ten
 int main(int argc, char** argv) {
     TrainConfig c = parse_args(argc, argv);
     Distributed distributed(c.nccl_id_file);                            // first: it picks this process's GPU
-    int rank = distributed.rank(), world_size = distributed.world_size();
+    int rank = distributed.rank();
+    int world_size = distributed.world_size();
     GPT2Config model_config;                                            // GPT-2 small
     DType dtype = c.dtype == "bf16" ? DType::BFloat16 : DType::Float32;
-    size_t B = c.batch_size, T = c.seq_len;
+    size_t B = c.batch_size;
+    size_t T = c.seq_len;
     size_t tokens_per_step = c.tokens_per_step;
     size_t tokens_per_round = (size_t)world_size * B * T;              // one micro-batch on every GPU
     if (tokens_per_step % tokens_per_round != 0) {
@@ -261,8 +276,10 @@ int main(int argc, char** argv) {
     adamw_config.learning_rate = learning_rate_at(0, c);
     adamw_config.weight_decay = c.weight_decay;
     adamw_config.max_norm = c.max_norm;
+    adamw_config.moments_8bit = c.moments == "8bit";
     AdamW optimizer(GPT2Params::shapes(model_config), adamw_config, dtype, rank, world_size);
-    std::vector<Tensor> param_tensors, grad_tensors;
+    std::vector<Tensor> param_tensors;
+    std::vector<Tensor> grad_tensors;
     for (int k = 0; k < optimizer.num_params(); k++) {
         param_tensors.push_back(optimizer.param(k));
         grad_tensors.push_back(optimizer.grad(k));
@@ -275,14 +292,16 @@ int main(int argc, char** argv) {
 
     GPT2Activations activations(B, T, model_config, dtype);
     GPT2Scratch scratch(B, T, model_config, dtype);
-    Tensor token_ids = Tensor::zeros({B, T}, DType::Int32), targets = Tensor::zeros({B, T}, DType::Int32);
+    Tensor token_ids = Tensor::zeros({B, T}, DType::Int32);
+    Tensor targets = Tensor::zeros({B, T}, DType::Int32);
     Tensor grad_norm_block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS});
     GradNorm grad_norm(grad_norm_block_sums);
 
-    size_t free_bytes, total_bytes;
+    size_t free_bytes;
+    size_t total_bytes;
     cudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
-    print0(distributed, "GPT-2 small: %zu parameters, %s, on %d GPU(s)\n", optimizer.all_params().numel(),
-           c.dtype.c_str(), world_size);
+    print0(distributed, "GPT-2 small: %zu parameters, %s, AdamW m and v in %s, on %d GPU(s)\n",
+           optimizer.all_params().numel(), c.dtype.c_str(), c.dtype == "bf16" ? c.moments.c_str() : "float", world_size);
     print0(distributed, "train: %d file(s), %zu tokens%s; val: %zu tokens, %d batches of it on each GPU each time\n",
            train_loader.num_files(), train_loader.total_tokens(),
            train_loader.more_files_coming() ? " so far (more being written)" : "", val_loader.total_tokens(),

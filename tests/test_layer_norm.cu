@@ -2,10 +2,10 @@
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
-// Part 1 checks both against PyTorch's layer_norm, with autograd for the backward, and times them
-// on GPT-2 small's sizes; part 2 checks numbers worked out by hand; part 3 checks that each kernel's
-// registers fit its block; part 4 times each kernel with other block and thread counts. (The C#
-// trainer had no LayerNorm test: TorchSharp's was trusted.)
+// Part 1 checks both against PyTorch's layer_norm, with autograd for the backward; part 2 checks numbers
+// worked out by hand; part 3 checks that each kernel's registers fit its block, and other block sizes. The
+// timings are in tunes/tune_layer_norm.cu. (The C# trainer had no LayerNorm test: TorchSharp's was
+// trusted.)
 #include <torch/types.h>              // torch::layer_norm, backward(); libtorch before any CUDA header
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
 #include "../llmc/kernels/layer_norm.cuh"
@@ -15,55 +15,75 @@ static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a f
 // rounding moves a value by up to 2^-8, about 0.4% of it. weight_grad and bias_grad are rounded once per
 // block that adds onto them, 8 times here.
 static const double BFLOAT16_TOLERANCE = 2e-2;
+// Between block sizes in bfloat16: the backward always launches LAYER_NORM_BACKWARD_BLOCKS (80) blocks, and
+// each block with rows rounds its sum into weight_grad and bias_grad once. 256 rows at 16 warps a block (the
+// default) fill 16 blocks: 16 roundings; at one warp a block every one of the 80 has rows: 80 roundings, and
+// the two land 2.6% apart on an H100 PCIe. A block that lost its rows would be far off.
+static const double BLOCK_SIZES_BFLOAT16_GRAD_TOLERANCE = 5e-2;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes random values from Tensor::randn as a CPU list: the same numbers for both sides of a test.
-static std::vector<float> random_values(const Shape &shape)
+static std::vector<float> random_values(const Shape &shape_list)
 {
-    return Tensor::randn(shape).tolist();
+    return Tensor::randn(shape_list).tolist();
 }
 
-/// Makes a tensor of `shape` on the GPU holding `values`, given in row order.
-static Tensor tensor_of(const Shape &shape, const std::vector<float> &values)
+/// Makes a tensor of `shape_list` on the GPU holding `values_list`, given in row order.
+static Tensor tensor_of(const Shape &shape_list, const std::vector<float> &values_list)
 {
-    Tensor tensor = Tensor::empty(shape);
-    tensor.copy_from_cpu(values.data());
+    Tensor tensor = Tensor::empty(shape_list);
+    tensor.copy_from_cpu(values_list.data());
     return tensor;
 }
 
 /// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
 {
-    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
-    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
+    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    std::vector<int64_t> sizes_list(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
+    return torch::from_blob(tensor.data(), sizes_list, on_gpu_val).clone();
 }
 
 /// Gives every value of a PyTorch tensor as a CPU list in row order, to compare with mine.
 static std::vector<float> list_of(const torch::Tensor &tensor)
 {
-    torch::Tensor on_cpu = tensor.detach().contiguous().cpu();
-    return std::vector<float>(on_cpu.data_ptr<float>(), on_cpu.data_ptr<float>() + on_cpu.numel());
+    torch::Tensor on_cpu_tensor = tensor.detach().contiguous().cpu();
+    return std::vector<float>(on_cpu_tensor.data_ptr<float>(), on_cpu_tensor.data_ptr<float>() + on_cpu_tensor.numel());
 }
 
-/// Measures how long `run` takes on the GPU, in milliseconds: a mark on the GPU's queue
-/// before it and one after; the GPU writes down the time as it reaches each.
-template <typename Run>
-static float gpu_milliseconds(Run run)
+/// One LayerNorm's tensors: the inputs, the forward's results and the gradients, float or bfloat16 (mean
+/// and rstd always float), the results and gradients all 0 at first.
+struct LayerNormTensors
 {
-    cudaEvent_t start, end;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&end));
-    cudaCheck(cudaEventRecord(start));
-    run();
-    cudaCheck(cudaEventRecord(end));
-    cudaCheck(cudaEventSynchronize(end)); // wait until the GPU has passed the second mark
-    float milliseconds = 0.0f;
-    cudaCheck(cudaEventElapsedTime(&milliseconds, start, end));
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(end));
-    return milliseconds;
+    Tensor input_tensor;
+    Tensor weight_tensor;
+    Tensor bias_tensor;
+    Tensor output_grad_tensor;
+    Tensor output_tensor;
+    Tensor mean_tensor;
+    Tensor rstd_tensor;
+    Tensor input_grad_tensor;
+    Tensor weight_grad_tensor;
+    Tensor bias_grad_tensor;
+};
+
+/// Makes a LayerNorm's tensors of {batch_size, seq_len, embed_dim} from random values, in `dtype_val`.
+static LayerNormTensors random_layer_norm(size_t batch_size_val, size_t seq_len_val, size_t embed_dim_val, DType dtype_val)
+{
+    Shape shape_list = {batch_size_val, seq_len_val, embed_dim_val};
+    LayerNormTensors tensors_val;
+    tensors_val.input_tensor = tensor_of(shape_list, random_values(shape_list)).to(dtype_val);
+    tensors_val.weight_tensor = tensor_of({embed_dim_val}, random_values({embed_dim_val})).to(dtype_val);
+    tensors_val.bias_tensor = tensor_of({embed_dim_val}, random_values({embed_dim_val})).to(dtype_val);
+    tensors_val.output_grad_tensor = tensor_of(shape_list, random_values(shape_list)).to(dtype_val);
+    tensors_val.output_tensor = Tensor::zeros(shape_list, dtype_val);
+    tensors_val.mean_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    tensors_val.rstd_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    tensors_val.input_grad_tensor = Tensor::zeros(shape_list, dtype_val);
+    tensors_val.weight_grad_tensor = Tensor::zeros({embed_dim_val}, dtype_val);
+    tensors_val.bias_grad_tensor = Tensor::zeros({embed_dim_val}, dtype_val);
+    return tensors_val;
 }
 
 // ══ part 1: mine against PyTorch's ═══════════════════════════════════════════
@@ -74,21 +94,20 @@ static void forward_matches_pytorch(void)
     // thread of a warp takes 6 of a row's 192 float4s), random input, weight and bias: output, mean
     // and rstd equal what PyTorch's native_layer_norm gives, within 1e-5. Not to the last bit: the
     // two add up a row's 768 values in a different order.
+    // 1. random tensors; mine
     Tensor::manual_seed(0);
-    size_t batch_size = 2, seq_len = 8, embed_dim = 768;
-    Tensor input = tensor_of({batch_size, seq_len, embed_dim}, random_values({batch_size, seq_len, embed_dim}));
-    Tensor weight = tensor_of({embed_dim}, random_values({embed_dim}));
-    Tensor bias = tensor_of({embed_dim}, random_values({embed_dim}));
-    Tensor output = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-
-    std::vector<int64_t> normalized_shape = {(int64_t)embed_dim};    // normalize over the last dim
-    auto [pytorch_output, pytorch_mean, pytorch_rstd] = torch::native_layer_norm(
-        pytorch_copy_of(input), normalized_shape, pytorch_copy_of(weight), pytorch_copy_of(bias), 1e-5);
-    ASSERT_NEAR(output.tolist(), list_of(pytorch_output), TOLERANCE);
-    ASSERT_NEAR(mean.tolist(), list_of(pytorch_mean), TOLERANCE);
-    ASSERT_NEAR(rstd.tolist(), list_of(pytorch_rstd), TOLERANCE);
+    LayerNormTensors tensors_val = random_layer_norm(2, 8, 768, DType::Float32);
+    layer_norm_forward(tensors_val.output_tensor, tensors_val.mean_tensor, tensors_val.rstd_tensor,
+                       tensors_val.input_tensor, tensors_val.weight_tensor, tensors_val.bias_tensor);
+    // 2. PyTorch's
+    std::vector<int64_t> normalized_shape_list = {768};               // normalize over the last dim
+    auto [pytorch_output_tensor, pytorch_mean_tensor, pytorch_rstd_tensor] =
+        torch::native_layer_norm(pytorch_copy_of(tensors_val.input_tensor), normalized_shape_list,
+                                 pytorch_copy_of(tensors_val.weight_tensor), pytorch_copy_of(tensors_val.bias_tensor), 1e-5);
+    // 3. check
+    ASSERT_NEAR(tensors_val.output_tensor.tolist(), list_of(pytorch_output_tensor), TOLERANCE);
+    ASSERT_NEAR(tensors_val.mean_tensor.tolist(), list_of(pytorch_mean_tensor), TOLERANCE);
+    ASSERT_NEAR(tensors_val.rstd_tensor.tolist(), list_of(pytorch_rstd_tensor), TOLERANCE);
 }
 
 static void backward_matches_pytorch(void)
@@ -97,30 +116,26 @@ static void backward_matches_pytorch(void)
     // backward, so weight_grad and bias_grad get adds from 8 blocks. Random input, weight, bias and
     // output_grad, backward from 0: input_grad, weight_grad and bias_grad equal PyTorch's .grad after
     // autograd's backward, within 1e-5.
+    // 1. random tensors; mine
     Tensor::manual_seed(0);
-    size_t batch_size = 4, seq_len = 64, embed_dim = 768;
-    Tensor input = tensor_of({batch_size, seq_len, embed_dim}, random_values({batch_size, seq_len, embed_dim}));
-    Tensor weight = tensor_of({embed_dim}, random_values({embed_dim}));
-    Tensor bias = tensor_of({embed_dim}, random_values({embed_dim}));
-    Tensor output_grad =
-        tensor_of({batch_size, seq_len, embed_dim}, random_values({batch_size, seq_len, embed_dim}));
-    Tensor output = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    Tensor input_grad = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor weight_grad = Tensor::zeros({embed_dim}), bias_grad = Tensor::zeros({embed_dim});
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-
-    torch::Tensor pytorch_input = pytorch_copy_of(input).requires_grad_(true);
-    torch::Tensor pytorch_weight = pytorch_copy_of(weight).requires_grad_(true);
-    torch::Tensor pytorch_bias = pytorch_copy_of(bias).requires_grad_(true);
-    std::vector<int64_t> normalized_shape = {(int64_t)embed_dim};
-    torch::Tensor pytorch_output =
-        torch::layer_norm(pytorch_input, normalized_shape, pytorch_weight, pytorch_bias, 1e-5);
-    pytorch_output.backward(pytorch_copy_of(output_grad));
-    ASSERT_NEAR(input_grad.tolist(), list_of(pytorch_input.grad()), TOLERANCE);
-    ASSERT_NEAR(weight_grad.tolist(), list_of(pytorch_weight.grad()), TOLERANCE);
-    ASSERT_NEAR(bias_grad.tolist(), list_of(pytorch_bias.grad()), TOLERANCE);
+    LayerNormTensors tensors_val = random_layer_norm(4, 64, 768, DType::Float32);
+    layer_norm_forward(tensors_val.output_tensor, tensors_val.mean_tensor, tensors_val.rstd_tensor,
+                       tensors_val.input_tensor, tensors_val.weight_tensor, tensors_val.bias_tensor);
+    layer_norm_backward(tensors_val.input_grad_tensor, tensors_val.weight_grad_tensor, tensors_val.bias_grad_tensor,
+                        tensors_val.output_grad_tensor, tensors_val.input_tensor, tensors_val.weight_tensor,
+                        tensors_val.mean_tensor, tensors_val.rstd_tensor);
+    // 2. PyTorch's, with autograd
+    torch::Tensor pytorch_input_tensor = pytorch_copy_of(tensors_val.input_tensor).requires_grad_(true);
+    torch::Tensor pytorch_weight_tensor = pytorch_copy_of(tensors_val.weight_tensor).requires_grad_(true);
+    torch::Tensor pytorch_bias_tensor = pytorch_copy_of(tensors_val.bias_tensor).requires_grad_(true);
+    std::vector<int64_t> normalized_shape_list = {768};
+    torch::Tensor pytorch_output_tensor =
+        torch::layer_norm(pytorch_input_tensor, normalized_shape_list, pytorch_weight_tensor, pytorch_bias_tensor, 1e-5);
+    pytorch_output_tensor.backward(pytorch_copy_of(tensors_val.output_grad_tensor));
+    // 3. check
+    ASSERT_NEAR(tensors_val.input_grad_tensor.tolist(), list_of(pytorch_input_tensor.grad()), TOLERANCE);
+    ASSERT_NEAR(tensors_val.weight_grad_tensor.tolist(), list_of(pytorch_weight_tensor.grad()), TOLERANCE);
+    ASSERT_NEAR(tensors_val.bias_grad_tensor.tolist(), list_of(pytorch_bias_tensor.grad()), TOLERANCE);
 }
 
 static void forward_and_backward_in_bfloat16(void)
@@ -130,96 +145,36 @@ static void forward_and_backward_in_bfloat16(void)
     // the same bfloat16 values PyTorch is given as floats, so mean and rstd are PyTorch's within 1e-5; output
     // and input_grad are rounded once as they are stored, weight_grad and bias_grad once per block: within
     // BFLOAT16_TOLERANCE.
+    // 1. random tensors in bfloat16; mine
     Tensor::manual_seed(0);
-    size_t batch_size = 4, seq_len = 64, embed_dim = 768;
-    Shape shape = {batch_size, seq_len, embed_dim};
-    Tensor input = tensor_of(shape, random_values(shape)).to(DType::BFloat16);
-    Tensor weight = tensor_of({embed_dim}, random_values({embed_dim})).to(DType::BFloat16);
-    Tensor bias = tensor_of({embed_dim}, random_values({embed_dim})).to(DType::BFloat16);
-    Tensor output_grad = tensor_of(shape, random_values(shape)).to(DType::BFloat16);
-    Tensor output = Tensor::zeros(shape, DType::BFloat16);
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    Tensor input_grad = Tensor::zeros(shape, DType::BFloat16);
-    Tensor weight_grad = Tensor::zeros({embed_dim}, DType::BFloat16);
-    Tensor bias_grad = Tensor::zeros({embed_dim}, DType::BFloat16);
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-
-    torch::Tensor pytorch_input = pytorch_copy_of(input.to(DType::Float32)).requires_grad_(true);
-    torch::Tensor pytorch_weight = pytorch_copy_of(weight.to(DType::Float32)).requires_grad_(true);
-    torch::Tensor pytorch_bias = pytorch_copy_of(bias.to(DType::Float32)).requires_grad_(true);
-    std::vector<int64_t> normalized_shape = {(int64_t)embed_dim};
-    auto [pytorch_output, pytorch_mean, pytorch_rstd] =
-        torch::native_layer_norm(pytorch_input, normalized_shape, pytorch_weight, pytorch_bias, 1e-5);
-    pytorch_output.backward(pytorch_copy_of(output_grad.to(DType::Float32)));
-    ASSERT_NEAR(mean.tolist(), list_of(pytorch_mean), TOLERANCE);
-    ASSERT_NEAR(rstd.tolist(), list_of(pytorch_rstd), TOLERANCE);
-    ASSERT_NEAR(output.to(DType::Float32).tolist(), list_of(pytorch_output), BFLOAT16_TOLERANCE);
-    ASSERT_NEAR(input_grad.to(DType::Float32).tolist(), list_of(pytorch_input.grad()), BFLOAT16_TOLERANCE);
-    ASSERT_NEAR(weight_grad.to(DType::Float32).tolist(), list_of(pytorch_weight.grad()), BFLOAT16_TOLERANCE);
-    ASSERT_NEAR(bias_grad.to(DType::Float32).tolist(), list_of(pytorch_bias.grad()), BFLOAT16_TOLERANCE);
-}
-
-static void time_20_steps_on_gpt2_small_size(void)
-{
-    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's sizes, batch_size = 4 rows
-    // of seq_len = 1024 tokens, embed_dim = 768, mine against PyTorch's layer_norm with autograd. A
-    // forward reads input and writes output, 2 x 12.6 MB: at a T4's 320 GB/s at least 0.079 ms. A
-    // backward reads input, output_grad and input_grad and writes input_grad, 4 x 12.6 MB: at least
-    // 0.157 ms. Both sides add 20 backwards onto their gradients; at the end they must still agree.
-    Tensor::manual_seed(0);
-    size_t batch_size = 4, seq_len = 1024, embed_dim = 768;
-    Tensor input = Tensor::randn({batch_size, seq_len, embed_dim});      // made on the CPU: a few seconds
-    Tensor weight = Tensor::randn({embed_dim}), bias = Tensor::randn({embed_dim});
-    Tensor output_grad = Tensor::randn({batch_size, seq_len, embed_dim});
-    Tensor output = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    Tensor input_grad = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor weight_grad = Tensor::zeros({embed_dim}), bias_grad = Tensor::zeros({embed_dim});
-
-    torch::Tensor pytorch_input = pytorch_copy_of(input).requires_grad_(true);
-    torch::Tensor pytorch_weight = pytorch_copy_of(weight).requires_grad_(true);
-    torch::Tensor pytorch_bias = pytorch_copy_of(bias).requires_grad_(true);
-    torch::Tensor pytorch_output_grad = pytorch_copy_of(output_grad);
-    std::vector<int64_t> normalized_shape = {(int64_t)embed_dim};
-    torch::Tensor pytorch_output;
-
-    // Steps 1 and 2 do first-time work, so the average is of 3..20: in step 1 CUDA loads each side's
-    // kernels; in step 2 PyTorch's backward first adds onto the .grad that step 1 made (26.6 ms on a
-    // T4, against 0.54 ms in every later step), most likely loading the kernel that adds.
-    print_test_name(__func__);
-    printf("    time in ms:   step   my forward   my backward   PyTorch forward   PyTorch backward\n");
-    double totals[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int t = 1; t <= 20; t++)
-    {
-        float times[4];
-        times[0] = gpu_milliseconds([&] { layer_norm_forward(output, mean, rstd, input, weight, bias); });
-        times[1] = gpu_milliseconds([&] {
-            layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-        });
-        times[2] = gpu_milliseconds([&] {
-            pytorch_output = torch::layer_norm(pytorch_input, normalized_shape, pytorch_weight, pytorch_bias, 1e-5);
-        });
-        times[3] = gpu_milliseconds([&] { pytorch_output.backward(pytorch_output_grad); });
-        printf("                  %4d   %10.3f   %11.3f   %15.3f   %16.3f\n", t, times[0], times[1], times[2],
-               times[3]);
-        if (t <= 2)
-            continue;
-        for (int column = 0; column < 4; column++)
-            totals[column] += times[column];
-    }
-    printf("    average of steps 3..20:  %10.3f   %11.3f   %15.3f   %16.3f\n", totals[0] / 18, totals[1] / 18,
-           totals[2] / 18, totals[3] / 18);
-    printf("    PyTorch takes, against mine:                         %14.2fx   %15.2fx\n", totals[2] / totals[0],
-           totals[3] / totals[1]);
-    ASSERT_NEAR(output.tolist(), list_of(pytorch_output), TOLERANCE);
-    ASSERT_NEAR(input_grad.tolist(), list_of(pytorch_input.grad()), TOLERANCE);
-    ASSERT_NEAR(weight_grad.tolist(), list_of(pytorch_weight.grad()), TOLERANCE);
-    ASSERT_NEAR(bias_grad.tolist(), list_of(pytorch_bias.grad()), TOLERANCE);
+    LayerNormTensors tensors_val = random_layer_norm(4, 64, 768, DType::BFloat16);
+    layer_norm_forward(tensors_val.output_tensor, tensors_val.mean_tensor, tensors_val.rstd_tensor,
+                       tensors_val.input_tensor, tensors_val.weight_tensor, tensors_val.bias_tensor);
+    layer_norm_backward(tensors_val.input_grad_tensor, tensors_val.weight_grad_tensor, tensors_val.bias_grad_tensor,
+                        tensors_val.output_grad_tensor, tensors_val.input_tensor, tensors_val.weight_tensor,
+                        tensors_val.mean_tensor, tensors_val.rstd_tensor);
+    // 2. PyTorch's, in float on the same values
+    torch::Tensor pytorch_input_tensor = pytorch_copy_of(tensors_val.input_tensor.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_weight_tensor = pytorch_copy_of(tensors_val.weight_tensor.to(DType::Float32)).requires_grad_(true);
+    torch::Tensor pytorch_bias_tensor = pytorch_copy_of(tensors_val.bias_tensor.to(DType::Float32)).requires_grad_(true);
+    std::vector<int64_t> normalized_shape_list = {768};
+    auto [pytorch_output_tensor, pytorch_mean_tensor, pytorch_rstd_tensor] = torch::native_layer_norm(
+        pytorch_input_tensor, normalized_shape_list, pytorch_weight_tensor, pytorch_bias_tensor, 1e-5);
+    pytorch_output_tensor.backward(pytorch_copy_of(tensors_val.output_grad_tensor.to(DType::Float32)));
+    // 3. check: mean and rstd within TOLERANCE, the rest within one or a few roundings
+    ASSERT_NEAR(tensors_val.mean_tensor.tolist(), list_of(pytorch_mean_tensor), TOLERANCE);
+    ASSERT_NEAR(tensors_val.rstd_tensor.tolist(), list_of(pytorch_rstd_tensor), TOLERANCE);
+    ASSERT_NEAR(tensors_val.output_tensor.to(DType::Float32).tolist(), list_of(pytorch_output_tensor), BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(tensors_val.input_grad_tensor.to(DType::Float32).tolist(), list_of(pytorch_input_tensor.grad()),
+                BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(tensors_val.weight_grad_tensor.to(DType::Float32).tolist(), list_of(pytorch_weight_tensor.grad()),
+                BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(tensors_val.bias_grad_tensor.to(DType::Float32).tolist(), list_of(pytorch_bias_tensor.grad()),
+                BFLOAT16_TOLERANCE);
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
-// Most tests here use rows of 4 (one float4: thread 0 of the warp has it all, threads 1 .. 31 have
+// Most tests here use rows of 4 (one float4: thread 0 of the warp has it all, threads 1 .. THREADS_PER_WARP - 1 have
 // nothing to read). The row 1 2 3 4 works out as:
 //
 //     mean = 10 / 4 = 2.5
@@ -233,25 +188,30 @@ static void forward_moves_a_row_to_mean_0_and_standard_deviation_1(void)
 {
     // Expect: the row 1 2 3 4, weight 1, bias 0: output is norm, -1.3416354 -0.4472118 0.4472118
     // 1.3416354 (mean 0, standard deviation 1); mean is 2.5 exactly, rstd 0.8944236.
-    Tensor input = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor output = Tensor::zeros({1, 1, 4}), mean = Tensor::zeros({1, 1}), rstd = Tensor::zeros({1, 1});
-    Tensor weight = Tensor::ones({4});
-    Tensor bias = Tensor::zeros({4});
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    ASSERT_NEAR(output.tolist(), NORM_OF_1_2_3_4, 1e-6);
-    ASSERT_EQ(mean.tolist(), std::vector<float>({2.5f}));
-    ASSERT_NEAR(rstd.tolist()[0], 0.8944236, 1e-6);
+    // 1. the forward
+    Tensor output_tensor = Tensor::zeros({1, 1, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 1});
+    Tensor rstd_tensor = Tensor::zeros({1, 1});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, tensor_of({1, 1, 4}, {1, 2, 3, 4}), Tensor::ones({4}),
+                       Tensor::zeros({4}));
+    // 2. check
+    ASSERT_NEAR(output_tensor.tolist(), NORM_OF_1_2_3_4, 1e-6);
+    ASSERT_EQ(mean_tensor.tolist(), std::vector<float>({2.5f}));
+    ASSERT_NEAR(rstd_tensor.tolist()[0], 0.8944236, 1e-6);
 }
 
 static void weight_and_bias_scale_and_shift_each_column(void)
 {
     // Expect: the row 1 2 3 4, weight 2 for every column, bias 10 20 30 40: output = 2 x norm + bias
     // = 10 - 2.6832708, 20 - 0.8944236, 30 + 0.8944236, 40 + 2.6832708.
-    Tensor input = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor weight = tensor_of({4}, {2, 2, 2, 2}), bias = tensor_of({4}, {10, 20, 30, 40});
-    Tensor output = Tensor::zeros({1, 1, 4}), mean = Tensor::zeros({1, 1}), rstd = Tensor::zeros({1, 1});
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    ASSERT_NEAR(output.tolist(), std::vector<float>({7.3167292f, 19.1055764f, 30.8944236f, 42.6832708f}), 1e-6);
+    // 1. the forward
+    Tensor output_tensor = Tensor::zeros({1, 1, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 1});
+    Tensor rstd_tensor = Tensor::zeros({1, 1});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, tensor_of({1, 1, 4}, {1, 2, 3, 4}),
+                       tensor_of({4}, {2, 2, 2, 2}), tensor_of({4}, {10, 20, 30, 40}));
+    // 2. check
+    ASSERT_NEAR(output_tensor.tolist(), std::vector<float>({7.3167292f, 19.1055764f, 30.8944236f, 42.6832708f}), 1e-6);
 }
 
 static void a_flat_row_gives_the_bias(void)
@@ -259,12 +219,15 @@ static void a_flat_row_gives_the_bias(void)
     // Expect: the row 5 5 5 5: mean 5, every x - mean is exactly 0, so output is the bias, 10 20 30
     // 40, exactly. The variance is 0 and rstd = 1 / sqrt(0 + 0.00001) = 316.22777: without the 1e-5
     // it would be 1 / 0 = infinity, and 0 x infinity = NaN.
-    Tensor input = tensor_of({1, 1, 4}, {5, 5, 5, 5});
-    Tensor weight = tensor_of({4}, {2, 2, 2, 2}), bias = tensor_of({4}, {10, 20, 30, 40});
-    Tensor output = Tensor::zeros({1, 1, 4}), mean = Tensor::zeros({1, 1}), rstd = Tensor::zeros({1, 1});
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    ASSERT_EQ(output.tolist(), std::vector<float>({10, 20, 30, 40}));
-    ASSERT_NEAR(rstd.tolist()[0], 316.22777, 1e-3);
+    // 1. the forward
+    Tensor output_tensor = Tensor::zeros({1, 1, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 1});
+    Tensor rstd_tensor = Tensor::zeros({1, 1});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, tensor_of({1, 1, 4}, {5, 5, 5, 5}),
+                       tensor_of({4}, {2, 2, 2, 2}), tensor_of({4}, {10, 20, 30, 40}));
+    // 2. check
+    ASSERT_EQ(output_tensor.tolist(), std::vector<float>({10, 20, 30, 40}));
+    ASSERT_NEAR(rstd_tensor.tolist()[0], 316.22777, 1e-3);
 }
 
 static void each_row_is_normalized_on_its_own(void)
@@ -273,12 +236,16 @@ static void each_row_is_normalized_on_its_own(void)
     // mean, 2.5 and 107.5, and its own rstd, so both come out as the same norm: shifting a row or
     // scaling it does not change its output. Within 1e-5, not exactly: the 1e-5 added to the
     // variance counts for less next to 11.25 than next to 1.25.
-    Tensor input = tensor_of({1, 2, 4}, {1, 2, 3, 4, 103, 106, 109, 112});
-    Tensor output = Tensor::zeros({1, 2, 4}), mean = Tensor::zeros({1, 2}), rstd = Tensor::zeros({1, 2});
-    layer_norm_forward(output, mean, rstd, input, Tensor::ones({4}), Tensor::zeros({4}));
-    ASSERT_EQ(mean.tolist(), std::vector<float>({2.5f, 107.5f}));
-    ASSERT_NEAR(output[0][0].tolist(), NORM_OF_1_2_3_4, 1e-5);
-    ASSERT_NEAR(output[0][1].tolist(), NORM_OF_1_2_3_4, 1e-5);
+    // 1. the forward on two rows
+    Tensor output_tensor = Tensor::zeros({1, 2, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 2});
+    Tensor rstd_tensor = Tensor::zeros({1, 2});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, tensor_of({1, 2, 4}, {1, 2, 3, 4, 103, 106, 109, 112}),
+                       Tensor::ones({4}), Tensor::zeros({4}));
+    // 2. check
+    ASSERT_EQ(mean_tensor.tolist(), std::vector<float>({2.5f, 107.5f}));
+    ASSERT_NEAR(output_tensor[0][0].tolist(), NORM_OF_1_2_3_4, 1e-5);
+    ASSERT_NEAR(output_tensor[0][1].tolist(), NORM_OF_1_2_3_4, 1e-5);
 }
 
 static void backward_adds_up_bias_grad_and_weight_grad_over_the_rows(void)
@@ -288,15 +255,22 @@ static void backward_adds_up_bias_grad_and_weight_grad_over_the_rows(void)
     //
     //     bias_grad   = 1 + 2                       = 3 3 3 3, exactly
     //     weight_grad = 1 x norm + 2 x (-norm) = -norm  = 1.3416354 0.4472118 -0.4472118 -1.3416354
-    Tensor input = tensor_of({1, 2, 4}, {1, 2, 3, 4, 4, 3, 2, 1});
-    Tensor weight = Tensor::ones({4});
-    Tensor output = Tensor::zeros({1, 2, 4}), mean = Tensor::zeros({1, 2}), rstd = Tensor::zeros({1, 2});
-    layer_norm_forward(output, mean, rstd, input, weight, Tensor::zeros({4}));
-    Tensor output_grad = tensor_of({1, 2, 4}, {1, 1, 1, 1, 2, 2, 2, 2});
-    Tensor input_grad = Tensor::zeros({1, 2, 4}), weight_grad = Tensor::zeros({4}), bias_grad = Tensor::zeros({4});
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    ASSERT_EQ(bias_grad.tolist(), std::vector<float>({3, 3, 3, 3}));
-    ASSERT_NEAR(weight_grad.tolist(), std::vector<float>({1.3416354f, 0.4472118f, -0.4472118f, -1.3416354f}), 1e-6);
+    // 1. the forward
+    Tensor input_tensor = tensor_of({1, 2, 4}, {1, 2, 3, 4, 4, 3, 2, 1});
+    Tensor weight_tensor = Tensor::ones({4});
+    Tensor output_tensor = Tensor::zeros({1, 2, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 2});
+    Tensor rstd_tensor = Tensor::zeros({1, 2});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, input_tensor, weight_tensor, Tensor::zeros({4}));
+    // 2. the backward
+    Tensor input_grad_tensor = Tensor::zeros({1, 2, 4});
+    Tensor weight_grad_tensor = Tensor::zeros({4});
+    Tensor bias_grad_tensor = Tensor::zeros({4});
+    layer_norm_backward(input_grad_tensor, weight_grad_tensor, bias_grad_tensor, tensor_of({1, 2, 4}, {1, 1, 1, 1, 2, 2, 2, 2}),
+                        input_tensor, weight_tensor, mean_tensor, rstd_tensor);
+    // 3. check
+    ASSERT_EQ(bias_grad_tensor.tolist(), std::vector<float>({3, 3, 3, 3}));
+    ASSERT_NEAR(weight_grad_tensor.tolist(), std::vector<float>({1.3416354f, 0.4472118f, -0.4472118f, -1.3416354f}), 1e-6);
 }
 
 static void the_same_output_grad_on_a_whole_row_gives_no_input_grad(void)
@@ -305,14 +279,21 @@ static void the_same_output_grad_on_a_whole_row_gives_no_input_grad(void)
     // Raising every output of a row by the same amount is something no change of the input can do,
     // since the forward subtracts the row's mean: norm_grad - mean(norm_grad) = 5 - 5 = 0, and
     // mean(norm_grad x norm) = 5 x mean(norm) = 0.
-    Tensor input = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor weight = Tensor::ones({4});
-    Tensor output = Tensor::zeros({1, 1, 4}), mean = Tensor::zeros({1, 1}), rstd = Tensor::zeros({1, 1});
-    layer_norm_forward(output, mean, rstd, input, weight, Tensor::zeros({4}));
-    Tensor output_grad = tensor_of({1, 1, 4}, {5, 5, 5, 5});
-    Tensor input_grad = Tensor::zeros({1, 1, 4}), weight_grad = Tensor::zeros({4}), bias_grad = Tensor::zeros({4});
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    ASSERT_NEAR(input_grad.tolist(), std::vector<float>(4, 0.0f), 1e-5);
+    // 1. the forward
+    Tensor input_tensor = tensor_of({1, 1, 4}, {1, 2, 3, 4});
+    Tensor weight_tensor = Tensor::ones({4});
+    Tensor output_tensor = Tensor::zeros({1, 1, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 1});
+    Tensor rstd_tensor = Tensor::zeros({1, 1});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, input_tensor, weight_tensor, Tensor::zeros({4}));
+    // 2. the backward
+    Tensor input_grad_tensor = Tensor::zeros({1, 1, 4});
+    Tensor weight_grad_tensor = Tensor::zeros({4});
+    Tensor bias_grad_tensor = Tensor::zeros({4});
+    layer_norm_backward(input_grad_tensor, weight_grad_tensor, bias_grad_tensor, tensor_of({1, 1, 4}, {5, 5, 5, 5}),
+                        input_tensor, weight_tensor, mean_tensor, rstd_tensor);
+    // 3. check
+    ASSERT_NEAR(input_grad_tensor.tolist(), std::vector<float>(4, 0.0f), 1e-5);
 }
 
 static void backward_adds_onto_the_gradients_already_there(void)
@@ -321,19 +302,27 @@ static void backward_adds_onto_the_gradients_already_there(void)
     // residual stream, had left it there). The row 1 2 3 4, weight 1, output_grad 1 1 1 1:
     // bias_grad becomes 11 exactly, weight_grad 10 + norm = 8.6583646 9.5527882 10.4472118 11.3416354,
     // input_grad 10 + 0 (as in the test above). A second backward adds again: bias_grad 12.
-    Tensor input = tensor_of({1, 1, 4}, {1, 2, 3, 4});
-    Tensor weight = Tensor::ones({4});
-    Tensor output = Tensor::zeros({1, 1, 4}), mean = Tensor::zeros({1, 1}), rstd = Tensor::zeros({1, 1});
-    layer_norm_forward(output, mean, rstd, input, weight, Tensor::zeros({4}));
-    Tensor output_grad = Tensor::ones({1, 1, 4});
-    Tensor input_grad = Tensor::zeros({1, 1, 4}).fill_(10);
-    Tensor weight_grad = Tensor::zeros({4}).fill_(10), bias_grad = Tensor::zeros({4}).fill_(10);
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    ASSERT_EQ(bias_grad.tolist(), std::vector<float>({11, 11, 11, 11}));
-    ASSERT_NEAR(weight_grad.tolist(), std::vector<float>({8.6583646f, 9.5527882f, 10.4472118f, 11.3416354f}), 1e-6);
-    ASSERT_NEAR(input_grad.tolist(), std::vector<float>({10, 10, 10, 10}), 1e-6);
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    ASSERT_EQ(bias_grad.tolist(), std::vector<float>({12, 12, 12, 12}));
+    // 1. the forward
+    Tensor input_tensor = tensor_of({1, 1, 4}, {1, 2, 3, 4});
+    Tensor weight_tensor = Tensor::ones({4});
+    Tensor output_tensor = Tensor::zeros({1, 1, 4});
+    Tensor mean_tensor = Tensor::zeros({1, 1});
+    Tensor rstd_tensor = Tensor::zeros({1, 1});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, input_tensor, weight_tensor, Tensor::zeros({4}));
+    // 2. one backward onto gradients of 10: added onto
+    Tensor output_grad_tensor = Tensor::ones({1, 1, 4});
+    Tensor input_grad_tensor = Tensor::zeros({1, 1, 4}).fill_(10);
+    Tensor weight_grad_tensor = Tensor::zeros({4}).fill_(10);
+    Tensor bias_grad_tensor = Tensor::zeros({4}).fill_(10);
+    layer_norm_backward(input_grad_tensor, weight_grad_tensor, bias_grad_tensor, output_grad_tensor, input_tensor,
+                        weight_tensor, mean_tensor, rstd_tensor);
+    ASSERT_EQ(bias_grad_tensor.tolist(), std::vector<float>({11, 11, 11, 11}));
+    ASSERT_NEAR(weight_grad_tensor.tolist(), std::vector<float>({8.6583646f, 9.5527882f, 10.4472118f, 11.3416354f}), 1e-6);
+    ASSERT_NEAR(input_grad_tensor.tolist(), std::vector<float>({10, 10, 10, 10}), 1e-6);
+    // 3. a second backward: added again
+    layer_norm_backward(input_grad_tensor, weight_grad_tensor, bias_grad_tensor, output_grad_tensor, input_tensor,
+                        weight_tensor, mean_tensor, rstd_tensor);
+    ASSERT_EQ(bias_grad_tensor.tolist(), std::vector<float>({12, 12, 12, 12}));
 }
 
 static void many_rows_adding_onto_bias_grad_lose_nothing(void)
@@ -344,22 +333,30 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
     // same moment. With atomicAdd no add is lost: 4096 x 1 = 4096 in every column, exactly (whole
     // numbers this small add exactly in floats). input_grad is 0 in every row, up to rounding, as
     // in the_same_output_grad_on_a_whole_row_gives_no_input_grad.
+    // 1. the forward
     Tensor::manual_seed(0);
-    size_t batch_size = 4, seq_len = 1024, embed_dim = 768;
-    Tensor input = Tensor::randn({batch_size, seq_len, embed_dim});      // made on the CPU: a few seconds
-    Tensor weight = Tensor::ones({embed_dim});
-    Tensor output = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    layer_norm_forward(output, mean, rstd, input, weight, Tensor::zeros({embed_dim}));
-    Tensor output_grad = Tensor::ones({batch_size, seq_len, embed_dim});
-    Tensor input_grad = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor weight_grad = Tensor::zeros({embed_dim}), bias_grad = Tensor::zeros({embed_dim});
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    ASSERT_EQ(bias_grad.tolist(), std::vector<float>(embed_dim, 4096.0f));
-    ASSERT_NEAR(input_grad.tolist(), std::vector<float>(batch_size * seq_len * embed_dim, 0.0f), 1e-5);
+    size_t batch_size_val = 4;
+    size_t seq_len_val = 1024;
+    size_t embed_dim_val = 768;
+    Tensor input_tensor = Tensor::randn({batch_size_val, seq_len_val, embed_dim_val});      // made on the CPU: a few seconds
+    Tensor weight_tensor = Tensor::ones({embed_dim_val});
+    Tensor output_tensor = Tensor::zeros({batch_size_val, seq_len_val, embed_dim_val});
+    Tensor mean_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    Tensor rstd_tensor = Tensor::zeros({batch_size_val, seq_len_val});
+    layer_norm_forward(output_tensor, mean_tensor, rstd_tensor, input_tensor, weight_tensor, Tensor::zeros({embed_dim_val}));
+    // 2. the backward with output_grad all 1
+    Tensor input_grad_tensor = Tensor::zeros({batch_size_val, seq_len_val, embed_dim_val});
+    Tensor weight_grad_tensor = Tensor::zeros({embed_dim_val});
+    Tensor bias_grad_tensor = Tensor::zeros({embed_dim_val});
+    layer_norm_backward(input_grad_tensor, weight_grad_tensor, bias_grad_tensor,
+                        Tensor::ones({batch_size_val, seq_len_val, embed_dim_val}), input_tensor, weight_tensor, mean_tensor,
+                        rstd_tensor);
+    // 3. check
+    ASSERT_EQ(bias_grad_tensor.tolist(), std::vector<float>(embed_dim_val, 4096.0f));
+    ASSERT_NEAR(input_grad_tensor.tolist(), std::vector<float>(batch_size_val * seq_len_val * embed_dim_val, 0.0f), 1e-5);
 }
 
-// ══ part 3: the kernels fit their launch ══════════════════════════════════════
+// ══ part 3: the kernels fit their launch, and other block sizes work ═════════
 
 static void every_kernel_fits_its_block(void)
 {
@@ -371,237 +368,84 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)layer_norm_forward_kernel<float>,
-                             (const void *)layer_norm_backward_kernel<float>};
-    const char *names[] = {"layer_norm_forward_kernel", "layer_norm_backward_kernel"};
-    int threads[] = {LAYER_NORM_THREADS_PER_BLOCK, LAYER_NORM_BACKWARD_THREADS_PER_BLOCK};
-    for (int k = 0; k < 2; k++)
+    const void *kernels_list[] = {(const void *)layer_norm_forward_kernel<float>,
+                                  (const void *)layer_norm_backward_kernel<float>};
+    const char *names_list[] = {"layer_norm_forward_kernel", "layer_norm_backward_kernel"};
+    int threads_list[] = {LAYER_NORM_THREADS_PER_BLOCK, LAYER_NORM_BACKWARD_THREADS_PER_BLOCK};
+    for (int kernel_index_val = 0; kernel_index_val < 2; kernel_index_val++)
     {
-        cudaFuncAttributes attributes;
-        cudaCheck(cudaFuncGetAttributes(&attributes, kernels[k]));
+        // 1. what the compiler wrote down
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, kernels_list[kernel_index_val]));
         print_test_name(__func__);
-        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n", names[k],
-               attributes.numRegs, attributes.maxThreadsPerBlock, attributes.localSizeBytes);
-        ASSERT_EQ(attributes.maxThreadsPerBlock >= threads[k], true);
-        ASSERT_EQ(attributes.localSizeBytes, (size_t)0);
+        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n",
+               names_list[kernel_index_val], attributes_val.numRegs, attributes_val.maxThreadsPerBlock,
+               attributes_val.localSizeBytes);
+        // 2. check
+        ASSERT_EQ(attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val], true);
+        ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
     }
 }
 
-// ══ part 4: other block and thread counts ═════════════════════════════════════
-
-/// Keeps the GPU busy with `run` for about a second before timing. While the CPU makes random
-/// numbers for seconds the GPU idles and its clock drops; without this, the first launches timed
-/// run while the clock is still rising.
-template <typename Run>
-static void warm_up_gpu(Run run)
+static void other_block_sizes_give_the_same_result(void)
 {
-    float total = 0.0f;
-    while (total < 1000.0f)
-        total += gpu_milliseconds(run);
-}
-
-static void time_each_kernel_with_other_block_and_thread_counts(void)
-{
-    // Prints the time of the forward and the backward on GPT-2 small's sizes (batch_size = 4,
-    // seq_len = 1024: 4096 rows of embed_dim = 768), in float and in bfloat16, for 10 block counts x 4 thread
-    // counts, each the average of 20 runs: the 8 picked on a T4, then this GPU's SM count x 1 and x 2 (114
-    // and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4 they repeat 40 and 80). The 40 launches take
-    // turns: 20 rounds, each timing every launch
-    // once (the forward and the backward in float, then both in bfloat16). One launch's 20 runs in a row
-    // would all land in the same stretch of the test, and a T4's clock can drift as it heats up (the first
-    // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
-    // late alike. Run 1 is counted too: warm_up_gpu has already done the first-time work. The kernels are
-    // launched here directly, <<<blocks, threads>>>, instead of through layer_norm_forward and
-    // layer_norm_backward, which always launch 256 x 512 and 80 x 512 (a T4's sweep picked 256 x 512 and
-    // 40 x 512, before them 512 x 256 and 128 x 512; an H100 PCIe's, 80 x 512 for the backward). Not 1024
-    // threads: since the kernels
-    // became templates for bfloat16, each takes 66 registers per thread, and a block of 1024 may have
-    // 65,536 / 1024 = 64 (cudaFuncGetAttributes: largest block 896). Held to 64, the backward spilled 8
-    // bytes; and blocks of 1024 were never the fastest here. A bfloat16 row is 1.5 KB instead of 3 KB, so
-    // twice as many rows fit in an SM's L1: its best launch may differ.
-    //
-    // Expect: every launch gives the same result as the usual ones of its dtype. Whatever the counts, each
-    // row is one warp's and its threads add in the same order, so output, mean, rstd and input_grad are the
-    // same to the last bit; weight_grad and bias_grad within TOLERANCE in float (atomicAdd's order). In
-    // bfloat16 they are not checked, only printed: each block's add onto them is rounded to 8 bits, in
-    // whatever order the blocks finish, so even two runs of one launch differ, by about 2.5% of the largest
-    // value with 128 blocks (each column about ±64, a bfloat16 step there 0.25 to 0.5, 128 rounded adds).
-    // The column "bf16 grad error" is the largest difference of the bfloat16 weight_grad and bias_grad from
-    // the float ones, as a fraction of their largest value: more blocks, more rounded adds, a larger error.
-    // Only the time changes. On a Colab T4 (at most 40 SMs x 32 warps = 1,280 warps at once), in float, both were fastest
-    // with far fewer warps than that: the forward with 160 to 640 (0.117 ms, against 0.167 for its usual
-    // 4096), the backward with about 512 (0.275 ms, against 0.333 for its usual 2048). Most likely the
-    // cache: the forward reads each row 3 times and the backward 2, and the re-reads come from an SM's L1
-    // (at most 64 KB) only while its warps' rows fit: 16 x 3 KB = 48 KB does, 26 x 3 KB = 77 KB does not.
-    // Not measured directly yet.
-    Tensor::manual_seed(0);
-    size_t batch_size = 4, seq_len = 1024, embed_dim = 768;
-    size_t rows = batch_size * seq_len;
-    Tensor input = Tensor::randn({batch_size, seq_len, embed_dim});      // made on the CPU: a few seconds
-    Tensor weight = Tensor::randn({embed_dim}), bias = Tensor::randn({embed_dim});
-    Tensor output_grad = Tensor::randn({batch_size, seq_len, embed_dim});
-    Tensor output = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor mean = Tensor::zeros({batch_size, seq_len}), rstd = Tensor::zeros({batch_size, seq_len});
-    Tensor input_grad = Tensor::zeros({batch_size, seq_len, embed_dim});
-    Tensor weight_grad = Tensor::zeros({embed_dim}), bias_grad = Tensor::zeros({embed_dim});
-    // The same values in bfloat16, with outputs of their own (mean and rstd are float in both).
-    Tensor input_bf16 = input.to(DType::BFloat16), output_grad_bf16 = output_grad.to(DType::BFloat16);
-    Tensor weight_bf16 = weight.to(DType::BFloat16), bias_bf16 = bias.to(DType::BFloat16);
-    Tensor output_bf16 = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
-    Tensor mean_bf16 = Tensor::zeros({batch_size, seq_len}), rstd_bf16 = Tensor::zeros({batch_size, seq_len});
-    Tensor input_grad_bf16 = Tensor::zeros({batch_size, seq_len, embed_dim}, DType::BFloat16);
-    Tensor weight_grad_bf16 = Tensor::zeros({embed_dim}, DType::BFloat16);
-    Tensor bias_grad_bf16 = Tensor::zeros({embed_dim}, DType::BFloat16);
-
-    // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
-    layer_norm_forward(output, mean, rstd, input, weight, bias);
-    layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
-    layer_norm_forward(output_bf16, mean_bf16, rstd_bf16, input_bf16, weight_bf16, bias_bf16);
-    layer_norm_backward(input_grad_bf16, weight_grad_bf16, bias_grad_bf16, output_grad_bf16, input_bf16, weight_bf16,
-                        mean_bf16, rstd_bf16);
-    torch::Tensor usual_output = pytorch_copy_of(output);
-    torch::Tensor usual_mean = pytorch_copy_of(mean), usual_rstd = pytorch_copy_of(rstd);
-    torch::Tensor usual_input_grad = pytorch_copy_of(input_grad);
-    torch::Tensor usual_weight_grad = pytorch_copy_of(weight_grad), usual_bias_grad = pytorch_copy_of(bias_grad);
-    torch::Tensor usual_output_bf16 = pytorch_copy_of(output_bf16.to(DType::Float32));
-    torch::Tensor usual_mean_bf16 = pytorch_copy_of(mean_bf16), usual_rstd_bf16 = pytorch_copy_of(rstd_bf16);
-    torch::Tensor usual_input_grad_bf16 = pytorch_copy_of(input_grad_bf16.to(DType::Float32));
-
-    // What layer_norm_forward and layer_norm_backward launch, worked out as they do: 256 and 80 blocks.
-    int forward_warps_per_block = LAYER_NORM_THREADS_PER_BLOCK / 32;
-    int usual_forward_blocks = (int)((rows + forward_warps_per_block - 1) / forward_warps_per_block);
-    int usual_backward_blocks = LAYER_NORM_BACKWARD_BLOCKS;
-
-    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loop
-    size_t shared_bytes = 2 * embed_dim * sizeof(float);     // the backward's block copy of bias_grad, weight_grad
-    auto forward = [&] {
-        layer_norm_forward_kernel<float><<<blocks, threads>>>(output.data(), mean.data(), rstd.data(), input.data(),
-                                                              weight.data(), bias.data(), rows, embed_dim);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward = [&] {
-        layer_norm_backward_kernel<float><<<blocks, threads, shared_bytes>>>(
-            input_grad.data(), weight_grad.data(), bias_grad.data(), output_grad.data(), input.data(), weight.data(),
-            mean.data(), rstd.data(), rows, embed_dim);
-        cudaCheck(cudaGetLastError());
-    };
-    auto forward_bf16 = [&] {
-        layer_norm_forward_kernel<nv_bfloat16><<<blocks, threads>>>(
-            output_bf16.data_ptr<nv_bfloat16>(), mean_bf16.data(), rstd_bf16.data(), input_bf16.data_ptr<nv_bfloat16>(),
-            weight_bf16.data_ptr<nv_bfloat16>(), bias_bf16.data_ptr<nv_bfloat16>(), rows, embed_dim);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward_bf16 = [&] {
-        layer_norm_backward_kernel<nv_bfloat16><<<blocks, threads, shared_bytes>>>(
-            input_grad_bf16.data_ptr<nv_bfloat16>(), weight_grad_bf16.data_ptr<nv_bfloat16>(),
-            bias_grad_bf16.data_ptr<nv_bfloat16>(), output_grad_bf16.data_ptr<nv_bfloat16>(),
-            input_bf16.data_ptr<nv_bfloat16>(), weight_bf16.data_ptr<nv_bfloat16>(), mean_bf16.data(),
-            rstd_bf16.data(), rows, embed_dim);
-        cudaCheck(cudaGetLastError());
-    };
-    blocks = usual_forward_blocks;
-    threads = LAYER_NORM_THREADS_PER_BLOCK;
-    warm_up_gpu(forward);
-
-    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
-    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
-    int block_counts[] = {40, 80, 128, 256, 512, 1024, 2048, 4096, sms, 2 * sms};
-    int thread_counts[] = {64, 128, 256, 512};
-    const int launches = 10 * 4, rounds = 20;
-    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
-    float total_ms[launches][4] = {};
-    for (int round = 1; round <= rounds; round++)
+    // Expect: 256 random rows of 768, in float and in bfloat16, both launchers called with threads_per_block
+    // 32, 128, 256 and 512 (one warp up; not 1024: the kernels' 66 registers per thread allow at most 896, see
+    // tunes/tune_layer_norm.cu). Each row is one warp's whatever the block size, so output, mean, rstd
+    // and input_grad are the defaults' to the last bit. weight_grad and bias_grad are each block's shared sums
+    // added onto GPU memory in whatever order the blocks finish: within TOLERANCE in float,
+    // BLOCK_SIZES_BFLOAT16_GRAD_TOLERANCE in bfloat16 (more blocks with rows, more roundings).
+    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP};
+    DType dtypes_list[] = {DType::Float32, DType::BFloat16};
+    for (DType dtype_val : dtypes_list)
     {
-        for (int k = 0; k < launches; k++)
+        // 1. random tensors; the defaults' results
+        Tensor::manual_seed(0);
+        double tolerance_val = dtype_val == DType::BFloat16 ? BLOCK_SIZES_BFLOAT16_GRAD_TOLERANCE : TOLERANCE;
+        LayerNormTensors usual_val = random_layer_norm(4, 64, 768, dtype_val);
+        layer_norm_forward(usual_val.output_tensor, usual_val.mean_tensor, usual_val.rstd_tensor, usual_val.input_tensor,
+                           usual_val.weight_tensor, usual_val.bias_tensor);
+        layer_norm_backward(usual_val.input_grad_tensor, usual_val.weight_grad_tensor, usual_val.bias_grad_tensor,
+                            usual_val.output_grad_tensor, usual_val.input_tensor, usual_val.weight_tensor,
+                            usual_val.mean_tensor, usual_val.rstd_tensor);
+
+        // 2. each block size, from the same inputs, against the defaults'
+        for (int threads_per_block_val : block_sizes_list)
         {
-            blocks = block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(forward);
-            total_ms[k][1] += gpu_milliseconds(backward);
-            total_ms[k][2] += gpu_milliseconds(forward_bf16);
-            total_ms[k][3] += gpu_milliseconds(backward_bf16);
+            LayerNormTensors tensors_val = usual_val;              // the same inputs; results of its own
+            tensors_val.output_tensor = Tensor::zeros(usual_val.output_tensor.shape(), dtype_val);
+            tensors_val.mean_tensor = Tensor::zeros(usual_val.mean_tensor.shape());
+            tensors_val.rstd_tensor = Tensor::zeros(usual_val.rstd_tensor.shape());
+            tensors_val.input_grad_tensor = Tensor::zeros(usual_val.input_grad_tensor.shape(), dtype_val);
+            tensors_val.weight_grad_tensor = Tensor::zeros(usual_val.weight_grad_tensor.shape(), dtype_val);
+            tensors_val.bias_grad_tensor = Tensor::zeros(usual_val.bias_grad_tensor.shape(), dtype_val);
+            layer_norm_forward(tensors_val.output_tensor, tensors_val.mean_tensor, tensors_val.rstd_tensor,
+                               tensors_val.input_tensor, tensors_val.weight_tensor, tensors_val.bias_tensor,
+                               threads_per_block_val);
+            layer_norm_backward(tensors_val.input_grad_tensor, tensors_val.weight_grad_tensor, tensors_val.bias_grad_tensor,
+                                tensors_val.output_grad_tensor, tensors_val.input_tensor, tensors_val.weight_tensor,
+                                tensors_val.mean_tensor, tensors_val.rstd_tensor, threads_per_block_val);
+            ASSERT_EQ(tensors_val.output_tensor.to(DType::Float32).tolist(), usual_val.output_tensor.to(DType::Float32).tolist());
+            ASSERT_EQ(tensors_val.mean_tensor.tolist(), usual_val.mean_tensor.tolist());
+            ASSERT_EQ(tensors_val.rstd_tensor.tolist(), usual_val.rstd_tensor.tolist());
+            ASSERT_EQ(tensors_val.input_grad_tensor.to(DType::Float32).tolist(),
+                      usual_val.input_grad_tensor.to(DType::Float32).tolist());
+            ASSERT_NEAR(tensors_val.weight_grad_tensor.to(DType::Float32).tolist(),
+                        usual_val.weight_grad_tensor.to(DType::Float32).tolist(), tolerance_val);
+            ASSERT_NEAR(tensors_val.bias_grad_tensor.to(DType::Float32).tolist(),
+                        usual_val.bias_grad_tensor.to(DType::Float32).tolist(), tolerance_val);
         }
     }
-
-    // Tells the largest difference between a launch's gradient and the usual one, as a fraction of the
-    // usual one's largest value.
-    auto difference = [](const torch::Tensor &actual, const torch::Tensor &usual) {
-        return ((actual - usual).abs().max() / usual.abs().max()).item<float>();
-    };
-    const char *kernel_names[] = {"forward", "backward", "bf16 forward", "bf16 backward"};
-    float fastest_ms[4] = {1e9f, 1e9f, 1e9f, 1e9f};
-    int fastest_blocks[4] = {}, fastest_threads[4] = {};
-    int launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads    warps   rows per warp   forward   backward   bf16 forward   "
-           "bf16 backward   bf16 grad error   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[4];
-        for (int j = 0; j < 4; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-
-        // One forward and one backward from 0 with this launch in each dtype, against the usual launches':
-        // output, mean, rstd and input_grad to the last bit, weight_grad and bias_grad within TOLERANCE in
-        // float; in bfloat16 only their error from the float ones, printed.
-        for (const Tensor *tensor : {&output, &mean, &rstd, &input_grad, &weight_grad, &bias_grad, &output_bf16,
-                                     &mean_bf16, &rstd_bf16, &input_grad_bf16, &weight_grad_bf16, &bias_grad_bf16})
-            tensor->zero_();
-        forward();
-        backward();
-        forward_bf16();
-        backward_bf16();
-        bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
-                    torch::equal(pytorch_copy_of(mean), usual_mean) &&
-                    torch::equal(pytorch_copy_of(rstd), usual_rstd) &&
-                    torch::equal(pytorch_copy_of(input_grad), usual_input_grad) &&
-                    difference(pytorch_copy_of(weight_grad), usual_weight_grad) <= TOLERANCE &&
-                    difference(pytorch_copy_of(bias_grad), usual_bias_grad) <= TOLERANCE &&
-                    torch::equal(pytorch_copy_of(output_bf16.to(DType::Float32)), usual_output_bf16) &&
-                    torch::equal(pytorch_copy_of(mean_bf16), usual_mean_bf16) &&
-                    torch::equal(pytorch_copy_of(rstd_bf16), usual_rstd_bf16) &&
-                    torch::equal(pytorch_copy_of(input_grad_bf16.to(DType::Float32)), usual_input_grad_bf16);
-        if (same)
-            launches_with_the_same_result++;
-        float bf16_grad_error =
-            std::max(difference(pytorch_copy_of(weight_grad_bf16.to(DType::Float32)), usual_weight_grad),
-                     difference(pytorch_copy_of(bias_grad_bf16.to(DType::Float32)), usual_bias_grad));
-
-        int warps = blocks * threads / 32;
-        int rows_per_warp = (int)((rows + warps - 1) / warps);    // the most any warp takes
-        const char *usual = "";
-        if (blocks == usual_forward_blocks && threads == LAYER_NORM_THREADS_PER_BLOCK)
-            usual = "   <- what layer_norm_forward launches";
-        if (blocks == usual_backward_blocks && threads == LAYER_NORM_BACKWARD_THREADS_PER_BLOCK)
-            usual = "   <- what layer_norm_backward launches";
-        printf("                  %6d   %7d   %6d   %13d   %7.3f   %8.3f   %12.3f   %13.3f   %14.2f%%   %-11s%s\n",
-               blocks, threads, warps, rows_per_warp, times[0], times[1], times[2], times[3], 100 * bf16_grad_error,
-               same ? "yes" : "NO", usual);
-    }
-    for (int j = 0; j < 4; j++)
-        printf("    fastest %-13s  %4d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
-               fastest_threads[j], fastest_ms[j]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+    start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     forward_matches_pytorch();
     backward_matches_pytorch();
     forward_and_backward_in_bfloat16();
-    time_20_steps_on_gpt2_small_size();
 
     forward_moves_a_row_to_mean_0_and_standard_deviation_1();
     weight_and_bias_scale_and_shift_each_column();
@@ -613,8 +457,7 @@ int main(void)
     many_rows_adding_onto_bias_grad_lose_nothing();
 
     every_kernel_fits_its_block();
-
-    time_each_kernel_with_other_block_and_thread_counts();
+    other_block_sizes_give_the_same_result();
 
     printf("\nall tests passed\n");
     return 0;

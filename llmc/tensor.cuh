@@ -1,49 +1,34 @@
-// tensor.cuh — a tensor on the GPU, a small version of libtorch's at::Tensor, called
-// the same way: Tensor::zeros({2, 4}), t.view({8}), t[1][2].item(), ...
-//
-// The class below lists every function, grouped, one line each. Their code follows
-// the class, in the same order and under the same headings.
-//
-// The values sit in row order, the last dim moving fastest. A 2x4 tensor:
-//
+// tensor.cuh — a tensor on the GPU, a small version of libtorch's at::Tensor, called the same way:
+// Tensor::zeros({2, 4}), t.view({8}), t[1][2].item(), ... Values in row order, the last dim fastest:
 //     data     [ a b c d | e f g h ]      shape   { 2, 4 }
 //                row 0     row 1          strides { 4, 1 }: [i][j] is data[i * 4 + j * 1]
+// A tensor and its views share one piece of GPU memory, freed when the last of them is gone.
 //
-// Memory, as in libtorch: a tensor and its views share one piece of GPU memory,
-// freed by itself when the last of them is gone. Nothing to free by hand.
-//
-// Four dtypes: float (4 bytes), half and bfloat16 (2 bytes each), int (4 bytes). The two
-// 2-byte ones hold a float rounded, in half the memory, for mixed precision:
-//
-//     dtype      significant bits   about   largest    how it cuts a float's 32 bits
-//     float      24                 7 digits  3.4e38   1 sign, 8 exponent, 23 fraction
-//     half       11                 3 digits  65504    1 sign, 5 exponent, 10 fraction
-//     bfloat16    8                 2 digits  3.4e38   1 sign, 8 exponent,  7 fraction: a float's first 16 bits
-//
-// t.to(DType::BFloat16) and copy_ turn floats into either and back. Kernels keep doing their
-// math in float: they read 4 values with load4, which turns them into a float4, and write
-// with store4 (the end of this file).
+//     dtype      significant bits   about     largest   bits
+//     float      24                 7 digits  3.4e38    1 sign, 8 exponent, 23 fraction
+//     half       11                 3 digits  65504     1 sign, 5 exponent, 10 fraction
+//     bfloat16    8                 2 digits  3.4e38    1 sign, 8 exponent,  7 fraction: a float's first 16 bits
+//     int        4 bytes, for token ids
+// Kernels do their math in float: read4_as_float reads 4 values as a float4, write4_from_float writes them
+// back (end of file).
 #ifndef TENSOR_CUH
 #define TENSOR_CUH
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cuda_bf16.h>                  // nv_bfloat16, and __float2bfloat16 / __bfloat162float on the CPU and the GPU
-#include <cuda_fp16.h>                  // half, and __float2half / __half2float on the CPU and the GPU
+#include <cuda_bf16.h>                  // nv_bfloat16
+#include <cuda_fp16.h>                  // half
 #include <memory>
 #include <type_traits>
 #include <vector>
 #include "kernels/cuda_common.h"
 
-/// What one value is: a float (weights, activations, 4 bytes), a half or a bfloat16 (a float rounded,
-/// 2 bytes) or an int (token ids, 4 bytes).
+/// What one value is.
 enum class DType { Float32, Float16, BFloat16, Int32 };
 
 // ── one value of each float dtype, as a float ─────────────────────────────────
-// to_float reads any of the three exactly: every half and every bfloat16 is a float. from_float<T> rounds
-// a float to the nearest T, a tie to the one whose last bit is 0. On the CPU (copy_from_cpu's values) and
-// on the GPU (inside kernels) alike.
+// to_float is exact; from_float<T> rounds to the nearest T, a tie to the one whose last bit is 0. CPU and GPU.
 
 __host__ __device__ __forceinline__ float to_float(float value) { return value; }
 __host__ __device__ __forceinline__ float to_float(half value) { return __half2float(value); }
@@ -107,7 +92,8 @@ public:
 private:
     std::shared_ptr<void> memory_;       // frees the GPU memory after the last tensor using it; empty for from_blob
     void* data_;
-    Shape shape_, strides_;
+    Shape shape_;
+    Shape strides_;
     size_t numel_;
     DType dtype_;
 
@@ -130,10 +116,12 @@ private:
 
 // ── making tensors ────────────────────────────────────────────────────────────
 
-///Undefined at::Tensor: Tensor t; ... t = Tensor::zeros({4});
+/// Makes a tensor with no values: Tensor t; ... t = Tensor::zeros({4});
 inline Tensor::Tensor() : data_(nullptr), numel_(0), dtype_(DType::Float32) {}
 
-/// New GPU memory of its own. Its values are whatever was there: set them before reading.
+/// Makes a tensor in new GPU memory; its values are whatever was there.
+///
+///   shape, dtype   the new tensor's
 inline Tensor Tensor::empty(const Shape& shape, DType dtype) {
     size_t bytes = numel_of(shape) * element_size_of(dtype);
     void* data;
@@ -154,8 +142,9 @@ inline Tensor Tensor::ones(const Shape& shape, DType dtype) {
     return tensor;
 }
 
-/// randn({n}, DType::BFloat16) after a seed is randn({n}) after the same seed, each value rounded to a
-/// bfloat16; the same for Float16.
+/// Makes a random tensor: the same numbers as a float randn after the same seed, rounded to the dtype.
+///
+///   shape, dtype   the new tensor's
 inline Tensor Tensor::randn(const Shape& shape, DType dtype) {
     Tensor tensor = empty(shape, dtype);
     tensor.normal_(0.0f, 1.0f);
@@ -166,7 +155,10 @@ inline Tensor Tensor::zeros_like(const Tensor& other) { return zeros(other.shape
 
 inline Tensor Tensor::empty_like(const Tensor& other) { return empty(other.shape_, other.dtype_); }
 
-/// GPU memory that already exists, in row order. The tensor does not copy it and does not free it.
+/// Makes a tensor on GPU memory that already exists; it neither copies nor frees it.
+///
+///   data           the first value, in row order
+///   shape, dtype   the tensor's
 inline Tensor Tensor::from_blob(void* data, const Shape& shape, DType dtype) {
     return Tensor(nullptr, data, shape, dtype);
 }
@@ -182,13 +174,17 @@ inline size_t Tensor::numel() const { return numel_; }
 inline const Shape& Tensor::shape() const { return shape_; }
 inline const Shape& Tensor::stride() const { return strides_; }
 
-/// How many values along dim d: for a matrix, dim 0 is its rows and dim 1 its columns.
+/// Gives how many values along dim d: for a matrix, dim 0 is its rows and dim 1 its columns.
+///
+///   d   the dim
 inline size_t Tensor::size(int d) const {
     check_dim(d);
     return shape_[d];
 }
 
-/// How many values one step along dim d moves in data: {4, 1} for a 2x4 matrix.
+/// Gives how many values one step along dim d moves in memory: {4, 1} for a 2x4 matrix.
+///
+///   d   the dim
 inline size_t Tensor::stride(int d) const {
     check_dim(d);
     return strides_[d];
@@ -196,12 +192,12 @@ inline size_t Tensor::stride(int d) const {
 
 inline float* Tensor::data() const { return data_ptr<float>(); }
 
-/// The address alone, for any dtype, as libtorch's t.data_ptr(): for alignment checks, and for cuBLAS, which
-/// is told the dtype separately.
+/// Gives the address alone, any dtype: for alignment checks, and for cuBLAS.
 inline void* Tensor::data_ptr() const { return data_; }
 
-/// data_ptr<half>() for a Float16 tensor, data_ptr<nv_bfloat16>() for a BFloat16 one, data_ptr<int>() for an
-/// Int32 one; asking for the wrong type stops the program.
+/// Gives the first value's address as T*; the wrong T stops the program.
+///
+///   T   float, half, nv_bfloat16 or int: the tensor's dtype
 template <typename T>
 inline T* Tensor::data_ptr() const {
     check_dtype<T>();
@@ -210,6 +206,9 @@ inline T* Tensor::data_ptr() const {
 
 // ── views: the same values, shared, not copied ────────────────────────────────
 
+/// Gives the same values in another shape.
+///
+///   shape   the same number of values
 inline Tensor Tensor::view(const Shape& shape) const {
     if (numel_of(shape) != numel_) {
         fprintf(stderr, "error: cannot view %zu values as a shape of %zu values\n", numel_, numel_of(shape));
@@ -218,8 +217,10 @@ inline Tensor Tensor::view(const Shape& shape) const {
     return Tensor(memory_, data_, shape, dtype_);
 }
 
-/// Rows 1 and 2 of a 4x3 tensor are narrow(0, 1, 2), a 2x3 tensor. Only dim 0 for now:
-/// other dims would give values out of row order, which this Tensor cannot describe yet.
+/// Gives some rows: rows 1 and 2 of a 4x3 tensor are narrow(0, 1, 2), a 2x3 tensor.
+///
+///   dim             only 0: other dims would not be in row order
+///   start, length   the first row and how many
 inline Tensor Tensor::narrow(int dim, size_t start, size_t length) const {
     check_dim(dim);
     if (dim != 0) {
@@ -235,8 +236,9 @@ inline Tensor Tensor::narrow(int dim, size_t start, size_t length) const {
     return Tensor(memory_, element(start * strides_[0]), shape, dtype_);
 }
 
-/// Row i along dim 0, without that dim: t[1] of a 2x4 is the 4 values of row 1, and
-/// t[1][2] is one value, a tensor with no dims (read it with item()).
+/// Gives row i along dim 0, without that dim: t[1] of a 2x4 is 4 values; t[1][2] one value (read it with item()).
+///
+///   i   the row
 inline Tensor Tensor::operator[](size_t i) const {
     check_dim(0);
     if (i >= shape_[0]) {
@@ -248,24 +250,27 @@ inline Tensor Tensor::operator[](size_t i) const {
 }
 
 // ── setting values ────────────────────────────────────────────────────────────
-// const, as in libtorch: they change the values on the GPU, not the tensor's shape
-// or pointer. They return the tensor, so calls can follow: t.zero_().fill_(1).
+// const, as in libtorch: they change the values, not the tensor. They return it: t.zero_().fill_(1).
 
 inline const Tensor& Tensor::zero_() const {
     cudaCheck(cudaMemset(data_, 0, bytes()));
     return *this;
 }
 
-/// Sets n values to `bits`, the value's bytes: Word is uint32_t for float and int, uint16_t for half and
-/// bfloat16.
+/// Sets n values to the same bytes.
+///
+///   data   the values: Word is uint32_t for float and int, uint16_t for half and bfloat16
+///   n      how many
+///   bits   the value's bytes
 template <typename Word>
 __global__ void tensor_fill_kernel(Word* data, size_t n, Word bits) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) data[i] = bits;
 }
 
-/// fill_(1.5) for floats, halves and bfloat16s, fill_(7) for ints. A 2-byte dtype gets `value` rounded:
-/// fill_(0.1) gives 0.0999756 in a half, 0.100098 in a bfloat16.
+/// Sets every value; a 2-byte dtype gets it rounded: fill_(0.1) is 0.0999756 in a half, 0.100098 in a bfloat16.
+///
+///   value   1.5 for floats, 7 for ints
 inline const Tensor& Tensor::fill_(double value) const {
     if (numel_ == 0) return *this;
     unsigned blocks = (unsigned)CEIL_DIV(numel_, 256);
@@ -294,8 +299,9 @@ inline const Tensor& Tensor::fill_(double value) const {
     return *this;
 }
 
-/// The numbers are made on the CPU as floats, then copied to the GPU; for a half or bfloat16 tensor each is
-/// rounded first, so one seed gives the same numbers in every dtype, up to that rounding.
+/// Sets random values, made on the CPU as floats, rounded to the dtype: one seed, the same numbers in every dtype.
+///
+///   mean, std   normal_(0, 0.02)
 inline const Tensor& Tensor::normal_(float mean, float std) const {
     if (dtype_ == DType::Int32) {
         fprintf(stderr, "error: normal_ on an int tensor: it needs float, half or bfloat16\n");
@@ -317,15 +323,23 @@ inline const Tensor& Tensor::normal_(float mean, float std) const {
     return *this;
 }
 
-/// copy_ between two float dtypes: each value read as a float, then rounded to the nearest To (exact when To
-/// is float). Into a half, from 65520 up is inf and below 2^-25, about 3e-8, is 0; a bfloat16 has float's range.
+/// Converts n values between float dtypes: read as float, rounded to To. A half overflows from 65520.
+///
+///   to     the result: float, half or nv_bfloat16
+///   from   the values: float, half or nv_bfloat16
+///   n      how many
 template <typename To, typename From>
 __global__ void tensor_convert_kernel(To* to, const From* from, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) to[i] = from_float<To>(to_float(from[i]));
 }
 
-/// Launches tensor_convert_kernel from `from`, of dtype from_dtype (float, half or bfloat16), into `to`.
+/// Launches tensor_convert_kernel for the dtype of `from`.
+///
+///   to           the result
+///   from         the values
+///   from_dtype   float, half or bfloat16
+///   n            how many
 template <typename To>
 inline void tensor_convert(To* to, const void* from, DType from_dtype, size_t n) {
     unsigned blocks = (unsigned)CEIL_DIV(n, 256);
@@ -337,8 +351,10 @@ inline void tensor_convert(To* to, const void* from, DType from_dtype, size_t n)
         tensor_convert_kernel<<<blocks, 256>>>(to, (const nv_bfloat16*)from, n);
 }
 
-/// Same numel; the shapes may differ. The same dtype is copied as it is; between float, half and bfloat16
-/// each value is converted, as libtorch's copy_ does. Ints copy only into ints.
+/// Copies other's values in, GPU to GPU: as they are in the same dtype, converted between float dtypes.
+/// Ints copy only into ints.
+///
+///   other   the same numel; the shape may differ
 inline const Tensor& Tensor::copy_(const Tensor& other) const {
     if (other.numel_ != numel_) {
         fprintf(stderr, "error: copy_ of %zu values into %zu\n", other.numel_, numel_);
@@ -365,16 +381,16 @@ inline const Tensor& Tensor::copy_(const Tensor& other) const {
 
 // ── copies and the CPU ────────────────────────────────────────────────────────
 
-/// Changing the copy does not change the original, and the other way round.
+/// Gives a copy in memory of its own.
 inline Tensor Tensor::clone() const {
     Tensor copy = empty(shape_, dtype_);
     copy.copy_(*this);
     return copy;
 }
 
-/// The same values as another dtype, in memory of their own: to(DType::BFloat16) rounds each float to a
-/// bfloat16, to(DType::Float32) gives them back as floats; the same for Float16. Asked for its own dtype, it gives this tensor back, shared,
-/// not copied, as libtorch's to() does.
+/// Gives the values as another dtype, in memory of their own; its own dtype gives this tensor back, shared.
+///
+///   dtype   to(DType::BFloat16) rounds each float
 inline Tensor Tensor::to(DType dtype) const {
     if (dtype == dtype_) return *this;
     Tensor converted = empty(shape_, dtype);
@@ -382,21 +398,27 @@ inline Tensor Tensor::to(DType dtype) const {
     return converted;
 }
 
-/// In row order: floats, halves for a Float16 tensor, nv_bfloat16s for a BFloat16 one, ints for an Int32 one.
+/// Copies numel values in from the CPU.
+///
+///   values   in row order, of the tensor's dtype
 template <typename T>
 inline void Tensor::copy_from_cpu(const T* values) const {
     check_dtype<T>();
     cudaCheck(cudaMemcpy(data_, values, bytes(), cudaMemcpyHostToDevice));
 }
 
+/// Copies numel values out to the CPU.
+///
+///   values   room for numel values of the tensor's dtype
 template <typename T>
 inline void Tensor::copy_to_cpu(T* values) const {
     check_dtype<T>();
     cudaCheck(cudaMemcpy(values, data_, bytes(), cudaMemcpyDeviceToHost));
 }
 
-/// Flat, in row order: a 2x4 gives 8 values (PyTorch's tolist nests them by dim).
-/// tolist<half>(), tolist<nv_bfloat16>(), tolist<int>() for the other dtypes.
+/// Gives every value on the CPU, flat, in row order: a 2x4 gives 8 values.
+///
+///   T   the tensor's dtype: tolist<nv_bfloat16>() for a bfloat16 one
 template <typename T>
 inline std::vector<T> Tensor::tolist() const {
     std::vector<T> values(numel_);
@@ -404,7 +426,9 @@ inline std::vector<T> Tensor::tolist() const {
     return values;
 }
 
-/// Only for a tensor of 1 value; item<half>(), item<nv_bfloat16>(), item<int>() for the other dtypes.
+/// Gives the one value of a 1-value tensor.
+///
+///   T   the tensor's dtype
 template <typename T>
 inline T Tensor::item() const {
     check_dtype<T>();
@@ -419,8 +443,11 @@ inline T Tensor::item() const {
 
 // ── private helpers ───────────────────────────────────────────────────────────
 
-/// Works out the strides and numel from the shape. Shape {} is a tensor with no dims
-/// and 1 value, as t[1][2] or torch::zeros({}).
+/// Makes a tensor on memory, working out the strides and numel. Shape {} is 1 value with no dims.
+///
+///   memory         frees the GPU memory; empty for from_blob
+///   data           the first value
+///   shape, dtype   the tensor's
 inline Tensor::Tensor(std::shared_ptr<void> memory, void* data, const Shape& shape, DType dtype)
     : memory_(memory), data_(data), shape_(shape), strides_(shape.size()), numel_(1), dtype_(dtype) {
     for (int d = dim() - 1; d >= 0; d--) {       // from the last dim: its stride is 1
@@ -484,74 +511,77 @@ inline uint32_t Tensor::random_u32() {
     return (uint32_t)((state * 0x2545F4914F6CDD1Dull) >> 32);
 }
 
-/// Uniform in (0, 1]: never 0, so the log in random_normal is safe.
+/// Gives a uniform number in (0, 1]: never 0, so the log in random_normal is safe.
 inline float Tensor::random_uniform() { return ((random_u32() >> 8) + 1) / 16777216.0f; }
 
-/// Mean 0, std 1: two uniforms make one normal.
+/// Gives a normal number, mean 0, std 1, from two uniforms.
 inline float Tensor::random_normal() {
-    float u1 = random_uniform(), u2 = random_uniform();
+    float u1 = random_uniform();
+    float u2 = random_uniform();
     return sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
 }
 
 // ── four values in a kernel, as a float4 ─────────────────────────────────────
-// A kernel templated on its tensors' dtype T (float or nv_bfloat16) reads 4 neighbouring values with load4,
-// works on the float4 it gives, and writes 4 with store4 or adds 4 with atomic_add4. For float that is one
-// 16-byte load or store, as a float4* has always done; for a 2-byte dtype one 8-byte load or store, and each
-// value turned into a float on the way in and rounded on the way out. Either way, `first` must start on
-// 4 x element_size bytes: 16 for float, 8 for the 2-byte dtypes.
+// For float one 16-byte load or store; for a 2-byte dtype one 8-byte one, converted on the way.
+// `first` must start on 4 values: 16 bytes for float, 8 for the 2-byte dtypes.
 
-/// Four values of a 2-byte dtype, next to each other: 8 bytes, read or written as one.
+#define VALUES_PER_FLOAT4 4   // values read4_as_float, write4_from_float and atomic_add4_from_float move at once
+
+/// Four values of a 2-byte dtype side by side: 8 bytes, read or written as one.
 template <typename T>
 struct alignas(8) Four {
     T value[4];
 };
 
 /// Gives first[0 .. 3] as a float4.
+///
+///   first   float, half or nv_bfloat16 (T)
 template <typename T>
-__device__ __forceinline__ float4 load4(const T* first) {
+__device__ __forceinline__ float4 read4_as_float(const T* first) {
     if constexpr (std::is_same<T, float>::value) {
-        return *(const float4*)first;
+        return *reinterpret_cast<const float4*>(first);
     } else {
-        Four<T> four = *(const Four<T>*)first;
+        Four<T> four = *reinterpret_cast<const Four<T>*>(first);
         return make_float4(to_float(four.value[0]), to_float(four.value[1]), to_float(four.value[2]),
                            to_float(four.value[3]));
     }
 }
 
-/// Writes the float4 into first[0 .. 3], each value rounded to T.
+/// Writes a float4 into first[0 .. 3], each value rounded to T.
+///
+///   first    float, half or nv_bfloat16 (T)
+///   values   the 4 floats
 template <typename T>
-__device__ __forceinline__ void store4(T* first, float4 values) {
+__device__ __forceinline__ void write4_from_float(T* first, float4 values) {
     if constexpr (std::is_same<T, float>::value) {
-        *(float4*)first = values;
+        *reinterpret_cast<float4*>(first) = values;
     } else {
         Four<T> four;
         four.value[0] = from_float<T>(values.x);
         four.value[1] = from_float<T>(values.y);
         four.value[2] = from_float<T>(values.z);
         four.value[3] = from_float<T>(values.w);
-        *(Four<T>*)first = four;
+        *reinterpret_cast<Four<T>*>(first) = four;
     }
 }
 
-/// Adds the float4 onto first[0 .. 3] while other threads may add onto the same values: nothing is lost.
-/// Floats get four atomicAdds. A T4 has no atomicAdd on a bfloat16 (compute capability 8.0 and newer), so
-/// a 2-byte dtype's 8 bytes are swapped in whole with a compare-and-swap:
+/// Adds a float4 onto first[0 .. 3] while other threads may add onto the same values. Floats: four atomicAdds.
+/// A 2-byte dtype (no atomicAdd on a T4): read the 8 bytes, add in float, round, then write them back with
+/// atomicCAS only if they still hold what was read; otherwise go round again.
 ///
-///     1. read the 8 bytes      2. add the 4 values in float, round each      3. write the 8 bytes back,
-///                                                                               only if they still hold what was read
-///
-/// atomicCAS does step 3 as one step and gives back what was there. If another thread wrote in between, that
-/// is not what this thread read, and it goes round again from what is there now.
+///   first    float, half or nv_bfloat16 (T)
+///   values   the 4 floats to add
 template <typename T>
-__device__ __forceinline__ void atomic_add4(T* first, float4 values) {
+__device__ __forceinline__ void atomic_add4_from_float(T* first, float4 values) {
     if constexpr (std::is_same<T, float>::value) {
         atomicAdd(first + 0, values.x);
         atomicAdd(first + 1, values.y);
         atomicAdd(first + 2, values.z);
         atomicAdd(first + 3, values.w);
     } else {
-        unsigned long long* word = (unsigned long long*)first;
-        unsigned long long seen = *word, read;
+        unsigned long long* word = reinterpret_cast<unsigned long long*>(first);
+        unsigned long long seen = *word;
+        unsigned long long read;
         do {
             read = seen;
             Four<T> four;

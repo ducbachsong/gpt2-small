@@ -2,32 +2,31 @@
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
-// Part 1 checks both against PyTorch's + with autograd for the backward, and times them on GPT-2
-// small's size; part 2 checks numbers worked out by hand; part 3 checks that each kernel's registers
-// fit its block; part 4 times each kernel with other block and thread counts.
+// Part 1 checks both against PyTorch's + with autograd for the backward; part 2 checks numbers worked out
+// by hand; part 3 checks that each kernel's registers fit its block, and that any block size gives the same
+// bits. The timings are in tunes/tune_residual.cu.
 // (The C# trainer had no residual test: TorchSharp's + was trusted.)
 #include <torch/types.h>              // torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "test_helpers.h"             // ASSERT_EQ: every check here is exact
 #include "../llmc/kernels/residual.cuh"
-
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Makes a tensor of `shape` on the GPU holding `values`, given in row order.
-static Tensor tensor_of(const Shape &shape, const std::vector<float> &values)
+/// Makes a tensor of `shape_list` on the GPU holding `values_list`, given in row order.
+static Tensor tensor_of(const Shape &shape_list, const std::vector<float> &values_list)
 {
-    Tensor tensor = Tensor::empty(shape);
-    tensor.copy_from_cpu(values.data());
+    Tensor tensor = Tensor::empty(shape_list);
+    tensor.copy_from_cpu(values_list.data());
     return tensor;
 }
 
-/// Makes a tensor of `shape` with random values, mean 0 and standard deviation 1, made by PyTorch on
+/// Makes a tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
 /// the GPU: Tensor::randn makes them on the CPU, which takes seconds for GPT-2's 3.1M values.
-static Tensor random_tensor_on_gpu(const Shape &shape)
+static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
-    Tensor tensor = Tensor::empty(shape);
-    torch::Tensor values = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA));
-    cudaCheck(cudaMemcpy(tensor.data(), values.data_ptr<float>(), tensor.numel() * sizeof(float),
+    Tensor tensor = Tensor::empty(shape_list);
+    torch::Tensor values_tensor = torch::randn({(int64_t)tensor.numel()}, torch::TensorOptions().device(torch::kCUDA));
+    cudaCheck(cudaMemcpy(tensor.data(), values_tensor.data_ptr<float>(), tensor.numel() * sizeof(float),
                          cudaMemcpyDeviceToDevice));
     return tensor;
 }
@@ -35,35 +34,16 @@ static Tensor random_tensor_on_gpu(const Shape &shape)
 /// Makes a PyTorch tensor on the GPU with a copy of my tensor's values, GPU to GPU.
 static torch::Tensor pytorch_copy_of(const Tensor &tensor)
 {
-    torch::TensorOptions on_gpu = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    std::vector<int64_t> sizes(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
-    return torch::from_blob(tensor.data(), sizes, on_gpu).clone();
+    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    std::vector<int64_t> sizes_list(tensor.shape().begin(), tensor.shape().end()); // PyTorch takes int64_t sizes
+    return torch::from_blob(tensor.data(), sizes_list, on_gpu_val).clone();
 }
 
 /// Gives every value of a PyTorch tensor as a CPU list in row order, to compare with mine.
 static std::vector<float> list_of(const torch::Tensor &tensor)
 {
-    torch::Tensor on_cpu = tensor.detach().contiguous().cpu();
-    return std::vector<float>(on_cpu.data_ptr<float>(), on_cpu.data_ptr<float>() + on_cpu.numel());
-}
-
-/// Measures how long `run` takes on the GPU, in milliseconds: a mark on the GPU's queue
-/// before it and one after; the GPU writes down the time as it reaches each.
-template <typename Run>
-static float gpu_milliseconds(Run run)
-{
-    cudaEvent_t start, end;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&end));
-    cudaCheck(cudaEventRecord(start));
-    run();
-    cudaCheck(cudaEventRecord(end));
-    cudaCheck(cudaEventSynchronize(end)); // wait until the GPU has passed the second mark
-    float milliseconds = 0.0f;
-    cudaCheck(cudaEventElapsedTime(&milliseconds, start, end));
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(end));
-    return milliseconds;
+    torch::Tensor on_cpu_tensor = tensor.detach().contiguous().cpu();
+    return std::vector<float>(on_cpu_tensor.data_ptr<float>(), on_cpu_tensor.data_ptr<float>() + on_cpu_tensor.numel());
 }
 
 // ══ part 1: mine against PyTorch's ═══════════════════════════════════════════
@@ -71,23 +51,29 @@ static float gpu_milliseconds(Run run)
 /// Runs one forward and one backward on random values, mine and PyTorch's residual + branch_output with
 /// autograd, and checks that output, residual_grad and branch_output_grad are the same to the last bit:
 /// both sides do the same one float add per value, and the backward only copies.
-static void forward_and_backward_match_pytorch(const Shape &shape)
+static void forward_and_backward_match_pytorch(const Shape &shape_list)
 {
+    // 1. random inputs; mine
     torch::manual_seed(0);
-    Tensor residual = random_tensor_on_gpu(shape), branch_output = random_tensor_on_gpu(shape);
-    Tensor output_grad = random_tensor_on_gpu(shape);
-    Tensor output = Tensor::zeros(shape);
-    Tensor residual_grad = Tensor::zeros(shape), branch_output_grad = Tensor::zeros(shape);
-    residual_forward(output, residual, branch_output);
-    residual_backward(residual_grad, branch_output_grad, output_grad);
+    Tensor residual_tensor = random_tensor_on_gpu(shape_list);
+    Tensor branch_output_tensor = random_tensor_on_gpu(shape_list);
+    Tensor output_grad_tensor = random_tensor_on_gpu(shape_list);
+    Tensor output_tensor = Tensor::zeros(shape_list);
+    Tensor residual_grad_tensor = Tensor::zeros(shape_list);
+    Tensor branch_output_grad_tensor = Tensor::zeros(shape_list);
+    residual_forward(output_tensor, residual_tensor, branch_output_tensor);
+    residual_backward(residual_grad_tensor, branch_output_grad_tensor, output_grad_tensor);
 
-    torch::Tensor pytorch_residual = pytorch_copy_of(residual).requires_grad_(true);
-    torch::Tensor pytorch_branch_output = pytorch_copy_of(branch_output).requires_grad_(true);
-    torch::Tensor pytorch_output = pytorch_residual + pytorch_branch_output;
-    pytorch_output.backward(pytorch_copy_of(output_grad));
-    ASSERT_EQ(output.tolist(), list_of(pytorch_output));
-    ASSERT_EQ(residual_grad.tolist(), list_of(pytorch_residual.grad()));
-    ASSERT_EQ(branch_output_grad.tolist(), list_of(pytorch_branch_output.grad()));
+    // 2. PyTorch's, with autograd
+    torch::Tensor pytorch_residual_tensor = pytorch_copy_of(residual_tensor).requires_grad_(true);
+    torch::Tensor pytorch_branch_output_tensor = pytorch_copy_of(branch_output_tensor).requires_grad_(true);
+    torch::Tensor pytorch_output_tensor = pytorch_residual_tensor + pytorch_branch_output_tensor;
+    pytorch_output_tensor.backward(pytorch_copy_of(output_grad_tensor));
+
+    // 3. the same bits
+    ASSERT_EQ(output_tensor.tolist(), list_of(pytorch_output_tensor));
+    ASSERT_EQ(residual_grad_tensor.tolist(), list_of(pytorch_residual_tensor.grad()));
+    ASSERT_EQ(branch_output_grad_tensor.tolist(), list_of(pytorch_branch_output_tensor.grad()));
 }
 
 static void matches_pytorch_on_gpt2_rows(void)
@@ -111,72 +97,27 @@ static void forward_and_backward_in_bfloat16(void)
     // a float, added in float, and rounded once to bfloat16 as it is stored: the same as PyTorch's float add
     // of the same values, rounded to bfloat16 by PyTorch, to the last bit (both round to the nearest, a tie
     // to the even one). The gradients are output_grad copied, so the same bfloat16s exactly.
+
+    // 1. random inputs in bfloat16; mine
     torch::manual_seed(0);
-    Shape shape = {2, 8, 768};
-    Tensor residual = random_tensor_on_gpu(shape).to(DType::BFloat16);
-    Tensor branch_output = random_tensor_on_gpu(shape).to(DType::BFloat16);
-    Tensor output_grad = random_tensor_on_gpu(shape).to(DType::BFloat16);
-    Tensor output = Tensor::zeros(shape, DType::BFloat16);
-    Tensor residual_grad = Tensor::zeros(shape, DType::BFloat16);
-    Tensor branch_output_grad = Tensor::zeros(shape, DType::BFloat16);
-    residual_forward(output, residual, branch_output);
-    residual_backward(residual_grad, branch_output_grad, output_grad);
+    Shape shape_list = {2, 8, 768};
+    Tensor residual_tensor = random_tensor_on_gpu(shape_list).to(DType::BFloat16);
+    Tensor branch_output_tensor = random_tensor_on_gpu(shape_list).to(DType::BFloat16);
+    Tensor output_grad_tensor = random_tensor_on_gpu(shape_list).to(DType::BFloat16);
+    Tensor output_tensor = Tensor::zeros(shape_list, DType::BFloat16);
+    Tensor residual_grad_tensor = Tensor::zeros(shape_list, DType::BFloat16);
+    Tensor branch_output_grad_tensor = Tensor::zeros(shape_list, DType::BFloat16);
+    residual_forward(output_tensor, residual_tensor, branch_output_tensor);
+    residual_backward(residual_grad_tensor, branch_output_grad_tensor, output_grad_tensor);
 
-    torch::Tensor pytorch_output = pytorch_copy_of(residual.to(DType::Float32)) +
-                                   pytorch_copy_of(branch_output.to(DType::Float32));
-    ASSERT_EQ(output.to(DType::Float32).tolist(), list_of(pytorch_output.to(torch::kBFloat16).to(torch::kFloat)));
-    ASSERT_EQ(residual_grad.to(DType::Float32).tolist(), output_grad.to(DType::Float32).tolist());
-    ASSERT_EQ(branch_output_grad.to(DType::Float32).tolist(), output_grad.to(DType::Float32).tolist());
-}
+    // 2. PyTorch's float add of the same values
+    torch::Tensor pytorch_output_tensor = pytorch_copy_of(residual_tensor.to(DType::Float32)) +
+                                          pytorch_copy_of(branch_output_tensor.to(DType::Float32));
 
-static void time_20_steps_on_gpt2_small_size(void)
-{
-    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's residual stream, {4, 1024, 768}:
-    // 3,145,728 values, 12.6 MB a tensor. Mine against PyTorch's + with autograd. A forward reads residual
-    // and branch_output and writes output, 3 x 12.6 MB: at a T4's 320 GB/s at least 0.118 ms. A backward
-    // reads output_grad and writes the two gradients, 3 x 12.6 MB: also at least 0.118 ms. Both sides
-    // write the gradients over each step; at the end they must agree.
-    torch::manual_seed(0);
-    Shape shape = {4, 1024, 768};
-    Tensor residual = random_tensor_on_gpu(shape), branch_output = random_tensor_on_gpu(shape);
-    Tensor output_grad = random_tensor_on_gpu(shape);
-    Tensor output = Tensor::zeros(shape);
-    Tensor residual_grad = Tensor::zeros(shape), branch_output_grad = Tensor::zeros(shape);
-
-    torch::Tensor pytorch_residual = pytorch_copy_of(residual).requires_grad_(true);
-    torch::Tensor pytorch_branch_output = pytorch_copy_of(branch_output).requires_grad_(true);
-    torch::Tensor pytorch_output_grad = pytorch_copy_of(output_grad);
-    torch::Tensor pytorch_output;
-
-    // Steps 1 and 2 do first-time work, so the averages are of 3..20: in step 1 CUDA loads each side's
-    // kernels.
-    double totals[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int t = 1; t <= 20; t++)
-    {
-        float times[4];
-        times[0] = gpu_milliseconds([&] { residual_forward(output, residual, branch_output); });
-        times[1] = gpu_milliseconds([&] { residual_backward(residual_grad, branch_output_grad, output_grad); });
-        times[2] = gpu_milliseconds([&] { pytorch_output = pytorch_residual + pytorch_branch_output; });
-        pytorch_residual.mutable_grad() = torch::Tensor();      // gradients written, as mine, not added onto
-        pytorch_branch_output.mutable_grad() = torch::Tensor();
-        times[3] = gpu_milliseconds([&] { pytorch_output.backward(pytorch_output_grad); });
-        if (t <= 2)
-            continue;
-        for (int column = 0; column < 4; column++)
-            totals[column] += times[column];
-    }
-    double moved_gb = 3 * (double)residual.numel() * sizeof(float) / 1e9;     // 0.0377 GB, for all four
-    print_test_name(__func__);
-    printf("    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward\n");
-    printf("        ms                    %10.3f   %11.3f   %15.3f   %16.3f\n", totals[0] / 18, totals[1] / 18,
-           totals[2] / 18, totals[3] / 18);
-    printf("        GB/s                  %10.1f   %11.1f   %15.1f   %16.1f\n", moved_gb / (totals[0] / 18 / 1e3),
-           moved_gb / (totals[1] / 18 / 1e3), moved_gb / (totals[2] / 18 / 1e3), moved_gb / (totals[3] / 18 / 1e3));
-    printf("    PyTorch takes, against mine:                          %14.2fx   %15.2fx\n", totals[2] / totals[0],
-           totals[3] / totals[1]);
-    ASSERT_EQ(output.tolist(), list_of(pytorch_output));
-    ASSERT_EQ(residual_grad.tolist(), list_of(pytorch_residual.grad()));
-    ASSERT_EQ(branch_output_grad.tolist(), list_of(pytorch_branch_output.grad()));
+    // 3. the same bits once rounded; the gradients output_grad itself
+    ASSERT_EQ(output_tensor.to(DType::Float32).tolist(), list_of(pytorch_output_tensor.to(torch::kBFloat16).to(torch::kFloat)));
+    ASSERT_EQ(residual_grad_tensor.to(DType::Float32).tolist(), output_grad_tensor.to(DType::Float32).tolist());
+    ASSERT_EQ(branch_output_grad_tensor.to(DType::Float32).tolist(), output_grad_tensor.to(DType::Float32).tolist());
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
@@ -197,36 +138,46 @@ static const std::vector<float> NOTE_OUTPUT_GRAD = {1, -2, 0.5f, 3};
 static void forward_of_the_note_s_example(void)
 {
     // Expect: 1 + 0.5, 2 - 2, 3 + 0, 4 + 2 = 1.5 0 3 6, exactly: every value is a float.
-    Tensor output = Tensor::zeros({4});
-    residual_forward(output, tensor_of({4}, NOTE_RESIDUAL), tensor_of({4}, NOTE_BRANCH_OUTPUT));
-    ASSERT_EQ(output.tolist(), NOTE_OUTPUT);
+    // 1. the forward
+    Tensor output_tensor = Tensor::zeros({4});
+    residual_forward(output_tensor, tensor_of({4}, NOTE_RESIDUAL), tensor_of({4}, NOTE_BRANCH_OUTPUT));
+    // 2. check
+    ASSERT_EQ(output_tensor.tolist(), NOTE_OUTPUT);
 }
 
 static void backward_gives_output_grad_to_both(void)
 {
     // Expect: the slope of r + b is 1 for r and 1 for b, so residual_grad and branch_output_grad are both
     // output_grad, 1 -2 0.5 3, exactly. Not halved: the add copies the gradient, it does not split it.
-    Tensor residual_grad = Tensor::zeros({4}), branch_output_grad = Tensor::zeros({4});
-    residual_backward(residual_grad, branch_output_grad, tensor_of({4}, NOTE_OUTPUT_GRAD));
-    ASSERT_EQ(residual_grad.tolist(), NOTE_OUTPUT_GRAD);
-    ASSERT_EQ(branch_output_grad.tolist(), NOTE_OUTPUT_GRAD);
+    // 1. the backward
+    Tensor residual_grad_tensor = Tensor::zeros({4});
+    Tensor branch_output_grad_tensor = Tensor::zeros({4});
+    residual_backward(residual_grad_tensor, branch_output_grad_tensor, tensor_of({4}, NOTE_OUTPUT_GRAD));
+    // 2. check
+    ASSERT_EQ(residual_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
+    ASSERT_EQ(branch_output_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
 }
 
 static void a_branch_of_0_leaves_the_row_as_it_is(void)
 {
     // Expect: branch_output all 0, as a block that has learned nothing gives: output is residual,
     // 1 2 3 4, exactly. The block is then the identity, and the row passes through it unchanged.
-    Tensor output = Tensor::zeros({4});
-    residual_forward(output, tensor_of({4}, NOTE_RESIDUAL), Tensor::zeros({4}));
-    ASSERT_EQ(output.tolist(), NOTE_RESIDUAL);
+    // 1. the forward with a branch of 0
+    Tensor output_tensor = Tensor::zeros({4});
+    residual_forward(output_tensor, tensor_of({4}, NOTE_RESIDUAL), Tensor::zeros({4}));
+    // 2. check
+    ASSERT_EQ(output_tensor.tolist(), NOTE_RESIDUAL);
 }
 
 static void adding_minus_itself_gives_0(void)
 {
     // Expect: x + (-x) = 0 exactly for any float, also 1000000 and -3.25: 0 0 0 0.
-    Tensor output = Tensor::ones({4});
-    residual_forward(output, tensor_of({4}, {1.5f, -2, 1000000, -3.25f}), tensor_of({4}, {-1.5f, 2, -1000000, 3.25f}));
-    ASSERT_EQ(output.tolist(), std::vector<float>(4, 0.0f));
+    // 1. the forward
+    Tensor output_tensor = Tensor::ones({4});
+    residual_forward(output_tensor, tensor_of({4}, {1.5f, -2, 1000000, -3.25f}),
+                     tensor_of({4}, {-1.5f, 2, -1000000, 3.25f}));
+    // 2. check
+    ASSERT_EQ(output_tensor.tolist(), std::vector<float>(4, 0.0f));
 }
 
 static void adds_in_float_as_pytorch_does(void)
@@ -241,18 +192,22 @@ static void adds_in_float_as_pytorch_does(void)
     //     100000000 + 1     = 100000001, nearest float 100000000
     //
     // PyTorch's + rounds the same way, so part 1 can ask for the same bits.
-    Tensor output = Tensor::zeros({4});
-    residual_forward(output, tensor_of({4}, {16777216, 1, 16777216, 100000000}), tensor_of({4}, {1, 1e-8f, 2, 1}));
-    ASSERT_EQ(output.tolist(), std::vector<float>({16777216, 1, 16777218, 100000000}));
+    // 1. the forward
+    Tensor output_tensor = Tensor::zeros({4});
+    residual_forward(output_tensor, tensor_of({4}, {16777216, 1, 16777216, 100000000}), tensor_of({4}, {1, 1e-8f, 2, 1}));
+    // 2. check
+    ASSERT_EQ(output_tensor.tolist(), std::vector<float>({16777216, 1, 16777218, 100000000}));
 }
 
 static void forward_can_write_into_residual_itself(void)
 {
     // Expect: the residual tensor passed as output too, as a trainer that keeps one residual stream
     // would: each thread reads its residual before writing its output, so the result is 1.5 0 3 6.
-    Tensor residual = tensor_of({4}, NOTE_RESIDUAL);
-    residual_forward(residual, residual, tensor_of({4}, NOTE_BRANCH_OUTPUT));
-    ASSERT_EQ(residual.tolist(), NOTE_OUTPUT);
+    // 1. the forward, in place
+    Tensor residual_tensor = tensor_of({4}, NOTE_RESIDUAL);
+    residual_forward(residual_tensor, residual_tensor, tensor_of({4}, NOTE_BRANCH_OUTPUT));
+    // 2. check
+    ASSERT_EQ(residual_tensor.tolist(), NOTE_OUTPUT);
 }
 
 static void backward_writes_over_both_grads(void)
@@ -260,14 +215,18 @@ static void backward_writes_over_both_grads(void)
     // Expect: residual_grad and branch_output_grad start at 10 (left from somewhere else); the backward
     // writes over them, so after it both are output_grad, with no 10 added. A second backward gives the
     // same: the layer after (LayerNorm) adds its part onto residual_grad, not the residual add.
-    Tensor output_grad = tensor_of({4}, NOTE_OUTPUT_GRAD);
-    Tensor residual_grad = Tensor::zeros({4}).fill_(10), branch_output_grad = Tensor::zeros({4}).fill_(10);
-    residual_backward(residual_grad, branch_output_grad, output_grad);
-    ASSERT_EQ(residual_grad.tolist(), NOTE_OUTPUT_GRAD);
-    ASSERT_EQ(branch_output_grad.tolist(), NOTE_OUTPUT_GRAD);
-    residual_backward(residual_grad, branch_output_grad, output_grad);
-    ASSERT_EQ(residual_grad.tolist(), NOTE_OUTPUT_GRAD);
-    ASSERT_EQ(branch_output_grad.tolist(), NOTE_OUTPUT_GRAD);
+    // 1. grads that start at 10
+    Tensor output_grad_tensor = tensor_of({4}, NOTE_OUTPUT_GRAD);
+    Tensor residual_grad_tensor = Tensor::zeros({4}).fill_(10);
+    Tensor branch_output_grad_tensor = Tensor::zeros({4}).fill_(10);
+    // 2. one backward: written over
+    residual_backward(residual_grad_tensor, branch_output_grad_tensor, output_grad_tensor);
+    ASSERT_EQ(residual_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
+    ASSERT_EQ(branch_output_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
+    // 3. a second backward: the same
+    residual_backward(residual_grad_tensor, branch_output_grad_tensor, output_grad_tensor);
+    ASSERT_EQ(residual_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
+    ASSERT_EQ(branch_output_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
 }
 
 static void backward_can_write_into_output_grad_itself(void)
@@ -275,13 +234,16 @@ static void backward_can_write_into_output_grad_itself(void)
     // Expect: the output_grad tensor passed as residual_grad too, as llm.c's trainer does: each thread
     // reads its output_grad before writing, so residual_grad stays 1 -2 0.5 3 and branch_output_grad
     // gets the same.
-    Tensor grad = tensor_of({4}, NOTE_OUTPUT_GRAD), branch_output_grad = Tensor::zeros({4});
-    residual_backward(grad, branch_output_grad, grad);
-    ASSERT_EQ(grad.tolist(), NOTE_OUTPUT_GRAD);
-    ASSERT_EQ(branch_output_grad.tolist(), NOTE_OUTPUT_GRAD);
+    // 1. the backward, in place
+    Tensor grad_tensor = tensor_of({4}, NOTE_OUTPUT_GRAD);
+    Tensor branch_output_grad_tensor = Tensor::zeros({4});
+    residual_backward(grad_tensor, branch_output_grad_tensor, grad_tensor);
+    // 2. check
+    ASSERT_EQ(grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
+    ASSERT_EQ(branch_output_grad_tensor.tolist(), NOTE_OUTPUT_GRAD);
 }
 
-// ══ part 3: the kernels fit their launch ══════════════════════════════════════
+// ══ part 3: the kernels fit their launch, and any block size works ═══════════
 
 static void every_kernel_fits_its_block(void)
 {
@@ -292,192 +254,70 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels[] = {(const void *)residual_forward_kernel<float>,
-                             (const void *)residual_backward_kernel<float>};
-    const char *names[] = {"residual_forward_kernel", "residual_backward_kernel"};
-    for (int k = 0; k < 2; k++)
+    const void *kernels_list[] = {(const void *)residual_forward_kernel<float>,
+                                  (const void *)residual_backward_kernel<float>};
+    const char *names_list[] = {"residual_forward_kernel", "residual_backward_kernel"};
+    for (int kernel_index_val = 0; kernel_index_val < 2; kernel_index_val++)
     {
-        cudaFuncAttributes attributes;
-        cudaCheck(cudaFuncGetAttributes(&attributes, kernels[k]));
+        // 1. what the compiler wrote down
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, kernels_list[kernel_index_val]));
         print_test_name(__func__);
-        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n", names[k],
-               attributes.numRegs, attributes.maxThreadsPerBlock, attributes.localSizeBytes);
-        ASSERT_EQ(attributes.maxThreadsPerBlock >= RESIDUAL_THREADS_PER_BLOCK, true);
-        ASSERT_EQ(attributes.localSizeBytes, (size_t)0);
+        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n",
+               names_list[kernel_index_val], attributes_val.numRegs, attributes_val.maxThreadsPerBlock,
+               attributes_val.localSizeBytes);
+        // 2. check
+        ASSERT_EQ(attributes_val.maxThreadsPerBlock >= RESIDUAL_THREADS_PER_BLOCK, true);
+        ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
     }
 }
 
-// ══ part 4: other block and thread counts ═════════════════════════════════════
-
-/// Keeps the GPU busy with `run` for about a second before timing, so the first launches timed do not
-/// run while its clock is still rising from idle.
-template <typename Run>
-static void warm_up_gpu(Run run)
+static void any_block_size_gives_the_same_bits(void)
 {
-    float total = 0.0f;
-    while (total < 1000.0f)
-        total += gpu_milliseconds(run);
-}
-
-static void time_each_kernel_with_other_block_and_thread_counts(void)
-{
-    // Prints the time of the forward and the backward on GPT-2 small's residual stream, {4, 1024, 768}
-    // (786,432 float4s), in float and in bfloat16, for 10 block counts x 4 thread counts, each the average of
-    // 20 runs: the 8 picked on a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132
-    // and 264 on an SXM; on a T4 they repeat 40 and 80). The 40 launches take turns: 20 rounds, each timing every launch once (the forward and the
-    // backward in float, then both in bfloat16). One launch's 20 runs in a row would all land in the same
-    // stretch of the test, and a T4's clock can drift as it heats up (the first launch timed would get the
-    // fastest clock); taking turns gives every launch runs from early, middle and late alike. Run 1 is
-    // counted too: warm_up_gpu has already done the first-time work. The kernels are launched here directly,
-    // <<<blocks, threads>>>, instead of through residual_forward and residual_backward, which always launch
-    // 3072 x 256: one float4 per thread. With fewer, each thread walks more float4s. A bfloat16 float4 is one
-    // 8-byte read instead of 16, so each thread keeps half the bytes in flight: its best launch may differ.
-    //
-    // Expect: every launch gives the same output and gradients as the usual ones of its dtype, to the last
-    // bit: each value is worked out alone, the same way whichever thread does it. Only the time changes. A
-    // T4 runs at most 40 SMs x 1024 threads = 40,960 threads at once (160 blocks of 256): far fewer than that
-    // likely cannot keep enough reads in flight to fill the memory bus.
-    torch::manual_seed(0);
-    Shape shape = {4, 1024, 768};
-    size_t total_float4s = 4 * 1024 * 768 / 4;
-    Tensor residual = random_tensor_on_gpu(shape), branch_output = random_tensor_on_gpu(shape);
-    Tensor output_grad = random_tensor_on_gpu(shape);
-    Tensor output = Tensor::zeros(shape);
-    Tensor residual_grad = Tensor::zeros(shape), branch_output_grad = Tensor::zeros(shape);
-    // The same values in bfloat16, with outputs of their own.
-    Tensor residual_bf16 = residual.to(DType::BFloat16), branch_output_bf16 = branch_output.to(DType::BFloat16);
-    Tensor output_grad_bf16 = output_grad.to(DType::BFloat16);
-    Tensor output_bf16 = Tensor::zeros(shape, DType::BFloat16);
-    Tensor residual_grad_bf16 = Tensor::zeros(shape, DType::BFloat16);
-    Tensor branch_output_grad_bf16 = Tensor::zeros(shape, DType::BFloat16);
-
-    // The usual launches' results, kept on the GPU as PyTorch tensors to compare each launch with.
-    residual_forward(output, residual, branch_output);
-    residual_backward(residual_grad, branch_output_grad, output_grad);
-    residual_forward(output_bf16, residual_bf16, branch_output_bf16);
-    residual_backward(residual_grad_bf16, branch_output_grad_bf16, output_grad_bf16);
-    torch::Tensor usual_output = pytorch_copy_of(output), usual_residual_grad = pytorch_copy_of(residual_grad);
-    torch::Tensor usual_branch_output_grad = pytorch_copy_of(branch_output_grad);
-    torch::Tensor usual_output_bf16 = pytorch_copy_of(output_bf16.to(DType::Float32));
-    torch::Tensor usual_residual_grad_bf16 = pytorch_copy_of(residual_grad_bf16.to(DType::Float32));
-    torch::Tensor usual_branch_output_grad_bf16 = pytorch_copy_of(branch_output_grad_bf16.to(DType::Float32));
-    int usual_blocks = residual_blocks(total_float4s);       // 3072
-
-    int blocks = 0, threads = 0;                             // the launch the 4 below use, set by the loop
-    auto forward = [&] {
-        residual_forward_kernel<float><<<blocks, threads>>>(output.data(), residual.data(), branch_output.data(),
-                                                            total_float4s);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward = [&] {
-        residual_backward_kernel<float><<<blocks, threads>>>(residual_grad.data(), branch_output_grad.data(),
-                                                             output_grad.data(), total_float4s);
-        cudaCheck(cudaGetLastError());
-    };
-    auto forward_bf16 = [&] {
-        residual_forward_kernel<nv_bfloat16><<<blocks, threads>>>(output_bf16.data_ptr<nv_bfloat16>(),
-                                                                  residual_bf16.data_ptr<nv_bfloat16>(),
-                                                                  branch_output_bf16.data_ptr<nv_bfloat16>(),
-                                                                  total_float4s);
-        cudaCheck(cudaGetLastError());
-    };
-    auto backward_bf16 = [&] {
-        residual_backward_kernel<nv_bfloat16><<<blocks, threads>>>(residual_grad_bf16.data_ptr<nv_bfloat16>(),
-                                                                   branch_output_grad_bf16.data_ptr<nv_bfloat16>(),
-                                                                   output_grad_bf16.data_ptr<nv_bfloat16>(),
-                                                                   total_float4s);
-        cudaCheck(cudaGetLastError());
-    };
-    blocks = usual_blocks;
-    threads = RESIDUAL_THREADS_PER_BLOCK;
-    warm_up_gpu(forward);
-
-    int sms = 0;                                             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
-    cudaCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
-    int block_counts[] = {40, 80, 160, 320, 640, 1280, 1536, 3072, sms, 2 * sms};
-    int thread_counts[] = {128, 256, 512, 1024};
-    const int launches = 10 * 4, rounds = 20;
-    // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
-    float total_ms[launches][4] = {};
-    for (int round = 1; round <= rounds; round++)
+    // Expect: residual_forward and residual_backward called with threads_per_block 32, 128, 512 and 1024
+    // (one warp up to MAX_THREADS_PER_BLOCK) give the same output and gradients as with the default,
+    // RESIDUAL_THREADS_PER_BLOCK, to the last bit, in float and in bfloat16: each value is one add or one copy,
+    // the same whichever thread does it. {3, 7, 100}: 525 float4s, so every size has a part-full last block.
+    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    DType dtypes_list[] = {DType::Float32, DType::BFloat16};
+    for (DType dtype_val : dtypes_list)
     {
-        for (int k = 0; k < launches; k++)
+        // 1. random inputs; the default launch's results
+        torch::manual_seed(0);
+        Shape shape_list = {3, 7, 100};
+        Tensor residual_tensor = random_tensor_on_gpu(shape_list).to(dtype_val);
+        Tensor branch_output_tensor = random_tensor_on_gpu(shape_list).to(dtype_val);
+        Tensor output_grad_tensor = random_tensor_on_gpu(shape_list).to(dtype_val);
+        Tensor usual_output_tensor = Tensor::zeros(shape_list, dtype_val);
+        Tensor usual_residual_grad_tensor = Tensor::zeros(shape_list, dtype_val);
+        Tensor usual_branch_output_grad_tensor = Tensor::zeros(shape_list, dtype_val);
+        residual_forward(usual_output_tensor, residual_tensor, branch_output_tensor);
+        residual_backward(usual_residual_grad_tensor, usual_branch_output_grad_tensor, output_grad_tensor);
+
+        // 2. each block size, against the default's
+        for (int threads_per_block_val : block_sizes_list)
         {
-            blocks = block_counts[k / 4];
-            threads = thread_counts[k % 4];
-            total_ms[k][0] += gpu_milliseconds(forward);
-            total_ms[k][1] += gpu_milliseconds(backward);
-            total_ms[k][2] += gpu_milliseconds(forward_bf16);
-            total_ms[k][3] += gpu_milliseconds(backward_bf16);
+            Tensor output_tensor = Tensor::zeros(shape_list, dtype_val);
+            Tensor residual_grad_tensor = Tensor::zeros(shape_list, dtype_val);
+            Tensor branch_output_grad_tensor = Tensor::zeros(shape_list, dtype_val);
+            residual_forward(output_tensor, residual_tensor, branch_output_tensor, threads_per_block_val);
+            residual_backward(residual_grad_tensor, branch_output_grad_tensor, output_grad_tensor, threads_per_block_val);
+            ASSERT_EQ(output_tensor.to(DType::Float32).tolist(), usual_output_tensor.to(DType::Float32).tolist());
+            ASSERT_EQ(residual_grad_tensor.to(DType::Float32).tolist(), usual_residual_grad_tensor.to(DType::Float32).tolist());
+            ASSERT_EQ(branch_output_grad_tensor.to(DType::Float32).tolist(),
+                      usual_branch_output_grad_tensor.to(DType::Float32).tolist());
         }
     }
-
-    const char *kernel_names[] = {"forward", "backward", "bf16 forward", "bf16 backward"};
-    float fastest_ms[4] = {1e9f, 1e9f, 1e9f, 1e9f};
-    int fastest_blocks[4] = {}, fastest_threads[4] = {};
-    int launches_with_the_same_result = 0;
-    print_test_name(__func__);
-    printf("    time in ms:   blocks   threads   float4s per thread   forward   backward   bf16 forward   "
-           "bf16 backward   same result\n");
-    for (int k = 0; k < launches; k++)
-    {
-        blocks = block_counts[k / 4];
-        threads = thread_counts[k % 4];
-        float times[4];
-        for (int j = 0; j < 4; j++)
-        {
-            times[j] = total_ms[k][j] / rounds;
-            if (times[j] < fastest_ms[j])
-            {
-                fastest_ms[j] = times[j];
-                fastest_blocks[j] = blocks;
-                fastest_threads[j] = threads;
-            }
-        }
-
-        // One forward and one backward from 0 with this launch in each dtype, against the usual launches'.
-        output.zero_();
-        residual_grad.zero_();
-        branch_output_grad.zero_();
-        output_bf16.zero_();
-        residual_grad_bf16.zero_();
-        branch_output_grad_bf16.zero_();
-        forward();
-        backward();
-        forward_bf16();
-        backward_bf16();
-        bool same = torch::equal(pytorch_copy_of(output), usual_output) &&
-                    torch::equal(pytorch_copy_of(residual_grad), usual_residual_grad) &&
-                    torch::equal(pytorch_copy_of(branch_output_grad), usual_branch_output_grad) &&
-                    torch::equal(pytorch_copy_of(output_bf16.to(DType::Float32)), usual_output_bf16) &&
-                    torch::equal(pytorch_copy_of(residual_grad_bf16.to(DType::Float32)), usual_residual_grad_bf16) &&
-                    torch::equal(pytorch_copy_of(branch_output_grad_bf16.to(DType::Float32)),
-                                 usual_branch_output_grad_bf16);
-        if (same)
-            launches_with_the_same_result++;
-
-        size_t threads_launched = (size_t)blocks * threads;
-        int float4s_per_thread = (int)((total_float4s + threads_launched - 1) / threads_launched); // the most
-        const char *usual = blocks == usual_blocks && threads == RESIDUAL_THREADS_PER_BLOCK
-                                ? "   <- what residual_forward and residual_backward launch"
-                                : "";
-        printf("                  %6d   %7d   %18d   %7.3f   %8.3f   %12.3f   %13.3f   %-11s%s\n", blocks, threads,
-               float4s_per_thread, times[0], times[1], times[2], times[3], same ? "yes" : "NO", usual);
-    }
-    for (int j = 0; j < 4; j++)
-        printf("    fastest %-13s  %5d blocks x %4d threads: %.3f ms\n", kernel_names[j], fastest_blocks[j],
-               fastest_threads[j], fastest_ms[j]);
-    ASSERT_EQ(launches_with_the_same_result, launches);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+    start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     matches_pytorch_on_gpt2_rows();
     matches_pytorch_with_a_part_full_last_block();
     forward_and_backward_in_bfloat16();
-    time_20_steps_on_gpt2_small_size();
 
     forward_of_the_note_s_example();
     backward_gives_output_grad_to_both();
@@ -489,8 +329,7 @@ int main(void)
     backward_can_write_into_output_grad_itself();
 
     every_kernel_fits_its_block();
-
-    time_each_kernel_with_other_block_and_thread_counts();
+    any_block_size_gives_the_same_bits();
 
     printf("\nall tests passed\n");
     return 0;
