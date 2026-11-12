@@ -22,7 +22,7 @@
 #include <memory>
 #include <type_traits>
 #include <vector>
-#include "kernels/cuda_common.h"
+#include "../kernels/cuda_common.h"
 
 /// What one value is.
 enum class DType { Float32, Float16, BFloat16, Int32 };

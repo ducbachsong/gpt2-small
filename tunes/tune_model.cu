@@ -1,16 +1,16 @@
-// tune_gpt2.cu — the timings of tests/test_gpt2.cu, moved here so the tests only check numbers:
+// tune_model.cu — the timings of tests/test_model.cu, moved here so the tests only check numbers:
 // time_20_steps_on_gpt2_small_size; and find_the_micro_batch_with_the_best_mfu, the --batch-size to train with.
 //
-// Built as tests/test_gpt2.cu is (see tunes/README.md); what it prints also goes to
-// tunes/results/<GPU>/gpt2_<date>_<time>.txt.
+// Built as tests/test_model.cu is (see tunes/README.md); what it prints also goes to
+// tunes/results/<GPU>/model_<date>_<time>.txt.
 #include <algorithm>                  // std::min
 #include <string>
 #include <torch/types.h>              // torch::embedding, torch::linear, cross_entropy_loss, ...; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed, torch::NoGradGuard
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
-#include "../llmc/gpt2.cuh"
+#include "../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
+#include "../llmc/model_bf16.cuh"      // the model training runs: gpt2_bf16_forward, gpt2_bf16_backward
 
 // In bfloat16, against PyTorch in float on the same values: every kernel rounds its outputs once (up to 2^-8,
 // 0.4%), and the next one reads them. The block's test allows 3e-2 for ten kernels; here are 25.
@@ -18,10 +18,10 @@ static const double BFLOAT16_TOLERANCE = 5e-2;
 
 #define BLOCK_PARAMS 12               // a block's parameter tensors: 4 matrices, then 8 vectors
 #define BLOCK_MATRICES 4              // of them matrices
-#define SEQ_LEN 1024                  // tokens per row, as train_gpt2.cu trains
+#define SEQ_LEN 1024                  // tokens per row, as train_bf16.cu trains
 #define LARGEST_MICRO_BATCH 512       // rows: the micro-batch sweep tries 1, 2, 4, ... this many, while they fit
 #define MOST_ROWS_STEP 8              // then the most rows that fit, rounded down to a multiple of this
-#define TOKENS_PER_STEP 524288        // train_gpt2.cu's step, all GPUs together: 2^19
+#define TOKENS_PER_STEP 524288        // train_bf16.cu's step, all GPUs together: 2^19
 #define MEMORY_HEADROOM 0.9           // the next size is tried only if it needs at most this much of the free memory
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -78,9 +78,9 @@ static std::vector<float> list_of(const Tensor &tensor)
     return tensor.to(DType::Float32).tolist();
 }
 
-/// Everything one model needs, for one config, size and dtype: its parameters and their gradients in a
-/// TensorBuffer each, as the optimizer keeps them, its activations and scratch, and token_ids and targets.
-/// All 0 to start.
+/// Everything one bfloat16 model needs, for one config and size (the dtype training runs in: model_bf16.cuh): its
+/// parameters and their gradients in a TensorBuffer each, as the optimizer keeps them, its activations, and
+/// token_ids and targets. All 0 to start.
 struct GPT2Tensors
 {
     GPT2Config config_val;
@@ -90,17 +90,15 @@ struct GPT2Tensors
     TensorBuffer grad_buffer_val;
     GPT2Params params_val;
     GPT2Params grads_val;
-    GPT2Activations activations_val;
-    GPT2Scratch scratch_val;
+    GPT2ActivationsBf16 activations_val;
     Tensor token_ids_tensor;
     Tensor targets_tensor;
 
-    GPT2Tensors(const GPT2Config &model_config_val, size_t model_batch_size_val, size_t model_seq_len_val,
-                DType dtype_val = DType::Float32)
+    GPT2Tensors(const GPT2Config &model_config_val, size_t model_batch_size_val, size_t model_seq_len_val)
         : config_val(model_config_val), batch_size_val(model_batch_size_val), seq_len_val(model_seq_len_val),
-          activations_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val),
-          scratch_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val)
+          activations_val(model_batch_size_val, model_seq_len_val, model_config_val)
     {
+        DType dtype_val = DType::BFloat16;
         // 1. the parameters and their gradients, in a TensorBuffer each
         int group_index_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
         param_buffer_val.allocate(dtype_val);
@@ -146,13 +144,16 @@ struct GPT2Tensors
         fill_random_ids(targets_tensor, config_val.vocab_size);
     }
 
-    /// Runs gpt2_forward on these tensors.
-    void forward() { gpt2_forward(activations_val, token_ids_tensor, targets_tensor, params_val, scratch_val, config_val); }
+    /// Runs gpt2_bf16_forward on these tensors.
+    void forward()
+    {
+        gpt2_bf16_forward(activations_val, token_ids_tensor, targets_tensor, params_val, config_val);
+    }
 
-    /// Runs gpt2_backward on these tensors.
+    /// Runs gpt2_bf16_backward on these tensors.
     void backward()
     {
-        gpt2_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, scratch_val, config_val);
+        gpt2_bf16_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, config_val);
     }
 
     /// Gives every parameter's gradient as a CPU list, in GPT2Params::shapes()' order.
@@ -245,7 +246,7 @@ static void time_20_steps_on_gpt2_small_size(void)
     // 1. GPT-2 small, random values; PyTorch's copy in bfloat16
     GPT2Config config_val;
     torch::manual_seed(0);
-    GPT2Tensors mine_val(config_val, 4, 1024, DType::BFloat16);
+    GPT2Tensors mine_val(config_val, 4, 1024);
     mine_val.fill_random_values();
     torch::Tensor token_ids_tensor = pytorch_ids_of(mine_val.token_ids_tensor);
     torch::Tensor targets_tensor = pytorch_ids_of(mine_val.targets_tensor);
@@ -322,7 +323,7 @@ static size_t gpu_bytes_free(void)
 
 static void find_the_micro_batch_with_the_best_mfu(void)
 {
-    // Finds how many rows a micro-batch should have (train_gpt2.cu's --batch-size) for the best MFU on this GPU.
+    // Finds how many rows a micro-batch should have (train_bf16.cu's --batch-size) for the best MFU on this GPU.
     // MFU, model flops utilization, is the flops training does a second over the most the tensor cores can do:
     //
     //     MFU = tokens/s x flops a token / peak flops a second
@@ -333,7 +334,7 @@ static void find_the_micro_batch_with_the_best_mfu(void)
     // keep every SM busy, the GPU waits between launches, and the loss read back after each micro-batch stops
     // the CPU from queueing the next. More rows give every launch more work for the same waits.
     //
-    // For 1, 2, 4, ... LARGEST_MICRO_BATCH rows of SEQ_LEN tokens, GPT-2 small in bfloat16 as train_gpt2.cu
+    // For 1, 2, 4, ... LARGEST_MICRO_BATCH rows of SEQ_LEN tokens, GPT-2 small in bfloat16 as train_bf16.cu
     // trains it: a micro-batch is a forward, a backward and the loss read back to the CPU, as the training loop
     // runs it, averaged over TIMED_STEPS after a second of warm-up. The parameters and gradients are made once,
     // with GPT-2's starting values; the activations and scratch again for each size. The activations grow with
@@ -386,10 +387,9 @@ static void find_the_micro_batch_with_the_best_mfu(void)
             return false;
         }
 
-        // the activations, scratch, token_ids and targets for this many rows; any ids below vocab_size
+        // the activations, token_ids and targets for this many rows; any ids below vocab_size
         size_t free_before_val = gpu_bytes_free();
-        GPT2Activations activations_val(rows_val, SEQ_LEN, config_val, DType::BFloat16);
-        GPT2Scratch scratch_val(rows_val, SEQ_LEN, config_val, DType::BFloat16);
+        GPT2ActivationsBf16 activations_val(rows_val, SEQ_LEN, config_val);
         Tensor token_ids_tensor = Tensor::zeros({rows_val, (size_t)SEQ_LEN}, DType::Int32);
         Tensor targets_tensor = Tensor::zeros({rows_val, (size_t)SEQ_LEN}, DType::Int32);
         std::vector<int> ids_list(rows_val * SEQ_LEN);
@@ -403,9 +403,8 @@ static void find_the_micro_batch_with_the_best_mfu(void)
 
         // one micro-batch as the training loop runs it, warmed up, then timed
         auto micro_batch_val = [&] {
-            gpt2_forward(activations_val, token_ids_tensor, targets_tensor, params_val, scratch_val, config_val);
-            gpt2_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, scratch_val,
-                          config_val);
+            gpt2_bf16_forward(activations_val, token_ids_tensor, targets_tensor, params_val, config_val);
+            gpt2_bf16_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, config_val);
             gpt2_mean_loss(activations_val);                    // read back to the CPU, as the training loop does
         };
         warm_up_gpu(micro_batch_val);

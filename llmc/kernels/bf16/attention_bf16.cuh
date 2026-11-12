@@ -25,7 +25,7 @@
 #include <cudaTypedefs.h>            // PFN_cuTensorMapEncodeTiled, to get it from the driver at run time
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_sum, HARDWARE_WGMMA_*, HARDWARE_TMA_*
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "wgmma_matmul_bf16.cuh"     // the WGMMA descriptor and the tile x tile WGMMA: wgmma_matmul_bf16_multiply_add
 
 #define ATTENTION_BF16_SOFTMAX_FORWARD_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)    // F4's default: one warp per row; fastest on an H100

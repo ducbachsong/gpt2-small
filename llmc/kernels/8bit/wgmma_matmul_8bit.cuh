@@ -36,7 +36,7 @@
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_THREADS_PER_WARP
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "round_8bit.cuh"            // the 8-bit copies: ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // The squares and steps: our choices. The hardware's numbers (WARPGROUP_*, WGMMA_*, TMA_*) are in cuda_common.h.

@@ -1,4 +1,4 @@
-// test_checkpoint.cu — tests for llmc/checkpoint.cuh (checkpoint_save, checkpoint_load, checkpoint_problem). Every
+// test_checkpoint.cu — tests for llmc/helper/checkpoint.cuh (checkpoint_save, checkpoint_load, checkpoint_problem). Every
 // check prints its test case, input, expected and actual value, and ok; the first FAIL stops the program.
 //
 // One GPU, one process (Distributed with no RANK set); NCCL is linked but not used. Each test writes its own
@@ -7,7 +7,9 @@
 //     nvcc -O3 -std=c++17 -arch=native tests/test_checkpoint.cu -o test_checkpoint -lnccl && ./test_checkpoint
 #include <filesystem>
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/checkpoint.cuh"
+#include "../llmc/helper/checkpoint.cuh"
+#include "../llmc/model_fp32.cuh"         // AdamW: a float run, refused
+#include "../llmc/model_bf16.cuh"         // AdamWBf16: the runs saved and loaded
 
 // A {6, 4} weight and an {8} bias, 32 values, in bfloat16: the smallest AdamW with a matrix and a vector.
 static const std::vector<Shape> SHAPES = {{6, 4}, {8}};
@@ -83,7 +85,7 @@ static void loading_goes_on_exactly_where_saving_stopped(const Distributed &dist
     write_token_file("test_checkpoint_tokens.bin", TOKENS_IN_FILE);
     AdamWConfig config_val;
     config_val.learning_rate = 1e-2f;
-    AdamW first_val(SHAPES, config_val, DType::BFloat16), second_val(SHAPES, config_val, DType::BFloat16);
+    AdamWBf16 first_val(SHAPES, config_val), second_val(SHAPES, config_val);
     DataLoader first_loader_val("test_checkpoint_tokens.bin", 2, 4), second_loader_val("test_checkpoint_tokens.bin", 2, 4);
     Tensor token_ids_tensor = Tensor::zeros({2, 4}, DType::Int32);
     Tensor targets_tensor = Tensor::zeros({2, 4}, DType::Int32);
@@ -117,7 +119,7 @@ static void loading_goes_on_exactly_where_saving_stopped(const Distributed &dist
     first_loader_val.next_batch(token_ids_tensor, targets_tensor);
     second_loader_val.next_batch(second_ids_tensor, second_targets_tensor);
     ASSERT_EQ(second_ids_tensor.tolist<int>(), token_ids_tensor.tolist<int>());
-    for (AdamW *adamw_ptr : {&first_val, &second_val})
+    for (AdamWBf16 *adamw_ptr : {&first_val, &second_val})
     {
         adamw_ptr->all_grads().copy_(tensor_of(some_values(3)));
         adamw_ptr->step();
@@ -134,7 +136,7 @@ static void latest_names_the_newest_and_two_are_kept(const Distributed &distribu
     std::filesystem::remove_all("test_checkpoint_keep");
     write_token_file("test_checkpoint_tokens.bin", TOKENS_IN_FILE);
     AdamWConfig config_val;
-    AdamW adamw_val(SHAPES, config_val, DType::BFloat16);
+    AdamWBf16 adamw_val(SHAPES, config_val);
     DataLoader loader_val("test_checkpoint_tokens.bin", 2, 4);
     for (int steps_done_val = 1; steps_done_val <= 3; steps_done_val++)
         checkpoint_save("test_checkpoint_keep", steps_done_val, 10, adamw_val, loader_val, distributed_val);
@@ -157,8 +159,8 @@ static void a_checkpoint_of_another_run_is_refused(const Distributed &distribute
     std::filesystem::remove_all("test_checkpoint_other");
     write_token_file("test_checkpoint_tokens.bin", TOKENS_IN_FILE);
     AdamWConfig config_val;
-    AdamW same_val(SHAPES, config_val, DType::BFloat16), two_gpus_val(SHAPES, config_val, DType::BFloat16, 0, 2);
-    AdamW in_float_val(SHAPES, config_val, DType::Float32);
+    AdamWBf16 same_val(SHAPES, config_val), two_gpus_val(SHAPES, config_val, 0, 2);
+    AdamW in_float_val(SHAPES, config_val);
     DataLoader loader_val("test_checkpoint_tokens.bin", 2, 4);
     checkpoint_save("test_checkpoint_other", 1, 10, same_val, loader_val, distributed_val);
     // 2. the same run: no problem

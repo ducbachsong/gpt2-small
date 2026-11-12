@@ -31,7 +31,7 @@
 
 #include <cuda_fp8.h>                    // FP8 E4M3
 #include "../cuda_common.h"              // cudaCheck, check_threads_per_block, warp_reduce_max
-#include "../../tensor.cuh"              // read8_as_float, write8_from_float
+#include "../../common/tensor.cuh"              // read8_as_float, write8_from_float
 #include "round_8bit.cuh"                // round_8bit_scale, ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 #include "../bf16/layer_norm_bf16.cuh"   // the 8 values a lane, the row's mean and rstd, the checks, the backward
 

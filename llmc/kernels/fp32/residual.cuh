@@ -13,7 +13,7 @@
 #define RESIDUAL_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define RESIDUAL_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
 

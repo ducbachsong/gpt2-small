@@ -10,7 +10,7 @@ Writes, in data/fineweb10B/:
     fineweb_train_000002.bin    ...
 
 and data/gpt2_tokenizer.bin, with a file `writing` in the folder while it runs, so training can start at
-the same time (train_gpt2 --steps N): each file appears whole. llmc/dataloader.cuh reads them: the train files with
+the same time (train_bf16 --steps N): each file appears whole. llmc/helper/dataloader.cuh reads them: the train files with
 the pattern data/fineweb10B/fineweb_train_%06d.bin, the val file on its own.
 
 The documents come through parquetpool.py and tokenpool.py, next to this file,
@@ -60,7 +60,7 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # `writing` is there while this runs: a trainer started at the same time waits for the files still
-    # to come instead of starting its next epoch (llmc/dataloader.cuh). Deleted at the end, whatever happens.
+    # to come instead of starting its next epoch (llmc/helper/dataloader.cuh). Deleted at the end, whatever happens.
     writing_marker = os.path.join(OUTPUT_DIR, "writing")
     open(writing_marker, "w").close()
     # ParquetPool first: it turns on huggingface_hub's faster downloads, which

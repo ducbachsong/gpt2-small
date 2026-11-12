@@ -1,5 +1,5 @@
 // test_adamw_bf16.cu — tests for llmc/kernels/bf16/adamw_bf16.cuh (bfloat16 params, grads, m and v, a float master)
-// and llmc/optimizer.cuh's AdamW on a bfloat16 model. Every check prints its test case, input, expected and
+// and llmc/model_bf16.cuh's AdamWBf16 on a bfloat16 model. Every check prints its test case, input, expected and
 // actual value, and ok; the first FAIL stops the program.
 // The timings are in tunes/tune_adamw_bf16.cu.
 //
@@ -8,7 +8,8 @@
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; only the headers needed, not <torch/torch.h>
 #include <torch/utils.h>              // torch::NoGradGuard
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update_bf16 (kernels/bf16/adamw_bf16.cuh)
+#include "../../llmc/model_fp32.cuh"     // AdamW, AdamWConfig: the float one the bfloat16 one is compared with
+#include "../../llmc/model_bf16.cuh"     // AdamWBf16; and adamw_update_bf16 (kernels/bf16/adamw_bf16.cuh)
 
 // The common tests' largest difference from PyTorch after several steps, as a fraction of the largest value:
 // m and v rounded to bfloat16 each step move the params by up to 5.8e-5 of float's (a Python copy).
@@ -443,7 +444,7 @@ static void bfloat16_adamw_keeps_a_float_master(void)
 
     // 1. the dtypes, shapes and layout
     AdamWConfig config_val;
-    AdamW my_adamw_val({{2, 4}, {1, 4}, {8}, {4}}, config_val, DType::BFloat16);
+    AdamWBf16 my_adamw_val({{2, 4}, {1, 4}, {8}, {4}}, config_val);
     ASSERT_EQ(my_adamw_val.dtype() == DType::BFloat16, true);
     ASSERT_EQ(my_adamw_val.param(0).dtype() == DType::BFloat16, true);
     ASSERT_EQ(my_adamw_val.grad(0).dtype() == DType::BFloat16, true);
@@ -484,7 +485,8 @@ static void bfloat16_master_steps_match_float_steps(void)
     config_val.learning_rate = 1e-2f;
     config_val.max_norm = 1.0f;
     std::vector<Shape> shapes_list = {{4, 8}, {8}};
-    AdamW float_adamw_val(shapes_list, config_val), bfloat16_adamw_val(shapes_list, config_val, DType::BFloat16);
+    AdamW float_adamw_val(shapes_list, config_val);
+    AdamWBf16 bfloat16_adamw_val(shapes_list, config_val);
     for (int param_index_val = 0; param_index_val < 2; param_index_val++)
     {
         Tensor values_tensor = Tensor::empty(shapes_list[param_index_val]);
@@ -535,7 +537,7 @@ static void a_small_update_adds_up_in_the_master(void)
     AdamWConfig config_val;
     config_val.learning_rate = 6e-4f;
     config_val.weight_decay = 0.0f;
-    AdamW my_adamw_val({{4}}, config_val, DType::BFloat16);
+    AdamWBf16 my_adamw_val({{4}}, config_val);
     my_adamw_val.param(0).fill_(1);
     my_adamw_val.copy_params_to_master();
     Tensor alone_tensor = Tensor::ones({4}, DType::BFloat16);
@@ -575,8 +577,8 @@ static void ranks_each_update_their_own_slice(void)
     AdamWConfig config_val;
     config_val.learning_rate = 1e-2f;
     std::vector<Shape> shapes_list = {{3, 4}, {4}};
-    AdamW one_val(shapes_list, config_val, DType::BFloat16);
-    AdamW rank0_val(shapes_list, config_val, DType::BFloat16, 0, 2), rank1_val(shapes_list, config_val, DType::BFloat16, 1, 2);
+    AdamWBf16 one_val(shapes_list, config_val);
+    AdamWBf16 rank0_val(shapes_list, config_val, 0, 2), rank1_val(shapes_list, config_val, 1, 2);
     ASSERT_EQ(rank1_val.slice_start(), (size_t)8);
     ASSERT_EQ(rank1_val.slice_size(), (size_t)8);
     ASSERT_EQ(rank1_val.buffer().numel(), (size_t)9);
@@ -587,7 +589,7 @@ static void ranks_each_update_their_own_slice(void)
     Tensor::manual_seed(0);
     Tensor values_tensor = Tensor::empty({16});
     values_tensor.copy_from_cpu(random_values({16}, 0.5f).data());
-    for (AdamW *adamw_ptr : {&one_val, &rank0_val, &rank1_val})
+    for (AdamWBf16 *adamw_ptr : {&one_val, &rank0_val, &rank1_val})
     {
         adamw_ptr->all_params().copy_(values_tensor);             // rounded to bfloat16
         adamw_ptr->copy_params_to_master();
@@ -599,7 +601,7 @@ static void ranks_each_update_their_own_slice(void)
         Tensor grads_tensor = Tensor::empty({16});
         grads_tensor.copy_from_cpu(random_values({16}, 1.0f).data());
         std::vector<float> rank0_before_list = rank0_val.all_params().to(DType::Float32).tolist();
-        for (AdamW *adamw_ptr : {&one_val, &rank0_val, &rank1_val})
+        for (AdamWBf16 *adamw_ptr : {&one_val, &rank0_val, &rank1_val})
         {
             adamw_ptr->all_grads().copy_(grads_tensor);
             adamw_ptr->step();

@@ -34,7 +34,7 @@
 
 #include <cuda_fp8.h>                    // FP8 E4M3
 #include "../cuda_common.h"              // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "round_8bit.cuh"                // the 8-bit copy: round_8bit, ROUND_8BIT_VALUES_PER_INT
 #include "../bf16/encoder_bf16.cuh"      // the 8 values a thread, the checks, the backward
 

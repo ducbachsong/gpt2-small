@@ -20,7 +20,7 @@ fineweb.py writes every document's tokens and one <|endoftext|> after each, so
     total tokens = the documents' tokens + documents
 
 The first --val-tokens are the val file; the rest is for training. steps = train tokens / tokens per step, and
-the time is that at each --tokens-per-second given: measured 2,830 on 1 T4 and 5,632 on 2 (train_gpt2.cu).
+the time is that at each --tokens-per-second given: measured 2,830 on 1 T4 and 5,632 on 2 (train_bf16.cu).
 """
 import argparse
 import time

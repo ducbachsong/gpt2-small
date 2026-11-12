@@ -12,7 +12,7 @@
 
 #include <cuda_fp8.h>             // FP8 E4M3
 #include "../cuda_common.h"             // cudaCheck, warp_reduce_max
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define ADAMW_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // the default block size: 8 warps, so a multiple of HARDWARE_THREADS_PER_WARP
 #define ADAMW_VALUES_PER_SCALE (HARDWARE_THREADS_PER_WARP * VALUES_PER_FLOAT4)   // one scale per warp, a float4 per thread

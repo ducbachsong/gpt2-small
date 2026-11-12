@@ -24,7 +24,7 @@
 #define FMA_MATMUL_BF16_CUH
 
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_THREADS_PER_WARP
-#include "../../tensor.cuh"             // read4_as_float, write4_from_float, VALUES_PER_FLOAT4
+#include "../../common/tensor.cuh"             // read4_as_float, write4_from_float, VALUES_PER_FLOAT4
 
 // The squares and steps: our choices. The kernels' index math is written for these numbers: change them together with it.
 #define FMA_MATMUL_BF16_BLOCK_ROWS 128     // each block makes 128 rows x 128 columns of output

@@ -9,7 +9,8 @@
 #include <torch/utils.h>              // torch::NoGradGuard
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update_bf16 (kernels/bf16/adamw_bf16.cuh)
+#include "../llmc/common/model_params.cuh"    // AdamWConfig
+#include "../llmc/kernels/bf16/adamw_bf16.cuh" // adamw_update_bf16
 
 #define GPT2_PARAMS 124439808         // GPT-2 small's values
 #define GPT2_DECAYED_PARAMS 124439040 // of them in matrices

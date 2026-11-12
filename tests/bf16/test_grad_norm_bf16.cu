@@ -11,7 +11,7 @@
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
-#include "../../llmc/tensor_buffer.cuh"  // TensorBuffer: float values in one allocation, around the norm
+#include "../../llmc/common/tensor_buffer.cuh"  // TensorBuffer: float values in one allocation, around the norm
 #include "../../llmc/kernels/fp32/grad_norm.cuh"      // the 4-value path, to compare with
 #include "../../llmc/kernels/bf16/grad_norm_bf16.cuh"
 

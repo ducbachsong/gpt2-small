@@ -41,7 +41,7 @@
 #include <cudaTypedefs.h>            // PFN_cuTensorMapEncodeTiled, to get it from the driver at run time
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_THREADS_PER_WARP
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 // The squares and steps: our choices. The hardware's numbers (WARPGROUP_*, WGMMA_*, TMA_*) are in cuda_common.h.
 // The index math is written for these numbers: change them together with it.

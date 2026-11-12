@@ -1,10 +1,10 @@
-// test_tensor.cu — tests for llmc/tensor.cuh. The expected numbers are worked out
+// test_tensor.cu — tests for llmc/common/tensor.cuh. The expected numbers are worked out
 // by hand in each test; no libtorch. Every check prints its test case, input, expected
 // and actual value, and ok; the first FAIL stops the program.
 //
 //     nvcc -O3 -std=c++17 tests/test_tensor.cu -o test_tensor && ./test_tensor     # on a GPU (Colab)
 #include "test_helpers.h"         // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../llmc/tensor.cuh"
+#include "../llmc/common/tensor.cuh"
 
 #define HALF_BYTES 2              // a half's or a bfloat16's bytes
 #define FLOAT_BYTES 4             // a float's or an int's bytes

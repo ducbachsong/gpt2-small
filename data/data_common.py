@@ -54,7 +54,7 @@ def write_token_file(path, tokens):
     header[1] = TOKEN_FILE_VERSION
     header[2] = len(tokens)
     # Written whole under another name, then renamed: a trainer reading the folder while this runs never
-    # sees half a file (llmc/dataloader.cuh).
+    # sees half a file (llmc/helper/dataloader.cuh).
     partial = path + ".partial"
     with open(partial, "wb") as token_file:
         token_file.write(header.tobytes())

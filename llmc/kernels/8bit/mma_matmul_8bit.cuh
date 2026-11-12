@@ -22,7 +22,7 @@
 
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"             // HARDWARE_MMA_*, HARDWARE_E4M3_PER_REGISTER
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "../bf16/mma_matmul_bf16.cuh"       // the squares and warps (MMA_MATMUL_BF16_BLOCK_*, _WARP_*, _M_TILES, _N_TILES), mma_matmul_bf16_block_square
 #include "round_8bit.cuh"            // ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 

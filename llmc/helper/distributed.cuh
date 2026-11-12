@@ -6,7 +6,7 @@
 //     AdamW on its slice                                        -> its slice of the new params
 //     all_gather(all params)                                    -> every GPU: all the new params
 // Each process reads RANK, LOCAL_RANK and WORLD_SIZE as torchrun sets them (none: one process, no NCCL):
-//     torchrun --standalone --nproc_per_node=8 --no-python ./train_gpt2
+//     torchrun --standalone --nproc_per_node=8 --no-python ./train_bf16
 #ifndef DISTRIBUTED_CUH
 #define DISTRIBUTED_CUH
 
@@ -16,7 +16,7 @@
 #include <string>
 #include <thread>
 #include <nccl.h>
-#include "tensor.cuh"
+#include "../common/tensor.cuh"
 
 /// Stops with the file and line if an NCCL call failed.
 ///

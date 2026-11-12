@@ -28,7 +28,7 @@
 #define GELU_BF16_CUH
 
 #include "../cuda_common.h"          // cudaCheck
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "../fp32/gelu.cuh"          // gelu_value, gelu_slope: the same math as the unfused GELU
 #include "linear_bf16.cuh"           // the two linear layers, and their checks: linear_bf16_forward, _backward
 

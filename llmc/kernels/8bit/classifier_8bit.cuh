@@ -32,7 +32,7 @@
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, HARDWARE_WGMMA_*, HARDWARE_TMA_*
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "round_8bit.cuh"            // the 8-bit copies: round_8bit
 #include "wgmma_matmul_8bit.cuh"     // the TMA tile description and the tile x tile E4M3 WGMMA
 #include "linear_8bit.cuh"           // Linear8bitScratch, linear_8bit_check_sizes, the head's backward: linear_8bit_backward

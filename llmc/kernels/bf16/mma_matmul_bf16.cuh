@@ -27,7 +27,7 @@
 #define MMA_MATMUL_BF16_CUH
 
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_MMA_*, HARDWARE_THREADS_PER_WARP
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 // The squares and steps: our choices. The hardware's numbers (HARDWARE_MMA_*) are in cuda_common.h. The index math
 // is written for these numbers: change them together with it.

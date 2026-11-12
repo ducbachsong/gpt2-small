@@ -18,7 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "tensor.cuh"
+#include "../common/tensor.cuh"
 
 #define TOKEN_FILE_MAGIC 20240520            // header[0]: "this is a token file"
 #define TOKEN_FILE_VERSION 1                 // header[1]

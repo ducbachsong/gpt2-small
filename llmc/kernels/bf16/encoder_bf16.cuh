@@ -24,7 +24,7 @@
 #define ENCODER_BF16_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define ENCODER_BF16_VALUES_PER_LOAD VALUES_PER_BF16_LOAD            // bfloat16s in one 16-byte load (read8_as_float): 8
 #define ENCODER_BF16_BLOCKS 512                                      // blocks in every launch here: fp32/encoder.cuh's, not swept for 8 values yet

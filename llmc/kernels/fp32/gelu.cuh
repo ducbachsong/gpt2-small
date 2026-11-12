@@ -11,7 +11,7 @@
 #define GELU_CUH
 
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define GELU_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
 #define GELU_SCALE 0.7978845608f                                 // sqrt(2 / pi)

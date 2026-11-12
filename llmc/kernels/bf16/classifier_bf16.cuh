@@ -39,7 +39,7 @@
 #include <cuda.h>                    // CUtensorMap, the TMA tile description (the types only: no -lcuda)
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, HARDWARE_WGMMA_*, HARDWARE_TMA_*
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "wgmma_matmul_bf16.cuh"     // the TMA tile description, the WGMMA descriptor and the tile x tile WGMMA
 #include "linear_bf16.cuh"           // the head's backward: linear_bf16_backward
 

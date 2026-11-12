@@ -21,7 +21,7 @@
 
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "../bf16/fma_matmul_bf16.cuh"       // the squares, the pieces, fma_matmul_bf16_add_outer_products
 #include "round_8bit.cuh"            // ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 

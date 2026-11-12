@@ -22,7 +22,7 @@
 #define LAYER_NORM_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, warp_reduce_sum
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define LAYER_NORM_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // forward's default: 8 warps, one row each; 0.012 ms against 0.013 for 16 on an H100 PCIe, bfloat16
 #define LAYER_NORM_BACKWARD_BLOCKS 80                                            // backward: blocks in every launch

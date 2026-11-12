@@ -16,8 +16,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include "tensor.cuh"
-#include "optimizer.cuh"
+#include "../common/tensor.cuh"
+#include "../common/model_params.cuh"      // Optimizer: any of the three models' AdamWs
 #include "dataloader.cuh"
 #include "distributed.cuh"
 
@@ -26,11 +26,11 @@
 #define CHECKPOINT_HEADER_INTS 32            // the header: 32 int64s, 256 bytes
 
 // ── saving and going on ───────────────────────────────────────────────────────
-void checkpoint_save(const std::string& checkpoint_dir, int steps_done, int total_steps, const AdamW& optimizer,
+void checkpoint_save(const std::string& checkpoint_dir, int steps_done, int total_steps, const Optimizer& optimizer,
                      const DataLoader& train_loader, const Distributed& distributed, int keep = 2);
-int checkpoint_load(const std::string& path, int total_steps, AdamW& optimizer, DataLoader& train_loader,
+int checkpoint_load(const std::string& path, int total_steps, Optimizer& optimizer, DataLoader& train_loader,
                     const Distributed& distributed);
-std::string checkpoint_problem(const std::string& path, int total_steps, const AdamW& optimizer);
+std::string checkpoint_problem(const std::string& path, int total_steps, const Optimizer& optimizer);
 
 // ── for both ──────────────────────────────────────────────────────────────────
 std::string checkpoint_folder_name(int steps_done);
@@ -49,8 +49,9 @@ std::string checkpoint_rank_file(const std::string& path, int rank);
 ///   train_loader               its place
 ///   distributed                to wait for every rank
 ///   keep                       how many checkpoints to keep
-inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, int total_steps, const AdamW& optimizer,
-                            const DataLoader& train_loader, const Distributed& distributed, int keep) {
+inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, int total_steps,
+                            const Optimizer& optimizer, const DataLoader& train_loader, const Distributed& distributed,
+                            int keep) {
     namespace fs = std::filesystem;
     std::string folder = checkpoint_dir + "/" + checkpoint_folder_name(steps_done);
     fs::create_directories(folder);
@@ -105,7 +106,7 @@ inline void checkpoint_save(const std::string& checkpoint_dir, int steps_done, i
 ///   total_steps                this run's length
 ///   optimizer, train_loader    filled in
 ///   distributed                for the all-gather of the params
-inline int checkpoint_load(const std::string& path, int total_steps, AdamW& optimizer, DataLoader& train_loader,
+inline int checkpoint_load(const std::string& path, int total_steps, Optimizer& optimizer, DataLoader& train_loader,
                            const Distributed& distributed) {
     std::string problem = checkpoint_problem(path, total_steps, optimizer);
     if (!problem.empty()) {
@@ -144,7 +145,7 @@ inline int checkpoint_load(const std::string& path, int total_steps, AdamW& opti
 /// (total steps, world size, dtype or slice).
 ///
 ///   path, total_steps, optimizer   as in checkpoint_load
-inline std::string checkpoint_problem(const std::string& path, int total_steps, const AdamW& optimizer) {
+inline std::string checkpoint_problem(const std::string& path, int total_steps, const Optimizer& optimizer) {
     std::string file_path = checkpoint_rank_file(path, optimizer.rank());
     FILE* file = fopen(file_path.c_str(), "rb");
     if (file == nullptr) return "no file " + file_path;

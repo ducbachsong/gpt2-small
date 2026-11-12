@@ -35,7 +35,7 @@
 #define LINEAR_8BIT_CUH
 
 #include "../cuda_common.h"             // cudaCheck
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "round_8bit.cuh"            // the 8-bit copies: round_8bit, ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 #include "wgmma_matmul_8bit.cuh"     // the products
 #include "../bf16/linear_bf16.cuh"           // the shape checks and bias_grad: linear_bf16_check_forward, _check_backward, linear_bf16_bias_grad

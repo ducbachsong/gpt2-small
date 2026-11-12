@@ -16,7 +16,7 @@
 #define CLASSIFIER_CUH
 
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp and block defines
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define CLASSIFIER_FORWARD_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)    // the forward's default: 8 warps, one block per row
 #define CLASSIFIER_BACKWARD_BLOCKS 40960                                        // at most

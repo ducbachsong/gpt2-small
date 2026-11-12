@@ -242,7 +242,7 @@ static void backward_writes_over_both_grads(void)
 
 static void backward_can_write_into_output_grad_itself(void)
 {
-    // Expect: the output_grad tensor passed as residual_grad too, as llm.c's trainer does (and block.cuh's backward,
+    // Expect: the output_grad tensor passed as residual_grad too, as llm.c's trainer does (and model_bf16.cuh's block_bf16_backward,
     // input_grad from residual2_grad): each thread reads its output_grad before writing, so residual_grad stays the
     // note's output_grad and branch_output_grad gets the same.
     // 1. the backward, in place

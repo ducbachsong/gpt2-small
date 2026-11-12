@@ -33,7 +33,7 @@
 #define ATTENTION_CUH
 
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_sum
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 // ── flash attention: head_size ATTENTION_FLASH_HEAD_SIZE, seq_len a multiple of ATTENTION_FLASH_TILE ──
 // A tile row (one query or key) is shared by ATTENTION_FLASH_ROW_LANES neighbouring lanes of one warp: lane l

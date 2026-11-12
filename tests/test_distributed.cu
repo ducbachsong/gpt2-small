@@ -1,5 +1,5 @@
-// test_distributed.cu — tests for llmc/distributed.cuh (Distributed), and for one AdamW step shared by several
-// GPUs the way train_gpt2.cu does it. Needs 2 GPUs or more: NCCL puts each rank on a GPU of its own. Every rank
+// test_distributed.cu — tests for llmc/helper/distributed.cuh (Distributed), and for one AdamW step shared by several
+// GPUs the way train_bf16.cu does it. Needs 2 GPUs or more: NCCL puts each rank on a GPU of its own. Every rank
 // runs every check, so each line prints once per rank; the first FAIL stops the program.
 //
 //     nvcc -O3 -std=c++17 -arch=native tests/test_distributed.cu -o test_distributed -lnccl
@@ -9,9 +9,9 @@
 // halves, so bfloat16 (8 significant bits: whole numbers up to 256) holds them and every sum of them exactly,
 // for up to 8 ranks: NCCL may add them in any order.
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/distributed.cuh"
-#include "../llmc/optimizer.cuh"
-#include "../llmc/kernels/bf16/grad_norm_bf16.cuh"   // the bfloat16 gradients' norm, as train_gpt2.cu takes it
+#include "../llmc/helper/distributed.cuh"
+#include "../llmc/model_bf16.cuh"            // AdamWBf16
+#include "../llmc/kernels/bf16/grad_norm_bf16.cuh"   // the bfloat16 gradients' norm, as train_bf16.cu takes it
 
 #define SLICE_VALUES 4                // values in each rank's slice, in the collectives' tests
 #define SHAPES_VALUES 32              // the AdamW step's values: a {6, 4} weight and an {8} bias
@@ -107,14 +107,14 @@ static void mean_of_cpu_value_averages_a_number_over_the_ranks(const Distributed
     ASSERT_NEAR(distributed_val.mean_of_cpu_value((float)rank_index_val), (n_val - 1) / 2.0, 1e-6);
 }
 
-// ══ one AdamW step on N GPUs, as train_gpt2.cu takes it ═════════════════════════
+// ══ one AdamW step on N GPUs, as train_bf16.cu takes it ═════════════════════════
 
 static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &distributed_val)
 {
     // Expect: a {6, 4} weight and an {8} bias, 32 values (decayed_count 24), bfloat16. Each rank's grads differ:
     // value i is -4 + (i mod 16) / 2 + r, so their mean is -4 + (i mod 16) / 2 + (N - 1) / 2. Every value is a
     // multiple of 1/2 small enough that bfloat16 holds it, and every partial sum too, so the average comes out
-    // exact whatever order NCCL adds in. Each rank runs train_gpt2.cu's step: reduce_scatter_mean of the grads,
+    // exact whatever order NCCL adds in. Each rank runs train_bf16.cu's step: reduce_scatter_mean of the grads,
     // GradNormBf16 of its slice then slice_norms_to_norm, AdamW on its slice, all_gather of the params. On every
     // rank, a world-of-1 AdamW given the mean grads directly is the answer: its grad norm within 1e-6 (the
     // squares added in another order), and the params after 3 steps the same to the last bit (no clipping, so
@@ -126,12 +126,12 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
     AdamWConfig config_val;
     config_val.learning_rate = 1e-2f;
     std::vector<Shape> shapes_list = {{6, 4}, {8}};
-    AdamW shared_val(shapes_list, config_val, DType::BFloat16, rank_index_val, n_val), one_val(shapes_list, config_val, DType::BFloat16);
+    AdamWBf16 shared_val(shapes_list, config_val, rank_index_val, n_val), one_val(shapes_list, config_val);
     Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
     Tensor one_block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
     GradNormBf16 shared_norm_val(block_sums_tensor), one_norm_val(one_block_sums_tensor);
     Tensor start_tensor = tensor_of(values_from(-0.5f, 1.0f / SHAPES_VALUES, SHAPES_VALUES), DType::BFloat16);
-    for (AdamW *adamw_ptr : {&shared_val, &one_val})
+    for (AdamWBf16 *adamw_ptr : {&shared_val, &one_val})
     {
         adamw_ptr->all_params().copy_(start_tensor);
         adamw_ptr->copy_params_to_master();
@@ -145,7 +145,7 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
         mean_grads_list[value_index_val] = -4.0f + (value_index_val % 16) / 2.0f + (n_val - 1) / 2.0f;
     }
 
-    // 3. three steps: the shared one as train_gpt2.cu takes it, the world-of-1 one on the mean grads
+    // 3. three steps: the shared one as train_bf16.cu takes it, the world-of-1 one on the mean grads
     Tensor grads_slice_tensor = shared_val.all_grads().narrow(0, shared_val.slice_start(), shared_val.slice_size());
     for (int t_val = 1; t_val <= 3; t_val++)
     {

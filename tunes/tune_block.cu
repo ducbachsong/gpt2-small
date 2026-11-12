@@ -7,8 +7,8 @@
 #include <torch/utils.h>              // torch::manual_seed
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
-#include "../llmc/block.cuh"
+#include "../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
+#include "../llmc/model_bf16.cuh"      // BlockParams, block_bf16_forward, block_bf16_backward
 
 // In bfloat16, against PyTorch in float on the same values: each kernel rounds its outputs once (up to 2^-8,
 // 0.4%), and the next kernel reads those rounded values, ten times in a row.
@@ -17,6 +17,7 @@ static const double BFLOAT16_TOLERANCE = 3e-2;
 #define BLOCK_PARAMS 12               // a block's parameter tensors: 4 matrices, then 8 vectors
 #define GPT2_EMBED_DIM 768            // its row width
 #define GPT2_NUM_HEADS 12             // its heads
+#define ONE_BLOCK_VOCAB 128           // the one-layer model's vocabulary, for a block's activations
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -55,9 +56,23 @@ static std::vector<float> list_of(const Tensor &tensor)
     return tensor.to(DType::Float32).tolist();
 }
 
-/// Everything one block needs, for one size and dtype: its parameters and their gradients in a TensorBuffer
-/// each, as the optimizer keeps them, its activations and scratch, and input, output and their gradients.
-/// All 0 to start.
+/// Gives the config of a one-layer model of these widths: a block's activations are made as that model's. Its
+/// ONE_BLOCK_VOCAB-word vocabulary keeps the head's tensors (logits and the like) small; the block never reads them.
+static GPT2Config one_block_config(size_t seq_len_val, size_t embed_dim_val, size_t num_heads_val)
+{
+    GPT2Config config_val;
+    config_val.max_seq_len = seq_len_val;
+    config_val.vocab_size = ONE_BLOCK_VOCAB;
+    config_val.padded_vocab_size = ONE_BLOCK_VOCAB;
+    config_val.num_layers = 1;
+    config_val.num_heads = num_heads_val;
+    config_val.embed_dim = embed_dim_val;
+    return config_val;
+}
+
+/// Everything one bfloat16 block needs, for one size (the dtype training runs in: model_bf16.cuh): its parameters
+/// and their gradients in a TensorBuffer each, as the optimizer keeps them, the activations of a one-layer model,
+/// and input, output and their gradients. All 0 to start.
 struct BlockTensors
 {
     size_t batch_size_val;
@@ -68,20 +83,20 @@ struct BlockTensors
     TensorBuffer grad_buffer_val;
     BlockParams params_val;
     BlockParams grads_val;
-    BlockActivations activations_val;
-    BlockScratch scratch_val;
+    GPT2ActivationsBf16 activations_val;
     Tensor input_tensor;
     Tensor output_tensor;
     Tensor output_grad_tensor;
     Tensor input_grad_tensor;
 
     BlockTensors(size_t block_batch_size_val, size_t block_seq_len_val, size_t block_embed_dim_val,
-                 size_t block_num_heads_val, DType dtype_val = DType::Float32)
+                 size_t block_num_heads_val)
         : batch_size_val(block_batch_size_val), seq_len_val(block_seq_len_val), embed_dim_val(block_embed_dim_val),
           num_heads_val(block_num_heads_val),
-          activations_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val),
-          scratch_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val)
+          activations_val(block_batch_size_val, block_seq_len_val,
+                          one_block_config(block_seq_len_val, block_embed_dim_val, block_num_heads_val))
     {
+        DType dtype_val = DType::BFloat16;
         // 1. the parameters and their gradients, in a TensorBuffer each
         int group_index_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
         param_buffer_val.allocate(dtype_val);
@@ -120,14 +135,14 @@ struct BlockTensors
         fill_random(output_grad_tensor, 1.0f);
     }
 
-    /// Runs block_forward on these tensors.
-    void forward() { block_forward(output_tensor, input_tensor, params_val, activations_val, scratch_val); }
+    /// Runs block_bf16_forward on these tensors, as layer 0.
+    void forward() { block_bf16_forward(output_tensor, input_tensor, params_val, activations_val, 0); }
 
-    /// Runs block_backward on these tensors.
+    /// Runs block_bf16_backward on these tensors, as layer 0.
     void backward()
     {
-        block_backward(input_grad_tensor, grads_val, output_grad_tensor, input_tensor, params_val, activations_val,
-                       scratch_val);
+        block_bf16_backward(input_grad_tensor, grads_val, output_grad_tensor, input_tensor, params_val, activations_val,
+                            0);
     }
 };
 
@@ -195,7 +210,7 @@ static void time_20_steps_on_gpt2_small_size(void)
 
     // 1. random values, mine and PyTorch's in bfloat16
     torch::manual_seed(0);
-    BlockTensors mine_val(4, 1024, GPT2_EMBED_DIM, GPT2_NUM_HEADS, DType::BFloat16);
+    BlockTensors mine_val(4, 1024, GPT2_EMBED_DIM, GPT2_NUM_HEADS);
     mine_val.fill_random_values();
     torch::Tensor pytorch_input_tensor = pytorch_copy_of(mine_val.input_tensor).to(torch::kBFloat16).requires_grad_(true);
     std::vector<torch::Tensor> pytorch_params_list;

@@ -13,7 +13,7 @@
 //     here                         15,559,488      16
 //
 // The trainer runs this whenever the gradients are bfloat16, also with AdamW's m and v in 8 bits (the gradients
-// stay bfloat16 there): there is no 8-bit grad norm. A GPU's slice of the gradients (train_gpt2.cu, several GPUs)
+// stay bfloat16 there): there is no 8-bit grad norm. A GPU's slice of the gradients (train_bf16.cu, several GPUs)
 // need not start on 16 bytes: the values before the first 16-byte boundary (0 .. 7, the head) and after the last
 // whole load (0 .. 7, the tail) are read one each by the first threads. Each thread adds other values than in the
 // 4-value path, so the squares are added in another order: the norm lands within a few float roundings of its, not
@@ -22,7 +22,7 @@
 #define GRAD_NORM_BF16_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, block_reduce_sum
-#include "../../tensor.cuh"          // read8_as_float, VALUES_PER_BF16_LOAD
+#include "../../common/tensor.cuh"          // read8_as_float, VALUES_PER_BF16_LOAD
 
 #define GRAD_NORM_BF16_VALUES_PER_LOAD VALUES_PER_BF16_LOAD       // bfloat16s in one 16-byte load: 8
 #define GRAD_NORM_BF16_BLOCKS 512                                 // blocks in the launch, each writes one block sum: fp32/grad_norm.cuh's, not swept for 8 values yet

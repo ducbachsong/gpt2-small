@@ -10,7 +10,7 @@
 #include <torch/utils.h>              // torch::manual_seed, for part 2's random values made on the GPU
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
+#include "../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
 #include "../llmc/kernels/fp32/grad_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the norm

@@ -1,4 +1,4 @@
-// test_tensor_buffer.cu — tests for llmc/tensor_buffer.cuh. The expected numbers are
+// test_tensor_buffer.cu — tests for llmc/common/tensor_buffer.cuh. The expected numbers are
 // worked out by hand in each test; no libtorch. Every check prints its test case,
 // input, expected and actual value, and ok; the first FAIL stops the program.
 //
@@ -13,7 +13,7 @@
 //
 // Part 2 runs every test of tests/test_tensor.cu again, on a tensor inside a buffer.
 #include "test_helpers.h"         // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../llmc/tensor_buffer.cuh"
+#include "../llmc/common/tensor_buffer.cuh"
 
 #define BFLOAT16_BYTES 2          // a bfloat16's bytes
 #define NEIGHBOUR_VALUES 4        // part 2: the values of each neighbour around the tensor under test

@@ -20,7 +20,7 @@
 #define RESIDUAL_BF16_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"          // read8_as_float, write8_from_float, VALUES_PER_BF16_LOAD
+#include "../../common/tensor.cuh"          // read8_as_float, write8_from_float, VALUES_PER_BF16_LOAD
 
 #define RESIDUAL_BF16_VALUES_PER_LOAD VALUES_PER_BF16_LOAD                     // bfloat16s in one 16-byte load: 8
 #define RESIDUAL_BF16_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)        // the default block size: fp32/residual.cuh's, not swept for 8 values yet

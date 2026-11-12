@@ -13,7 +13,7 @@
 #include <torch/types.h>              // torch::tensor, torch::embedding, backward(); libtorch before any CUDA header
 #include <random>                     // std::mt19937: random token ids
 #include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../../llmc/tensor_buffer.cuh"  // TensorBuffer: wte and wpe in one allocation, as the trainer keeps them
+#include "../../llmc/common/tensor_buffer.cuh"  // TensorBuffer: wte and wpe in one allocation, as the trainer keeps them
 #include "../../llmc/kernels/fp32/encoder.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value

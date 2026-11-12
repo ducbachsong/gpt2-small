@@ -9,7 +9,8 @@
 #include <torch/types.h>              // torch::randn, torch::from_blob
 #include <torch/utils.h>              // torch::manual_seed, torch::NoGradGuard
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../../llmc/optimizer.cuh"            // AdamWConfig; adamw_update, which 8-bit AdamW is compared with
+#include "../../llmc/common/model_params.cuh"  // AdamWConfig
+#include "../../llmc/kernels/fp32/adamw.cuh"   // adamw_update, which 8-bit AdamW is compared with
 #include "../../llmc/kernels/8bit/adamw_8bit.cuh"   // adamw_update_8bit
 
 // The common tests' largest difference from PyTorch after several steps, as a fraction of the largest value:

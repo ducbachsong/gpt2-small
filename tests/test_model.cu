@@ -1,16 +1,18 @@
-// test_gpt2.cu — tests for llmc/gpt2.cuh (GPT2Params, gpt2_init_params, gpt2_forward, gpt2_backward,
-// gpt2_mean_loss). Every check prints its test case, input, expected and actual value, and ok; the first FAIL
+// test_model.cu — tests for llmc/model_fp32.cuh and llmc/model_bf16.cuh (gpt2_forward, gpt2_backward and their
+// bfloat16 ones) and llmc/common/model_params.cuh (GPT2Params, gpt2_init_params, gpt2_mean_loss). Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
 // Part 1 checks the model against the same model written in PyTorch, with autograd for the backward, in float
-// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tunes/tune_gpt2.cu.
+// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tunes/tune_model.cu.
 #include <algorithm>                  // std::min
+#include <memory>                     // std::unique_ptr
 #include <string>
 #include <torch/types.h>              // torch::embedding, torch::linear, cross_entropy_loss, ...; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed, torch::NoGradGuard
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
-#include "../llmc/gpt2.cuh"
+#include "../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
+#include "../llmc/model_fp32.cuh"      // the float model
+#include "../llmc/model_bf16.cuh"      // the bfloat16 model
 
 // Two blocks are twenty kernels in a row, then the last LayerNorm, the head and the classifier; the block's
 // test allows 1e-4 for its ten (each list as a fraction of its largest value).
@@ -134,8 +136,8 @@ static std::pair<double, double> mean_and_std(const std::vector<float> &values_l
 }
 
 /// Everything one model needs, for one config, size and dtype: its parameters and their gradients in a
-/// TensorBuffer each, as the optimizer keeps them, its activations and scratch, and token_ids and targets.
-/// All 0 to start.
+/// TensorBuffer each, as the optimizer keeps them, its activations (model_fp32.cuh's for float,
+/// model_bf16.cuh's for bfloat16; the other stays empty), and token_ids and targets. All 0 to start.
 struct GPT2Tensors
 {
     GPT2Config config_val;
@@ -145,17 +147,20 @@ struct GPT2Tensors
     TensorBuffer grad_buffer_val;
     GPT2Params params_val;
     GPT2Params grads_val;
-    GPT2Activations activations_val;
-    GPT2Scratch scratch_val;
+    std::unique_ptr<GPT2Activations> fp32_activations_ptr;      // float
+    std::unique_ptr<GPT2ActivationsBf16> bf16_activations_ptr;  // bfloat16
     Tensor token_ids_tensor;
     Tensor targets_tensor;
 
     GPT2Tensors(const GPT2Config &model_config_val, size_t model_batch_size_val, size_t model_seq_len_val,
                 DType dtype_val = DType::Float32)
-        : config_val(model_config_val), batch_size_val(model_batch_size_val), seq_len_val(model_seq_len_val),
-          activations_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val),
-          scratch_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val)
+        : config_val(model_config_val), batch_size_val(model_batch_size_val), seq_len_val(model_seq_len_val)
     {
+        // 0. the activations of the dtype's model
+        if (dtype_val == DType::BFloat16)
+            bf16_activations_ptr.reset(new GPT2ActivationsBf16(batch_size_val, seq_len_val, config_val));
+        else
+            fp32_activations_ptr.reset(new GPT2Activations(batch_size_val, seq_len_val, config_val));
         // 1. the parameters and their gradients, in a TensorBuffer each
         int group_index_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
         param_buffer_val.allocate(dtype_val);
@@ -201,13 +206,37 @@ struct GPT2Tensors
         fill_random_ids(targets_tensor, config_val.vocab_size);
     }
 
-    /// Runs gpt2_forward on these tensors.
-    void forward() { gpt2_forward(activations_val, token_ids_tensor, targets_tensor, params_val, scratch_val, config_val); }
-
-    /// Runs gpt2_backward on these tensors.
-    void backward()
+    /// Runs the dtype's forward on these tensors: gpt2_forward or gpt2_bf16_forward.
+    void forward()
     {
-        gpt2_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, scratch_val, config_val);
+        if (fp32_activations_ptr)
+            gpt2_forward(*fp32_activations_ptr, token_ids_tensor, targets_tensor, params_val, config_val);
+        else
+            gpt2_bf16_forward(*bf16_activations_ptr, token_ids_tensor, targets_tensor, params_val, config_val);
+    }
+
+    /// Runs the dtype's backward on these tensors: gpt2_backward or gpt2_bf16_backward, for a step of
+    /// micro_batches_val micro-batches.
+    void backward(size_t micro_batches_val = 1)
+    {
+        if (fp32_activations_ptr)
+            gpt2_backward(grads_val, token_ids_tensor, targets_tensor, params_val, *fp32_activations_ptr, config_val,
+                          micro_batches_val);
+        else
+            gpt2_bf16_backward(grads_val, token_ids_tensor, targets_tensor, params_val, *bf16_activations_ptr, config_val,
+                               micro_batches_val);
+    }
+
+    /// Gives the logits the last forward wrote.
+    const Tensor &logits() const { return fp32_activations_ptr ? fp32_activations_ptr->logits : bf16_activations_ptr->logits; }
+
+    /// Gives the row losses the last forward wrote.
+    const Tensor &losses() const { return fp32_activations_ptr ? fp32_activations_ptr->losses : bf16_activations_ptr->losses; }
+
+    /// Gives gpt2_mean_loss of the last forward.
+    float mean_loss() const
+    {
+        return fp32_activations_ptr ? gpt2_mean_loss(*fp32_activations_ptr) : gpt2_mean_loss(*bf16_activations_ptr);
     }
 
     /// Gives every parameter's gradient as a CPU list, in GPT2Params::shapes()' order.
@@ -323,8 +352,8 @@ static void forward_and_backward_match_pytorch(const char *test_ptr, const GPT2C
     printf("    {%zu, %zu}, %zu layers, %zu heads, embed_dim %zu, vocab %zu padded to %zu, %s\n", batch_size_val,
            seq_len_val, config_val.num_layers, config_val.num_heads, config_val.embed_dim, config_val.vocab_size,
            config_val.padded_vocab_size, dtype_val == DType::BFloat16 ? "bfloat16" : "float");
-    ASSERT_NEAR((double)gpt2_mean_loss(mine_val.activations_val), pytorch_val.loss_tensor.item<double>(), tolerance_val);
-    ASSERT_NEAR(list_of(mine_val.activations_val.logits), list_of(pytorch_val.logits_tensor), tolerance_val);
+    ASSERT_NEAR((double)mine_val.mean_loss(), pytorch_val.loss_tensor.item<double>(), tolerance_val);
+    ASSERT_NEAR(list_of(mine_val.logits()), list_of(pytorch_val.logits_tensor), tolerance_val);
     std::vector<Tensor> grads_list = mine_val.grads_val.tensors();
     std::vector<std::string> names_list = param_names(config_val);
     for (size_t param_index_val = 0; param_index_val < grads_list.size(); param_index_val++)
@@ -471,9 +500,9 @@ static void zero_wte_gives_every_word_the_same_chance(void)
     mine_val.params_val.wte.zero_();
     mine_val.forward();
     // 2. check
-    ASSERT_EQ(list_of(mine_val.activations_val.logits), std::vector<float>(3 * SMALL_SEQ_LEN * 128, 0.0f));
-    ASSERT_NEAR(list_of(mine_val.activations_val.losses), std::vector<float>(3 * SMALL_SEQ_LEN, 4.6051702f), 1e-6);
-    ASSERT_NEAR((double)gpt2_mean_loss(mine_val.activations_val), 4.6051702, 1e-6);
+    ASSERT_EQ(list_of(mine_val.logits()), std::vector<float>(3 * SMALL_SEQ_LEN * 128, 0.0f));
+    ASSERT_NEAR(list_of(mine_val.losses()), std::vector<float>(3 * SMALL_SEQ_LEN, 4.6051702f), 1e-6);
+    ASSERT_NEAR((double)mine_val.mean_loss(), 4.6051702, 1e-6);
 }
 
 static void padding_rows_never_change_the_loss_or_learn(void)
@@ -489,10 +518,10 @@ static void padding_rows_never_change_the_loss_or_learn(void)
     mine_val.backward();
     ASSERT_EQ(list_of(mine_val.grads_val.wte.narrow(0, 100, 28)), std::vector<float>(28 * 64, 0.0f));
     // 2. other padding rows, the forward again: the same losses
-    std::vector<float> losses_list = list_of(mine_val.activations_val.losses);
+    std::vector<float> losses_list = list_of(mine_val.losses());
     fill_random(mine_val.params_val.wte.narrow(0, 100, 28), 10.0f);
     mine_val.forward();
-    ASSERT_EQ(list_of(mine_val.activations_val.losses), losses_list);
+    ASSERT_EQ(list_of(mine_val.losses()), losses_list);
 }
 
 static void backward_adds_onto_the_param_grads(void)
@@ -537,8 +566,7 @@ static void micro_batches_divide_each_gradient(void)
     std::vector<std::vector<float>> for_1_list = mine_val.grad_lists();
     // 2. a backward for 4, from 0: a quarter of each
     mine_val.grad_buffer_val.flat().zero_();
-    gpt2_backward(mine_val.grads_val, mine_val.token_ids_tensor, mine_val.targets_tensor, mine_val.params_val,
-                  mine_val.activations_val, mine_val.scratch_val, mine_val.config_val, micro_batches_val);
+    mine_val.backward(micro_batches_val);
     std::vector<Tensor> grads_list = mine_val.grads_val.tensors();
     std::vector<std::string> names_list = param_names(mine_val.config_val);
     print_test_name(__func__);

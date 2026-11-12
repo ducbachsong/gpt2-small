@@ -13,7 +13,7 @@
 #define ENCODER_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define ENCODER_BLOCKS 512                                        // blocks in every launch here
 #define ENCODER_THREADS HARDWARE_MAX_THREADS_PER_BLOCK            // the default block size of the two backwards

@@ -29,7 +29,7 @@
 #define LAYER_NORM_BF16_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, warp_reduce_sum
-#include "../../tensor.cuh"          // read8_as_float, write8_from_float, VALUES_PER_BF16_LOAD
+#include "../../common/tensor.cuh"          // read8_as_float, write8_from_float, VALUES_PER_BF16_LOAD
 
 #define LAYER_NORM_BF16_VALUES_PER_LOAD VALUES_PER_BF16_LOAD                          // bfloat16s in one 16-byte load: 8
 #define LAYER_NORM_BF16_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // the forward's default: fp32/layer_norm.cuh's, not swept for 8 values yet

@@ -11,7 +11,7 @@
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
-#include "../../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
+#include "../../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
 #include "../../llmc/kernels/fp32/grad_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the norm

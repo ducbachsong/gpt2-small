@@ -21,7 +21,7 @@
 
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_max, HARDWARE_E4M3_LARGEST
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define ROUND_8BIT_VALUES_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))      // E4M3s in one int of an Int32 tensor: 4
 #define ROUND_8BIT_ROW_LENGTH_MULTIPLE 16                                    // row_length's multiple: the products read rows of whole 16-byte pieces

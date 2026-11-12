@@ -1,4 +1,4 @@
-// test_dataloader.cu — tests for llmc/dataloader.cuh (DataLoader). Every check prints its test case, input,
+// test_dataloader.cu — tests for llmc/helper/dataloader.cuh (DataLoader). Every check prints its test case, input,
 // expected and actual value, and ok; the first FAIL stops the program.
 //
 // The last four cases have a writer at work (a `writing` file, and files written by a child process a
@@ -16,7 +16,7 @@
 #include <sys/wait.h>                 // waitpid, WIFEXITED, WEXITSTATUS
 #include <unistd.h>                   // fork, _exit
 #include "test_helpers.h"             // ASSERT_EQ
-#include "../llmc/dataloader.cuh"
+#include "../llmc/helper/dataloader.cuh"
 
 #define BATCH_TOKENS 8                // a {2, 4} batch's token_ids; it reads one more for the targets
 

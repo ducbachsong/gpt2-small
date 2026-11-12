@@ -1,6 +1,6 @@
-// test_adamw.cu — tests for llmc/kernels/fp32/adamw.cuh (AdamW all in float) and llmc/optimizer.cuh's AdamW on a
-// float model. A bfloat16 model: test_adamw_bf16.cu; 8-bit m and v: test_adamw_8bit.cu. Every check prints its
-// test case, input, expected and actual value, and ok; the first FAIL stops the program.
+// test_adamw.cu — tests for llmc/kernels/fp32/adamw.cuh (AdamW all in float) and llmc/model_fp32.cuh's AdamW
+// on a float model. A bfloat16 model: test_adamw_bf16.cu; 8-bit m and v: test_adamw_8bit.cu. Every check prints
+// its test case, input, expected and actual value, and ok; the first FAIL stops the program.
 // The timings are in tunes/tune_adamw.cu.
 //
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
@@ -8,7 +8,7 @@
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; only the headers needed, not <torch/torch.h>
 #include <torch/utils.h>              // torch::NoGradGuard
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update, which the tests call directly
+#include "../../llmc/model_fp32.cuh"     // AdamW, AdamWConfig; and adamw_update, which the tests call directly
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 static const double STEPS_TOLERANCE = TOLERANCE;   // the common tests' after several steps
@@ -663,8 +663,8 @@ static void step_leaves_the_gradients_as_they_are(void)
 static void adamw_counts_the_matrices_and_the_steps(void)
 {
     // Expect: (new) params {2, 4}, {1, 4}, {8}, {4}, matrices first: decayed_count is the
-    // matrices' 8 + 4 = 12 values. One buffer, 5 groups: params and grads (Optimizer's),
-    // m and v (AdamW's), then grad_norm last; params, grads, m and v have 4 tensors and 24
+    // matrices' 8 + 4 = 12 values. One buffer, 5 groups: params, grads, m and v (AdamW's),
+    // then grad_norm last (Optimizer's); params, grads, m and v have 4 tensors and 24
     // values each: 17 tensors, 97 values. Tensor 0 is the {2, 4}, and its gradient starts
     // right after the 24 parameter values. m and v start on 16 bytes, as the kernel's
     // float4 loads need (grad_norm, 1 value, before them would put them 4 bytes off), and

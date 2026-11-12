@@ -1,5 +1,5 @@
 From build/h100_full_tests (the H100 PCIe run of 2026-11-04, the code of commit 1397010, when these
-timings were still in tests/test_gpt2.cu).
+timings were still in tests/test_model.cu).
 2026-11-04 06:47:22  NVIDIA H100 PCIe, 81559 MiB, 570.195.03, 1 GPU(s)
 Build cuda_12.8.r12.8/compiler.35583870_0   torch 2.11.0+cu128
 

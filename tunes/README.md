@@ -34,7 +34,7 @@ tunes/
 | `tune_gelu.cu` | GELU against PyTorch; other launches |
 | `tune_gelu_bf16.cu` | GPT-2's MLP with GELU done inside its two bfloat16 WGMMA products (the epilogue) against linear_bf16 + GELU on its own, and what fusing saves over 12 layers; needs an H100 and `-arch=sm_90a` |
 | `tune_gelu_8bit.cu` | the same with the products in 8 bits, against the unfused 8-bit MLP and the fused bfloat16 one; needs an H100 and `-arch=sm_90a` |
-| `tune_gpt2.cu` | the whole GPT-2 small step, bfloat16; the micro-batch size (`--batch-size`) with the best MFU |
+| `tune_model.cu` | the whole GPT-2 small step, bfloat16; the micro-batch size (`--batch-size`) with the best MFU |
 | `tune_grad_norm.cu` | the grad norm against PyTorch; other launches |
 | `tune_grad_norm_bf16.cu` | the bfloat16 gradients' norm, 8 values a thread (16-byte loads), against the 4-value path and on a slice off a 16-byte boundary, with GB/s and MBU; other launches |
 | `tune_layer_norm.cu` | layer norm against PyTorch; other launches |
@@ -76,7 +76,7 @@ MFU = tokens/s x flops a token / the GPU's peak bfloat16 flops a second
 
 GPT-2 small at T = 1024 takes 6 x 124,475,904 + 12 x 12 x 768 x 1024 = 860.1M flops a token. The H100 PCIe
 run of 2026-11-04 trained at 186,000 tokens/s: 160 TFLOPS of the GPU's 820, an MFU of 20%, with `--batch-size
-4`, which used 6 GB of its 85 GB. `tune_gpt2.cu`'s `find_the_micro_batch_with_the_best_mfu` tries 1, 2, 4, ...
+4`, which used 6 GB of its 85 GB. `tune_model.cu`'s `find_the_micro_batch_with_the_best_mfu` tries 1, 2, 4, ...
 rows a micro-batch while they fit in memory, and prints the MFU of each and the best `--batch-size`.
 
 ## Running one
@@ -97,7 +97,7 @@ nvcc -O3 -std=c++17 -arch=native tunes/tune_gelu.cu -o tune_gelu \
 ```
 
 A tune or test that includes `linear_bf16.cuh` or `linear_8bit.cuh` (`linear_bf16`, `linear_8bit`, `block`,
-`gpt2`, and `train_gpt2.cu`) needs an H100 and `-arch=sm_90a` in place of `-arch=native`: a linear layer's
+`model`, `train_bf16.cu` and `train_8bit.cu`) needs an H100 and `-arch=sm_90a` in place of `-arch=native`: a linear layer's
 bfloat16 products are `wgmma_matmul_bf16`'s, its 8-bit ones `wgmma_matmul_8bit`'s, and WGMMA and TMA are
 Hopper's own instructions. `linear.cuh` (float) runs on any GPU.
 

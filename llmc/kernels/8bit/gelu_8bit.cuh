@@ -26,7 +26,7 @@
 #define GELU_8BIT_CUH
 
 #include "../cuda_common.h"          // cudaCheck
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "linear_8bit.cuh"           // the two linear layers in 8 bits: linear_8bit_forward, _backward, Linear8bitScratch
 #include "../bf16/gelu_bf16.cuh"     // the epilogues, and gelu_bf16_check_beside
 

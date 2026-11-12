@@ -21,7 +21,7 @@
 
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_max
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define ATTENTION_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // the rounding's and the turn-back's default: one warp per row, one int per thread
 #define ATTENTION_8BIT_HEAD_SIZE 64                                                 // the only head_size the kernels take: GPT-2's

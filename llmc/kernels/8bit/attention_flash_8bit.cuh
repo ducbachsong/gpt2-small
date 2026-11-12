@@ -35,7 +35,7 @@
 #include <cuda/barrier>              // cuda::barrier, and the TMA copy into shared memory
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_WGMMA_*, HARDWARE_TMA_*
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "attention_8bit.cuh"        // the rounding and the turning back: attention_8bit_round_qkv, attention_8bit_turn_back
 #include "../bf16/attention_flash_bf16.cuh"  // FLASH_* tiles, the barrier wait and the WGMMAs for F5, attention_bf16_flash_backward
 

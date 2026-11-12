@@ -1,4 +1,4 @@
-log: tunes/results/H100/gpt2_2026-11-07_082553.txt
+log: tunes/results/H100/model_2026-11-07_082553.txt
 GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
 
 

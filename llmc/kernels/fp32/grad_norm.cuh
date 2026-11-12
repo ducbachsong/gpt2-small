@@ -9,7 +9,7 @@
 #define GRAD_NORM_CUH
 
 #include "../cuda_common.h"          // cudaCheck, check_threads_per_block, block_reduce_sum
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 
 #define GRAD_NORM_BLOCKS 512                               // blocks in the launch: each writes one block sum
 #define GRAD_NORM_THREADS HARDWARE_MAX_THREADS_PER_BLOCK   // the default block size

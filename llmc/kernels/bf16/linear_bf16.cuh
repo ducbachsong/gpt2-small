@@ -29,7 +29,7 @@
 #define LINEAR_BF16_CUH
 
 #include "../cuda_common.h"             // cudaCheck, HARDWARE_THREADS_PER_WARP
-#include "../../tensor.cuh"
+#include "../../common/tensor.cuh"
 #include "wgmma_matmul_bf16.cuh"     // the products
 
 // bias_grad: a block takes HARDWARE_THREADS_PER_WARP neighbouring columns of output_grad, one per lane, and its

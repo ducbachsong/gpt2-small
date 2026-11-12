@@ -1,14 +1,17 @@
-// test_block.cu — tests for llmc/block.cuh (BlockParams, block_init_params, block_forward, block_backward).
+// test_block.cu — tests for one block: llmc/model_fp32.cuh's block_forward and block_backward, llmc/model_bf16.cuh's
+// block_bf16_forward and block_bf16_backward, and llmc/common/model_params.cuh's BlockParams and block_init_params.
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL stops the
 // program.
 //
 // Part 1 checks a block against the same block written in PyTorch, with autograd for the backward, in float
 // and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tunes/tune_block.cu.
+#include <memory>                     // std::unique_ptr
 #include <torch/types.h>              // torch::layer_norm, torch::linear, scaled_dot_product_attention; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
-#include "../llmc/block.cuh"
+#include "../llmc/common/tensor_buffer.cuh"  // TensorBuffer: the parameters in one allocation, as the optimizer keeps them
+#include "../llmc/model_fp32.cuh"      // the float block: block_forward, block_backward
+#include "../llmc/model_bf16.cuh"      // the bfloat16 block: block_bf16_forward, block_bf16_backward
 
 // A block is ten kernels in a row, each within 1e-5 of PyTorch's; the differences add up through them.
 static const double TOLERANCE = 1e-4;
@@ -20,6 +23,7 @@ static const double BFLOAT16_TOLERANCE = 3e-2;
 #define GPT2_LAYERS 12                // GPT-2 small's blocks
 #define GPT2_EMBED_DIM 768            // its row width
 #define GPT2_NUM_HEADS 12             // its heads
+#define ONE_BLOCK_VOCAB 128           // the one-layer model's vocabulary, for a block's activations
 
 static const char *PARAM_NAMES[BLOCK_PARAMS] = {
     "qkv_weight", "attention_out_weight", "mlp_up_weight", "mlp_down_weight",
@@ -63,9 +67,23 @@ static std::vector<float> list_of(const Tensor &tensor)
     return tensor.to(DType::Float32).tolist();
 }
 
+/// Gives the config of a one-layer model of these widths: a block's activations are made as that model's. Its
+/// ONE_BLOCK_VOCAB-word vocabulary keeps the head's tensors (logits and the like) small; the block never reads them.
+static GPT2Config one_block_config(size_t seq_len_val, size_t embed_dim_val, size_t num_heads_val)
+{
+    GPT2Config config_val;
+    config_val.max_seq_len = seq_len_val;
+    config_val.vocab_size = ONE_BLOCK_VOCAB;
+    config_val.padded_vocab_size = ONE_BLOCK_VOCAB;
+    config_val.num_layers = 1;
+    config_val.num_heads = num_heads_val;
+    config_val.embed_dim = embed_dim_val;
+    return config_val;
+}
+
 /// Everything one block needs, for one size and dtype: its parameters and their gradients in a TensorBuffer
-/// each, as the optimizer keeps them, its activations and scratch, and input, output and their gradients.
-/// All 0 to start.
+/// each, as the optimizer keeps them, the activations of a one-layer model (model_fp32.cuh's for float,
+/// model_bf16.cuh's for bfloat16; the other stays empty), and input, output and their gradients. All 0 to start.
 struct BlockTensors
 {
     size_t batch_size_val;
@@ -76,8 +94,8 @@ struct BlockTensors
     TensorBuffer grad_buffer_val;
     BlockParams params_val;
     BlockParams grads_val;
-    BlockActivations activations_val;
-    BlockScratch scratch_val;
+    std::unique_ptr<GPT2Activations> fp32_activations_ptr;      // float
+    std::unique_ptr<GPT2ActivationsBf16> bf16_activations_ptr;  // bfloat16
     Tensor input_tensor;
     Tensor output_tensor;
     Tensor output_grad_tensor;
@@ -86,10 +104,14 @@ struct BlockTensors
     BlockTensors(size_t block_batch_size_val, size_t block_seq_len_val, size_t block_embed_dim_val,
                  size_t block_num_heads_val, DType dtype_val = DType::Float32)
         : batch_size_val(block_batch_size_val), seq_len_val(block_seq_len_val), embed_dim_val(block_embed_dim_val),
-          num_heads_val(block_num_heads_val),
-          activations_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val),
-          scratch_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val)
+          num_heads_val(block_num_heads_val)
     {
+        // 0. the activations of the dtype's one-layer model
+        GPT2Config config_val = one_block_config(seq_len_val, embed_dim_val, num_heads_val);
+        if (dtype_val == DType::BFloat16)
+            bf16_activations_ptr.reset(new GPT2ActivationsBf16(batch_size_val, seq_len_val, config_val));
+        else
+            fp32_activations_ptr.reset(new GPT2Activations(batch_size_val, seq_len_val, config_val));
         // 1. the parameters and their gradients, in a TensorBuffer each
         int group_index_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
         param_buffer_val.allocate(dtype_val);
@@ -128,14 +150,24 @@ struct BlockTensors
         fill_random(output_grad_tensor, 1.0f);
     }
 
-    /// Runs block_forward on these tensors.
-    void forward() { block_forward(output_tensor, input_tensor, params_val, activations_val, scratch_val); }
+    /// Runs the dtype's block forward on these tensors, as layer 0: block_forward or block_bf16_forward.
+    void forward()
+    {
+        if (fp32_activations_ptr)
+            block_forward(output_tensor, input_tensor, params_val, *fp32_activations_ptr, 0);
+        else
+            block_bf16_forward(output_tensor, input_tensor, params_val, *bf16_activations_ptr, 0);
+    }
 
-    /// Runs block_backward on these tensors.
+    /// Runs the dtype's block backward on these tensors, as layer 0: block_backward or block_bf16_backward.
     void backward()
     {
-        block_backward(input_grad_tensor, grads_val, output_grad_tensor, input_tensor, params_val, activations_val,
-                       scratch_val);
+        if (fp32_activations_ptr)
+            block_backward(input_grad_tensor, grads_val, output_grad_tensor, input_tensor, params_val, *fp32_activations_ptr,
+                           0);
+        else
+            block_bf16_backward(input_grad_tensor, grads_val, output_grad_tensor, input_tensor, params_val,
+                                *bf16_activations_ptr, 0);
     }
 };
 
