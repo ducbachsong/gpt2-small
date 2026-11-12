@@ -1,15 +1,16 @@
-// test_residual.cu — tests for llmc/kernels/residual.cuh (residual_forward, residual_backward).
+// test_residual.cu — tests for llmc/kernels/fp32/residual.cuh (residual_forward, residual_backward).
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
 // Part 1 checks both against PyTorch's + with autograd for the backward; part 2 checks numbers worked out
 // by hand; part 3 checks that each kernel's registers fit its block, and that any block size gives the same
 // bits. The timings are in tunes/tune_residual.cu.
-// (The C# trainer had no residual test: TorchSharp's + was trusted.)
+// (The C# trainer had no residual test: TorchSharp's + was trusted.) The model's bfloat16 residual add, 8 values a
+// thread, is tested in tests/bf16/test_residual_bf16.cu.
 #include <torch/types.h>              // torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
-#include "test_helpers.h"             // ASSERT_EQ: every check here is exact
-#include "../llmc/kernels/residual.cuh"
+#include "../test_helpers.h"          // ASSERT_EQ: every check here is exact
+#include "../../llmc/kernels/fp32/residual.cuh"
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a tensor of `shape_list` on the GPU holding `values_list`, given in row order.

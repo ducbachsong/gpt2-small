@@ -5,12 +5,15 @@
 //     wte       {vocab_size, embed_dim}             {50304, 768}
 //     wpe       {max_seq_len, embed_dim}            {1024, 768}
 //     encoded   {batch_size, seq_len, embed_dim}    {4, 1024, 768}
-// All float or all bfloat16 (T); the adds are in float.
+// All float or all bfloat16 (T); the adds are in float. Each thread takes VALUES_PER_FLOAT4 values at a time: one
+// 16-byte load in float, one 8-byte load in bfloat16. The model runs these kernels in float; in bfloat16 it runs
+// bf16/encoder_bf16.cuh (8 values a thread, one 16-byte load), and 8bit/encoder_8bit.cuh reads wte from its E4M3
+// copy. These kernels on bfloat16 are the 8-byte path the bfloat16 tests and tunes compare it with.
 #ifndef ENCODER_CUH
 #define ENCODER_CUH
 
-#include "cuda_common.h"             // cudaCheck, check_threads_per_block
-#include "../tensor.cuh"
+#include "../cuda_common.h"          // cudaCheck, check_threads_per_block
+#include "../../tensor.cuh"
 
 #define ENCODER_BLOCKS 512                                        // blocks in every launch here
 #define ENCODER_THREADS HARDWARE_MAX_THREADS_PER_BLOCK            // the default block size of the two backwards

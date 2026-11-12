@@ -1,14 +1,15 @@
-// test_layer_norm.cu — tests for llmc/kernels/layer_norm.cuh (layer_norm_forward, layer_norm_backward).
+// test_layer_norm.cu — tests for llmc/kernels/fp32/layer_norm.cuh (layer_norm_forward, layer_norm_backward).
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
 // Part 1 checks both against PyTorch's layer_norm, with autograd for the backward; part 2 checks numbers
 // worked out by hand; part 3 checks that each kernel's registers fit its block, and other block sizes. The
 // timings are in tunes/tune_layer_norm.cu. (The C# trainer had no LayerNorm test: TorchSharp's was
-// trusted.)
+// trusted.) The model's bfloat16 LayerNorm, 8 values a lane, is tested in tests/bf16/test_layer_norm_bf16.cu; the
+// 8-bit one in tests/8bit/test_layer_norm_8bit.cu.
 #include <torch/types.h>              // torch::layer_norm, backward(); libtorch before any CUDA header
-#include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/kernels/layer_norm.cuh"
+#include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
+#include "../../llmc/kernels/fp32/layer_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 // In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so each

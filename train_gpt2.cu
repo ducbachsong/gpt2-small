@@ -42,7 +42,8 @@
 #include "llmc/dataloader.cuh"
 #include "llmc/optimizer.cuh"
 #include "llmc/checkpoint.cuh"
-#include "llmc/kernels/grad_norm.cuh"
+#include "llmc/kernels/fp32/grad_norm.cuh"         // float gradients: GradNorm
+#include "llmc/kernels/bf16/grad_norm_bf16.cuh"    // bfloat16 gradients (also with 8-bit m and v): GradNormBf16
 
 /// The run's settings; each can be changed with a --kebab-case flag of the same name.
 struct TrainConfig {
@@ -295,7 +296,9 @@ int main(int argc, char** argv) {
     Tensor token_ids = Tensor::zeros({B, T}, DType::Int32);
     Tensor targets = Tensor::zeros({B, T}, DType::Int32);
     Tensor grad_norm_block_sums = Tensor::zeros({2, GRAD_NORM_BLOCKS});
-    GradNorm grad_norm(grad_norm_block_sums);
+    Tensor grad_norm_bf16_block_sums = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
+    GradNorm grad_norm(grad_norm_block_sums);                          // float gradients
+    GradNormBf16 grad_norm_bf16(grad_norm_bf16_block_sums);            // bfloat16 gradients
 
     size_t free_bytes;
     size_t total_bytes;
@@ -342,7 +345,10 @@ int main(int argc, char** argv) {
             loss_sum += gpt2_mean_loss(activations);
         }
         distributed.reduce_scatter_mean(optimizer.all_grads());        // this rank's slice: averaged over all
-        grad_norm.compute(grads_slice, optimizer.grad_norm());         // the norm of this rank's slice...
+        if (grads_slice.dtype() == DType::BFloat16)                    // the norm of this rank's slice...
+            grad_norm_bf16.compute(grads_slice, optimizer.grad_norm());
+        else
+            grad_norm.compute(grads_slice, optimizer.grad_norm());
         distributed.slice_norms_to_norm(optimizer.grad_norm());        // ...then of all of them
         float learning_rate = learning_rate_at(step, c);
         optimizer.set_learning_rate(learning_rate);

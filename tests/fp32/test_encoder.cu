@@ -1,18 +1,20 @@
-// test_encoder.cu — tests for llmc/kernels/encoder.cuh (encoder_forward, encoder_backward).
+// test_encoder.cu — tests for llmc/kernels/fp32/encoder.cuh (encoder_forward, encoder_backward).
 // Every check prints its test case, input, expected and actual value, and ok; the first FAIL
 // stops the program.
 //
 // Part 1 checks both against PyTorch's embedding, with autograd for the backward; part 2
 // checks numbers worked out by hand; part 3 checks that each kernel's registers fit a block
 // of ENCODER_THREADS, and that any block size gives the same result. The timings are in
-// tunes/tune_encoder.cu. (The C# trainer had no encoder test: TorchSharp's embedding was trusted.)
+// tunes/tune_encoder.cu. (The C# trainer had no encoder test: TorchSharp's embedding was trusted.) The model's
+// bfloat16 encoder, 8 values a thread, is tested in tests/bf16/test_encoder_bf16.cu; the 8-bit one in
+// tests/8bit/test_encoder_8bit.cu.
 //
 // The tests use a Tensor for each weight, the simplest to write.
 #include <torch/types.h>              // torch::tensor, torch::embedding, backward(); libtorch before any CUDA header
 #include <random>                     // std::mt19937: random token ids
-#include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: wte and wpe in one allocation, as the trainer keeps them
-#include "../llmc/kernels/encoder.cuh"
+#include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR, sample_data
+#include "../../llmc/tensor_buffer.cuh"  // TensorBuffer: wte and wpe in one allocation, as the trainer keeps them
+#include "../../llmc/kernels/fp32/encoder.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 // In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so each

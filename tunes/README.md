@@ -27,6 +27,8 @@ tunes/
 | `tune_classifier_bf16.cu` | GPT-2's head and loss in bfloat16, the softmax's sums worked out as each WGMMA tile of logits is stored, against the unfused path (linear_bf16 + the classifier) and PyTorch; needs an H100 and `-arch=sm_90a` |
 | `tune_classifier_8bit.cu` | the same with the head's products in 8 bits, against the bfloat16 classifier and PyTorch; needs an H100 and `-arch=sm_90a` |
 | `tune_encoder.cu` | the encoder against PyTorch; other launches; the float4 wte backward and the finer forward sweep |
+| `tune_encoder_bf16.cu` | the bfloat16 encoder, 8 values a thread (16-byte loads), against the 4-value path, with GB/s and MBU; other launches |
+| `tune_encoder_8bit.cu` | the 8-bit encoder (wte rounded to E4M3, then the gather) against the bfloat16 one, and the step's encoder with the head's rounding counted; the gather's launches, with GB/s and MBU |
 | `tune_fma_matmul_bf16.cu` | bfloat16 products on the CUDA cores against PyTorch: GPT-2's 5 linear layers, each one's forward, input_grad and weight_grad (left or right turned round), and 4096³ |
 | `tune_fma_matmul_8bit.cu` | E4M3 products on the CUDA cores against fma_matmul_bf16 and PyTorch, GPT-2's 5 forward shapes and 4096³, with the rounding |
 | `tune_gelu.cu` | GELU against PyTorch; other launches |
@@ -34,13 +36,17 @@ tunes/
 | `tune_gelu_8bit.cu` | the same with the products in 8 bits, against the unfused 8-bit MLP and the fused bfloat16 one; needs an H100 and `-arch=sm_90a` |
 | `tune_gpt2.cu` | the whole GPT-2 small step, bfloat16; the micro-batch size (`--batch-size`) with the best MFU |
 | `tune_grad_norm.cu` | the grad norm against PyTorch; other launches |
+| `tune_grad_norm_bf16.cu` | the bfloat16 gradients' norm, 8 values a thread (16-byte loads), against the 4-value path and on a slice off a 16-byte boundary, with GB/s and MBU; other launches |
 | `tune_layer_norm.cu` | layer norm against PyTorch; other launches |
+| `tune_layer_norm_bf16.cu` | bfloat16 layer norm, 8 values a lane (16-byte loads), against the 4-value path, with GB/s and MBU; other launches |
+| `tune_layer_norm_8bit.cu` | layer norm writing its output's E4M3 copy in the same kernel, against layer_norm_bf16 then round_8bit, and what that saves over a forward's 25 LayerNorms; other launches |
 | `tune_linear.cu` | GPT-2 small's 5 linear layers in float against PyTorch (fma_matmul_bf16's products in float); any GPU |
 | `tune_linear_bf16.cu` | GPT-2 small's 5 linear layers in bfloat16 against PyTorch's bfloat16 linear (wgmma_matmul_bf16's products); needs an H100 and `-arch=sm_90a` |
 | `tune_linear_8bit.cu` | GPT-2 small's 5 linear layers with 8-bit products (round_8bit + wgmma_matmul_8bit) against the bfloat16 layer and PyTorch; needs an H100 and `-arch=sm_90a` |
 | `tune_mma_matmul_bf16.cu` | bfloat16 products on the tensor cores by mma.sync against fma_matmul_bf16 and PyTorch, the same shapes as fma's; needs sm_80 or later |
 | `tune_mma_matmul_8bit.cu` | E4M3 products by mma.sync against mma_matmul_bf16 and PyTorch, with the rounding; needs sm_89 or later |
 | `tune_residual.cu` | the residual add against PyTorch; other launches |
+| `tune_residual_bf16.cu` | the bfloat16 residual add, 8 values a thread (16-byte loads), against the 4-value path, with GB/s and MBU; other launches |
 | `tune_round_8bit.cu` | the rounding to E4M3 with other launches, with GB/s and MBU; turned rounding (a linear backward's output_grad and input) against rounding as it sits |
 | `tune_wgmma_matmul_8bit.cu` | E4M3 products on the tensor cores (WGMMA + TMA) against wgmma_matmul_bf16, mma_matmul_8bit and PyTorch, with the rounding; needs an H100 and `-arch=sm_90a` |
 | `tune_wgmma_matmul_bf16.cu` | bfloat16 products on the tensor cores (WGMMA + TMA) against mma_matmul_bf16, fma_matmul_bf16 and PyTorch, the same shapes as fma's; needs an H100 and `-arch=sm_90a` in place of `-arch=native` |
@@ -77,8 +83,7 @@ rows a micro-batch while they fit in memory, and prints the MFU of each and the 
 
 Build a tune the way its test is built, with `tunes/tune_<kernel>.cu` in place of
 `tests/test_<kernel>.cu`. The tests sit as their kernels do in `llmc/kernels/`: `tests/fp32/`, `tests/bf16/` and
-`tests/8bit/` for the kernels in those folders, `tests/` itself for the shared kernels (encoder, layer_norm,
-residual, grad_norm) and the rest (tensor, block, gpt2, ...). On Colab, with the libtorch that comes with PyTorch:
+`tests/8bit/` for the kernels in those folders, `tests/` itself for the rest (tensor, block, gpt2, ...). On Colab, with the libtorch that comes with PyTorch:
 
 ```
 TORCH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))")

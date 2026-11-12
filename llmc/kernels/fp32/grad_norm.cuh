@@ -1,11 +1,15 @@
 // grad_norm.cuh — the norm of all the gradients together, as one long list:
 //     grad_norm = sqrt(sum of every g²)
-// The gradients are float or bfloat16 (T); the squares are added in float.
+// The gradients are float or bfloat16 (T); the squares are added in float. Each thread reads VALUES_PER_FLOAT4
+// values at a time: one 16-byte load in float, one 8-byte load in bfloat16. The trainer runs this for float
+// gradients; for bfloat16 ones (also with AdamW's m and v in 8 bits: the gradients stay bfloat16) it runs
+// bf16/grad_norm_bf16.cuh (8 values a thread, one 16-byte load). This on bfloat16 is the 8-byte path the bfloat16
+// tests and tunes compare it with.
 #ifndef GRAD_NORM_CUH
 #define GRAD_NORM_CUH
 
-#include "cuda_common.h"             // cudaCheck, check_threads_per_block, block_reduce_sum
-#include "../tensor.cuh"
+#include "../cuda_common.h"          // cudaCheck, check_threads_per_block, block_reduce_sum
+#include "../../tensor.cuh"
 
 #define GRAD_NORM_BLOCKS 512                               // blocks in the launch: each writes one block sum
 #define GRAD_NORM_THREADS HARDWARE_MAX_THREADS_PER_BLOCK   // the default block size

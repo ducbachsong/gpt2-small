@@ -15,8 +15,8 @@
 #include "tensor.cuh"
 #include "block.cuh"
 #include "kernels/fp32/classifier.cuh"
-#include "kernels/encoder.cuh"
-#include "kernels/layer_norm.cuh"
+#include "kernels/fp32/encoder.cuh"         // float: the encoder
+#include "kernels/bf16/encoder_bf16.cuh"    // bfloat16: the encoder, 8 values a thread
 
 /// GPT-2's sizes. The defaults are GPT-2 small's: 124,475,904 parameters with the padded vocabulary.
 struct GPT2Config {
@@ -197,13 +197,14 @@ inline void gpt2_forward(const GPT2Activations& activations, const Tensor& token
                          const GPT2Params& params, const GPT2Scratch& scratch, const GPT2Config& config) {
     const GPT2Activations& a = activations;
     size_t num_layers = params.blocks.size();
-    encoder_forward(a.encoded, token_ids, params.wte, params.wpe);
+    if (a.encoded.dtype() == DType::BFloat16) encoder_bf16_forward(a.encoded, token_ids, params.wte, params.wpe);
+    else encoder_forward(a.encoded, token_ids, params.wte, params.wpe);
     for (size_t l = 0; l < num_layers; l++) {
         const Tensor& input = l == 0 ? a.encoded : a.block_outputs[l - 1];
         block_forward(a.block_outputs[l], input, params.blocks[l], a.blocks[l], scratch.block);
     }
-    layer_norm_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
-                       params.lnf_bias);
+    block_layer_norm_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
+                             params.lnf_bias);
     block_linear_forward(a.logits, a.lnf_output, params.wte, Tensor());    // the head: no bias
     classifier_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
@@ -229,15 +230,16 @@ inline void gpt2_backward(const GPT2Params& param_grads, const Tensor& token_ids
     Tensor output_grad = s.residual_grads[0];
     Tensor input_grad = s.residual_grads[1];
     output_grad.zero_();                                    // LayerNorm's backward adds onto it
-    layer_norm_backward(output_grad, param_grads.lnf_weight, param_grads.lnf_bias, s.lnf_output_grad,
-                        a.block_outputs[num_layers - 1], params.lnf_weight, a.lnf_mean, a.lnf_rstd);
+    block_layer_norm_backward(output_grad, param_grads.lnf_weight, param_grads.lnf_bias, s.lnf_output_grad,
+                              a.block_outputs[num_layers - 1], params.lnf_weight, a.lnf_mean, a.lnf_rstd);
     for (size_t l = num_layers; l-- > 0;) {                 // l = num_layers - 1, ..., 0
         const Tensor& input = l == 0 ? a.encoded : a.block_outputs[l - 1];
         block_backward(input_grad, param_grads.blocks[l], output_grad, input, params.blocks[l], a.blocks[l],
                        s.block);
         std::swap(output_grad, input_grad);                 // block l - 1's output_grad
     }
-    encoder_backward(param_grads.wte, param_grads.wpe, output_grad, token_ids);
+    if (output_grad.dtype() == DType::BFloat16) encoder_bf16_backward(param_grads.wte, param_grads.wpe, output_grad, token_ids);
+    else encoder_backward(param_grads.wte, param_grads.wpe, output_grad, token_ids);
 }
 
 /// Gives the mean of the row losses the last gpt2_forward wrote. Waits for the GPU.

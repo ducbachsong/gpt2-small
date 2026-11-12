@@ -1,17 +1,18 @@
-// test_grad_norm.cu — tests for llmc/kernels/grad_norm.cuh (GradNorm). Every check
+// test_grad_norm.cu — tests for llmc/kernels/fp32/grad_norm.cuh (GradNorm). Every check
 // prints its test case, input, expected and actual value, and ok; the first FAIL stops the
 // program.
 //
 // Part 1 checks the norm against PyTorch's, from torch::nn::utils::clip_grad_norm_ (it
 // returns the norm of all the gradients it was given); part 2 checks numbers worked out by
 // hand, how the work is shared out between the blocks, and any block size. The timings are in
-// tunes/tune_grad_norm.cu.
+// tunes/tune_grad_norm.cu. The bfloat16 gradients' norm the trainer runs, 8 values a thread, is tested in
+// tests/bf16/test_grad_norm_bf16.cu.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
-#include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
-#include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
-#include "../llmc/kernels/grad_norm.cuh"
+#include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
+#include "../../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
+#include "../../llmc/kernels/fp32/grad_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the norm
 

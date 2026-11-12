@@ -1,8 +1,9 @@
-// tune_grad_norm.cu — the timings of tests/test_grad_norm.cu, moved here so the tests only check numbers:
-// time_20_norms_on_gpt2_small_size, time_20_norms_on_gpt2_small_148_tensors,
-// time_the_kernel_with_other_block_and_thread_counts.
+// tune_grad_norm.cu — the timings of llmc/kernels/fp32/grad_norm.cuh, apart from tests/fp32/test_grad_norm.cu so
+// the tests only check numbers: time_20_norms_on_gpt2_small_size, time_20_norms_on_gpt2_small_148_tensors,
+// time_the_kernel_with_other_block_and_thread_counts. The bfloat16 gradients' norm (8 values a thread) is timed in
+// tunes/tune_grad_norm_bf16.cu.
 //
-// Built as tests/test_grad_norm.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_grad_norm.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/grad_norm_<date>_<time>.txt.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
@@ -10,7 +11,7 @@
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
 #include "../llmc/tensor_buffer.cuh"  // TensorBuffer: the gradients in one allocation, as the optimizer keeps them
-#include "../llmc/kernels/grad_norm.cuh"
+#include "../llmc/kernels/fp32/grad_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the norm
 

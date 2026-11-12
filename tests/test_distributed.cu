@@ -11,7 +11,7 @@
 #include "test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
 #include "../llmc/distributed.cuh"
 #include "../llmc/optimizer.cuh"
-#include "../llmc/kernels/grad_norm.cuh"
+#include "../llmc/kernels/bf16/grad_norm_bf16.cuh"   // the bfloat16 gradients' norm, as train_gpt2.cu takes it
 
 #define SLICE_VALUES 4                // values in each rank's slice, in the collectives' tests
 #define SHAPES_VALUES 32              // the AdamW step's values: a {6, 4} weight and an {8} bias
@@ -115,7 +115,7 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
     // value i is -4 + (i mod 16) / 2 + r, so their mean is -4 + (i mod 16) / 2 + (N - 1) / 2. Every value is a
     // multiple of 1/2 small enough that bfloat16 holds it, and every partial sum too, so the average comes out
     // exact whatever order NCCL adds in. Each rank runs train_gpt2.cu's step: reduce_scatter_mean of the grads,
-    // GradNorm of its slice then slice_norms_to_norm, AdamW on its slice, all_gather of the params. On every
+    // GradNormBf16 of its slice then slice_norms_to_norm, AdamW on its slice, all_gather of the params. On every
     // rank, a world-of-1 AdamW given the mean grads directly is the answer: its grad norm within 1e-6 (the
     // squares added in another order), and the params after 3 steps the same to the last bit (no clipping, so
     // the norm's last bit does not reach them).
@@ -127,9 +127,9 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
     config_val.learning_rate = 1e-2f;
     std::vector<Shape> shapes_list = {{6, 4}, {8}};
     AdamW shared_val(shapes_list, config_val, DType::BFloat16, rank_index_val, n_val), one_val(shapes_list, config_val, DType::BFloat16);
-    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS});
-    Tensor one_block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS});
-    GradNorm shared_norm_val(block_sums_tensor), one_norm_val(one_block_sums_tensor);
+    Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
+    Tensor one_block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
+    GradNormBf16 shared_norm_val(block_sums_tensor), one_norm_val(one_block_sums_tensor);
     Tensor start_tensor = tensor_of(values_from(-0.5f, 1.0f / SHAPES_VALUES, SHAPES_VALUES), DType::BFloat16);
     for (AdamW *adamw_ptr : {&shared_val, &one_val})
     {

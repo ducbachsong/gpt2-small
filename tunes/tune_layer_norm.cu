@@ -1,12 +1,14 @@
-// tune_layer_norm.cu — the timings of tests/test_layer_norm.cu, moved here so the tests only check numbers:
-// time_20_steps_on_gpt2_small_size, time_each_kernel_with_other_block_and_thread_counts.
+// tune_layer_norm.cu — the timings of llmc/kernels/fp32/layer_norm.cuh, apart from tests/fp32/test_layer_norm.cu so
+// the tests only check numbers: time_20_steps_on_gpt2_small_size, time_each_kernel_with_other_block_and_thread_counts.
+// The model's bfloat16 LayerNorm (8 values a lane) is timed in tunes/tune_layer_norm_bf16.cu, the 8-bit one in
+// tunes/tune_layer_norm_8bit.cu.
 //
-// Built as tests/test_layer_norm.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_layer_norm.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/layer_norm_<date>_<time>.txt.
 #include <torch/types.h>              // torch::layer_norm, backward(); libtorch before any CUDA header
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/kernels/layer_norm.cuh"
+#include "../llmc/kernels/fp32/layer_norm.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 

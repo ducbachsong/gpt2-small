@@ -1,16 +1,17 @@
-// tune_encoder.cu — the timings of tests/test_encoder.cu, moved here so the tests only check numbers:
-// time_20_steps_on_gpt2_small_size, time_20_steps_on_gpt2_small_size_in_tensor_buffer,
+// tune_encoder.cu — the timings of llmc/kernels/fp32/encoder.cuh, apart from tests/fp32/test_encoder.cu so the
+// tests only check numbers: time_20_steps_on_gpt2_small_size, time_20_steps_on_gpt2_small_size_in_tensor_buffer,
 // time_each_kernel_with_other_block_and_thread_counts, time_wte_backward_with_float4_loads,
-// time_forward_with_blocks_of_128_around_512.
+// time_forward_with_blocks_of_128_around_512. The model's bfloat16 encoder (8 values a thread) is timed in
+// tunes/tune_encoder_bf16.cu, the 8-bit one in tunes/tune_encoder_8bit.cu.
 //
-// Built as tests/test_encoder.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_encoder.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/encoder_<date>_<time>.txt.
 #include <torch/types.h>              // torch::tensor, torch::embedding, backward(); libtorch before any CUDA header
 #include <random>                     // std::mt19937: random token ids
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
 #include "../llmc/tensor_buffer.cuh"  // TensorBuffer: wte and wpe in one allocation, as the trainer keeps them
-#include "../llmc/kernels/encoder.cuh"
+#include "../llmc/kernels/fp32/encoder.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 // In bfloat16, against PyTorch in float on the same values: a bfloat16 keeps 8 significant bits, so each

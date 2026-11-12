@@ -13,12 +13,16 @@
 //     weight, bias    {embed_dim}                        {768}
 //     mean, rstd      {batch_size, seq_len}: kept for the backward
 // input, output, weight, bias and their gradients float or bfloat16 (T); mean and rstd float; the math in float.
+// Each lane takes VALUES_PER_FLOAT4 values at a time: one 16-byte load in float, one 8-byte load in bfloat16. The
+// model runs these kernels in float; in bfloat16 it runs bf16/layer_norm_bf16.cuh (8 values a lane, one 16-byte
+// load), and 8bit/layer_norm_8bit.cuh also writes the output's E4M3 copy for the 8-bit product after it. These
+// kernels on bfloat16 are the 8-byte path the bfloat16 tests and tunes compare it with.
 // Math: https://ducbachsong.github.io/posts/layer-norm-backward
 #ifndef LAYER_NORM_CUH
 #define LAYER_NORM_CUH
 
-#include "cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_sum
-#include "../tensor.cuh"
+#include "../cuda_common.h"          // cudaCheck, check_threads_per_block, warp_reduce_sum
+#include "../../tensor.cuh"
 
 #define LAYER_NORM_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // forward's default: 8 warps, one row each; 0.012 ms against 0.013 for 16 on an H100 PCIe, bfloat16
 #define LAYER_NORM_BACKWARD_BLOCKS 80                                            // backward: blocks in every launch

@@ -597,4 +597,35 @@ __device__ __forceinline__ void atomic_add4_from_float(T* first, float4 values) 
     }
 }
 
+// ── eight bfloat16s in a kernel, as floats ────────────────────────────────────
+// One 16-byte load or store: twice the bytes of read4_as_float's 8 in bfloat16, so a thread keeps twice the bytes
+// in flight and the same bytes take half the loads (bf16/encoder_bf16.cuh, layer_norm_bf16.cuh, grad_norm_bf16.cuh).
+// `first` must start on 16 bytes.
+
+#define VALUES_PER_BF16_LOAD ((int)(sizeof(uint4) / sizeof(nv_bfloat16)))   // bfloat16s in one 16-byte load: 8
+
+/// Reads first[0 .. 7] with one 16-byte load and gives them as floats (exact).
+///
+///   values   written: the 8 floats
+///   first    the first of the 8, on 16 bytes
+__device__ __forceinline__ void read8_as_float(float (&values)[VALUES_PER_BF16_LOAD], const nv_bfloat16* first) {
+    uint4 load = *reinterpret_cast<const uint4*>(first);
+    const nv_bfloat16* loaded = reinterpret_cast<const nv_bfloat16*>(&load);
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_BF16_LOAD; i++) values[i] = to_float(loaded[i]);
+}
+
+/// Writes 8 floats into first[0 .. 7] with one 16-byte store, each rounded to the nearest bfloat16 (from_float, as
+/// write4_from_float rounds).
+///
+///   first    the first of the 8, on 16 bytes: written
+///   values   the 8 floats
+__device__ __forceinline__ void write8_from_float(nv_bfloat16* first, const float (&values)[VALUES_PER_BF16_LOAD]) {
+    uint4 store;
+    nv_bfloat16* stored = reinterpret_cast<nv_bfloat16*>(&store);
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_BF16_LOAD; i++) stored[i] = from_float<nv_bfloat16>(values[i]);
+    *reinterpret_cast<uint4*>(first) = store;
+}
+
 #endif // TENSOR_CUH

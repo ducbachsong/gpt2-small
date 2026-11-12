@@ -20,10 +20,12 @@
 #include "kernels/bf16/attention_flash_bf16.cuh"   // bfloat16: flash attention
 #include "kernels/fp32/gelu.cuh"                  // float: GELU on its own
 #include "kernels/bf16/gelu_bf16.cuh"        // bfloat16: GELU inside the MLP's two linears
-#include "kernels/layer_norm.cuh"
+#include "kernels/fp32/layer_norm.cuh"         // float: LayerNorm
+#include "kernels/bf16/layer_norm_bf16.cuh"    // bfloat16: LayerNorm, 8 values a lane
 #include "kernels/fp32/linear.cuh"         // float: the four linears
 #include "kernels/bf16/linear_bf16.cuh"    // bfloat16: the four linears
-#include "kernels/residual.cuh"
+#include "kernels/fp32/residual.cuh"          // float: the residual adds
+#include "kernels/bf16/residual_bf16.cuh"     // bfloat16: the residual adds, 8 values a thread
 
 /// A block's 12 parameter tensors, or their gradients: views of the optimizer's buffer, the 4 matrices first.
 /// D is embed_dim.
@@ -93,6 +95,13 @@ bool block_uses_flash(DType dtype, size_t seq_len, size_t head_size);
 void block_linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias);
 void block_linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
                            const Tensor& output_grad, const Tensor& input, const Tensor& weight);
+void block_layer_norm_forward(const Tensor& output, const Tensor& mean, const Tensor& rstd, const Tensor& input,
+                              const Tensor& weight, const Tensor& bias);
+void block_layer_norm_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
+                               const Tensor& output_grad, const Tensor& input, const Tensor& weight, const Tensor& mean,
+                               const Tensor& rstd);
+void block_residual_forward(const Tensor& output, const Tensor& residual, const Tensor& branch_output);
+void block_residual_backward(const Tensor& residual_grad, const Tensor& branch_output_grad, const Tensor& output_grad);
 void block_init_params(const BlockParams& params, int num_layers);
 void block_forward(const Tensor& output, const Tensor& input, const BlockParams& params,
                    const BlockActivations& activations, const BlockScratch& scratch);
@@ -214,6 +223,46 @@ inline void block_linear_backward(const Tensor& input_grad, const Tensor& weight
     else linear_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight);
 }
 
+/// Runs a LayerNorm's forward in the model's dtype: layer_norm_bf16_forward for bfloat16, layer_norm_forward for
+/// float. Also gpt2.cuh's last LayerNorm.
+///
+///   output, mean, rstd, input, weight, bias   as in layer_norm_forward
+inline void block_layer_norm_forward(const Tensor& output, const Tensor& mean, const Tensor& rstd, const Tensor& input,
+                                     const Tensor& weight, const Tensor& bias) {
+    if (input.dtype() == DType::BFloat16) layer_norm_bf16_forward(output, mean, rstd, input, weight, bias);
+    else layer_norm_forward(output, mean, rstd, input, weight, bias);
+}
+
+/// Runs a LayerNorm's backward in the model's dtype: layer_norm_bf16_backward for bfloat16, layer_norm_backward
+/// for float. Also gpt2.cuh's last LayerNorm.
+///
+///   input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd   as in layer_norm_backward
+inline void block_layer_norm_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
+                                      const Tensor& output_grad, const Tensor& input, const Tensor& weight, const Tensor& mean,
+                                      const Tensor& rstd) {
+    if (input.dtype() == DType::BFloat16)
+        layer_norm_bf16_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
+    else layer_norm_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight, mean, rstd);
+}
+
+/// Runs a residual add's forward in the model's dtype: residual_bf16_forward for bfloat16, residual_forward for
+/// float.
+///
+///   output, residual, branch_output   as in residual_forward
+inline void block_residual_forward(const Tensor& output, const Tensor& residual, const Tensor& branch_output) {
+    if (output.dtype() == DType::BFloat16) residual_bf16_forward(output, residual, branch_output);
+    else residual_forward(output, residual, branch_output);
+}
+
+/// Runs a residual add's backward in the model's dtype: residual_bf16_backward for bfloat16, residual_backward for
+/// float.
+///
+///   residual_grad, branch_output_grad, output_grad   as in residual_backward
+inline void block_residual_backward(const Tensor& residual_grad, const Tensor& branch_output_grad, const Tensor& output_grad) {
+    if (output_grad.dtype() == DType::BFloat16) residual_bf16_backward(residual_grad, branch_output_grad, output_grad);
+    else residual_backward(residual_grad, branch_output_grad, output_grad);
+}
+
 /// Sets GPT-2's starting values: matrices normal std 0.02, the two projections std 0.02 / sqrt(2 num_layers),
 /// biases 0, LayerNorm weights 1.
 ///
@@ -240,7 +289,7 @@ inline void block_forward(const Tensor& output, const Tensor& input, const Block
                           const BlockActivations& activations, const BlockScratch& scratch) {
     const BlockActivations& a = activations;
     // the attention branch
-    layer_norm_forward(a.ln1_output, a.ln1_mean, a.ln1_rstd, input, params.ln1_weight, params.ln1_bias);
+    block_layer_norm_forward(a.ln1_output, a.ln1_mean, a.ln1_rstd, input, params.ln1_weight, params.ln1_bias);
     block_linear_forward(a.qkv, a.ln1_output, params.qkv_weight, params.qkv_bias);
     bool bfloat16_val = a.qkv.dtype() == DType::BFloat16;
     if (a.flash_attention && bfloat16_val)
@@ -250,9 +299,9 @@ inline void block_forward(const Tensor& output, const Tensor& input, const Block
     else
         attention_bf16_forward(a.attention_output, a.attention_probs, a.qkv);
     block_linear_forward(scratch.branch_output, a.attention_output, params.attention_out_weight, params.attention_out_bias);
-    residual_forward(a.residual2, input, scratch.branch_output);
+    block_residual_forward(a.residual2, input, scratch.branch_output);
     // the MLP branch
-    layer_norm_forward(a.ln2_output, a.ln2_mean, a.ln2_rstd, a.residual2, params.ln2_weight, params.ln2_bias);
+    block_layer_norm_forward(a.ln2_output, a.ln2_mean, a.ln2_rstd, a.residual2, params.ln2_weight, params.ln2_bias);
     if (bfloat16_val) {
         // mlp_up and GELU in one product on the tensor cores: GELU as each pair of mlp_up_output is stored
         gelu_bf16_forward(a.mlp_up_output, a.gelu_output, a.ln2_output, params.mlp_up_weight, params.mlp_up_bias);
@@ -261,7 +310,7 @@ inline void block_forward(const Tensor& output, const Tensor& input, const Block
         gelu_forward(a.gelu_output, a.mlp_up_output);
     }
     block_linear_forward(scratch.branch_output, a.gelu_output, params.mlp_down_weight, params.mlp_down_bias);
-    residual_forward(output, a.residual2, scratch.branch_output);
+    block_residual_forward(output, a.residual2, scratch.branch_output);
 }
 
 /// Writes input_grad and adds the parameters' gradients onto param_grads: the forward's steps the other way.
@@ -277,7 +326,7 @@ inline void block_backward(const Tensor& input_grad, const BlockParams& param_gr
     const BlockActivations& a = activations;
     const BlockScratch& s = scratch;
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
-    residual_backward(s.residual2_grad, s.branch_output_grad, output_grad);
+    block_residual_backward(s.residual2_grad, s.branch_output_grad, output_grad);
     if (a.qkv.dtype() == DType::BFloat16) {
         // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored, so
         // gelu_output_grad is never written
@@ -290,10 +339,10 @@ inline void block_backward(const Tensor& input_grad, const BlockParams& param_gr
     }
     block_linear_backward(s.ln_output_grad, param_grads.mlp_up_weight, param_grads.mlp_up_bias, s.mlp_up_output_grad,
                           a.ln2_output, params.mlp_up_weight);
-    layer_norm_backward(s.residual2_grad, param_grads.ln2_weight, param_grads.ln2_bias, s.ln_output_grad,
-                        a.residual2, params.ln2_weight, a.ln2_mean, a.ln2_rstd);
+    block_layer_norm_backward(s.residual2_grad, param_grads.ln2_weight, param_grads.ln2_bias, s.ln_output_grad,
+                              a.residual2, params.ln2_weight, a.ln2_mean, a.ln2_rstd);
     // the attention branch; LayerNorm 1 adds its part onto input_grad
-    residual_backward(input_grad, s.branch_output_grad, s.residual2_grad);
+    block_residual_backward(input_grad, s.branch_output_grad, s.residual2_grad);
     block_linear_backward(s.attention_output_grad, param_grads.attention_out_weight, param_grads.attention_out_bias,
                           s.branch_output_grad, a.attention_output, params.attention_out_weight);
     bool bfloat16_val = a.qkv.dtype() == DType::BFloat16;
@@ -307,8 +356,8 @@ inline void block_backward(const Tensor& input_grad, const BlockParams& param_gr
         attention_bf16_backward(s.qkv_grad, s.attention_output_grad, a.qkv, a.attention_probs, s.attention_probs_grad);
     block_linear_backward(s.ln_output_grad, param_grads.qkv_weight, param_grads.qkv_bias, s.qkv_grad, a.ln1_output,
                           params.qkv_weight);
-    layer_norm_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, s.ln_output_grad, input,
-                        params.ln1_weight, a.ln1_mean, a.ln1_rstd);
+    block_layer_norm_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, s.ln_output_grad, input,
+                              params.ln1_weight, a.ln1_mean, a.ln1_rstd);
 }
 
 #endif // BLOCK_CUH

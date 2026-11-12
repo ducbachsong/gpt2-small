@@ -1,13 +1,14 @@
-// tune_residual.cu — the timings of tests/test_residual.cu, moved here so the tests only check numbers:
-// time_20_steps_on_gpt2_small_size, time_each_kernel_with_other_block_and_thread_counts.
+// tune_residual.cu — the timings of llmc/kernels/fp32/residual.cuh, apart from tests/fp32/test_residual.cu so the
+// tests only check numbers: time_20_steps_on_gpt2_small_size, time_each_kernel_with_other_block_and_thread_counts.
+// The model's bfloat16 residual add (8 values a thread) is timed in tunes/tune_residual_bf16.cu.
 //
-// Built as tests/test_residual.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_residual.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/residual_<date>_<time>.txt.
 #include <torch/types.h>              // torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../tests/test_helpers.h"    // ASSERT_EQ: every check here is exact
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/kernels/residual.cuh"
+#include "../llmc/kernels/fp32/residual.cuh"
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on

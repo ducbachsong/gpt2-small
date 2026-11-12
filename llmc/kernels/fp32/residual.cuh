@@ -3,12 +3,17 @@
 //     backward:   residual_grad = branch_output_grad = output_grad
 // All three tensors {batch_size, seq_len, embed_dim}, all float or all bfloat16 (T); the add is in float.
 // residual_grad is only part 1: the branch's LayerNorm backward adds part 2 onto it, so this runs first.
+// Each thread takes VALUES_PER_FLOAT4 values at a time: one 16-byte load in float, one 8-byte load in bfloat16. The
+// model runs these kernels in float; in bfloat16 (also with its products in 8 bits: the residual stream stays
+// bfloat16, and what reads it next is a LayerNorm, not a product, so there is no 8-bit residual add) it runs
+// bf16/residual_bf16.cuh (8 values a thread, one 16-byte load). These kernels on bfloat16 are the 8-byte path the
+// bfloat16 tests and tunes compare it with.
 // Math: https://ducbachsong.github.io/posts/residual-backward/
 #ifndef RESIDUAL_CUH
 #define RESIDUAL_CUH
 
-#include "cuda_common.h"             // cudaCheck, check_threads_per_block
-#include "../tensor.cuh"
+#include "../cuda_common.h"          // cudaCheck, check_threads_per_block
+#include "../../tensor.cuh"
 
 #define RESIDUAL_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
 
