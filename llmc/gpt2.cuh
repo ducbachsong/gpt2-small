@@ -14,10 +14,9 @@
 #include <vector>
 #include "tensor.cuh"
 #include "block.cuh"
-#include "kernels/classifier.cuh"
+#include "kernels/fp32/classifier.cuh"
 #include "kernels/encoder.cuh"
 #include "kernels/layer_norm.cuh"
-#include "kernels/linear_cublas.cuh"   // the head; kernels/linear.cuh has the same functions
 
 /// GPT-2's sizes. The defaults are GPT-2 small's: 124,475,904 parameters with the padded vocabulary.
 struct GPT2Config {
@@ -205,7 +204,7 @@ inline void gpt2_forward(const GPT2Activations& activations, const Tensor& token
     }
     layer_norm_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
                        params.lnf_bias);
-    linear_forward(a.logits, a.lnf_output, params.wte, Tensor());          // the head: no bias
+    block_linear_forward(a.logits, a.lnf_output, params.wte, Tensor());    // the head: no bias
     classifier_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
 
@@ -226,7 +225,7 @@ inline void gpt2_backward(const GPT2Params& param_grads, const Tensor& token_ids
     s.losses_grad.fill_(1.0 / ((double)micro_batches * a.losses.numel()));
     classifier_backward(s.logits_grad, s.losses_grad, a.logits, targets, a.max_of_each_row, a.sum_of_each_row,
                         config.vocab_size);
-    linear_backward(s.lnf_output_grad, param_grads.wte, Tensor(), s.logits_grad, a.lnf_output, params.wte);
+    block_linear_backward(s.lnf_output_grad, param_grads.wte, Tensor(), s.logits_grad, a.lnf_output, params.wte);
     Tensor output_grad = s.residual_grads[0];
     Tensor input_grad = s.residual_grads[1];
     output_grad.zero_();                                    // LayerNorm's backward adds onto it

@@ -64,9 +64,9 @@ static void value_i_j_sits_at_i_times_stride_0_plus_j(void) {
     t_tensor.copy_from_cpu(sample_data(8).data());
     std::vector<float> values_on_cpu_list = t_tensor.tolist();
     // 2. each value at i x stride(0) + j x stride(1)
-    for (size_t i_val = 0; i_val < 2; i_val++) {
-        for (size_t j_val = 0; j_val < 4; j_val++)
-            ASSERT_EQ(values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)], (float)(i_val * 4 + j_val));
+    for (size_t row_index_val = 0; row_index_val < 2; row_index_val++) {
+        for (size_t column_index_val = 0; column_index_val < 4; column_index_val++)
+            ASSERT_EQ(values_on_cpu_list[row_index_val * t_tensor.stride(0) + column_index_val * t_tensor.stride(1)], (float)(row_index_val * 4 + column_index_val));
     }
     ASSERT_EQ(values_on_cpu_list[1 * t_tensor.stride(0) + 2 * t_tensor.stride(1)], 6.0f);
 }
@@ -214,14 +214,14 @@ static void int_tensors_hold_ints(void) {
 /// Reads halves as floats, to compare them: every half is a float exactly, so nothing is lost.
 static std::vector<float> as_floats(const std::vector<half>& halves_list) {
     std::vector<float> floats_list(halves_list.size());
-    for (size_t i_val = 0; i_val < halves_list.size(); i_val++) floats_list[i_val] = __half2float(halves_list[i_val]);
+    for (size_t value_index_val = 0; value_index_val < halves_list.size(); value_index_val++) floats_list[value_index_val] = __half2float(halves_list[value_index_val]);
     return floats_list;
 }
 
 /// Rounds floats to halves on the CPU, to put values into a half tensor.
 static std::vector<half> as_halves(const std::vector<float>& floats_list) {
     std::vector<half> halves_list(floats_list.size());
-    for (size_t i_val = 0; i_val < floats_list.size(); i_val++) halves_list[i_val] = __float2half(floats_list[i_val]);
+    for (size_t value_index_val = 0; value_index_val < floats_list.size(); value_index_val++) halves_list[value_index_val] = __float2half(floats_list[value_index_val]);
     return halves_list;
 }
 

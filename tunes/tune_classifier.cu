@@ -1,13 +1,13 @@
-// tune_classifier.cu — the timings of tests/test_classifier.cu, moved here so the tests only check numbers:
+// tune_classifier.cu — the timings of tests/fp32/test_classifier.cu, moved here so the tests only check numbers:
 // time_20_steps_on_gpt2_small_size, time_each_kernel_with_other_block_and_thread_counts.
 //
-// Built as tests/test_classifier.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_classifier.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/classifier_<date>_<time>.txt.
 #include <torch/types.h>              // torch::cross_entropy_loss, torch::randn, backward(); before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/kernels/classifier.cuh"
+#include "../llmc/kernels/fp32/classifier.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 
@@ -105,7 +105,7 @@ static void time_20_steps_on_gpt2_small_size(void)
     // 2. time TIMED_STEPS steps; the first WARM_UP_STEPS do first-time work (in step 1 CUDA loads each side's
     //    kernels), so the averages are of the rest
     double totals_list[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float times_list[4];
         times_list[0] = gpu_milliseconds([&] {
@@ -123,10 +123,10 @@ static void time_20_steps_on_gpt2_small_size(void)
         });
         pytorch_logits_tensor.mutable_grad() = torch::Tensor(); // the gradient written, as mine, not added onto
         times_list[3] = gpu_milliseconds([&] { pytorch_loss_tensor.backward(); });
-        if (step_val <= WARM_UP_STEPS)
+        if (step_index_val <= WARM_UP_STEPS)
             continue;
-        for (int column_val = 0; column_val < 4; column_val++)
-            totals_list[column_val] += times_list[column_val];
+        for (int column_index_val = 0; column_index_val < 4; column_index_val++)
+            totals_list[column_index_val] += times_list[column_index_val];
     }
 
     // 3. print the averages
@@ -209,7 +209,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     torch::Tensor usual_max_of_each_row_bf16_tensor = pytorch_copy_of(max_of_each_row_bf16_tensor);
     torch::Tensor usual_sum_of_each_row_bf16_tensor = pytorch_copy_of(sum_of_each_row_bf16_tensor);
     torch::Tensor usual_logits_grad_bf16_tensor = pytorch_copy_of(logits_grad_bf16_tensor.to(DType::Float32));
-    const int t4_backward_threads_val = 8 * THREADS_PER_WARP;  // 256: a T4's pick, one float4 per thread
+    const int t4_backward_threads_val = 8 * HARDWARE_THREADS_PER_WARP;  // 256: a T4's pick, one float4 per thread
     int one_float4_per_thread_blocks_val =
         (int)CEIL_DIV(logits_tensor.numel() / VALUES_PER_FLOAT4, (size_t)t4_backward_threads_val);   // 201,216
 
@@ -251,18 +251,18 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;                                         // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     int forward_block_counts_list[] = {40, 80, 160, 320, 640, 1280, 4096, sms_val, 2 * sms_val};
-    int thread_counts_list[] = {4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    int thread_counts_list[] = {4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     const int thread_count_choices_val = 4;
     const int launches_val = 9 * thread_count_choices_val;
     float total_ms_list[launches_val][2] = {}; // launch k is block count number k / 4 x thread_counts[k % 4]; [0] float, [1] bf16
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = forward_block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val][0] += gpu_milliseconds(forward_val);
-            total_ms_list[launch_val][1] += gpu_milliseconds(forward_bf16_val);
+            blocks_val = forward_block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val][0] += gpu_milliseconds(forward_val);
+            total_ms_list[launch_index_val][1] += gpu_milliseconds(forward_bf16_val);
         }
     }
     float fastest_ms_list[2] = {1e9f, 1e9f};
@@ -271,14 +271,14 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     int launches_with_the_same_result_val = 0;
     print_test_name(__func__);
     printf("    forward, time in ms:    blocks   threads   rows per block    float     bf16   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = forward_block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
+        blocks_val = forward_block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
         float times_list[2];
         for (int dtype_index_val = 0; dtype_index_val < 2; dtype_index_val++)
         {
-            times_list[dtype_index_val] = total_ms_list[launch_val][dtype_index_val] / SWEEP_ROUNDS;
+            times_list[dtype_index_val] = total_ms_list[launch_index_val][dtype_index_val] / SWEEP_ROUNDS;
             if (times_list[dtype_index_val] < fastest_ms_list[dtype_index_val])
             {
                 fastest_ms_list[dtype_index_val] = times_list[dtype_index_val];
@@ -325,29 +325,29 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
                          rows_val * sizeof(float), cudaMemcpyDeviceToDevice));
     int backward_block_counts_list[] = {40, 160, 640, 2560, 10240, CLASSIFIER_BACKWARD_BLOCKS,
                                         one_float4_per_thread_blocks_val, sms_val, 2 * sms_val};
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
-        total_ms_list[launch_val][0] = total_ms_list[launch_val][1] = 0.0f;
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
+        total_ms_list[launch_index_val][0] = total_ms_list[launch_index_val][1] = 0.0f;
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = backward_block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val][0] += gpu_milliseconds(backward_val);
-            total_ms_list[launch_val][1] += gpu_milliseconds(backward_bf16_val);
+            blocks_val = backward_block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val][0] += gpu_milliseconds(backward_val);
+            total_ms_list[launch_index_val][1] += gpu_milliseconds(backward_bf16_val);
         }
     }
     fastest_ms_list[0] = fastest_ms_list[1] = 1e9f;
     launches_with_the_same_result_val = 0;
     printf("    backward, time in ms:   blocks   threads   float4s per thread    float     bf16   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = backward_block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
+        blocks_val = backward_block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
         float times_list[2];
         for (int dtype_index_val = 0; dtype_index_val < 2; dtype_index_val++)
         {
-            times_list[dtype_index_val] = total_ms_list[launch_val][dtype_index_val] / SWEEP_ROUNDS;
+            times_list[dtype_index_val] = total_ms_list[launch_index_val][dtype_index_val] / SWEEP_ROUNDS;
             if (times_list[dtype_index_val] < fastest_ms_list[dtype_index_val])
             {
                 fastest_ms_list[dtype_index_val] = times_list[dtype_index_val];

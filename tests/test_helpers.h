@@ -104,7 +104,7 @@ static std::string start_run_log(const char* folder_ptr, const char* file_ptr, c
 ///   n_val   how many values
 static std::vector<float> sample_data(size_t n_val) {
     std::vector<float> values_list(n_val);
-    for (size_t i_val = 0; i_val < n_val; i_val++) values_list[i_val] = (float)i_val;
+    for (size_t value_index_val = 0; value_index_val < n_val; value_index_val++) values_list[value_index_val] = (float)value_index_val;
     return values_list;
 }
 
@@ -124,9 +124,9 @@ static void print_value(const void* value_ptr) { printf("%p", value_ptr); }
 template <typename T>
 static void print_value(const std::vector<T>& values_list) {
     printf("{");
-    for (size_t i_val = 0; i_val < values_list.size() && i_val < PRINTED_LIST_VALUES; i_val++) {
-        if (i_val > 0) printf(", ");
-        print_value(values_list[i_val]);
+    for (size_t value_index_val = 0; value_index_val < values_list.size() && value_index_val < PRINTED_LIST_VALUES; value_index_val++) {
+        if (value_index_val > 0) printf(", ");
+        print_value(values_list[value_index_val]);
     }
     if (values_list.size() > PRINTED_LIST_VALUES) printf(", ... (%zu values)", values_list.size());
     printf("}");
@@ -184,10 +184,10 @@ static void check_near(const char* test_ptr, const char* input_ptr, double actua
 static double relative_difference(const std::vector<float>& actual_list, const std::vector<float>& expected_list) {
     double largest_difference_val = 0.0;
     double largest_value_val = 0.0;
-    for (size_t i_val = 0; i_val < expected_list.size(); i_val++) {
-        double difference_val = fabs((double)actual_list[i_val] - expected_list[i_val]);
+    for (size_t value_index_val = 0; value_index_val < expected_list.size(); value_index_val++) {
+        double difference_val = fabs((double)actual_list[value_index_val] - expected_list[value_index_val]);
         if (std::isnan(difference_val) || difference_val > largest_difference_val) largest_difference_val = difference_val;
-        largest_value_val = fmax(largest_value_val, fabs((double)expected_list[i_val]));
+        largest_value_val = fmax(largest_value_val, fabs((double)expected_list[value_index_val]));
     }
     return largest_value_val > 0 ? largest_difference_val / largest_value_val : largest_difference_val;
 }

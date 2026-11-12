@@ -174,7 +174,7 @@ static void forward_and_backward_in_bfloat16(void)
 }
 
 // ══ part 2: numbers worked out by hand ════════════════════════════════════════
-// Most tests here use rows of 4 (one float4: thread 0 of the warp has it all, threads 1 .. THREADS_PER_WARP - 1 have
+// Most tests here use rows of 4 (one float4: thread 0 of the warp has it all, threads 1 .. HARDWARE_THREADS_PER_WARP - 1 have
 // nothing to read). The row 1 2 3 4 works out as:
 //
 //     mean = 10 / 4 = 2.5
@@ -360,7 +360,7 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: the forward can be launched with LAYER_NORM_THREADS_PER_BLOCK (512) and the backward
+    // Expect: the forward can be launched with LAYER_NORM_THREADS_PER_BLOCK (256) and the backward
     // with LAYER_NORM_BACKWARD_THREADS_PER_BLOCK (512), and nothing is spilled. The compiler picks
     // each kernel's registers per thread; cudaFuncGetAttributes reads what it wrote down, without
     // running anything:
@@ -395,7 +395,7 @@ static void other_block_sizes_give_the_same_result(void)
     // and input_grad are the defaults' to the last bit. weight_grad and bias_grad are each block's shared sums
     // added onto GPU memory in whatever order the blocks finish: within TOLERANCE in float,
     // BLOCK_SIZES_BFLOAT16_GRAD_TOLERANCE in bfloat16 (more blocks with rows, more roundings).
-    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP};
+    const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP};
     DType dtypes_list[] = {DType::Float32, DType::BFloat16};
     for (DType dtype_val : dtypes_list)
     {

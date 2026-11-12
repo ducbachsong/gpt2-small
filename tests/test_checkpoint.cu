@@ -20,8 +20,8 @@ static const std::vector<Shape> SHAPES = {{6, 4}, {8}};
 static std::vector<float> some_values(int seed_val)
 {
     std::vector<float> values_list(SHAPES_VALUES);
-    for (int i_val = 0; i_val < SHAPES_VALUES; i_val++)
-        values_list[i_val] = (float)((i_val * 37 + seed_val * 11) % 17 - 8) / 16.0f;
+    for (int value_index_val = 0; value_index_val < SHAPES_VALUES; value_index_val++)
+        values_list[value_index_val] = (float)((value_index_val * 37 + seed_val * 11) % 17 - 8) / 16.0f;
     return values_list;
 }
 
@@ -39,8 +39,8 @@ static void write_token_file(const std::string &path_val, int count_val)
 {
     int header_list[TOKEN_FILE_HEADER_INTS] = {TOKEN_FILE_MAGIC, TOKEN_FILE_VERSION, count_val};
     std::vector<uint16_t> tokens_list(count_val);
-    for (int i_val = 0; i_val < count_val; i_val++)
-        tokens_list[i_val] = (uint16_t)i_val;
+    for (int value_index_val = 0; value_index_val < count_val; value_index_val++)
+        tokens_list[value_index_val] = (uint16_t)value_index_val;
     FILE *file_ptr = fopen(path_val.c_str(), "wb");
     assert(file_ptr != nullptr && "cannot write a test file in this folder");
     fwrite(header_list, sizeof(int), TOKEN_FILE_HEADER_INTS, file_ptr);

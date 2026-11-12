@@ -50,15 +50,15 @@ static void time_20_norms(const char *test_ptr, const std::vector<Shape> &param_
     int num_params_val = (int)param_shapes_list.size();
     // [ grads | block sums: 2 x GRAD_NORM_BLOCKS | grad_norm: 1 ]
     TensorBuffer buffer_val;
-    int grads_group_val = buffer_val.add_many(param_shapes_list);
+    int grads_group_index_val = buffer_val.add_many(param_shapes_list);
     int block_sums_index_val = buffer_val.add({2, GRAD_NORM_BLOCKS});  // row 0: block sums; row 1, value 0: blocks done
     int grad_norm_index_val = buffer_val.add({1});
     buffer_val.allocate();
-    const Tensor &grads_tensor = buffer_val.group(grads_group_val); // every gradient, one flat view
+    const Tensor &grads_tensor = buffer_val.group(grads_group_index_val); // every gradient, one flat view
     grads_tensor.normal_(0.0f, 1.0f);                                // made on the CPU: a few seconds
     std::vector<torch::Tensor> pytorch_grads_list;
     for (int param_index_val = 0; param_index_val < num_params_val; param_index_val++)
-        pytorch_grads_list.push_back(pytorch_copy_of(buffer_val.tensor(grads_group_val, param_index_val)));
+        pytorch_grads_list.push_back(pytorch_copy_of(buffer_val.tensor(grads_group_index_val, param_index_val)));
     GradNorm grad_norm_kernel_val(buffer_val.tensor(block_sums_index_val));
     const Tensor &grad_norm_tensor = buffer_val.tensor(grad_norm_index_val);
     torch::Tensor per_tensor_norm_tensor;
@@ -72,7 +72,7 @@ static void time_20_norms(const char *test_ptr, const std::vector<Shape> &param_
     double my_total_val = 0.0;
     double per_tensor_total_val = 0.0;
     double foreach_total_val = 0.0;
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float my_ms_val = gpu_milliseconds([&] { grad_norm_kernel_val.compute(grads_tensor, grad_norm_tensor); });
         float per_tensor_ms_val = gpu_milliseconds([&] {
@@ -85,9 +85,9 @@ static void time_20_norms(const char *test_ptr, const std::vector<Shape> &param_
             std::vector<torch::Tensor> norms_list = at::_foreach_norm(pytorch_grads_list);
             foreach_norm_tensor = torch::stack(norms_list).norm();
         });
-        printf("                               %4d   %11.3f   %18.3f   %15.3f\n", step_val, my_ms_val, per_tensor_ms_val,
+        printf("                               %4d   %11.3f   %18.3f   %15.3f\n", step_index_val, my_ms_val, per_tensor_ms_val,
                foreach_ms_val);
-        if (step_val == 1)
+        if (step_index_val == 1)
             continue;
         my_total_val += my_ms_val;
         per_tensor_total_val += per_tensor_ms_val;
@@ -115,7 +115,7 @@ static void time_20_norms(const char *test_ptr, const std::vector<Shape> &param_
 static std::vector<Shape> gpt2_small_param_shapes(void)
 {
     std::vector<Shape> shapes_list = {{50257, 768}, {1024, 768}}; // wte, wpe
-    for (int layer_val = 0; layer_val < 12; layer_val++)
+    for (int layer_index_val = 0; layer_index_val < 12; layer_index_val++)
     {
         std::vector<Shape> layer_shapes_list = {
             {768}, {768},         // ln1w, ln1b
@@ -217,18 +217,18 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;             // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe; 2 x sms is within block_sums' 4096
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     int block_counts_list[] = {40, 80, 160, 320, 512, 1024, 2048, largest_blocks_val, sms_val, 2 * sms_val};
-    int thread_counts_list[] = {4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    int thread_counts_list[] = {4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     const int thread_count_choices_val = 4;
     const int launches_val = 10 * thread_count_choices_val;
     float total_ms_list[launches_val][2] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]; [0] float, [1] bf16
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val][0] += gpu_milliseconds(norm_val);
-            total_ms_list[launch_val][1] += gpu_milliseconds(norm_bf16_val);
+            blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val][0] += gpu_milliseconds(norm_val);
+            total_ms_list[launch_index_val][1] += gpu_milliseconds(norm_bf16_val);
         }
     }
 
@@ -239,14 +239,14 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int launches_with_the_same_result_val = 0;
     print_test_name(__func__);
     printf("    time in ms:   blocks   threads   float4s per thread    float    GB/s     bf16    GB/s   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
+        blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
         float times_list[2];
         for (int dtype_index_val = 0; dtype_index_val < 2; dtype_index_val++)
         {
-            times_list[dtype_index_val] = total_ms_list[launch_val][dtype_index_val] / SWEEP_ROUNDS;
+            times_list[dtype_index_val] = total_ms_list[launch_index_val][dtype_index_val] / SWEEP_ROUNDS;
             if (times_list[dtype_index_val] < fastest_ms_list[dtype_index_val])
             {
                 fastest_ms_list[dtype_index_val] = times_list[dtype_index_val];

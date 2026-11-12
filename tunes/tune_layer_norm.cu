@@ -65,7 +65,7 @@ static void time_20_steps_on_gpt2_small_size(void)
     print_test_name(__func__);
     printf("    time in ms:   step   my forward   my backward   PyTorch forward   PyTorch backward\n");
     double totals_list[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float times_list[4];
         times_list[0] = gpu_milliseconds([&] {
@@ -80,12 +80,12 @@ static void time_20_steps_on_gpt2_small_size(void)
                                                       pytorch_bias_tensor, 1e-5);
         });
         times_list[3] = gpu_milliseconds([&] { pytorch_output_tensor.backward(pytorch_output_grad_tensor); });
-        printf("                  %4d   %10.3f   %11.3f   %15.3f   %16.3f\n", step_val, times_list[0], times_list[1],
+        printf("                  %4d   %10.3f   %11.3f   %15.3f   %16.3f\n", step_index_val, times_list[0], times_list[1],
                times_list[2], times_list[3]);
-        if (step_val <= WARM_UP_STEPS)
+        if (step_index_val <= WARM_UP_STEPS)
             continue;
-        for (int column_val = 0; column_val < 4; column_val++)
-            totals_list[column_val] += times_list[column_val];
+        for (int column_index_val = 0; column_index_val < 4; column_index_val++)
+            totals_list[column_index_val] += times_list[column_index_val];
     }
 
     // 3. print the averages
@@ -117,9 +117,9 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     // launch timed would get the fastest clock); taking turns gives every launch runs from early, middle and
     // late alike. Run 1 is counted too: warm_up_gpu has already done the first-time work. The kernels are
     // launched here directly, <<<blocks, threads>>>, instead of through layer_norm_forward and
-    // layer_norm_backward, which always launch 256 x 512 and 80 x 512 (a T4's sweep picked 256 x 512 and
-    // 40 x 512, before them 512 x 256 and 128 x 512; an H100 PCIe's, 80 x 512 for the backward). Not 1024
-    // threads: since the kernels
+    // layer_norm_backward, which launch 512 x 256 and 80 x 512 on these 4,096 rows (a T4's sweep picked
+    // 256 x 512 and 40 x 512, before them 512 x 256 and 128 x 512; an H100 PCIe's, 80 x 512 for the backward
+    // and, on 2026-11-07, 8 warps a block for the forward). Not 1024 threads: since the kernels
     // became templates for bfloat16, each takes 66 registers per thread, and a block of 1024 may have
     // 65,536 / 1024 = 64 (cudaFuncGetAttributes: largest block 896). Held to 64, the backward spilled 8
     // bytes; and blocks of 1024 were never the fastest here. A bfloat16 row is 1.5 KB instead of 3 KB, so
@@ -188,7 +188,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     torch::Tensor usual_input_grad_bf16_tensor = pytorch_copy_of(input_grad_bf16_tensor.to(DType::Float32));
 
     // what layer_norm_forward and layer_norm_backward launch, worked out as they do: 256 and 80 blocks
-    int forward_warps_per_block_val = LAYER_NORM_THREADS_PER_BLOCK / THREADS_PER_WARP;
+    int forward_warps_per_block_val = LAYER_NORM_THREADS_PER_BLOCK / HARDWARE_THREADS_PER_WARP;
     int usual_forward_blocks_val = (int)CEIL_DIV(rows_val, (size_t)forward_warps_per_block_val);
     int usual_backward_blocks_val = LAYER_NORM_BACKWARD_BLOCKS;
 
@@ -232,21 +232,21 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;                                         // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     int block_counts_list[] = {40, 80, 128, 256, 512, 1024, 2048, 4096, sms_val, 2 * sms_val};
-    int thread_counts_list[] = {2 * THREADS_PER_WARP, 4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP};
+    int thread_counts_list[] = {2 * HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP};
     const int thread_count_choices_val = 4;
     const int launches_val = 10 * thread_count_choices_val;
     // launch k is block_counts[k / 4] x thread_counts[k % 4]; one time per kernel, in kernel_names' order
     float total_ms_list[launches_val][4] = {};
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val][0] += gpu_milliseconds(forward_val);
-            total_ms_list[launch_val][1] += gpu_milliseconds(backward_val);
-            total_ms_list[launch_val][2] += gpu_milliseconds(forward_bf16_val);
-            total_ms_list[launch_val][3] += gpu_milliseconds(backward_bf16_val);
+            blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val][0] += gpu_milliseconds(forward_val);
+            total_ms_list[launch_index_val][1] += gpu_milliseconds(backward_val);
+            total_ms_list[launch_index_val][2] += gpu_milliseconds(forward_bf16_val);
+            total_ms_list[launch_index_val][3] += gpu_milliseconds(backward_bf16_val);
         }
     }
 
@@ -264,14 +264,14 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
     print_test_name(__func__);
     printf("    time in ms:   blocks   threads    warps   rows per warp   forward   backward   bf16 forward   "
            "bf16 backward   bf16 grad error   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
+        blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
         float times_list[4];
         for (int kernel_index_val = 0; kernel_index_val < 4; kernel_index_val++)
         {
-            times_list[kernel_index_val] = total_ms_list[launch_val][kernel_index_val] / SWEEP_ROUNDS;
+            times_list[kernel_index_val] = total_ms_list[launch_index_val][kernel_index_val] / SWEEP_ROUNDS;
             if (times_list[kernel_index_val] < fastest_ms_list[kernel_index_val])
             {
                 fastest_ms_list[kernel_index_val] = times_list[kernel_index_val];
@@ -308,7 +308,7 @@ static void time_each_kernel_with_other_block_and_thread_counts(void)
             std::max(difference_val(pytorch_copy_of(weight_grad_bf16_tensor.to(DType::Float32)), usual_weight_grad_tensor),
                      difference_val(pytorch_copy_of(bias_grad_bf16_tensor.to(DType::Float32)), usual_bias_grad_tensor));
 
-        int warps_val = blocks_val * threads_val / THREADS_PER_WARP;
+        int warps_val = blocks_val * threads_val / HARDWARE_THREADS_PER_WARP;
         int rows_per_warp_val = (int)CEIL_DIV(rows_val, (size_t)warps_val);    // the most any warp takes
         const char *usual_ptr = "";
         if (blocks_val == usual_forward_blocks_val && threads_val == LAYER_NORM_THREADS_PER_BLOCK)

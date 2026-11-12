@@ -25,12 +25,15 @@ static const double BFLOAT16_TOLERANCE = 5e-2;
 #define GPT2_PADDED_VOCAB_SIZE 50304  // wte's rows
 #define GPT2_EMBED_DIM 768            // its row width
 
-// A small model whose sizes no warp or square divides: seq_len 37, 100 words padded to 128, rows of 64.
+// A small model with part-full edges: 3 rows of SMALL_SEQ_LEN = 96 tokens (288, which no 128-row square divides),
+// 100 words padded to 128, rows of 64. One head of 64 and seq_len a multiple of 32: float attention is flash
+// attention, which takes only those.
+#define SMALL_SEQ_LEN 96
 static GPT2Config small_config()
 {
     GPT2Config config_val;
-    config_val.max_seq_len = 64, config_val.vocab_size = 100, config_val.padded_vocab_size = 128;
-    config_val.num_layers = 2, config_val.num_heads = 4, config_val.embed_dim = 64;
+    config_val.max_seq_len = SMALL_SEQ_LEN, config_val.vocab_size = 100, config_val.padded_vocab_size = 128;
+    config_val.num_layers = 2, config_val.num_heads = 1, config_val.embed_dim = 64;
     return config_val;
 }
 
@@ -54,12 +57,12 @@ static const char *BLOCK_PARAM_NAMES[BLOCK_PARAMS] = {
 static std::vector<std::string> param_names(const GPT2Config &config_val)
 {
     std::vector<std::string> names_list = {"wte", "wpe"};
-    for (size_t layer_val = 0; layer_val < config_val.num_layers; layer_val++)
+    for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
         for (int param_index_val = 0; param_index_val < BLOCK_MATRICES; param_index_val++)
-            names_list.push_back("block " + std::to_string(layer_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
-    for (size_t layer_val = 0; layer_val < config_val.num_layers; layer_val++)
+            names_list.push_back("block " + std::to_string(layer_index_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
+    for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
         for (int param_index_val = BLOCK_MATRICES; param_index_val < BLOCK_PARAMS; param_index_val++)
-            names_list.push_back("block " + std::to_string(layer_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
+            names_list.push_back("block " + std::to_string(layer_index_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
     names_list.push_back("lnf_weight");
     names_list.push_back("lnf_bias");
     return names_list;
@@ -154,15 +157,15 @@ struct GPT2Tensors
           scratch_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val)
     {
         // 1. the parameters and their gradients, in a TensorBuffer each
-        int group_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
+        int group_index_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
         param_buffer_val.allocate(dtype_val);
         grad_buffer_val = TensorBuffer::zeros_like(param_buffer_val);
         std::vector<Tensor> param_tensors_list;
         std::vector<Tensor> grad_tensors_list;
-        for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_val); param_index_val++)
+        for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_index_val); param_index_val++)
         {
-            param_tensors_list.push_back(param_buffer_val.tensor(group_val, param_index_val));
-            grad_tensors_list.push_back(grad_buffer_val.tensor(group_val, param_index_val));
+            param_tensors_list.push_back(param_buffer_val.tensor(group_index_val, param_index_val));
+            grad_tensors_list.push_back(grad_buffer_val.tensor(group_index_val, param_index_val));
         }
         params_val = GPT2Params(param_tensors_list, config_val);
         grads_val = GPT2Params(grad_tensors_list, config_val);
@@ -257,13 +260,13 @@ static torch::Tensor pytorch_gpt2_logits(const torch::Tensor &token_ids_tensor, 
     int64_t seq_len_val = token_ids_tensor.size(1);
     torch::Tensor x_tensor = torch::embedding(p_list[0], token_ids_tensor) + p_list[1].narrow(0, 0, seq_len_val);
     // 2. the blocks, each's 12 gathered as GPT2Params does
-    for (int64_t layer_val = 0; layer_val < num_layers_val; layer_val++)
+    for (int64_t layer_index_val = 0; layer_index_val < num_layers_val; layer_index_val++)
     {
         std::vector<torch::Tensor> block_list;
         for (int64_t param_index_val = 0; param_index_val < BLOCK_MATRICES; param_index_val++)
-            block_list.push_back(p_list[2 + BLOCK_MATRICES * layer_val + param_index_val]);
+            block_list.push_back(p_list[2 + BLOCK_MATRICES * layer_index_val + param_index_val]);
         for (int64_t param_index_val = 0; param_index_val < BLOCK_PARAMS - BLOCK_MATRICES; param_index_val++)
-            block_list.push_back(p_list[2 + BLOCK_MATRICES * num_layers_val + (BLOCK_PARAMS - BLOCK_MATRICES) * layer_val +
+            block_list.push_back(p_list[2 + BLOCK_MATRICES * num_layers_val + (BLOCK_PARAMS - BLOCK_MATRICES) * layer_index_val +
                                         param_index_val]);
         x_tensor = pytorch_block_forward(x_tensor, block_list, (int64_t)config_val.num_heads);
     }
@@ -334,9 +337,9 @@ static void forward_and_backward_match_pytorch(const char *test_ptr, const GPT2C
 
 static void matches_pytorch_with_small_odd_sizes(void)
 {
-    // Expect: small_config's model on {3, 37}: a seq_len no warp or square divides, 100 words padded to 128.
+    // Expect: small_config's model on {3, 96}: 288 rows no 128-row square divides, 100 words padded to 128.
     // The loss, the logits and all 28 parameter gradients the same as PyTorch's within 1e-4, in float.
-    forward_and_backward_match_pytorch(__func__, small_config(), 3, 37, DType::Float32, TOLERANCE);
+    forward_and_backward_match_pytorch(__func__, small_config(), 3, SMALL_SEQ_LEN, DType::Float32, TOLERANCE);
 }
 
 static void matches_pytorch_on_gpt2_widths(void)
@@ -376,20 +379,20 @@ static void shapes_are_gpt2s_with_the_matrices_first(void)
     // 2. where the matrices end and the vectors start, and the values each holds
     size_t matrix_values_val = 0;
     size_t vector_values_val = 0;
-    size_t last_matrix_val = 0;
-    size_t first_vector_val = shapes_list.size();
+    size_t last_matrix_index_val = 0;
+    size_t first_vector_index_val = shapes_list.size();
     for (size_t param_index_val = 0; param_index_val < shapes_list.size(); param_index_val++)
     {
         size_t numel_val = 1;
         for (size_t size_val : shapes_list[param_index_val])
             numel_val *= size_val;
         if (shapes_list[param_index_val].size() == 2)
-            matrix_values_val += numel_val, last_matrix_val = param_index_val;
+            matrix_values_val += numel_val, last_matrix_index_val = param_index_val;
         else
-            vector_values_val += numel_val, first_vector_val = std::min(first_vector_val, param_index_val);
+            vector_values_val += numel_val, first_vector_index_val = std::min(first_vector_index_val, param_index_val);
     }
-    ASSERT_EQ(last_matrix_val, (size_t)49);
-    ASSERT_EQ(first_vector_val, (size_t)50);
+    ASSERT_EQ(last_matrix_index_val, (size_t)49);
+    ASSERT_EQ(first_vector_index_val, (size_t)50);
     ASSERT_EQ(matrix_values_val, (size_t)124354560);
     ASSERT_EQ(vector_values_val, (size_t)121344);
     ASSERT_EQ(matrix_values_val + vector_values_val, (size_t)124475904);
@@ -463,13 +466,13 @@ static void zero_wte_gives_every_word_the_same_chance(void)
     // log(100) - 0 = 4.6051702, and so is the mean, within 1e-6.
     // 1. random values, wte 0; a forward
     torch::manual_seed(0);
-    GPT2Tensors mine_val(small_config(), 3, 37);
+    GPT2Tensors mine_val(small_config(), 3, SMALL_SEQ_LEN);
     mine_val.fill_random_values();
     mine_val.params_val.wte.zero_();
     mine_val.forward();
     // 2. check
-    ASSERT_EQ(list_of(mine_val.activations_val.logits), std::vector<float>(3 * 37 * 128, 0.0f));
-    ASSERT_NEAR(list_of(mine_val.activations_val.losses), std::vector<float>(3 * 37, 4.6051702f), 1e-6);
+    ASSERT_EQ(list_of(mine_val.activations_val.logits), std::vector<float>(3 * SMALL_SEQ_LEN * 128, 0.0f));
+    ASSERT_NEAR(list_of(mine_val.activations_val.losses), std::vector<float>(3 * SMALL_SEQ_LEN, 4.6051702f), 1e-6);
     ASSERT_NEAR((double)gpt2_mean_loss(mine_val.activations_val), 4.6051702, 1e-6);
 }
 
@@ -480,7 +483,7 @@ static void padding_rows_never_change_the_loss_or_learn(void)
     // changes no row's loss, to the last bit: each word's logit uses only its own row of wte.
     // 1. a forward and a backward: the padding rows' gradient 0
     torch::manual_seed(0);
-    GPT2Tensors mine_val(small_config(), 3, 37);
+    GPT2Tensors mine_val(small_config(), 3, SMALL_SEQ_LEN);
     mine_val.fill_random_values();
     mine_val.forward();
     mine_val.backward();
@@ -499,7 +502,7 @@ static void backward_adds_onto_the_param_grads(void)
     // order).
     // 1. a forward and one backward; its gradients kept
     torch::manual_seed(0);
-    GPT2Tensors mine_val(small_config(), 3, 37);
+    GPT2Tensors mine_val(small_config(), 3, SMALL_SEQ_LEN);
     mine_val.fill_random_values();
     mine_val.forward();
     mine_val.backward();
@@ -527,7 +530,7 @@ static void micro_batches_divide_each_gradient(void)
     // 1. a forward and a backward for 1 micro-batch; its gradients kept
     const int micro_batches_val = 4;
     torch::manual_seed(0);
-    GPT2Tensors mine_val(small_config(), 3, 37);
+    GPT2Tensors mine_val(small_config(), 3, SMALL_SEQ_LEN);
     mine_val.fill_random_values();
     mine_val.forward();
     mine_val.backward();

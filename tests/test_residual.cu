@@ -275,10 +275,10 @@ static void every_kernel_fits_its_block(void)
 static void any_block_size_gives_the_same_bits(void)
 {
     // Expect: residual_forward and residual_backward called with threads_per_block 32, 128, 512 and 1024
-    // (one warp up to MAX_THREADS_PER_BLOCK) give the same output and gradients as with the default,
+    // (one warp up to HARDWARE_MAX_THREADS_PER_BLOCK) give the same output and gradients as with the default,
     // RESIDUAL_THREADS_PER_BLOCK, to the last bit, in float and in bfloat16: each value is one add or one copy,
     // the same whichever thread does it. {3, 7, 100}: 525 float4s, so every size has a part-full last block.
-    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     DType dtypes_list[] = {DType::Float32, DType::BFloat16};
     for (DType dtype_val : dtypes_list)
     {

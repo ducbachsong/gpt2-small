@@ -346,12 +346,12 @@ static void every_kernel_fits_a_block_of_encoder_threads(void)
 static void any_block_size_gives_the_same_result(void)
 {
     // Expect: encoder_forward and encoder_backward called with threads_per_block 32, 128, 512 and 1024 (one
-    // warp up to MAX_THREADS_PER_BLOCK) give the same result as with the defaults, ENCODER_FORWARD_THREADS
+    // warp up to HARDWARE_MAX_THREADS_PER_BLOCK) give the same result as with the defaults, ENCODER_FORWARD_THREADS
     // and ENCODER_THREADS, in float and in bfloat16: encoded and wpe_grad to the last bit (each value worked
     // out alone, wpe_grad's batch rows added in order), wte_grad within TOLERANCE (BFLOAT16_TOLERANCE in
     // bfloat16): its atomic adds onto a repeated token's row can land in another order, as from run to run.
     // The tiny encoder of part 1, ids from 0 .. 15 so most tokens repeat.
-    const int block_sizes_list[] = {THREADS_PER_WARP, 4 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     DType dtypes_list[] = {DType::Float32, DType::BFloat16};
     for (DType dtype_val : dtypes_list)
     {

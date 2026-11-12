@@ -27,8 +27,8 @@
 static std::vector<int> count_up(int first_val, int count_val)
 {
     std::vector<int> values_list(count_val);
-    for (int i_val = 0; i_val < count_val; i_val++)
-        values_list[i_val] = first_val + i_val;
+    for (int value_index_val = 0; value_index_val < count_val; value_index_val++)
+        values_list[value_index_val] = first_val + value_index_val;
     return values_list;
 }
 
@@ -359,12 +359,12 @@ static void a_file_of_exactly_one_batch_gives_it_every_time(void)
     DataLoader loader_val("test_dataloader_one.bin", 2, 4);
     Batch batch_val;
     // 2. three batches, each the same, each a new epoch
-    for (int epoch_val = 2; epoch_val <= 4; epoch_val++)
+    for (int epoch_index_val = 2; epoch_index_val <= 4; epoch_index_val++)
     {
         batch_val.next_from(loader_val);
         ASSERT_EQ(batch_val.ids(), count_up(0, BATCH_TOKENS));
         ASSERT_EQ(batch_val.targets(), count_up(1, BATCH_TOKENS));
-        ASSERT_EQ(loader_val.epoch(), epoch_val);
+        ASSERT_EQ(loader_val.epoch(), epoch_index_val);
     }
 }
 
@@ -404,17 +404,17 @@ static void ranks_take_turns_batch_by_batch(void)
     int rank1_first_list[3] = {8, 24, 8};
     size_t positions_after_list[3] = {16, 0, 16};
     int epochs_after_list[3] = {1, 2, 2};
-    for (int round_val = 0; round_val < 3; round_val++)
+    for (int round_index_val = 0; round_index_val < 3; round_index_val++)
     {
         batch_val.next_from(rank0_val);
-        ASSERT_EQ(batch_val.ids(), count_up(rank0_first_list[round_val], BATCH_TOKENS));
-        ASSERT_EQ(batch_val.targets(), count_up(rank0_first_list[round_val] + 1, BATCH_TOKENS));
+        ASSERT_EQ(batch_val.ids(), count_up(rank0_first_list[round_index_val], BATCH_TOKENS));
+        ASSERT_EQ(batch_val.targets(), count_up(rank0_first_list[round_index_val] + 1, BATCH_TOKENS));
         batch_val.next_from(rank1_val);
-        ASSERT_EQ(batch_val.ids(), count_up(rank1_first_list[round_val], BATCH_TOKENS));
-        ASSERT_EQ(batch_val.targets(), count_up(rank1_first_list[round_val] + 1, BATCH_TOKENS));
-        ASSERT_EQ(rank0_val.position(), positions_after_list[round_val]);
-        ASSERT_EQ(rank1_val.position(), positions_after_list[round_val]);
-        ASSERT_EQ(rank1_val.epoch(), epochs_after_list[round_val]);
+        ASSERT_EQ(batch_val.ids(), count_up(rank1_first_list[round_index_val], BATCH_TOKENS));
+        ASSERT_EQ(batch_val.targets(), count_up(rank1_first_list[round_index_val] + 1, BATCH_TOKENS));
+        ASSERT_EQ(rank0_val.position(), positions_after_list[round_index_val]);
+        ASSERT_EQ(rank1_val.position(), positions_after_list[round_index_val]);
+        ASSERT_EQ(rank1_val.epoch(), epochs_after_list[round_index_val]);
     }
 }
 

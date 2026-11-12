@@ -14,9 +14,9 @@
 
 #include <algorithm>
 #include "tensor_buffer.cuh"
-#include "kernels/adamw.cuh"
-#include "kernels/adamw_bf16.cuh"
-#include "kernels/adamw_8bit.cuh"
+#include "kernels/fp32/adamw.cuh"
+#include "kernels/bf16/adamw_bf16.cuh"
+#include "kernels/8bit/adamw_8bit.cuh"
 
 // ══ Optimizer: what every algorithm needs ═════════════════════════════════════
 

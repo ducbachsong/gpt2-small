@@ -1,14 +1,14 @@
-// tune_linear.cu — the timings of tests/test_linear.cu, moved here so the tests only check numbers:
+// tune_linear.cu — the timings of tests/fp32/test_linear.cu, moved here so the tests only check numbers:
 // time_20_steps_on_qkv, time_20_steps_on_attention_output, time_20_steps_on_mlp_up, time_20_steps_on_mlp_down,
 // time_20_steps_on_head.
 //
-// Built as tests/test_linear.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_linear.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/linear_<date>_<time>.txt.
 #include <torch/types.h>              // torch::linear, torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/kernels/linear.cuh"
+#include "../llmc/kernels/fp32/linear.cuh"
 
 static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a fraction of the largest value
 
@@ -74,7 +74,7 @@ static void time_20_steps(const char *test_ptr, size_t in_features_val, size_t o
     //    in step 1 CUDA loads each side's kernels; in step 2 PyTorch's backward first adds onto the .grad that
     //    step 1 made
     double totals_list[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float times_list[4];
         times_list[0] = gpu_milliseconds([&] { linear_forward(output_tensor, input_tensor, weight_tensor, bias_tensor); });
@@ -89,10 +89,10 @@ static void time_20_steps(const char *test_ptr, size_t in_features_val, size_t o
         });
         pytorch_input_tensor.mutable_grad() = torch::Tensor(); // input's gradient written, as mine, not added onto
         times_list[3] = gpu_milliseconds([&] { pytorch_output_tensor.backward(pytorch_output_grad_tensor); });
-        if (step_val <= WARM_UP_STEPS)
+        if (step_index_val <= WARM_UP_STEPS)
             continue;
-        for (int column_val = 0; column_val < 4; column_val++)
-            totals_list[column_val] += times_list[column_val];
+        for (int column_index_val = 0; column_index_val < 4; column_index_val++)
+            totals_list[column_index_val] += times_list[column_index_val];
     }
 
     // 3. print the averages and TFLOPS

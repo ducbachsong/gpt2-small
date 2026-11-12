@@ -1,7 +1,7 @@
-// tune_adamw_8bit.cu — the timings of tests/test_adamw_8bit.cu, moved here so the tests only check numbers:
+// tune_adamw_8bit.cu — the timings of tests/8bit/test_adamw_8bit.cu, moved here so the tests only check numbers:
 // time_the_three_adamws_on_gpt2_small_size, time_the_kernel_with_other_block_and_thread_counts.
 //
-// Built as tests/test_adamw_8bit.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/8bit/test_adamw_8bit.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/adamw_8bit_<date>_<time>.txt.
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls
@@ -11,7 +11,7 @@
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
 #include "../llmc/optimizer.cuh"            // AdamWConfig; adamw_update and adamw_update_bf16, timed against
-#include "../llmc/kernels/adamw_8bit.cuh"   // adamw_update_8bit
+#include "../llmc/kernels/8bit/adamw_8bit.cuh"   // adamw_update_8bit
 
 #define GPT2_PARAMS 124439808         // GPT-2 small's values
 #define GPT2_DECAYED_PARAMS 124439040 // of them in matrices
@@ -144,11 +144,11 @@ static void time_the_three_adamws_on_gpt2_small_size(void)
     print_test_name(__func__);
     printf("    average of %d updates; this GPU's peak memory bandwidth %.0f GB/s\n", TIMED_STEPS, peak_val);
     printf("    AdamW            bytes a value   time ms     GB/s    MBU\n");
-    for (int k_val = 0; k_val < 3; k_val++)
+    for (int side_index_val = 0; side_index_val < 3; side_index_val++)
     {
-        double milliseconds_val = totals_list[k_val] / TIMED_STEPS;
-        double speed_val = gigabytes_per_second((double)count_val * bytes_per_value_list[k_val], milliseconds_val);
-        printf("    %-16s %13d   %7.3f   %6.0f   %3.0f%%\n", names_list[k_val], bytes_per_value_list[k_val],
+        double milliseconds_val = totals_list[side_index_val] / TIMED_STEPS;
+        double speed_val = gigabytes_per_second((double)count_val * bytes_per_value_list[side_index_val], milliseconds_val);
+        printf("    %-16s %13d   %7.3f   %6.0f   %3.0f%%\n", names_list[side_index_val], bytes_per_value_list[side_index_val],
                milliseconds_val, speed_val, 100.0 * speed_val / peak_val);
     }
 }
@@ -167,7 +167,7 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
 {
     // Prints the time of one update on as many values as GPT-2 small has, 124,439,808 (the matrices'
     // 124,439,040 decayed, then 768), as training would run it: bfloat16 params and grads, a float master, m
-    // and sqrt(v) in 8 bits. 9 block counts x 4 thread counts (all multiples of THREADS_PER_WARP, as the kernel needs), each
+    // and sqrt(v) in 8 bits. 9 block counts x 4 thread counts (all multiples of HARDWARE_THREADS_PER_WARP, as the kernel needs), each
     // the average of 20 runs: the 7 picked on a T4, then this GPU's SM count x 1 and x 2 (114 and 228 on an
     // H100 PCIe). The 36 launches take turns over 20 rounds, so each gets runs from early, middle and late
     // alike. The kernel is launched directly, <<<blocks, threads>>>; adamw_update_8bit launches one float4 per
@@ -177,7 +177,7 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     //
     // Each run changes the master, p, m, sqrt(v) and the scales, so before each check they are put back: the
     // master and p from kept copies, the rest to 0. Expect: every launch gives the same master, p, bytes and
-    // scales as the usual one, to the last bit: a warp always takes THREADS_PER_WARP float4s in a row, one scale, whatever
+    // scales as the usual one, to the last bit: a warp always takes HARDWARE_THREADS_PER_WARP float4s in a row, one scale, whatever
     // the launch.
 
     // 1. GPT-2 small's number of values: a random float master and gradients, the model's in bfloat16
@@ -238,17 +238,17 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;                                         // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     int block_counts_list[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks_val, sms_val, 2 * sms_val};
-    int thread_counts_list[] = {4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    int thread_counts_list[] = {4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     const int thread_count_choices_val = 4;
     const int launches_val = 9 * thread_count_choices_val;
     float total_ms_list[launches_val] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val] += gpu_milliseconds(update_val);
+            blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val] += gpu_milliseconds(update_val);
         }
     }
 
@@ -262,11 +262,11 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     print_test_name(__func__);
     printf("    this GPU's peak memory bandwidth %.0f GB/s\n", peak_val);
     printf("    time in ms:   blocks   threads   float4s per thread     time     GB/s    MBU   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-        float time_val = total_ms_list[launch_val] / SWEEP_ROUNDS;
+        blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+        float time_val = total_ms_list[launch_index_val] / SWEEP_ROUNDS;
         if (time_val < fastest_ms_val)
         {
             fastest_ms_val = time_val;

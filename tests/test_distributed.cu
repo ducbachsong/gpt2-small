@@ -22,8 +22,8 @@
 static std::vector<float> values_from(float first_val, float step_val, size_t count_val)
 {
     std::vector<float> values_list(count_val);
-    for (size_t i_val = 0; i_val < count_val; i_val++)
-        values_list[i_val] = first_val + step_val * i_val;
+    for (size_t value_index_val = 0; value_index_val < count_val; value_index_val++)
+        values_list[value_index_val] = first_val + step_val * value_index_val;
     return values_list;
 }
 
@@ -44,14 +44,14 @@ static void reduce_scatter_mean_averages_each_ranks_slice(const Distributed &dis
     // slice (values 4 r .. 4 r + 3) holds that mean; its other values are its own, as before. With 2 ranks:
     // rank 0 {0, ..., 7} becomes {1, 2, 3, 4, 4, 5, 6, 7}, rank 1 {2, ..., 9} becomes {2, 3, 4, 5, 5, 6, 7, 8}.
     // 1. this rank's values, and what they should become
-    int r_val = distributed_val.rank();
+    int rank_index_val = distributed_val.rank();
     int n_val = distributed_val.world_size();
     std::vector<float> values_list(SLICE_VALUES * n_val), expected_list(SLICE_VALUES * n_val);
-    for (int i_val = 0; i_val < SLICE_VALUES * n_val; i_val++)
+    for (int value_index_val = 0; value_index_val < SLICE_VALUES * n_val; value_index_val++)
     {
-        values_list[i_val] = 2.0f * r_val + (i_val % 8);
-        bool in_own_slice_val = i_val >= SLICE_VALUES * r_val && i_val < SLICE_VALUES * (r_val + 1);
-        expected_list[i_val] = in_own_slice_val ? (n_val - 1.0f) + (i_val % 8) : values_list[i_val];
+        values_list[value_index_val] = 2.0f * rank_index_val + (value_index_val % 8);
+        bool in_own_slice_val = value_index_val >= SLICE_VALUES * rank_index_val && value_index_val < SLICE_VALUES * (rank_index_val + 1);
+        expected_list[value_index_val] = in_own_slice_val ? (n_val - 1.0f) + (value_index_val % 8) : values_list[value_index_val];
     }
     // 2. reduce_scatter_mean
     Tensor flat_tensor = tensor_of(values_list, dtype_val);
@@ -65,14 +65,14 @@ static void all_gather_gives_every_rank_every_slice(const Distributed &distribut
     // Expect: N ranks, 4 N values each, all -1 but rank r's own slice, 10 r + j for j = 0 .. 3. After all_gather
     // every rank holds every slice: {0, 1, 2, 3, 10, 11, 12, 13, ...}.
     // 1. this rank's values: its own slice, -1 elsewhere; and every slice, expected
-    int r_val = distributed_val.rank();
+    int rank_index_val = distributed_val.rank();
     int n_val = distributed_val.world_size();
     std::vector<float> values_list(SLICE_VALUES * n_val, -1.0f), expected_list(SLICE_VALUES * n_val);
-    for (int slice_val = 0; slice_val < n_val; slice_val++)
-        for (int j_val = 0; j_val < SLICE_VALUES; j_val++)
-            expected_list[SLICE_VALUES * slice_val + j_val] = 10.0f * slice_val + j_val;
-    for (int j_val = 0; j_val < SLICE_VALUES; j_val++)
-        values_list[SLICE_VALUES * r_val + j_val] = expected_list[SLICE_VALUES * r_val + j_val];
+    for (int slice_index_val = 0; slice_index_val < n_val; slice_index_val++)
+        for (int value_index_val = 0; value_index_val < SLICE_VALUES; value_index_val++)
+            expected_list[SLICE_VALUES * slice_index_val + value_index_val] = 10.0f * slice_index_val + value_index_val;
+    for (int value_index_val = 0; value_index_val < SLICE_VALUES; value_index_val++)
+        values_list[SLICE_VALUES * rank_index_val + value_index_val] = expected_list[SLICE_VALUES * rank_index_val + value_index_val];
     // 2. all_gather
     Tensor flat_tensor = tensor_of(values_list, dtype_val);
     distributed_val.all_gather(flat_tensor);
@@ -85,12 +85,12 @@ static void slice_norms_add_up_to_the_norm_of_all(const Distributed &distributed
     // Expect: rank r's norm is r + 1, the norm of a slice; together sqrt(1² + 2² + ... + N²). With 2 ranks
     // sqrt(5) = 2.2360680, with 8 sqrt(204) = 14.2828569; on every rank.
     // 1. this rank's norm, and the norm of all, worked out
-    int r_val = distributed_val.rank();
+    int rank_index_val = distributed_val.rank();
     int n_val = distributed_val.world_size();
-    float norm_value_val = r_val + 1.0f;
+    float norm_value_val = rank_index_val + 1.0f;
     float sum_squares_val = 0.0f;
-    for (int rank_val = 0; rank_val < n_val; rank_val++)
-        sum_squares_val += (rank_val + 1.0f) * (rank_val + 1.0f);
+    for (int other_rank_index_val = 0; other_rank_index_val < n_val; other_rank_index_val++)
+        sum_squares_val += (other_rank_index_val + 1.0f) * (other_rank_index_val + 1.0f);
     // 2. slice_norms_to_norm
     Tensor norm_tensor = Tensor::zeros({1});
     norm_tensor.copy_from_cpu(&norm_value_val);
@@ -102,9 +102,9 @@ static void slice_norms_add_up_to_the_norm_of_all(const Distributed &distributed
 static void mean_of_cpu_value_averages_a_number_over_the_ranks(const Distributed &distributed_val)
 {
     // Expect: rank r gives r; every rank gets (0 + 1 + ... + N - 1) / N = (N - 1) / 2: 0.5 with 2 ranks.
-    int r_val = distributed_val.rank();
+    int rank_index_val = distributed_val.rank();
     int n_val = distributed_val.world_size();
-    ASSERT_NEAR(distributed_val.mean_of_cpu_value((float)r_val), (n_val - 1) / 2.0, 1e-6);
+    ASSERT_NEAR(distributed_val.mean_of_cpu_value((float)rank_index_val), (n_val - 1) / 2.0, 1e-6);
 }
 
 // ══ one AdamW step on N GPUs, as train_gpt2.cu takes it ═════════════════════════
@@ -121,12 +121,12 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
     // the norm's last bit does not reach them).
 
     // 1. a shared AdamW (this rank's slice) and a world-of-1 one, from the same start
-    int r_val = distributed_val.rank();
+    int rank_index_val = distributed_val.rank();
     int n_val = distributed_val.world_size();
     AdamWConfig config_val;
     config_val.learning_rate = 1e-2f;
     std::vector<Shape> shapes_list = {{6, 4}, {8}};
-    AdamW shared_val(shapes_list, config_val, DType::BFloat16, r_val, n_val), one_val(shapes_list, config_val, DType::BFloat16);
+    AdamW shared_val(shapes_list, config_val, DType::BFloat16, rank_index_val, n_val), one_val(shapes_list, config_val, DType::BFloat16);
     Tensor block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS});
     Tensor one_block_sums_tensor = Tensor::zeros({2, GRAD_NORM_BLOCKS});
     GradNorm shared_norm_val(block_sums_tensor), one_norm_val(one_block_sums_tensor);
@@ -139,10 +139,10 @@ static void a_shared_step_equals_one_adamw_on_the_mean_grads(const Distributed &
 
     // 2. this rank's grads, and the mean of all ranks' grads
     std::vector<float> rank_grads_list(SHAPES_VALUES), mean_grads_list(SHAPES_VALUES);
-    for (int i_val = 0; i_val < SHAPES_VALUES; i_val++)
+    for (int value_index_val = 0; value_index_val < SHAPES_VALUES; value_index_val++)
     {
-        rank_grads_list[i_val] = -4.0f + (i_val % 16) / 2.0f + r_val;
-        mean_grads_list[i_val] = -4.0f + (i_val % 16) / 2.0f + (n_val - 1) / 2.0f;
+        rank_grads_list[value_index_val] = -4.0f + (value_index_val % 16) / 2.0f + rank_index_val;
+        mean_grads_list[value_index_val] = -4.0f + (value_index_val % 16) / 2.0f + (n_val - 1) / 2.0f;
     }
 
     // 3. three steps: the shared one as train_gpt2.cu takes it, the world-of-1 one on the mean grads

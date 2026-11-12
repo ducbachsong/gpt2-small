@@ -12,9 +12,9 @@
 #include "cuda_common.h"             // cudaCheck, check_threads_per_block
 #include "../tensor.cuh"
 
-#define ENCODER_BLOCKS 512                                  // blocks in every launch here
-#define ENCODER_THREADS MAX_THREADS_PER_BLOCK               // the default block size of the two backwards
-#define ENCODER_FORWARD_THREADS (4 * THREADS_PER_WARP)      // the forward's default: 4 warps, fastest in bfloat16 on a T4
+#define ENCODER_BLOCKS 512                                        // blocks in every launch here
+#define ENCODER_THREADS HARDWARE_MAX_THREADS_PER_BLOCK            // the default block size of the two backwards
+#define ENCODER_FORWARD_THREADS (8 * HARDWARE_THREADS_PER_WARP)   // the forward's default: 8 warps; 0.015 ms against 0.018 for 4 on an H100 PCIe, bfloat16
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void encoder_forward(const Tensor& encoded_tensor, const Tensor& token_ids_tensor, const Tensor& wte_tensor,
@@ -41,7 +41,7 @@ __global__ void encoder_forward_kernel(T* encoded_ptr, const int* token_ids_ptr,
 ///   token_ids_tensor        {batch_size, seq_len} ints
 ///   wte_tensor              {vocab_size, embed_dim}: one row per token
 ///   wpe_tensor              {max_seq_len, embed_dim}: one row per position; rows seq_len and after are not read
-///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///   threads_per_block_val   the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                           ENCODER_FORWARD_THREADS. Any size gives the same bits; only the time changes.
 inline void encoder_forward(const Tensor& encoded_tensor, const Tensor& token_ids_tensor, const Tensor& wte_tensor,
                             const Tensor& wpe_tensor, int threads_per_block_val) {
@@ -78,11 +78,11 @@ __global__ void encoder_forward_kernel(T* encoded_ptr, const int* token_ids_ptr,
         // 1. where this float4 is: which token (b x seq_len + t), which float4 of its row, which position t
         size_t token_index_val = index_val / row_float4s_val;
         size_t row_float4_index_val = index_val % row_float4s_val;
-        size_t position_val = token_index_val % seq_len_val;
+        size_t position_index_val = token_index_val % seq_len_val;
         size_t token_id_val = token_ids_ptr[token_index_val];
         // 2. read the token's and the position's float4
         float4 token_embed_val = read4_as_float(wte_ptr + (token_id_val * row_float4s_val + row_float4_index_val) * VALUES_PER_FLOAT4);
-        float4 position_embed_val = read4_as_float(wpe_ptr + (position_val * row_float4s_val + row_float4_index_val) * VALUES_PER_FLOAT4);
+        float4 position_embed_val = read4_as_float(wpe_ptr + (position_index_val * row_float4s_val + row_float4_index_val) * VALUES_PER_FLOAT4);
         // 3. add and write
         write4_from_float(encoded_ptr + index_val * VALUES_PER_FLOAT4,
                make_float4(token_embed_val.x + position_embed_val.x, token_embed_val.y + position_embed_val.y,
@@ -106,7 +106,7 @@ __global__ void encoder_backward_wpe_kernel(T* wpe_grad_ptr, const T* encoded_gr
 ///   wpe_grad_tensor         wpe's shape
 ///   encoded_grad_tensor     encoded's shape: the gradient from the first block
 ///   token_ids_tensor        the forward's
-///   threads_per_block_val   the block size of both kernels: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///   threads_per_block_val   the block size of both kernels: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                           ENCODER_THREADS. wpe_grad's bits never change with it; wte_grad's atomic adds can
 ///                           land in another order, as they can from run to run.
 inline void encoder_backward(const Tensor& wte_grad_tensor, const Tensor& wpe_grad_tensor, const Tensor& encoded_grad_tensor,
@@ -178,9 +178,9 @@ __global__ void encoder_backward_wpe_kernel(T* wpe_grad_ptr, const T* encoded_gr
     for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
         // 1. add up this float4 over the batch, b = 0, 1, ... in order
         float4 sum_val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (size_t b_val = 0; b_val < batch_size_val; b_val++) {
+        for (size_t batch_index_val = 0; batch_index_val < batch_size_val; batch_index_val++) {
             // row (b, t)
-            float4 g_val = read4_as_float(encoded_grad_ptr + (b_val * seq_len_val * row_float4s_val + index_val) * VALUES_PER_FLOAT4);
+            float4 g_val = read4_as_float(encoded_grad_ptr + (batch_index_val * seq_len_val * row_float4s_val + index_val) * VALUES_PER_FLOAT4);
             sum_val.x += g_val.x;
             sum_val.y += g_val.y;
             sum_val.z += g_val.z;

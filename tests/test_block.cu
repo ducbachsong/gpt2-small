@@ -91,15 +91,15 @@ struct BlockTensors
           scratch_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val)
     {
         // 1. the parameters and their gradients, in a TensorBuffer each
-        int group_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
+        int group_index_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
         param_buffer_val.allocate(dtype_val);
         grad_buffer_val = TensorBuffer::zeros_like(param_buffer_val);
         std::vector<Tensor> param_tensors_list;
         std::vector<Tensor> grad_tensors_list;
         for (int param_index_val = 0; param_index_val < BLOCK_PARAMS; param_index_val++)
         {
-            param_tensors_list.push_back(param_buffer_val.tensor(group_val, param_index_val));
-            grad_tensors_list.push_back(grad_buffer_val.tensor(group_val, param_index_val));
+            param_tensors_list.push_back(param_buffer_val.tensor(group_index_val, param_index_val));
+            grad_tensors_list.push_back(grad_buffer_val.tensor(group_index_val, param_index_val));
         }
         params_val = BlockParams(param_tensors_list);
         grads_val = BlockParams(grad_tensors_list);
@@ -227,9 +227,10 @@ static void matches_pytorch_on_gpt2_widths(void)
 
 static void matches_pytorch_with_small_odd_sizes(void)
 {
-    // Expect: {3, 37, 64} with 4 heads of 16: a seq_len no warp or square divides, and rows of 64, so
-    // every kernel's part-full edges are crossed. The same as PyTorch within 1e-4.
-    forward_and_backward_match_pytorch(__func__, 3, 37, 64, 4, DType::Float32, TOLERANCE);
+    // Expect: {3, 96, 64} with one head of 64 (float attention is flash attention: head_size 64, seq_len a
+    // multiple of 32): 288 rows, which no 128-row square of linear.cuh divides, and rows of 64 that leave half of
+    // each square's columns empty, so the kernels' part-full edges are crossed. The same as PyTorch within 1e-4.
+    forward_and_backward_match_pytorch(__func__, 3, 96, 64, 1, DType::Float32, TOLERANCE);
 }
 
 static void forward_and_backward_in_bfloat16(void)

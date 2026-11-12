@@ -4,7 +4,7 @@
 //
 //     python data/fineweb.py --train-tokens 10000M                        # once: the token files, 10B tokens
 //     ./train_gpt2 --steps 19073 ...                                      # ...or at the same time: dataloader.cuh
-//     nvcc -O3 -std=c++17 -arch=native train_gpt2.cu -o train_gpt2 -lcublas -lcublasLt -lnccl
+//     nvcc -O3 -std=c++17 -arch=native train_gpt2.cu -o train_gpt2 -lnccl
 //     torchrun --standalone --nproc_per_node=8 --no-python ./train_gpt2   # 8 GPUs (distributed.cuh)
 //     ./train_gpt2                                                        # one GPU: the same steps, 8x the time
 //     ./train_gpt2 --steps 20 --tokens-per-step 32768 --val-every 10      # a quick try

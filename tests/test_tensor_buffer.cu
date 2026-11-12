@@ -110,7 +110,7 @@ static void writing_a_tensor_writes_only_its_part(void) {
     buffer_val.tensor(1).fill_(1);
     // 2. what flat() should hold
     std::vector<float> expected_list(32, 0.0f);
-    for (size_t i_val = 8; i_val < 20; i_val++) expected_list[i_val] = 1.0f;
+    for (size_t value_index_val = 8; value_index_val < 20; value_index_val++) expected_list[value_index_val] = 1.0f;
     // 3. check
     ASSERT_EQ(buffer_val.flat().tolist(), expected_list);
 }
@@ -185,7 +185,7 @@ static void a_group_is_one_flat_tensor_of_its_values(void) {
     ASSERT_EQ(buffer_val.group(0).tolist(), sample_data(32));
     // 2. group 1
     std::vector<float> values_32_to_63_list;
-    for (int i_val = 32; i_val < 64; i_val++) values_32_to_63_list.push_back((float)i_val);
+    for (int value_index_val = 32; value_index_val < 64; value_index_val++) values_32_to_63_list.push_back((float)value_index_val);
     ASSERT_EQ(buffer_val.group(1).data(), buffer_val.flat().data() + 32);
     ASSERT_EQ(buffer_val.group(1).tolist(), values_32_to_63_list);
 }
@@ -374,9 +374,9 @@ static void buffer_tensor_value_i_j_sits_at_i_times_stride_0_plus_j(void) {
     t_tensor.copy_from_cpu(sample_data(8).data());
     std::vector<float> values_on_cpu_list = t_tensor.tolist();
     // 2. each value at i x stride(0) + j x stride(1)
-    for (size_t i_val = 0; i_val < 2; i_val++) {
-        for (size_t j_val = 0; j_val < 4; j_val++)
-            ASSERT_EQ(values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)], (float)(i_val * 4 + j_val));
+    for (size_t row_index_val = 0; row_index_val < 2; row_index_val++) {
+        for (size_t column_index_val = 0; column_index_val < 4; column_index_val++)
+            ASSERT_EQ(values_on_cpu_list[row_index_val * t_tensor.stride(0) + column_index_val * t_tensor.stride(1)], (float)(row_index_val * 4 + column_index_val));
     }
     ASSERT_EQ(values_on_cpu_list[1 * t_tensor.stride(0) + 2 * t_tensor.stride(1)], 6.0f);
 }

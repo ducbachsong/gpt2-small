@@ -15,10 +15,14 @@
 #include <cmath>
 #include <vector>
 #include "tensor.cuh"
-#include "kernels/attention.cuh"
-#include "kernels/gelu.cuh"
+#include "kernels/fp32/attention.cuh"          // float: flash attention
+#include "kernels/bf16/attention_bf16.cuh"     // bfloat16: the steps
+#include "kernels/bf16/attention_flash_bf16.cuh"   // bfloat16: flash attention
+#include "kernels/fp32/gelu.cuh"                  // float: GELU on its own
+#include "kernels/bf16/gelu_bf16.cuh"        // bfloat16: GELU inside the MLP's two linears
 #include "kernels/layer_norm.cuh"
-#include "kernels/linear_cublas.cuh"   // the four linears; kernels/linear.cuh has the same functions
+#include "kernels/fp32/linear.cuh"         // float: the four linears
+#include "kernels/bf16/linear_bf16.cuh"    // bfloat16: the four linears
 #include "kernels/residual.cuh"
 
 /// A block's 12 parameter tensors, or their gradients: views of the optimizer's buffer, the 4 matrices first.
@@ -44,17 +48,15 @@ struct BlockParams {
 };
 
 /// What the forward keeps for the backward, for one block. mean, rstd and attention_logsumexp float, the rest
-/// of dtype. With flash attention, attention_logsumexp in place of attention_weights.
+/// of dtype. With flash attention, attention_logsumexp in place of attention_probs.
 struct BlockActivations {
-    bool flash_attention;                                   // attention_flash_forward and _backward, or the steps
+    bool flash_attention;                                   // flash attention (block_uses_flash), or the steps
     Tensor ln1_output;                                      // {B, T, D}
     Tensor ln1_mean;                                        // {B, T}
     Tensor ln1_rstd;                                        // {B, T}
-    Tensor query;                                           // {B, NH, T, HS}
-    Tensor key;                                             // {B, NH, T, HS}
-    Tensor value;                                           // {B, NH, T, HS}
-    Tensor attention_weights;                               // {B, NH, T, T}; none with flash attention
-    Tensor attention_logsumexp;                             // {B, NH, T}: flash attention's, in the weights' place
+    Tensor qkv;                                             // {B, T, 3D}: attention reads query, key, value here
+    Tensor attention_probs;                                 // {B, NH, T, T}; none with flash attention
+    Tensor attention_logsumexp;                             // {B, NH, T}: flash attention's, in the attention_probs' place
     Tensor attention_output;                                // {B, T, D}: the heads merged, before the projection
     Tensor residual2;                                       // {B, T, D}: input + the attention branch
     Tensor ln2_output;                                      // {B, T, D}
@@ -70,21 +72,15 @@ struct BlockActivations {
 /// What lives only during one forward or backward: one for all the blocks of a model.
 struct BlockScratch {
     Tensor branch_output;                                   // {B, T, D}: a branch's output, before its residual add
-    Tensor qkv;                                             // {B, T, 3D}: split into query, key, value, then unread
-    Tensor head_outputs;                                   // {B, NH, T, HS}: attention's, before the merge; not flash's
     Tensor residual2_grad;                                  // {B, T, D}
     Tensor branch_output_grad;                              // {B, T, D}
     Tensor ln_output_grad;                                  // {B, T, D}
     Tensor attention_output_grad;                           // {B, T, D}
-    Tensor gelu_output_grad;                                // {B, T, 4D}
+    Tensor gelu_output_grad;                                // {B, T, 4D}; none in bfloat16 (gelu_bf16 never writes it)
     Tensor mlp_up_output_grad;                              // {B, T, 4D}
     Tensor qkv_grad;                                        // {B, T, 3D}
     // the attention steps' scratch (none with flash attention):
-    Tensor head_outputs_grad;                                     // {B, NH, T, HS}
-    Tensor query_grad;                                            // {B, NH, T, HS}
-    Tensor key_grad;                                              // {B, NH, T, HS}
-    Tensor value_grad;                                            // {B, NH, T, HS}
-    Tensor weights_grad;                                    // {B, NH, T, T}
+    Tensor attention_probs_grad;                            // {B, NH, T, T}
     // flash attention's (none without):
     Tensor attention_row_dot;                               // {B, NH, T} float
 
@@ -93,6 +89,10 @@ struct BlockScratch {
 };
 
 // ── the block ─────────────────────────────────────────────────────────────────
+bool block_uses_flash(DType dtype, size_t seq_len, size_t head_size);
+void block_linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias);
+void block_linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
+                           const Tensor& output_grad, const Tensor& input, const Tensor& weight);
 void block_init_params(const BlockParams& params, int num_layers);
 void block_forward(const Tensor& output, const Tensor& input, const BlockParams& params,
                    const BlockActivations& activations, const BlockScratch& scratch);
@@ -146,13 +146,12 @@ inline BlockActivations::BlockActivations(size_t batch_size, size_t seq_len, siz
     size_t D = embed_dim;
     size_t NH = num_heads;
     size_t HS = embed_dim / num_heads;
-    flash_attention = attention_flash_fits(dtype, T, HS);
+    flash_attention = block_uses_flash(dtype, T, HS);
     ln1_output = Tensor::zeros({B, T, D}, dtype);
     ln1_mean = Tensor::zeros({B, T}), ln1_rstd = Tensor::zeros({B, T});
-    query =Tensor::zeros({B, NH, T, HS}, dtype), key = Tensor::zeros({B, NH, T, HS}, dtype);
-    value = Tensor::zeros({B, NH, T, HS}, dtype);
+    qkv = Tensor::zeros({B, T, 3 * D}, dtype);
     if (flash_attention) attention_logsumexp = Tensor::zeros({B, NH, T});
-    else attention_weights = Tensor::zeros({B, NH, T, T}, dtype);
+    else attention_probs = Tensor::zeros({B, NH, T, T}, dtype);
     attention_output = Tensor::zeros({B, T, D}, dtype);
     residual2 = Tensor::zeros({B, T, D}, dtype);
     ln2_output = Tensor::zeros({B, T, D}, dtype);
@@ -160,7 +159,8 @@ inline BlockActivations::BlockActivations(size_t batch_size, size_t seq_len, siz
     mlp_up_output = Tensor::zeros({B, T, 4 * D}, dtype), gelu_output = Tensor::zeros({B, T, 4 * D}, dtype);
 }
 
-/// Makes the scratch tensors, all 0: with flash attention, attention_row_dot in place of the attention steps' six.
+/// Makes the scratch tensors, all 0: with flash attention, attention_row_dot in place of the attention steps'
+/// attention_probs_grad.
 ///
 ///   batch_size, seq_len, embed_dim, num_heads   B, T, D, NH
 ///   dtype                                       Float32 or BFloat16
@@ -171,25 +171,48 @@ inline BlockScratch::BlockScratch(size_t batch_size, size_t seq_len, size_t embe
     size_t D = embed_dim;
     size_t NH = num_heads;
     size_t HS = embed_dim / num_heads;
-    bool flash_attention = attention_flash_fits(dtype, T, HS);
+    bool flash_attention = block_uses_flash(dtype, T, HS);
     branch_output = Tensor::zeros({B, T, D}, dtype);
-    qkv = Tensor::zeros({B, T, 3 * D}, dtype);
     residual2_grad = Tensor::zeros({B, T, D}, dtype), branch_output_grad = Tensor::zeros({B, T, D}, dtype);
     ln_output_grad = Tensor::zeros({B, T, D}, dtype), attention_output_grad = Tensor::zeros({B, T, D}, dtype);
-    gelu_output_grad = Tensor::zeros({B, T, 4 * D}, dtype), mlp_up_output_grad = Tensor::zeros({B, T, 4 * D}, dtype);
+    if (dtype != DType::BFloat16) gelu_output_grad = Tensor::zeros({B, T, 4 * D}, dtype);
+    mlp_up_output_grad = Tensor::zeros({B, T, 4 * D}, dtype);
     qkv_grad = Tensor::zeros({B, T, 3 * D}, dtype);
-    if (flash_attention) {
-        attention_row_dot = Tensor::zeros({B, NH, T});
-        return;
-    }
-    head_outputs = Tensor::zeros({B, NH, T, HS}, dtype);
-    head_outputs_grad = Tensor::zeros({B, NH, T, HS}, dtype);
-    query_grad = Tensor::zeros({B, NH, T, HS}, dtype), key_grad = Tensor::zeros({B, NH, T, HS}, dtype);
-    value_grad = Tensor::zeros({B, NH, T, HS}, dtype);
-    weights_grad = Tensor::zeros({B, NH, T, T}, dtype);
+    if (flash_attention) attention_row_dot = Tensor::zeros({B, NH, T});
+    else attention_probs_grad = Tensor::zeros({B, NH, T, T}, dtype);
 }
 
 // ── the block ─────────────────────────────────────────────────────────────────
+
+/// Tells if the block's attention is flash attention: always in float (attention.cuh has only flash attention:
+/// head_size 64, seq_len a multiple of 32, any GPU; other sizes stop with its error when the forward runs); in
+/// bfloat16 when attention_bf16_flash_fits (head_size 64, seq_len a multiple of 64, sm_80 or later), otherwise
+/// the bfloat16 steps, which keep the attention_probs.
+///
+///   dtype                the model's
+///   seq_len, head_size   T and D / NH
+inline bool block_uses_flash(DType dtype, size_t seq_len, size_t head_size) {
+    return dtype == DType::BFloat16 ? attention_bf16_flash_fits(seq_len, head_size) : true;
+}
+
+/// Runs a linear layer's forward in the model's dtype: linear_bf16_forward for bfloat16, linear_forward for
+/// float.
+///
+///   output, input, weight, bias   as in linear_forward; bias Tensor() for none
+inline void block_linear_forward(const Tensor& output, const Tensor& input, const Tensor& weight, const Tensor& bias) {
+    if (input.dtype() == DType::BFloat16) linear_bf16_forward(output, input, weight, bias);
+    else linear_forward(output, input, weight, bias);
+}
+
+/// Runs a linear layer's backward in the model's dtype: linear_bf16_backward for bfloat16, linear_backward for
+/// float.
+///
+///   input_grad, weight_grad, bias_grad, output_grad, input, weight   as in linear_backward; bias_grad Tensor() for none
+inline void block_linear_backward(const Tensor& input_grad, const Tensor& weight_grad, const Tensor& bias_grad,
+                                  const Tensor& output_grad, const Tensor& input, const Tensor& weight) {
+    if (input.dtype() == DType::BFloat16) linear_bf16_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight);
+    else linear_backward(input_grad, weight_grad, bias_grad, output_grad, input, weight);
+}
 
 /// Sets GPT-2's starting values: matrices normal std 0.02, the two projections std 0.02 / sqrt(2 num_layers),
 /// biases 0, LayerNorm weights 1.
@@ -218,19 +241,26 @@ inline void block_forward(const Tensor& output, const Tensor& input, const Block
     const BlockActivations& a = activations;
     // the attention branch
     layer_norm_forward(a.ln1_output, a.ln1_mean, a.ln1_rstd, input, params.ln1_weight, params.ln1_bias);
-    linear_forward(scratch.qkv, a.ln1_output, params.qkv_weight, params.qkv_bias);
-    if (a.flash_attention)
-        attention_flash_forward(a.attention_output, a.query, a.key, a.value, a.attention_logsumexp, scratch.qkv);
+    block_linear_forward(a.qkv, a.ln1_output, params.qkv_weight, params.qkv_bias);
+    bool bfloat16_val = a.qkv.dtype() == DType::BFloat16;
+    if (a.flash_attention && bfloat16_val)
+        attention_bf16_flash_forward(a.attention_output, a.attention_logsumexp, a.qkv);
+    else if (a.flash_attention)
+        attention_flash_forward(a.attention_output, a.attention_logsumexp, a.qkv);
     else
-        attention_forward(a.attention_output, a.query, a.key, a.value, a.attention_weights, scratch.head_outputs,
-                          scratch.qkv);
-    linear_forward(scratch.branch_output, a.attention_output, params.attention_out_weight, params.attention_out_bias);
+        attention_bf16_forward(a.attention_output, a.attention_probs, a.qkv);
+    block_linear_forward(scratch.branch_output, a.attention_output, params.attention_out_weight, params.attention_out_bias);
     residual_forward(a.residual2, input, scratch.branch_output);
     // the MLP branch
     layer_norm_forward(a.ln2_output, a.ln2_mean, a.ln2_rstd, a.residual2, params.ln2_weight, params.ln2_bias);
-    linear_forward(a.mlp_up_output, a.ln2_output, params.mlp_up_weight, params.mlp_up_bias);
-    gelu_forward(a.gelu_output, a.mlp_up_output);
-    linear_forward(scratch.branch_output, a.gelu_output, params.mlp_down_weight, params.mlp_down_bias);
+    if (bfloat16_val) {
+        // mlp_up and GELU in one product on the tensor cores: GELU as each pair of mlp_up_output is stored
+        gelu_bf16_forward(a.mlp_up_output, a.gelu_output, a.ln2_output, params.mlp_up_weight, params.mlp_up_bias);
+    } else {
+        linear_forward(a.mlp_up_output, a.ln2_output, params.mlp_up_weight, params.mlp_up_bias);
+        gelu_forward(a.gelu_output, a.mlp_up_output);
+    }
+    block_linear_forward(scratch.branch_output, a.gelu_output, params.mlp_down_weight, params.mlp_down_bias);
     residual_forward(output, a.residual2, scratch.branch_output);
 }
 
@@ -248,25 +278,35 @@ inline void block_backward(const Tensor& input_grad, const BlockParams& param_gr
     const BlockScratch& s = scratch;
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_backward(s.residual2_grad, s.branch_output_grad, output_grad);
-    linear_backward(s.gelu_output_grad, param_grads.mlp_down_weight, param_grads.mlp_down_bias, s.branch_output_grad,
-                    a.gelu_output, params.mlp_down_weight);
-    gelu_backward(s.mlp_up_output_grad, s.gelu_output_grad, a.mlp_up_output);
-    linear_backward(s.ln_output_grad, param_grads.mlp_up_weight, param_grads.mlp_up_bias, s.mlp_up_output_grad,
-                    a.ln2_output, params.mlp_up_weight);
+    if (a.qkv.dtype() == DType::BFloat16) {
+        // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored, so
+        // gelu_output_grad is never written
+        gelu_bf16_backward(s.mlp_up_output_grad, param_grads.mlp_down_weight, param_grads.mlp_down_bias, s.branch_output_grad,
+                           a.gelu_output, params.mlp_down_weight, a.mlp_up_output);
+    } else {
+        linear_backward(s.gelu_output_grad, param_grads.mlp_down_weight, param_grads.mlp_down_bias, s.branch_output_grad,
+                        a.gelu_output, params.mlp_down_weight);
+        gelu_backward(s.mlp_up_output_grad, s.gelu_output_grad, a.mlp_up_output);
+    }
+    block_linear_backward(s.ln_output_grad, param_grads.mlp_up_weight, param_grads.mlp_up_bias, s.mlp_up_output_grad,
+                          a.ln2_output, params.mlp_up_weight);
     layer_norm_backward(s.residual2_grad, param_grads.ln2_weight, param_grads.ln2_bias, s.ln_output_grad,
                         a.residual2, params.ln2_weight, a.ln2_mean, a.ln2_rstd);
     // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_backward(input_grad, s.branch_output_grad, s.residual2_grad);
-    linear_backward(s.attention_output_grad, param_grads.attention_out_weight, param_grads.attention_out_bias,
-                    s.branch_output_grad, a.attention_output, params.attention_out_weight);
-    if (a.flash_attention)
-        attention_flash_backward(s.qkv_grad, s.attention_output_grad, a.attention_output, a.query, a.key, a.value,
-                                 a.attention_logsumexp, s.attention_row_dot);
+    block_linear_backward(s.attention_output_grad, param_grads.attention_out_weight, param_grads.attention_out_bias,
+                          s.branch_output_grad, a.attention_output, params.attention_out_weight);
+    bool bfloat16_val = a.qkv.dtype() == DType::BFloat16;
+    if (a.flash_attention && bfloat16_val)
+        attention_bf16_flash_backward(s.qkv_grad, s.attention_output_grad, a.attention_output, a.qkv,
+                                      a.attention_logsumexp, s.attention_row_dot);
+    else if (a.flash_attention)
+        attention_flash_backward(s.qkv_grad, s.attention_output_grad, a.attention_output, a.qkv, a.attention_logsumexp,
+                                 s.attention_row_dot);
     else
-        attention_backward(s.qkv_grad, s.attention_output_grad, a.query, a.key, a.value, a.attention_weights,
-                           s.head_outputs_grad, s.weights_grad, s.query_grad, s.key_grad, s.value_grad);
-    linear_backward(s.ln_output_grad, param_grads.qkv_weight, param_grads.qkv_bias, s.qkv_grad, a.ln1_output,
-                    params.qkv_weight);
+        attention_bf16_backward(s.qkv_grad, s.attention_output_grad, a.qkv, a.attention_probs, s.attention_probs_grad);
+    block_linear_backward(s.ln_output_grad, param_grads.qkv_weight, param_grads.qkv_bias, s.qkv_grad, a.ln1_output,
+                          params.qkv_weight);
     layer_norm_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, s.ln_output_grad, input,
                         params.ln1_weight, a.ln1_mean, a.ln1_rstd);
 }

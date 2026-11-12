@@ -83,15 +83,15 @@ struct BlockTensors
           scratch_val(block_batch_size_val, block_seq_len_val, block_embed_dim_val, block_num_heads_val, dtype_val)
     {
         // 1. the parameters and their gradients, in a TensorBuffer each
-        int group_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
+        int group_index_val = param_buffer_val.add_many(BlockParams::shapes(embed_dim_val));
         param_buffer_val.allocate(dtype_val);
         grad_buffer_val = TensorBuffer::zeros_like(param_buffer_val);
         std::vector<Tensor> param_tensors_list;
         std::vector<Tensor> grad_tensors_list;
         for (int param_index_val = 0; param_index_val < BLOCK_PARAMS; param_index_val++)
         {
-            param_tensors_list.push_back(param_buffer_val.tensor(group_val, param_index_val));
-            grad_tensors_list.push_back(grad_buffer_val.tensor(group_val, param_index_val));
+            param_tensors_list.push_back(param_buffer_val.tensor(group_index_val, param_index_val));
+            grad_tensors_list.push_back(grad_buffer_val.tensor(group_index_val, param_index_val));
         }
         params_val = BlockParams(param_tensors_list);
         grads_val = BlockParams(grad_tensors_list);
@@ -206,7 +206,7 @@ static void time_20_steps_on_gpt2_small_size(void)
 
     // 2. time TIMED_STEPS steps, each backward from gradients of 0
     double totals_list[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float times_list[4];
         times_list[0] = gpu_milliseconds([&] { mine_val.forward(); });
@@ -219,10 +219,10 @@ static void time_20_steps_on_gpt2_small_size(void)
         for (torch::Tensor &param_tensor : pytorch_params_list)
             param_tensor.mutable_grad() = torch::Tensor();
         times_list[3] = gpu_milliseconds([&] { pytorch_output_tensor.backward(pytorch_output_grad_tensor); });
-        if (step_val <= WARM_UP_STEPS)
+        if (step_index_val <= WARM_UP_STEPS)
             continue;
-        for (int column_val = 0; column_val < 4; column_val++)
-            totals_list[column_val] += times_list[column_val];
+        for (int column_index_val = 0; column_index_val < 4; column_index_val++)
+            totals_list[column_index_val] += times_list[column_index_val];
     }
 
     // 3. print the averages

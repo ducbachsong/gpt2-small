@@ -8,7 +8,7 @@ peak memory bandwidth from the GPU itself); only the results are kept per GPU.
 ```
 tunes/
   tune_helpers.h          gpu_milliseconds, warm_up_gpu, print_gpu, GB/s and MBU
-  tune_<kernel>.cu        the timings of tests/test_<kernel>.cu
+  tune_<kernel>.cu        the timings of tests/test_<kernel>.cu (or tests/fp32/, bf16/, 8bit/ as its kernel sits)
   results/
     T4/  L4/  A100/  H100/  H200/  B200/
       <kernel>_<date>_<time>.txt   what one run of tune_<kernel> printed on that GPU
@@ -19,16 +19,31 @@ tunes/
 | `tune_adamw.cu` | float AdamW against PyTorch's fused AdamW; other block and thread counts |
 | `tune_adamw_bf16.cu` | bfloat16 AdamW with other block and thread counts |
 | `tune_adamw_8bit.cu` | the three AdamWs side by side with GB/s and MBU; other block and thread counts, with GB/s and MBU |
-| `tune_attention.cu` | attention against PyTorch; flash attention against the steps and PyTorch; the softmax kernels' launches |
+| `tune_attention.cu` | float flash attention against PyTorch; its row_dot kernel's launches |
+| `tune_attention_bf16.cu` | bfloat16 attention steps against PyTorch; flash attention against the steps and PyTorch; the bfloat16 softmax kernels' launches |
+| `tune_attention_8bit.cu` | 8-bit attention against flash attention and PyTorch, with the bytes each keeps for the backward; the rounding and turn-back launches, with GB/s and MBU |
 | `tune_block.cu` | one transformer block, forward and backward, bfloat16 |
 | `tune_classifier.cu` | the classifier against PyTorch; other launches |
+| `tune_classifier_bf16.cu` | GPT-2's head and loss in bfloat16, the softmax's sums worked out as each WGMMA tile of logits is stored, against the unfused path (linear_bf16 + the classifier) and PyTorch; needs an H100 and `-arch=sm_90a` |
+| `tune_classifier_8bit.cu` | the same with the head's products in 8 bits, against the bfloat16 classifier and PyTorch; needs an H100 and `-arch=sm_90a` |
 | `tune_encoder.cu` | the encoder against PyTorch; other launches; the float4 wte backward and the finer forward sweep |
+| `tune_fma_matmul_bf16.cu` | bfloat16 products on the CUDA cores against PyTorch: GPT-2's 5 linear layers, each one's forward, input_grad and weight_grad (left or right turned round), and 4096³ |
+| `tune_fma_matmul_8bit.cu` | E4M3 products on the CUDA cores against fma_matmul_bf16 and PyTorch, GPT-2's 5 forward shapes and 4096³, with the rounding |
 | `tune_gelu.cu` | GELU against PyTorch; other launches |
+| `tune_gelu_bf16.cu` | GPT-2's MLP with GELU done inside its two bfloat16 WGMMA products (the epilogue) against linear_bf16 + GELU on its own, and what fusing saves over 12 layers; needs an H100 and `-arch=sm_90a` |
+| `tune_gelu_8bit.cu` | the same with the products in 8 bits, against the unfused 8-bit MLP and the fused bfloat16 one; needs an H100 and `-arch=sm_90a` |
 | `tune_gpt2.cu` | the whole GPT-2 small step, bfloat16; the micro-batch size (`--batch-size`) with the best MFU |
 | `tune_grad_norm.cu` | the grad norm against PyTorch; other launches |
 | `tune_layer_norm.cu` | layer norm against PyTorch; other launches |
-| `tune_linear.cu`, `tune_linear_cublas.cu` | GPT-2 small's 5 linear layers against PyTorch |
+| `tune_linear.cu` | GPT-2 small's 5 linear layers in float against PyTorch (fma_matmul_bf16's products in float); any GPU |
+| `tune_linear_bf16.cu` | GPT-2 small's 5 linear layers in bfloat16 against PyTorch's bfloat16 linear (wgmma_matmul_bf16's products); needs an H100 and `-arch=sm_90a` |
+| `tune_linear_8bit.cu` | GPT-2 small's 5 linear layers with 8-bit products (round_8bit + wgmma_matmul_8bit) against the bfloat16 layer and PyTorch; needs an H100 and `-arch=sm_90a` |
+| `tune_mma_matmul_bf16.cu` | bfloat16 products on the tensor cores by mma.sync against fma_matmul_bf16 and PyTorch, the same shapes as fma's; needs sm_80 or later |
+| `tune_mma_matmul_8bit.cu` | E4M3 products by mma.sync against mma_matmul_bf16 and PyTorch, with the rounding; needs sm_89 or later |
 | `tune_residual.cu` | the residual add against PyTorch; other launches |
+| `tune_round_8bit.cu` | the rounding to E4M3 with other launches, with GB/s and MBU; turned rounding (a linear backward's output_grad and input) against rounding as it sits |
+| `tune_wgmma_matmul_8bit.cu` | E4M3 products on the tensor cores (WGMMA + TMA) against wgmma_matmul_bf16, mma_matmul_8bit and PyTorch, with the rounding; needs an H100 and `-arch=sm_90a` |
+| `tune_wgmma_matmul_bf16.cu` | bfloat16 products on the tensor cores (WGMMA + TMA) against mma_matmul_bf16, fma_matmul_bf16 and PyTorch, the same shapes as fma's; needs an H100 and `-arch=sm_90a` in place of `-arch=native` |
 
 ## MBU
 
@@ -61,7 +76,9 @@ rows a micro-batch while they fit in memory, and prints the MFU of each and the 
 ## Running one
 
 Build a tune the way its test is built, with `tunes/tune_<kernel>.cu` in place of
-`tests/test_<kernel>.cu`. On Colab, with the libtorch that comes with PyTorch:
+`tests/test_<kernel>.cu`. The tests sit as their kernels do in `llmc/kernels/`: `tests/fp32/`, `tests/bf16/` and
+`tests/8bit/` for the kernels in those folders, `tests/` itself for the shared kernels (encoder, layer_norm,
+residual, grad_norm) and the rest (tensor, block, gpt2, ...). On Colab, with the libtorch that comes with PyTorch:
 
 ```
 TORCH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))")
@@ -73,6 +90,11 @@ nvcc -O3 -std=c++17 -arch=native tunes/tune_gelu.cu -o tune_gelu \
     -Xlinker -rpath=$TORCH/lib
 ./tune_gelu
 ```
+
+A tune or test that includes `linear_bf16.cuh` or `linear_8bit.cuh` (`linear_bf16`, `linear_8bit`, `block`,
+`gpt2`, and `train_gpt2.cu`) needs an H100 and `-arch=sm_90a` in place of `-arch=native`: a linear layer's
+bfloat16 products are `wgmma_matmul_bf16`'s, its 8-bit ones `wgmma_matmul_8bit`'s, and WGMMA and TMA are
+Hopper's own instructions. `linear.cuh` (float) runs on any GPU.
 
 Run it from the repo's folder. Everything it prints shows on the console and also goes into a new file for
 that run, in the folder of the GPU it ran on (picked from the GPU's name):
@@ -87,8 +109,8 @@ The tests do the same into `logs/tests/` (`logs/` is not kept in git), e.g.
 This needs `tee`, so it works on Linux and Colab; on Windows the output only goes to the console.
 
 A tune needs `tunes/tune_<kernel>.cu`, `tunes/tune_helpers.h`, `tests/test_helpers.h` and
-the `llmc/` files its test needs. The ones that call cuBLAS (attention, linear_cublas, block, gpt2) also link
-PyTorch's cuBLAS, the same way as their tests.
+the `llmc/` files its test needs. No kernel calls cuBLAS: the linears and attention's products are our own (the matmul tools: `fma_`, `mma_` and
+`wgmma_matmul_bf16.cuh`, and their 8-bit ones).
 
 Run one tune at a time, never two together: they would share the GPU and slow each other down. Each
 result file starts with the GPU line `print_gpu` prints, so you can always tell where the numbers came from:

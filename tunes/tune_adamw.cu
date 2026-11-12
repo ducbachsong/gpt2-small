@@ -1,7 +1,7 @@
-// tune_adamw.cu — the timings of tests/test_adamw.cu, moved here so the tests only check numbers:
+// tune_adamw.cu — the timings of tests/fp32/test_adamw.cu, moved here so the tests only check numbers:
 // time_20_updates_on_gpt2_small_size, time_the_kernel_with_other_block_and_thread_counts.
 //
-// Built as tests/test_adamw.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/fp32/test_adamw.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/adamw_<date>_<time>.txt.
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls
@@ -215,15 +215,15 @@ static void time_20_updates(const char *test_ptr, const std::vector<Shape> &para
     printf("    time of one update, in ms:   step   my AdamW   PyTorch fused\n");
     double my_total_val = 0.0;
     double pytorch_total_val = 0.0;
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float my_ms_val = gpu_milliseconds([&] { my_adamw_val.step(); });
         float pytorch_ms_val = gpu_milliseconds([&] {
             matrices_val.step(config_val.weight_decay, config_val);
             rest_val.step(0.0, config_val);
         });
-        printf("                                 %4d   %8.3f   %13.3f\n", step_val, my_ms_val, pytorch_ms_val);
-        if (step_val == 1)
+        printf("                                 %4d   %8.3f   %13.3f\n", step_index_val, my_ms_val, pytorch_ms_val);
+        if (step_index_val == 1)
             continue;
         my_total_val += my_ms_val;
         pytorch_total_val += pytorch_ms_val;
@@ -308,20 +308,20 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;                                         // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     const int t4_blocks_val = 40;                            // a T4's pick: 40 x 128
-    const int t4_threads_val = 4 * THREADS_PER_WARP;
+    const int t4_threads_val = 4 * HARDWARE_THREADS_PER_WARP;
     int block_counts_list[] = {t4_blocks_val, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks_val, sms_val,
                                2 * sms_val};
-    int thread_counts_list[] = {4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    int thread_counts_list[] = {4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     const int thread_count_choices_val = 4;
     const int launches_val = 9 * thread_count_choices_val;
     float total_ms_list[launches_val] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val] += gpu_milliseconds(update_val);
+            blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val] += gpu_milliseconds(update_val);
         }
     }
 
@@ -332,11 +332,11 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int launches_with_the_same_result_val = 0;
     print_test_name(__func__);
     printf("    time in ms:   blocks   threads   float4s per thread     time   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-        float time_val = total_ms_list[launch_val] / SWEEP_ROUNDS;
+        blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+        float time_val = total_ms_list[launch_index_val] / SWEEP_ROUNDS;
         if (time_val < fastest_ms_val)
         {
             fastest_ms_val = time_val;

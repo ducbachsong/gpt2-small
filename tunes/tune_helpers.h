@@ -27,12 +27,12 @@
 #include "../llmc/kernels/cuda_common.h" // cudaCheck
 #include "../tests/test_helpers.h"       // start_run_log
 
-#define TIMED_STEPS 20                // steps (or updates, or norms) timed of each side
-#define WARM_UP_STEPS 2               // first steps left out of the averages: first-time work
-#define SWEEP_ROUNDS 20               // rounds of a launch sweep: each times every launch once
-#define WARM_UP_MILLISECONDS 1000.0f  // how long warm_up_gpu keeps the GPU busy
+#define TIMED_STEPS 20                   // steps (or updates, or norms) timed of each side
+#define WARM_UP_STEPS 2                  // first steps left out of the averages: first-time work
+#define SWEEP_ROUNDS 20                  // rounds of a launch sweep: each times every launch once
+#define WARM_UP_MILLISECONDS 1000.0f     // how long warm_up_gpu keeps the GPU busy
 #define BITS_PER_BYTE 8
-#define TRANSFERS_PER_CLOCK 2         // GPU memory moves data on both edges of its clock (double data rate)
+#define HARDWARE_TRANSFERS_PER_CLOCK 2   // GPU memory moves data on both edges of its clock (double data rate)
 #define GIGA 1e9
 #define TERA 1e12
 #define MILLISECONDS_PER_SECOND 1e3
@@ -69,7 +69,7 @@ static void warm_up_gpu(Run run_val)
 }
 
 /// Gives this GPU's peak memory bandwidth in GB/s, to say how near a memory-bound kernel comes to it (its MBU):
-/// TRANSFERS_PER_CLOCK x the memory clock x the bus width in bytes. An H100 PCIe: 2 x 1,593 MHz x 5,120 bits / 8
+/// HARDWARE_TRANSFERS_PER_CLOCK x the memory clock x the bus width in bytes. An H100 PCIe: 2 x 1,593 MHz x 5,120 bits / 8
 /// = 2,039 GB/s; a T4: 2 x 5,001 MHz x 256 bits / 8 = 320 GB/s.
 static double peak_gigabytes_per_second(void)
 {
@@ -77,7 +77,7 @@ static double peak_gigabytes_per_second(void)
     int bus_bits_val = 0;
     cudaCheck(cudaDeviceGetAttribute(&memory_clock_khz_val, cudaDevAttrMemoryClockRate, 0));
     cudaCheck(cudaDeviceGetAttribute(&bus_bits_val, cudaDevAttrGlobalMemoryBusWidth, 0));
-    double transfers_per_second_val = TRANSFERS_PER_CLOCK * (memory_clock_khz_val * 1e3);
+    double transfers_per_second_val = HARDWARE_TRANSFERS_PER_CLOCK * (memory_clock_khz_val * 1e3);
     return transfers_per_second_val * (bus_bits_val / BITS_PER_BYTE) / GIGA;
 }
 

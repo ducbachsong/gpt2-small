@@ -102,15 +102,15 @@ struct GPT2Tensors
           scratch_val(model_batch_size_val, model_seq_len_val, model_config_val, dtype_val)
     {
         // 1. the parameters and their gradients, in a TensorBuffer each
-        int group_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
+        int group_index_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
         param_buffer_val.allocate(dtype_val);
         grad_buffer_val = TensorBuffer::zeros_like(param_buffer_val);
         std::vector<Tensor> param_tensors_list;
         std::vector<Tensor> grad_tensors_list;
-        for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_val); param_index_val++)
+        for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_index_val); param_index_val++)
         {
-            param_tensors_list.push_back(param_buffer_val.tensor(group_val, param_index_val));
-            grad_tensors_list.push_back(grad_buffer_val.tensor(group_val, param_index_val));
+            param_tensors_list.push_back(param_buffer_val.tensor(group_index_val, param_index_val));
+            grad_tensors_list.push_back(grad_buffer_val.tensor(group_index_val, param_index_val));
         }
         params_val = GPT2Params(param_tensors_list, config_val);
         grads_val = GPT2Params(grad_tensors_list, config_val);
@@ -205,13 +205,13 @@ static torch::Tensor pytorch_gpt2_logits(const torch::Tensor &token_ids_tensor, 
     int64_t seq_len_val = token_ids_tensor.size(1);
     torch::Tensor x_tensor = torch::embedding(p_list[0], token_ids_tensor) + p_list[1].narrow(0, 0, seq_len_val);
     // 2. the blocks, each's 12 gathered as GPT2Params does
-    for (int64_t layer_val = 0; layer_val < num_layers_val; layer_val++)
+    for (int64_t layer_index_val = 0; layer_index_val < num_layers_val; layer_index_val++)
     {
         std::vector<torch::Tensor> block_list;
         for (int64_t param_index_val = 0; param_index_val < BLOCK_MATRICES; param_index_val++)
-            block_list.push_back(p_list[2 + BLOCK_MATRICES * layer_val + param_index_val]);
+            block_list.push_back(p_list[2 + BLOCK_MATRICES * layer_index_val + param_index_val]);
         for (int64_t param_index_val = 0; param_index_val < BLOCK_PARAMS - BLOCK_MATRICES; param_index_val++)
-            block_list.push_back(p_list[2 + BLOCK_MATRICES * num_layers_val + (BLOCK_PARAMS - BLOCK_MATRICES) * layer_val +
+            block_list.push_back(p_list[2 + BLOCK_MATRICES * num_layers_val + (BLOCK_PARAMS - BLOCK_MATRICES) * layer_index_val +
                                         param_index_val]);
         x_tensor = pytorch_block_forward(x_tensor, block_list, (int64_t)config_val.num_heads);
     }
@@ -256,7 +256,7 @@ static void time_20_steps_on_gpt2_small_size(void)
 
     // 2. time TIMED_STEPS steps, each backward from gradients of 0
     double totals_list[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float times_list[4];
         times_list[0] = gpu_milliseconds([&] { mine_val.forward(); });
@@ -269,10 +269,10 @@ static void time_20_steps_on_gpt2_small_size(void)
         for (torch::Tensor &param_tensor : pytorch_params_list)
             param_tensor.mutable_grad() = torch::Tensor();
         times_list[3] = gpu_milliseconds([&] { pytorch_loss_tensor.backward(); });
-        if (step_val <= WARM_UP_STEPS)
+        if (step_index_val <= WARM_UP_STEPS)
             continue;
-        for (int column_val = 0; column_val < 4; column_val++)
-            totals_list[column_val] += times_list[column_val];
+        for (int column_index_val = 0; column_index_val < 4; column_index_val++)
+            totals_list[column_index_val] += times_list[column_index_val];
     }
 
     // 3. print the averages
@@ -349,15 +349,15 @@ static void find_the_micro_batch_with_the_best_mfu(void)
     // 1. GPT-2 small's parameters and gradients in bfloat16, a TensorBuffer each, with GPT-2's starting values
     GPT2Config config_val;
     TensorBuffer param_buffer_val;
-    int group_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
+    int group_index_val = param_buffer_val.add_many(GPT2Params::shapes(config_val));
     param_buffer_val.allocate(DType::BFloat16);
     TensorBuffer grad_buffer_val = TensorBuffer::zeros_like(param_buffer_val);
     std::vector<Tensor> param_tensors_list;
     std::vector<Tensor> grad_tensors_list;
-    for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_val); param_index_val++)
+    for (int param_index_val = 0; param_index_val < param_buffer_val.group_size(group_index_val); param_index_val++)
     {
-        param_tensors_list.push_back(param_buffer_val.tensor(group_val, param_index_val));
-        grad_tensors_list.push_back(grad_buffer_val.tensor(group_val, param_index_val));
+        param_tensors_list.push_back(param_buffer_val.tensor(group_index_val, param_index_val));
+        grad_tensors_list.push_back(grad_buffer_val.tensor(group_index_val, param_index_val));
     }
     GPT2Params params_val(param_tensors_list, config_val);
     GPT2Params grads_val(grad_tensors_list, config_val);
@@ -393,8 +393,8 @@ static void find_the_micro_batch_with_the_best_mfu(void)
         Tensor token_ids_tensor = Tensor::zeros({rows_val, (size_t)SEQ_LEN}, DType::Int32);
         Tensor targets_tensor = Tensor::zeros({rows_val, (size_t)SEQ_LEN}, DType::Int32);
         std::vector<int> ids_list(rows_val * SEQ_LEN);
-        for (size_t i_val = 0; i_val < ids_list.size(); i_val++)
-            ids_list[i_val] = (int)((i_val * 7919) % config_val.vocab_size);  // 7919, a prime: ids spread over the vocabulary
+        for (size_t id_index_val = 0; id_index_val < ids_list.size(); id_index_val++)
+            ids_list[id_index_val] = (int)((id_index_val * 7919) % config_val.vocab_size);  // 7919, a prime: ids spread over the vocabulary
         token_ids_tensor.copy_from_cpu(ids_list.data());
         std::rotate(ids_list.begin(), ids_list.begin() + 1, ids_list.end()); // each target the next id
         targets_tensor.copy_from_cpu(ids_list.data());
@@ -410,7 +410,7 @@ static void find_the_micro_batch_with_the_best_mfu(void)
         };
         warm_up_gpu(micro_batch_val);
         double total_ms_val = 0.0;
-        for (int step_val = 1; step_val <= TIMED_STEPS; step_val++)
+        for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
             total_ms_val += gpu_milliseconds(micro_batch_val);
 
         // its numbers

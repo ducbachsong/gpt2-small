@@ -7,8 +7,8 @@
 #include "cuda_common.h"             // cudaCheck, check_threads_per_block, block_reduce_sum
 #include "../tensor.cuh"
 
-#define GRAD_NORM_BLOCKS 512                     // blocks in the launch: each writes one block sum
-#define GRAD_NORM_THREADS MAX_THREADS_PER_BLOCK  // the default block size
+#define GRAD_NORM_BLOCKS 512                               // blocks in the launch: each writes one block sum
+#define GRAD_NORM_THREADS HARDWARE_MAX_THREADS_PER_BLOCK   // the default block size
 
 class GradNorm {
 public:
@@ -50,12 +50,12 @@ __global__ void compute_grad_norm_kernel(float* grad_norm_ptr, float* block_sums
 ///
 ///   grads_tensor            every gradient, float or bfloat16, starting on a whole float4
 ///   grad_norm_tensor        1 float: the result
-///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///   threads_per_block_val   the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                           GRAD_NORM_THREADS. Another size adds the squares in another order, so the last bits
 ///                           can change; the same size gives the same bits every run.
 inline void GradNorm::compute(const Tensor& grads_tensor, const Tensor& grad_norm_tensor, int threads_per_block_val) const {
     // 1. check the launch and the tensors; any of them wrong: stop with an error
-    // block size: whole warps, for block_reduce_sum; at most MAX_THREADS_PER_BLOCK
+    // block size: whole warps, for block_reduce_sum; at most HARDWARE_MAX_THREADS_PER_BLOCK
     check_threads_per_block(threads_per_block_val, "GradNorm");
     // grad_norm: one value
     if (grad_norm_tensor.numel() != 1) {

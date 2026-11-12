@@ -1,7 +1,7 @@
-// tune_adamw_bf16.cu — the timings of tests/test_adamw_bf16.cu, moved here so the tests only check numbers:
+// tune_adamw_bf16.cu — the timings of tests/bf16/test_adamw_bf16.cu, moved here so the tests only check numbers:
 // time_the_kernel_with_other_block_and_thread_counts.
 //
-// Built as tests/test_adamw_bf16.cu is (see tunes/README.md); what it prints also goes to
+// Built as tests/bf16/test_adamw_bf16.cu is (see tunes/README.md); what it prints also goes to
 // tunes/results/<GPU>/adamw_bf16_<date>_<time>.txt.
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls
@@ -9,7 +9,7 @@
 #include <torch/utils.h>              // torch::NoGradGuard
 #include "../tests/test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR, sample_data
 #include "tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, print_gpu, MBU
-#include "../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update_bf16 (kernels/adamw_bf16.cuh)
+#include "../llmc/optimizer.cuh"      // AdamW, AdamWConfig; and adamw_update_bf16 (kernels/bf16/adamw_bf16.cuh)
 
 #define GPT2_PARAMS 124439808         // GPT-2 small's values
 #define GPT2_DECAYED_PARAMS 124439040 // of them in matrices
@@ -111,17 +111,17 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int sms_val = 0;                                         // this GPU's SMs: 40 on a T4, 114 on an H100 PCIe
     cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
     int block_counts_list[] = {40, 160, 640, 2560, 10240, 40960, one_float4_per_thread_blocks_val, sms_val, 2 * sms_val};
-    int thread_counts_list[] = {4 * THREADS_PER_WARP, 8 * THREADS_PER_WARP, 16 * THREADS_PER_WARP, MAX_THREADS_PER_BLOCK};
+    int thread_counts_list[] = {4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     const int thread_count_choices_val = 4;
     const int launches_val = 9 * thread_count_choices_val;
     float total_ms_list[launches_val] = {}; // launch k is block_counts[k / 4] x thread_counts[k % 4]
-    for (int round_val = 1; round_val <= SWEEP_ROUNDS; round_val++)
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
     {
-        for (int launch_val = 0; launch_val < launches_val; launch_val++)
+        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
         {
-            blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-            threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-            total_ms_list[launch_val] += gpu_milliseconds(update_val);
+            blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+            total_ms_list[launch_index_val] += gpu_milliseconds(update_val);
         }
     }
 
@@ -132,11 +132,11 @@ static void time_the_kernel_with_other_block_and_thread_counts(void)
     int launches_with_the_same_result_val = 0;
     print_test_name(__func__);
     printf("    time in ms:   blocks   threads   float4s per thread     time   same result\n");
-    for (int launch_val = 0; launch_val < launches_val; launch_val++)
+    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
     {
-        blocks_val = block_counts_list[launch_val / thread_count_choices_val];
-        threads_val = thread_counts_list[launch_val % thread_count_choices_val];
-        float time_val = total_ms_list[launch_val] / SWEEP_ROUNDS;
+        blocks_val = block_counts_list[launch_index_val / thread_count_choices_val];
+        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
+        float time_val = total_ms_list[launch_index_val] / SWEEP_ROUNDS;
         if (time_val < fastest_ms_val)
         {
             fastest_ms_val = time_val;

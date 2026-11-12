@@ -10,7 +10,7 @@
 #include "cuda_common.h"             // cudaCheck, check_threads_per_block
 #include "../tensor.cuh"
 
-#define RESIDUAL_THREADS_PER_BLOCK (8 * THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
+#define RESIDUAL_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)   // the default block size: 8 warps, one float4 per thread
 
 // ── forward and backward ──────────────────────────────────────────────────────
 void residual_forward(const Tensor& output_tensor, const Tensor& residual_tensor, const Tensor& branch_output_tensor,
@@ -35,7 +35,7 @@ __global__ void residual_forward_kernel(T* output_ptr, const T* residual_ptr, co
 ///   output_tensor           the sum; may be residual or branch_output itself
 ///   residual_tensor         the row the branch was given
 ///   branch_output_tensor    what the attention or MLP gave
-///   threads_per_block_val   the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///   threads_per_block_val   the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                           RESIDUAL_THREADS_PER_BLOCK. Any size gives the same bits; only the time changes.
 inline void residual_forward(const Tensor& output_tensor, const Tensor& residual_tensor, const Tensor& branch_output_tensor,
                              int threads_per_block_val) {
@@ -65,12 +65,12 @@ __global__ void residual_forward_kernel(T* output_ptr, const T* residual_ptr, co
     size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     // Thread n takes float4s n, n + every thread launched, ...
     for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
-        size_t first_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
+        size_t first_value_index_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
         // 1. read both, to float
-        float4 residual_val = read4_as_float(residual_ptr + first_val);
-        float4 branch_output_val = read4_as_float(branch_output_ptr + first_val);
+        float4 residual_val = read4_as_float(residual_ptr + first_value_index_val);
+        float4 branch_output_val = read4_as_float(branch_output_ptr + first_value_index_val);
         // 2. add and write
-        write4_from_float(output_ptr + first_val,
+        write4_from_float(output_ptr + first_value_index_val,
                           make_float4(residual_val.x + branch_output_val.x, residual_val.y + branch_output_val.y,
                                       residual_val.z + branch_output_val.z, residual_val.w + branch_output_val.w));
     }
@@ -88,7 +88,7 @@ __global__ void residual_backward_kernel(T* residual_grad_ptr, T* branch_output_
 ///   residual_grad_tensor        part 1 of the residual's gradient
 ///   branch_output_grad_tensor   the branch's gradient
 ///   output_grad_tensor          the gradient from the layer above; may be either of the two itself
-///   threads_per_block_val       the block size: whole warps, at most MAX_THREADS_PER_BLOCK; not given:
+///   threads_per_block_val       the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                               RESIDUAL_THREADS_PER_BLOCK. Any size gives the same bits; only the time changes.
 inline void residual_backward(const Tensor& residual_grad_tensor, const Tensor& branch_output_grad_tensor,
                               const Tensor& output_grad_tensor, int threads_per_block_val) {
@@ -118,12 +118,12 @@ __global__ void residual_backward_kernel(T* residual_grad_ptr, T* branch_output_
     size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     // Thread n takes float4s n, n + every thread launched, ...
     for (size_t index_val = thread_index_val; index_val < total_float4s_val; index_val += (size_t)gridDim.x * blockDim.x) {
-        size_t first_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
+        size_t first_value_index_val = VALUES_PER_FLOAT4 * index_val;    // this float4's first value
         // 1. read output_grad
-        float4 output_grad_val = read4_as_float(output_grad_ptr + first_val);
+        float4 output_grad_val = read4_as_float(output_grad_ptr + first_value_index_val);
         // 2. write it to both
-        write4_from_float(residual_grad_ptr + first_val, output_grad_val);
-        write4_from_float(branch_output_grad_ptr + first_val, output_grad_val);
+        write4_from_float(residual_grad_ptr + first_value_index_val, output_grad_val);
+        write4_from_float(branch_output_grad_ptr + first_value_index_val, output_grad_val);
     }
 }
 
