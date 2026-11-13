@@ -52,8 +52,8 @@ struct GPT2Activations8bit {
     Tensor lnf_mean;                                        // {B, T}
     Tensor lnf_rstd;                                        // {B, T}
     Tensor logits;                                          // {B, T, padded_vocab_size}; the backward writes logits_grad
-                                                            // over it (classifier_bf16_backward allows it): 1.6 GB less
-                                                            // at {16, 1024}
+                                                            // over it (classifier_bf16_backward allows it): 6.6 GB less
+                                                            // at {64, 1024}
     Tensor losses;                                          // {B, T}
     Tensor max_of_each_row;                                 // {B, T}
     Tensor sum_of_each_row;                                 // {B, T}

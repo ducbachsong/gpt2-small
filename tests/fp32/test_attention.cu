@@ -7,7 +7,7 @@
 // what the mask must give; part 3 checks that each kernel's registers fit its block, and other block sizes.
 // Flash attention takes head_size ATTENTION_FLASH_HEAD_SIZE (64) and seq_len a multiple of ATTENTION_FLASH_TILE
 // (32), so every test is of those sizes. bfloat16 (its steps and its flash attention):
-// tests/bf16/test_attention_bf16.cu; 8-bit: tests/test_attention_8bit.cu. The timings are in tunes/tune_attention.cu.
+// tests/bf16/test_attention_bf16.cu; 8-bit: tests/test_attention_8bit.cu. The timings are in tests/fp32/tune_attention.cu.
 // (The C# trainer had no attention test: TorchSharp's was trusted.)
 #include <torch/types.h>              // torch::scaled_dot_product_attention, torch::randn, backward(); before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed

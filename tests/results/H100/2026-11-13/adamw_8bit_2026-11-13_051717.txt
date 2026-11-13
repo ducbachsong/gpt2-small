@@ -1,0 +1,54 @@
+log: tests/results/H100/adamw_8bit_2026-11-13_051717.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_the_three_adamws_on_gpt2_small_size
+    average of 20 updates; this GPU's peak memory bandwidth 3939 GB/s
+    AdamW            bytes a value   time ms     GB/s    MBU
+    float                       28     1.056     3301    84%
+    bfloat16                    20     0.806     3089    78%
+    8-bit m and v               16     0.905     2200    56%
+
+time_the_kernel_with_other_block_and_thread_counts
+    this GPU's peak memory bandwidth 3939 GB/s
+    time in ms:   blocks   threads   float4s per thread     time     GB/s    MBU   same result
+                      40       128                 6077    7.891      252     6%   yes        
+                      40       256                 3039    4.168      478    12%   yes        
+                      40       512                 1520    2.353      846    21%   yes        
+                      40      1024                  760    1.522     1308    33%   yes        
+                     160       128                 1520    2.154      924    23%   yes        
+                     160       256                  760    1.266     1573    40%   yes        
+                     160       512                  380    0.939     2121    54%   yes        
+                     160      1024                  190    1.044     1907    48%   yes        
+                     640       128                  380    0.846     2353    60%   yes        
+                     640       256                  190    0.713     2791    71%   yes        
+                     640       512                   95    0.870     2289    58%   yes        
+                     640      1024                   48    0.892     2232    57%   yes        
+                    2560       128                   95    0.731     2724    69%   yes        
+                    2560       256                   48    0.733     2716    69%   yes        
+                    2560       512                   24    0.821     2425    62%   yes        
+                    2560      1024                   12    0.883     2255    57%   yes        
+                   10240       128                   24    0.706     2822    72%   yes        
+                   10240       256                   12    0.678     2939    75%   yes        
+                   10240       512                    6    0.724     2752    70%   yes        
+                   10240      1024                    3    0.686     2904    74%   yes        
+                   40960       128                    6    0.621     3207    81%   yes        
+                   40960       256                    3    0.631     3154    80%   yes        
+                   40960       512                    2    0.682     2919    74%   yes        
+                   40960      1024                    1    0.764     2608    66%   yes        
+                  121524       128                    2    0.625     3185    81%   yes        
+                  121524       256                    1    0.645     3085    78%   yes           <- what adamw_update_8bit launches: one float4 per thread
+                  121524       512                    1    0.769     2590    66%   yes        
+                  121524      1024                    1    1.001     1989    50%   yes        
+                     132       128                 1842    2.483      802    20%   yes        
+                     132       256                  921    1.392     1430    36%   yes        
+                     132       512                  461    0.941     2115    54%   yes        
+                     132      1024                  231    0.819     2432    62%   yes        
+                     264       128                  921    1.416     1406    36%   yes        
+                     264       256                  461    0.880     2262    57%   yes        
+                     264       512                  231    0.785     2536    64%   yes        
+                     264      1024                  116    0.851     2339    59%   yes        
+    fastest        40960 blocks x  128 threads: 0.621 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 307)
+
+all tunes done

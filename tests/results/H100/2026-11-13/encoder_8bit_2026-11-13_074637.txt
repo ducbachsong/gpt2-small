@@ -1,0 +1,61 @@
+log: tests/results/H100/encoder_8bit_2026-11-13_074637.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_8bit_forward_against_bfloat16
+    this GPU's peak 3939 GB/s; encoded's largest difference from the bfloat16 encoder: 3.78e-02 of its largest value
+    run                        MB        ms     GB/s    MBU
+    encoder_8bit_forward      131.9    0.0517     2549    65%
+      the rounding            116.1    0.0447     2595    66%
+      the gather               15.8    0.0098     1602    41%
+    encoder_bf16_forward       18.9    0.0108     1742    44%
+    the step's encoder and the head's rounding of wte:   bfloat16 encoder 0.0556 ms   8-bit encoder 0.0517 ms
+    input: difference_val <= EIGHT_BIT_TOLERANCE expected: true   actual: true   ok  (line 180)
+
+time_gather_with_other_block_and_thread_counts
+    15.8 MB asked for; this GPU's peak 3939 GB/s
+    blocks   threads        ms     GB/s    MBU   same result
+        40       128    0.0531      297     8%   yes        
+        40       256    0.0305      517    13%   yes        
+        40       512    0.0191      827    21%   yes        
+        40      1024    0.0140     1124    29%   yes        
+        80       128    0.0293      539    14%   yes        
+        80       256    0.0183      862    22%   yes        
+        80       512    0.0123     1279    32%   yes        
+        80      1024    0.0099     1589    40%   yes        
+       160       128    0.0177      892    23%   yes        
+       160       256    0.0125     1257    32%   yes        
+       160       512    0.0095     1664    42%   yes        
+       160      1024    0.0095     1660    42%   yes        
+       320       128    0.0118     1331    34%   yes        
+       320       256    0.0093     1695    43%   yes        
+       320       512    0.0087     1818    46%   yes        
+       320      1024    0.0086     1842    47%   yes        
+       512       128    0.0098     1606    41%   yes        
+       512       256    0.0084     1867    47%   yes           <- the default
+       512       512    0.0082     1918    49%   yes        
+       512      1024    0.0086     1829    46%   yes        
+      1024       128    0.0083     1895    48%   yes        
+      1024       256    0.0083     1889    48%   yes        
+      1024       512    0.0089     1780    45%   yes        
+      1024      1024    0.0090     1745    44%   yes        
+      2048       128    0.0082     1931    49%   yes        
+      2048       256    0.0085     1864    47%   yes        
+      2048       512    0.0086     1832    47%   yes        
+      2048      1024    0.0104     1516    38%   yes        
+      4096       128    0.0087     1821    46%   yes        
+      4096       256    0.0095     1667    42%   yes        
+      4096       512    0.0099     1597    41%   yes        
+      4096      1024    0.0133     1187    30%   yes        
+       132       128    0.0199      793    20%   yes        
+       132       256    0.0132     1191    30%   yes        
+       132       512    0.0102     1544    39%   yes        
+       132      1024    0.0088     1799    46%   yes        
+       264       128    0.0131     1200    30%   yes        
+       264       256    0.0099     1595    40%   yes        
+       264       512    0.0087     1811    46%   yes        
+       264      1024    0.0088     1787    45%   yes        
+    fastest gather  2048 blocks x  128 threads: 0.0082 ms, 1931 GB/s, MBU 49%
+    input: launches_with_the_same_result_val    expected: 40   actual: 40   ok  (line 255)
+
+all tunes done

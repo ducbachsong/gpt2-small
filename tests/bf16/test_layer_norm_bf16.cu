@@ -5,7 +5,7 @@
 // Part 1 checks both against PyTorch's layer_norm (with autograd for the backward) and against fp32/layer_norm.cuh's
 // bfloat16 path (4 values a lane); part 2 checks numbers worked out by hand, the cases of tests/fp32/test_layer_norm.cu
 // on rows of 8; part 3 checks that each kernel's registers fit its block, and other block sizes. Any GPU. The timings
-// are in tunes/tune_layer_norm_bf16.cu.
+// are in tests/bf16/tune_layer_norm_bf16.cu.
 #include <torch/types.h>              // torch::layer_norm, backward(); libtorch before any CUDA header
 #include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
 #include "../../llmc/kernels/fp32/layer_norm.cuh"      // the 4-value path, to compare with
@@ -411,10 +411,12 @@ static void every_kernel_fits_its_block(void)
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels_list[] = {(const void *)layer_norm_bf16_forward_kernel, (const void *)layer_norm_bf16_backward_kernel};
-    const char *names_list[] = {"layer_norm_bf16_forward_kernel", "layer_norm_bf16_backward_kernel"};
-    int threads_list[] = {LAYER_NORM_BF16_THREADS_PER_BLOCK, LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK};
-    for (int kernel_index_val = 0; kernel_index_val < 2; kernel_index_val++)
+    const void *kernels_list[] = {(const void *)layer_norm_bf16_forward_kernel, (const void *)layer_norm_bf16_backward_kernel,
+                                  (const void *)layer_norm_bf16_backward_sums_kernel};
+    const char *names_list[] = {"layer_norm_bf16_forward_kernel", "layer_norm_bf16_backward_kernel",
+                                "layer_norm_bf16_backward_sums_kernel"};
+    int threads_list[] = {LAYER_NORM_BF16_THREADS_PER_BLOCK, LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK, LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK};
+    for (int kernel_index_val = 0; kernel_index_val < (int)(sizeof(kernels_list) / sizeof(kernels_list[0])); kernel_index_val++)
     {
         // 1. what the compiler wrote down
         cudaFuncAttributes attributes_val;

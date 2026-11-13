@@ -5,7 +5,7 @@
 // Part 1 checks both against PyTorch's + (in float on the same values, rounded to bfloat16) and against
 // fp32/residual.cuh's bfloat16 path (4 values a thread); part 2 checks numbers worked out by hand, the cases of
 // tests/fp32/test_residual.cu on 8 values; part 3 checks that each kernel's registers fit its block, and that any
-// block size gives the same bits. Any GPU. The timings are in tunes/tune_residual_bf16.cu.
+// block size gives the same bits. Any GPU. The timings are in tests/bf16/tune_residual_bf16.cu.
 #include <torch/types.h>              // torch::randn; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"          // ASSERT_EQ: every check here is exact

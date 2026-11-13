@@ -19,6 +19,14 @@
 // writes them; a matrix that sits turned round (a linear layer's backward) is turned while rounding (round_8bit's
 // turned), not here.
 //
+// The sums are moved out of the tensor cores as the product goes: an FP8 WGMMA adds its products into its sums
+// with fewer bits than a float keeps, so over a long sum (the head's backward adds 50,304 terms, a weight_grad
+// one per token of the micro-batch) the small terms added late are lost. Every promotion_steps steps the tensor
+// cores' sum is added into a second set of sums, in ordinary float registers, and the tensor cores start again
+// from 0 (DeepSeek-V3's "increasing accumulation precision"; every 4 steps, 512 values of k, by default: on an H100 NVL
+// as accurate as every step and 2-5% faster, tune_wgmma_matmul_8bit's sweep). 0 keeps the whole
+// sum in the tensor cores, the way it was before; tune_wgmma_matmul_8bit times and checks each.
+//
 // Step 1 (wgmma_matmul_bf16.cuh's step 1, the worklog's kernel 2): each block makes one HARDWARE_WGMMA_M x
 // WGMMA_MATMUL_8BIT_BLOCK_COLUMNS square of output with one warpgroup (128 threads), walking the sum WGMMA_MATMUL_8BIT_BLOCK_K
 // (128) values at a time: one thread asks TMA for the step's tiles of left_8bit and right_8bit {64 rows, 128
@@ -44,6 +52,7 @@
 #define WGMMA_MATMUL_8BIT_BLOCK_COLUMNS 64                                                        // columns of output per block: one WGMMA's N (any multiple of 8 to 256)
 #define WGMMA_MATMUL_8BIT_BLOCK_K ((int)(HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW / sizeof(__nv_fp8_e4m3)))     // values of k a step loads: one swizzled row, 128
 #define WGMMA_MATMUL_8BIT_COLUMN_GROUPS (WGMMA_MATMUL_8BIT_BLOCK_COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS)   // 8 groups across: 32 sums a thread
+#define WGMMA_MATMUL_8BIT_PROMOTION_STEPS 4     // the default: steps the tensor cores add up before their sum moves into float registers; 0: never. 4: as accurate as 1, 2-5% faster (H100 NVL)
 static_assert(WGMMA_MATMUL_8BIT_BLOCK_COLUMNS == 64, "wgmma_matmul_8bit_multiply_add is written for m64n64k32: its 32 sums a thread");
 static_assert(WGMMA_MATMUL_8BIT_BLOCK_K % HARDWARE_WGMMA_K_E4M3 == 0, "each step is whole WGMMAs");
 static_assert(ROUND_8BIT_ROW_LENGTH_MULTIPLE == HARDWARE_TMA_BYTES_PER_CELL, "round_8bit's rows are whole 16-byte pieces, as TMA reads them");
@@ -62,7 +71,7 @@ template <typename EPILOGUE = WgmmaMatmul8bitStore>
 void wgmma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8bit_tensor, const Tensor& left_scales_tensor,
                       const Tensor& right_8bit_tensor, const Tensor& right_scales_tensor,
                       const Tensor& bias_tensor = Tensor(), bool add_onto_val = false,
-                      const EPILOGUE& epilogue_val = EPILOGUE());
+                      const EPILOGUE& epilogue_val = EPILOGUE(), int promotion_steps_val = WGMMA_MATMUL_8BIT_PROMOTION_STEPS);
 
 // ── for it ────────────────────────────────────────────────────────────────────
 CUtensorMap wgmma_matmul_8bit_tensor_map(const void* matrix_ptr, size_t matrix_rows_val, size_t matrix_bytes_per_row_val,
@@ -81,10 +90,11 @@ __global__ void __launch_bounds__(HARDWARE_WARPGROUP_THREADS)
 wgmma_matmul_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                         nv_bfloat16* output_ptr, const float* left_scales_ptr, const float* right_scales_ptr,
                         const nv_bfloat16* bias_ptr, int rows_val, int columns_val, int sum_length_val, bool add_onto_val,
-                        EPILOGUE epilogue_val);
+                        EPILOGUE epilogue_val, int promotion_steps_val);
 __device__ __forceinline__ uint64_t wgmma_matmul_8bit_descriptor(const uint8_t* tile_ptr);
 __device__ __forceinline__ void wgmma_matmul_8bit_multiply_add(float (&sums_list)[WGMMA_MATMUL_8BIT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP],
-                                               const uint8_t* left_tile_ptr, const uint8_t* right_tile_ptr);
+                                               const uint8_t* left_tile_ptr, const uint8_t* right_tile_ptr,
+                                               int add_onto_sums_val);
 
 /// Writes output = left_scale · right_scale · (left_8bit · right_8bitᵀ) (+ bias) (+ output): checks, describes
 /// left_8bit's and right_8bit's tiles for TMA, then launches wgmma_matmul_8bit_kernel, one block per square of
@@ -97,14 +107,22 @@ __device__ __forceinline__ void wgmma_matmul_8bit_multiply_add(float (&sums_list
 ///   add_onto_val                            true: added onto what output holds; false: written over
 ///   epilogue_val                            what is done to each pair of results as it is stored; not given:
 ///                                           WgmmaMatmul8bitStore, nothing
+///   promotion_steps_val                     every how many steps (WGMMA_MATMUL_8BIT_BLOCK_K values of k each) the
+///                                           tensor cores' sum moves into float registers; 0: never. Not given:
+///                                           WGMMA_MATMUL_8BIT_PROMOTION_STEPS
 /// sum_length must be a multiple of 16 and columns of 8; output bfloat16.
 template <typename EPILOGUE>
 inline void wgmma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8bit_tensor, const Tensor& left_scales_tensor,
                              const Tensor& right_8bit_tensor, const Tensor& right_scales_tensor,
-                             const Tensor& bias_tensor, bool add_onto_val, const EPILOGUE& epilogue_val) {
-    // 1. check the tensors; any of them wrong: stop with an error
+                             const Tensor& bias_tensor, bool add_onto_val, const EPILOGUE& epilogue_val,
+                             int promotion_steps_val) {
+    // 1. check the tensors and the promotion; any of them wrong: stop with an error
     wgmma_matmul_8bit_check_shapes(output_tensor, left_8bit_tensor, left_scales_tensor, right_8bit_tensor, right_scales_tensor,
                           bias_tensor);
+    if (promotion_steps_val < 0) {
+        fprintf(stderr, "error: wgmma_matmul_8bit's promotion_steps must be 0 (never) or more; got %d\n", promotion_steps_val);
+        exit(EXIT_FAILURE);
+    }
 
     // 2. the sizes, and TMA's description of left_8bit's and right_8bit's tiles (one byte a value)
     size_t sum_length_val = left_8bit_tensor.size(left_8bit_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT;
@@ -120,7 +138,7 @@ inline void wgmma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8b
     wgmma_matmul_8bit_kernel<EPILOGUE><<<total_blocks_val, HARDWARE_WARPGROUP_THREADS>>>(
         left_map_val, right_map_val, output_tensor.data_ptr<nv_bfloat16>(), left_scales_tensor.data(),
         right_scales_tensor.data(), bias_tensor.data_ptr() != nullptr ? bias_tensor.data_ptr<nv_bfloat16>() : nullptr,
-        (int)rows_val, (int)columns_val, (int)sum_length_val, add_onto_val, epilogue_val);
+        (int)rows_val, (int)columns_val, (int)sum_length_val, add_onto_val, epilogue_val, promotion_steps_val);
     cudaCheck(cudaGetLastError());
 }
 
@@ -132,12 +150,13 @@ inline void wgmma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8b
 ///   output_ptr, left_scales_ptr, right_scales_ptr, bias_ptr   as in wgmma_matmul_8bit; bias nullptr for none
 ///   rows_val, columns_val, sum_length_val      the shapes
 ///   add_onto_val, epilogue_val                 as in wgmma_matmul_8bit
+///   promotion_steps_val                        as in wgmma_matmul_8bit: 0 never, else every that many steps
 template <typename EPILOGUE>
 __global__ void __launch_bounds__(HARDWARE_WARPGROUP_THREADS)
 wgmma_matmul_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                         nv_bfloat16* output_ptr, const float* left_scales_ptr, const float* right_scales_ptr,
                         const nv_bfloat16* bias_ptr, int rows_val, int columns_val, int sum_length_val, bool add_onto_val,
-                        EPILOGUE epilogue_val) {
+                        EPILOGUE epilogue_val, int promotion_steps_val) {
     namespace cde = cuda::device::experimental;
     // this step's tiles, in TMA's swizzled layout (on a 1024-byte atom), and the barrier that says they arrived
     __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) uint8_t left_tile_list[HARDWARE_WGMMA_M * WGMMA_MATMUL_8BIT_BLOCK_K];
@@ -157,10 +176,16 @@ wgmma_matmul_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const
     }
     __syncthreads();
 
-    // 2. walk the sum: TMA brings the step's tiles, the tensor cores add their product
-    float sums_list[WGMMA_MATMUL_8BIT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // this thread's part of the square
+    // 2. walk the sum: TMA brings the step's tiles, the tensor cores add their product into tensor_sums, and every
+    //    promotion_steps steps (and at the end) tensor_sums is added into sums, in float, and starts again from 0
+    float sums_list[WGMMA_MATMUL_8BIT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};          // this thread's part of the square
+    float tensor_sums_list[WGMMA_MATMUL_8BIT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // the tensor cores' sum since the last move
     int total_steps_val = CEIL_DIV(sum_length_val, WGMMA_MATMUL_8BIT_BLOCK_K);
     for (int step_index_val = 0; step_index_val < total_steps_val; step_index_val++) {
+        // which steps start a fresh tensor_sums, and which move it into sums: the same for every thread
+        bool start_again_val = promotion_steps_val > 0 ? step_index_val % promotion_steps_val == 0 : step_index_val == 0;
+        bool move_val = (promotion_steps_val > 0 && (step_index_val + 1) % promotion_steps_val == 0) ||
+                        step_index_val + 1 == total_steps_val;
         // a. one thread asks for both tiles (past the edges TMA gives 0s) and says how many bytes to wait for;
         //    the others arrive; all wait until the bytes are in
         WgmmaMatmul8bitBarrier::arrival_token token_val;
@@ -176,16 +201,27 @@ wgmma_matmul_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const
         }
         tiles_barrier_val.wait(std::move(token_val));
 
-        // b. the tensor cores: WGMMA_MATMUL_8BIT_BLOCK_K / HARDWARE_WGMMA_K_E4M3 WGMMAs, each 32 more values (bytes) of k
+        // b. the tensor cores: WGMMA_MATMUL_8BIT_BLOCK_K / HARDWARE_WGMMA_K_E4M3 WGMMAs, each 32 more values (bytes) of k;
+        //    the first of a fresh start writes tensor_sums over (adds onto 0) instead of adding onto it
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");          // the sums ready for the tensor cores
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < WGMMA_MATMUL_8BIT_BLOCK_K / HARDWARE_WGMMA_K_E4M3; k_step_index_val++)
-            wgmma_matmul_8bit_multiply_add(sums_list, left_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3,
-                           right_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3);
+            wgmma_matmul_8bit_multiply_add(tensor_sums_list, left_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3,
+                           right_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3,
+                           (k_step_index_val == 0 && start_again_val) ? 0 : 1);
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");   // the step's WGMMAs as one group
         asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");   // ... done
 
-        // c. every thread done with the tiles before TMA fills them again
+        // c. move the tensor cores' sum into the float sums, when it is time
+        if (move_val) {
+#pragma unroll
+            for (int group_index_val = 0; group_index_val < WGMMA_MATMUL_8BIT_COLUMN_GROUPS; group_index_val++)
+#pragma unroll
+                for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++)
+                    sums_list[group_index_val][c_value_index_val] += tensor_sums_list[group_index_val][c_value_index_val];
+        }
+
+        // d. every thread done with the tiles before TMA fills them again
         __syncthreads();
     }
 
@@ -241,11 +277,13 @@ __device__ __forceinline__ uint64_t wgmma_matmul_8bit_descriptor(const uint8_t* 
 ///
 ///   sums_list                       this thread's 32 sums, in WGMMA's layout
 ///   left_tile_ptr, right_tile_ptr   the 32 values of k to use, in the shared memory tiles
+///   add_onto_sums_val               1: sums += the product; 0: sums = the product (what sums held is not read)
 __device__ __forceinline__ void wgmma_matmul_8bit_multiply_add(float (&sums_list)[WGMMA_MATMUL_8BIT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP],
-                                               const uint8_t* left_tile_ptr, const uint8_t* right_tile_ptr) {
+                                               const uint8_t* left_tile_ptr, const uint8_t* right_tile_ptr,
+                                               int add_onto_sums_val) {
     uint64_t left_descriptor_val = wgmma_matmul_8bit_descriptor(left_tile_ptr);
     uint64_t right_descriptor_val = wgmma_matmul_8bit_descriptor(right_tile_ptr);
-    // scale-d 1: add onto the sums; scale-a, scale-b 1
+    // scale-d (the predicate p, from add_onto_sums_val): 1 adds onto the sums, 0 writes them over; scale-a, scale-b 1
     asm volatile(
         "{\n"
         ".reg .pred p;\n"
@@ -259,7 +297,7 @@ __device__ __forceinline__ void wgmma_matmul_8bit_multiply_add(float (&sums_list
           "+f"(sums_list[2][0]), "+f"(sums_list[2][1]), "+f"(sums_list[2][2]), "+f"(sums_list[2][3]), "+f"(sums_list[3][0]), "+f"(sums_list[3][1]), "+f"(sums_list[3][2]), "+f"(sums_list[3][3]),
           "+f"(sums_list[4][0]), "+f"(sums_list[4][1]), "+f"(sums_list[4][2]), "+f"(sums_list[4][3]), "+f"(sums_list[5][0]), "+f"(sums_list[5][1]), "+f"(sums_list[5][2]), "+f"(sums_list[5][3]),
           "+f"(sums_list[6][0]), "+f"(sums_list[6][1]), "+f"(sums_list[6][2]), "+f"(sums_list[6][3]), "+f"(sums_list[7][0]), "+f"(sums_list[7][1]), "+f"(sums_list[7][2]), "+f"(sums_list[7][3])
-        : "l"(left_descriptor_val), "l"(right_descriptor_val), "r"(1));
+        : "l"(left_descriptor_val), "l"(right_descriptor_val), "r"(add_onto_sums_val));
 }
 
 // ── for it ────────────────────────────────────────────────────────────────────

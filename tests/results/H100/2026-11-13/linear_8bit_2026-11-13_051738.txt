@@ -1,0 +1,75 @@
+log: tests/results/H100/linear_8bit_2026-11-13_051738.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+[W1113 05:17:38.622644681 CublasHandlePool.cpp:335] Warning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (function operator())
+
+time_20_steps_on_qkv
+    input {4, 1024, 768}, weight {2304, 768}: 14.5 GFLOP forward, 29.0 GFLOP backward
+    average of steps 3..20:     forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        0.069         0.716           210.45             40.50
+        bfloat16                      0.071         0.167           203.51            174.03
+        PyTorch bfloat16              0.062         0.195           232.45            148.77
+    bfloat16 takes, against 8-bit:                    1.03x          0.23x
+
+time_20_steps
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 0.1   actual: 0.0359477   ok  (line 148)
+    input: relative_difference_on_gpu(eight_bit_val.input_grad_tensor, pytorch_input_tensor.grad()) expected: 0 +/- 0.1   actual: 0.037642   ok  (line 149)
+    input: relative_difference_on_gpu(eight_bit_val.weight_grad_tensor, pytorch_weight_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0439024   ok  (line 150)
+    input: relative_difference_on_gpu(eight_bit_val.bias_grad_tensor, pytorch_bias_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0179856   ok  (line 152)
+
+time_20_steps_on_attention_output
+    input {4, 1024, 768}, weight {768, 768}: 4.8 GFLOP forward, 9.7 GFLOP backward
+    average of steps 3..20:     forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        0.035         0.416           139.42             23.21
+        bfloat16                      0.027         0.104           176.71             93.06
+        PyTorch bfloat16              0.035         0.134           137.87             72.23
+    bfloat16 takes, against 8-bit:                    0.79x          0.25x
+
+time_20_steps
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 0.1   actual: 0.0352823   ok  (line 148)
+    input: relative_difference_on_gpu(eight_bit_val.input_grad_tensor, pytorch_input_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0372469   ok  (line 149)
+    input: relative_difference_on_gpu(eight_bit_val.weight_grad_tensor, pytorch_weight_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0469613   ok  (line 150)
+    input: relative_difference_on_gpu(eight_bit_val.bias_grad_tensor, pytorch_bias_tensor.grad()) expected: 0 +/- 0.1   actual: 0.033195   ok  (line 152)
+
+time_20_steps_on_mlp_up
+    input {4, 1024, 768}, weight {3072, 768}: 19.3 GFLOP forward, 38.7 GFLOP backward
+    average of steps 3..20:     forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        0.069         0.814           281.44             47.50
+        bfloat16                      0.081         0.185           237.78            209.20
+        PyTorch bfloat16              0.064         0.151           300.93            256.01
+    bfloat16 takes, against 8-bit:                    1.18x          0.23x
+
+time_20_steps
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 0.1   actual: 0.0367647   ok  (line 148)
+    input: relative_difference_on_gpu(eight_bit_val.input_grad_tensor, pytorch_input_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0364209   ok  (line 149)
+    input: relative_difference_on_gpu(eight_bit_val.weight_grad_tensor, pytorch_weight_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0389908   ok  (line 150)
+    input: relative_difference_on_gpu(eight_bit_val.bias_grad_tensor, pytorch_bias_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0316901   ok  (line 152)
+
+time_20_steps_on_mlp_down
+    input {4, 1024, 3072}, weight {768, 3072}: 19.3 GFLOP forward, 38.7 GFLOP backward
+    average of steps 3..20:     forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        0.071         0.662           271.37             58.40
+        bfloat16                      0.064         0.189           300.15            204.48
+        PyTorch bfloat16              0.055         0.152           352.68            253.87
+    bfloat16 takes, against 8-bit:                    0.90x          0.29x
+
+time_20_steps
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 0.1   actual: 0.0386691   ok  (line 148)
+    input: relative_difference_on_gpu(eight_bit_val.input_grad_tensor, pytorch_input_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0402685   ok  (line 149)
+    input: relative_difference_on_gpu(eight_bit_val.weight_grad_tensor, pytorch_weight_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0435323   ok  (line 150)
+    input: relative_difference_on_gpu(eight_bit_val.bias_grad_tensor, pytorch_bias_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0176056   ok  (line 152)
+
+time_20_steps_on_head
+    input {4, 1024, 768}, weight {50304, 768}: 316.5 GFLOP forward, 633.0 GFLOP backward
+    average of steps 3..20:     forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        1.040         5.693           304.37            111.18
+        bfloat16                      1.785         2.100           177.30            301.41
+        PyTorch bfloat16              0.698         1.359           453.68            465.88
+    bfloat16 takes, against 8-bit:                    1.72x          0.37x
+
+time_20_steps
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 0.1   actual: 0.0497611   ok  (line 148)
+    input: relative_difference_on_gpu(eight_bit_val.input_grad_tensor, pytorch_input_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0361842   ok  (line 149)
+    input: relative_difference_on_gpu(eight_bit_val.weight_grad_tensor, pytorch_weight_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0444444   ok  (line 150)
+
+all tunes done

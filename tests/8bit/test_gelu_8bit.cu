@@ -7,7 +7,7 @@
 // within one bfloat16 rounding) and against PyTorch's float linear and tanh GELU with autograd on the values before
 // rounding to 8 bits; part 2 checks numbers worked out by hand; part 3 checks that the products' kernels made with
 // GELU's epilogues fit their block. Run it on an H100 (compute capability 9.0), built with -arch=sm_90a in place of
-// -arch=native. The timings are in tunes/tune_gelu_8bit.cu.
+// -arch=native. The timings are in tests/8bit/tune_gelu_8bit.cu.
 #include <torch/types.h>              // torch::linear, torch::gelu, torch::randn, backward(); before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

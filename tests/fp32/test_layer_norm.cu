@@ -4,7 +4,7 @@
 //
 // Part 1 checks both against PyTorch's layer_norm, with autograd for the backward; part 2 checks numbers
 // worked out by hand; part 3 checks that each kernel's registers fit its block, and other block sizes. The
-// timings are in tunes/tune_layer_norm.cu. (The C# trainer had no LayerNorm test: TorchSharp's was
+// timings are in tests/fp32/tune_layer_norm.cu. (The C# trainer had no LayerNorm test: TorchSharp's was
 // trusted.) The model's bfloat16 LayerNorm, 8 values a lane, is tested in tests/bf16/test_layer_norm_bf16.cu; the
 // 8-bit one in tests/8bit/test_layer_norm_8bit.cu.
 #include <torch/types.h>              // torch::layer_norm, backward(); libtorch before any CUDA header
@@ -16,7 +16,7 @@ static const double TOLERANCE = 1e-5; // largest difference from PyTorch, as a f
 // rounding moves a value by up to 2^-8, about 0.4% of it. weight_grad and bias_grad are rounded once per
 // block that adds onto them, 8 times here.
 static const double BFLOAT16_TOLERANCE = 2e-2;
-// Between block sizes in bfloat16: the backward always launches LAYER_NORM_BACKWARD_BLOCKS (80) blocks, and
+// Between block sizes in bfloat16: the backward always launches LAYER_NORM_BACKWARD_BF16_BLOCKS (80) blocks, and
 // each block with rows rounds its sum into weight_grad and bias_grad once. 256 rows at 16 warps a block (the
 // default) fill 16 blocks: 16 roundings; at one warp a block every one of the 80 has rows: 80 roundings, and
 // the two land 2.6% apart on an H100 PCIe. A block that lost its rows would be far off.
@@ -330,7 +330,7 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 {
     // Expect: GPT-2 small's sizes, batch_size = 4 rows of seq_len = 1024 tokens, embed_dim = 768,
     // random input, weight 1, output_grad all 1. All 4096 rows add onto the same 768 values of
-    // bias_grad: 51 or 52 rows into each block's shared copy, then 80 blocks into GPU memory, many at the
+    // bias_grad: 16 rows into each block's shared copy, then 256 blocks into GPU memory, many at the
     // same moment. With atomicAdd no add is lost: 4096 x 1 = 4096 in every column, exactly (whole
     // numbers this small add exactly in floats). input_grad is 0 in every row, up to rounding, as
     // in the_same_output_grad_on_a_whole_row_gives_no_input_grad.
@@ -392,7 +392,7 @@ static void other_block_sizes_give_the_same_result(void)
 {
     // Expect: 256 random rows of 768, in float and in bfloat16, both launchers called with threads_per_block
     // 32, 128, 256 and 512 (one warp up; not 1024: the kernels' 66 registers per thread allow at most 896, see
-    // tunes/tune_layer_norm.cu). Each row is one warp's whatever the block size, so output, mean, rstd
+    // tests/fp32/tune_layer_norm.cu). Each row is one warp's whatever the block size, so output, mean, rstd
     // and input_grad are the defaults' to the last bit. weight_grad and bias_grad are each block's shared sums
     // added onto GPU memory in whatever order the blocks finish: within TOLERANCE in float,
     // BLOCK_SIZES_BFLOAT16_GRAD_TOLERANCE in bfloat16 (more blocks with rows, more roundings).

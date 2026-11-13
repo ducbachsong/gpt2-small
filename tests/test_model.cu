@@ -3,7 +3,7 @@
 // stops the program.
 //
 // Part 1 checks the model against the same model written in PyTorch, with autograd for the backward, in float
-// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tunes/tune_model.cu.
+// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tests/tune_model.cu.
 #include <algorithm>                  // std::min
 #include <memory>                     // std::unique_ptr
 #include <string>

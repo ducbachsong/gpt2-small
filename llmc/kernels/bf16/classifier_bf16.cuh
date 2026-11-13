@@ -48,6 +48,7 @@
 #define CLASSIFIER_BF16_TILE_ROWS HARDWARE_WGMMA_M                              // rows of a tile: one WGMMA's M
 #define CLASSIFIER_BF16_TILE_COLUMNS WGMMA_MATMUL_BF16_BLOCK_COLUMNS            // columns of a tile: one WGMMA's N
 #define CLASSIFIER_BF16_TILE_GROUPS WGMMA_MATMUL_BF16_COLUMN_GROUPS             // groups of C across a tile
+#define CLASSIFIER_BF16_TILE_ROWS_PER_GROUP 64                                   // the default tile order: rows of tiles a group of blocks runs down before the next column (1: row after row); tune_classifier_bf16 sweeps it
 #define CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)      // the loss kernel's default: one warp per row
 #define CLASSIFIER_BF16_BACKWARD_BLOCKS 40960                                       // logits_grad's blocks, at most
 #define CLASSIFIER_BF16_BACKWARD_THREADS_PER_BLOCK (4 * HARDWARE_THREADS_PER_WARP)  // logits_grad's default: fp32/classifier.cuh's bfloat16 pick on an H100
@@ -61,7 +62,8 @@ void classifier_bf16_forward(const Tensor& losses_tensor, const Tensor& max_of_e
                              const Tensor& sum_of_each_row_tensor, const Tensor& tile_max_tensor,
                              const Tensor& tile_sum_tensor, const Tensor& logits_tensor, const Tensor& lnf_output_tensor,
                              const Tensor& wte_tensor, const Tensor& targets_tensor, size_t vocab_size_val,
-                             int threads_per_block_val = CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK);
+                             int threads_per_block_val = CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK,
+                             int tile_rows_per_group_val = CLASSIFIER_BF16_TILE_ROWS_PER_GROUP);
 void classifier_bf16_backward(const Tensor& lnf_output_grad_tensor, const Tensor& wte_grad_tensor,
                               const Tensor& logits_grad_tensor, const Tensor& losses_grad_tensor,
                               const Tensor& logits_tensor, const Tensor& lnf_output_tensor, const Tensor& wte_tensor,
@@ -92,7 +94,7 @@ void classifier_bf16_logits_grad(const char* name_ptr, const Tensor& logits_grad
 __global__ void __launch_bounds__(HARDWARE_WARPGROUP_THREADS)
 classifier_bf16_logits_kernel(const __grid_constant__ CUtensorMap lnf_output_map_val, const __grid_constant__ CUtensorMap wte_map_val,
                               nv_bfloat16* logits_ptr, float* tile_max_ptr, float* tile_sum_ptr, int rows_val,
-                              int padded_vocab_size_val, int vocab_size_val, int embed_dim_val);
+                              int padded_vocab_size_val, int vocab_size_val, int embed_dim_val, int tile_rows_per_group_val);
 __device__ __forceinline__ void classifier_bf16_store_tile(
         const float (&logits_list)[CLASSIFIER_BF16_TILE_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP],
         nv_bfloat16* logits_ptr, float* tile_max_ptr, float* tile_sum_ptr, int block_first_row_index_val,
@@ -117,13 +119,21 @@ __device__ __forceinline__ void classifier_bf16_store_tile(
 ///   threads_per_block_val    the loss kernel's block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not
 ///                            given: CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK. Any size gives the same bits (each row is
 ///                            one warp's); the logits kernel's block is one warpgroup, fixed by its tiles.
+///   tile_rows_per_group_val  the logits kernel's tile order: rows of tiles a group of blocks runs down, so the blocks
+///                            running at once share wte's tiles in L2 (wte, 77 MB, is larger than L2: row after row,
+///                            1, reads all of it again for every row of tiles); not given: CLASSIFIER_BF16_TILE_ROWS_PER_GROUP
 inline void classifier_bf16_forward(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                     const Tensor& sum_of_each_row_tensor, const Tensor& tile_max_tensor,
                                     const Tensor& tile_sum_tensor, const Tensor& logits_tensor,
                                     const Tensor& lnf_output_tensor, const Tensor& wte_tensor,
-                                    const Tensor& targets_tensor, size_t vocab_size_val, int threads_per_block_val) {
+                                    const Tensor& targets_tensor, size_t vocab_size_val, int threads_per_block_val,
+                                    int tile_rows_per_group_val) {
     // 1. check the launch and the tensors; any of them wrong: stop with an error
     check_threads_per_block(threads_per_block_val, "classifier_bf16_forward");
+    if (tile_rows_per_group_val < 1) {
+        fprintf(stderr, "error: classifier_bf16_forward's tile_rows_per_group must be 1 or more; got %d\n", tile_rows_per_group_val);
+        exit(EXIT_FAILURE);
+    }
     classifier_bf16_check_forward("classifier_bf16_forward", losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor,
                                   tile_max_tensor, tile_sum_tensor, logits_tensor, lnf_output_tensor, wte_tensor,
                                   targets_tensor, vocab_size_val);
@@ -142,7 +152,8 @@ inline void classifier_bf16_forward(const Tensor& losses_tensor, const Tensor& m
     size_t total_block_rows_val = CEIL_DIV(rows_val, (size_t)CLASSIFIER_BF16_TILE_ROWS);
     classifier_bf16_logits_kernel<<<(unsigned)(total_block_columns_val * total_block_rows_val), HARDWARE_WARPGROUP_THREADS>>>(
         lnf_output_map_val, wte_map_val, logits_tensor.data_ptr<nv_bfloat16>(), tile_max_tensor.data(),
-        tile_sum_tensor.data(), (int)rows_val, (int)padded_vocab_size_val, (int)vocab_size_val, (int)embed_dim_val);
+        tile_sum_tensor.data(), (int)rows_val, (int)padded_vocab_size_val, (int)vocab_size_val, (int)embed_dim_val,
+        tile_rows_per_group_val);
     cudaCheck(cudaGetLastError());
 
     // 4. each row's tiles put together: row_max, row_sum, the loss
@@ -161,10 +172,11 @@ inline void classifier_bf16_forward(const Tensor& losses_tensor, const Tensor& m
 ///   rows_val, padded_vocab_size_val          logits' shape
 ///   vocab_size_val                           the real words: the columns the softmax takes
 ///   embed_dim_val                            the length summed over
+///   tile_rows_per_group_val                  the tile order: rows of tiles a group of blocks runs down
 __global__ void __launch_bounds__(HARDWARE_WARPGROUP_THREADS)
 classifier_bf16_logits_kernel(const __grid_constant__ CUtensorMap lnf_output_map_val, const __grid_constant__ CUtensorMap wte_map_val,
                               nv_bfloat16* logits_ptr, float* tile_max_ptr, float* tile_sum_ptr, int rows_val,
-                              int padded_vocab_size_val, int vocab_size_val, int embed_dim_val) {
+                              int padded_vocab_size_val, int vocab_size_val, int embed_dim_val, int tile_rows_per_group_val) {
     namespace cde = cuda::device::experimental;
     // this step's tiles, in TMA's swizzled layout (on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom), and the barrier
     // that says they arrived
@@ -173,10 +185,16 @@ classifier_bf16_logits_kernel(const __grid_constant__ CUtensorMap lnf_output_map
 #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ WgmmaMatmulBf16Barrier tiles_barrier_val;
 
-    // 1. the block's tile, from its number: tiles row after row; and the barrier, by one thread
+    // 1. the block's tile, from its number: groups of tile_rows_per_group rows of tiles, down a group first (the last
+    //    group has the rows left); and the barrier, by one thread
     int total_block_columns_val = CEIL_DIV(padded_vocab_size_val, CLASSIFIER_BF16_TILE_COLUMNS);
-    int block_row_index_val = blockIdx.x / total_block_columns_val;
-    int block_column_index_val = blockIdx.x % total_block_columns_val;
+    int total_block_rows_val = CEIL_DIV(rows_val, CLASSIFIER_BF16_TILE_ROWS);
+    int blocks_per_group_val = tile_rows_per_group_val * total_block_columns_val;
+    int group_first_block_row_index_val = (blockIdx.x / blocks_per_group_val) * tile_rows_per_group_val;
+    int group_block_rows_val = min(tile_rows_per_group_val, total_block_rows_val - group_first_block_row_index_val);
+    int block_index_in_group_val = blockIdx.x % blocks_per_group_val;
+    int block_row_index_val = group_first_block_row_index_val + block_index_in_group_val % group_block_rows_val;
+    int block_column_index_val = block_index_in_group_val / group_block_rows_val;
     int block_first_row_index_val = block_row_index_val * CLASSIFIER_BF16_TILE_ROWS;
     int block_first_column_index_val = block_column_index_val * CLASSIFIER_BF16_TILE_COLUMNS;
     if (threadIdx.x == 0) {

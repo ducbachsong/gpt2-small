@@ -1,0 +1,42 @@
+log: tests/results/H100/residual_bf16_2026-11-13_051812.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_8_values_against_4_values
+    18.9 MB moved by each; this GPU's peak 3939 GB/s; the same results on both sides: yes
+    kernel      8 values: ms    GB/s   MBU     4 values: ms    GB/s   MBU     4 / 8
+    forward         0.0112    1681   43%          0.0094    2006   51%      0.84x
+    backward        0.0114    1654   42%          0.0100    1889   48%      0.88x
+    over a step's 24 forwards and backwards: -0.078 ms saved
+    input: same_val                             expected: true   actual: true   ok  (line 169)
+
+time_each_kernel_with_other_block_and_thread_counts
+    18.9 MB moved by each; this GPU's peak 3939 GB/s
+    blocks   threads   forward: ms    GB/s    MBU   backward: ms    GB/s    MBU   same result
+      3072       128        0.0086    2197    56%         0.0103    1831    46%   yes        
+      1536       256        0.0086    2200    56%         0.0097    1946    49%   yes           <- the default
+       768       512        0.0086    2196    56%         0.0097    1949    49%   yes        
+       384      1024        0.0093    2032    52%         0.0094    2012    51%   yes        
+       512       128        0.0086    2196    56%         0.0102    1859    47%   yes        
+       512       256        0.0084    2244    57%         0.0097    1949    49%   yes        
+       512       512        0.0084    2254    57%         0.0102    1847    47%   yes        
+       512      1024        0.0088    2156    55%         0.0102    1849    47%   yes        
+      1024       128        0.0085    2227    57%         0.0099    1897    48%   yes        
+      1024       256        0.0086    2207    56%         0.0100    1887    48%   yes        
+      1024       512        0.0085    2220    56%         0.0098    1935    49%   yes        
+      1024      1024        0.0085    2208    56%         0.0094    2014    51%   yes        
+      2048       128        0.0079    2397    61%         0.0097    1944    49%   yes        
+      2048       256        0.0084    2247    57%         0.0097    1951    50%   yes        
+      2048       512        0.0087    2173    55%         0.0103    1834    47%   yes        
+      2048      1024        0.0099    1898    48%         0.0102    1849    47%   yes        
+       264       128        0.0106    1778    45%         0.0107    1760    45%   yes        
+       264       256        0.0091    2064    52%         0.0101    1877    48%   yes        
+       264       512        0.0084    2258    57%         0.0097    1936    49%   yes        
+       264      1024        0.0086    2190    56%         0.0097    1938    49%   yes        
+       528       128        0.0087    2180    55%         0.0103    1832    47%   yes        
+       528       256        0.0086    2206    56%         0.0096    1958    50%   yes        
+       528       512        0.0085    2218    56%         0.0099    1910    48%   yes        
+       528      1024        0.0086    2184    55%         0.0096    1975    50%   yes        
+    input: launches_with_the_same_result_val    expected: 24   actual: 24   ok  (line 245)
+
+all tunes done

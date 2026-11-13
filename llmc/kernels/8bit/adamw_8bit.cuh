@@ -14,7 +14,8 @@
 #include "../cuda_common.h"             // cudaCheck, warp_reduce_max
 #include "../../common/tensor.cuh"
 
-#define ADAMW_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // the default block size: 8 warps, so a multiple of HARDWARE_THREADS_PER_WARP
+#define ADAMW_8BIT_THREADS_PER_BLOCK (4 * HARDWARE_THREADS_PER_WARP)             // the default block size: 4 warps; with ADAMW_8BIT_BLOCKS 0.623 ms against 0.652 for one float4 a thread at 8 warps (H100 NVL)
+#define ADAMW_8BIT_BLOCKS 40960                                                  // blocks in the launch, at most: past that each thread takes several float4s
 #define ADAMW_VALUES_PER_SCALE (HARDWARE_THREADS_PER_WARP * VALUES_PER_FLOAT4)   // one scale per warp, a float4 per thread
 #define FP8_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))                        // 8-bit values one int holds, when an Int32 tensor holds them: 4
 
@@ -214,8 +215,10 @@ inline void adamw_update_8bit(nv_bfloat16* params_ptr, const nv_bfloat16* grads_
     float inverse_sqrt_bias_correction2_val = 1.0f / sqrtf(bias_correction2_val);
     // decay: p x (1 - learning_rate x weight_decay)
     float weight_decay_factor_val = 1.0f - learning_rate_val * weight_decay_val;
-    // 3. launch: one float4 per thread, the blocks rounded up
-    int blocks_val = (int)CEIL_DIV(params_in_slice_val / VALUES_PER_FLOAT4, threads_per_block_val);
+    // 3. launch: one float4 per thread, the blocks rounded up, but at most ADAMW_8BIT_BLOCKS; the kernel's warps
+    //    then step over the rest
+    size_t one_float4_per_thread_blocks_val = CEIL_DIV(params_in_slice_val / VALUES_PER_FLOAT4, (size_t)threads_per_block_val);
+    int blocks_val = (int)(one_float4_per_thread_blocks_val < ADAMW_8BIT_BLOCKS ? one_float4_per_thread_blocks_val : ADAMW_8BIT_BLOCKS);
     adamw_8bit_kernel<<<blocks_val, threads_per_block_val>>>(
         params_ptr, grads_ptr, m_ptr, m_scales_ptr, sqrt_v_ptr, sqrt_v_scales_ptr, params_in_slice_val, decayed_count_val,
         grad_norm_ptr, max_norm_val, weight_decay_factor_val, beta1_val, beta2_val, eps_val, step_size_val,

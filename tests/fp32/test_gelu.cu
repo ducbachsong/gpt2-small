@@ -4,7 +4,7 @@
 //
 // Part 1 checks both against PyTorch's gelu (tanh), with autograd for the backward; part 2 checks
 // numbers worked out by hand; part 3 checks that each kernel's registers fit its block, and that any block
-// size gives the same bits. The timings are in tunes/tune_gelu.cu.
+// size gives the same bits. The timings are in tests/fp32/tune_gelu.cu.
 // (The C# trainer had no GELU test: TorchSharp's was trusted.)
 #include <torch/types.h>              // torch::gelu, torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed

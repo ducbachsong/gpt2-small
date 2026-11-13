@@ -5,7 +5,7 @@
 // Part 1 checks the norm against PyTorch's, from torch::nn::utils::clip_grad_norm_ (it
 // returns the norm of all the gradients it was given); part 2 checks numbers worked out by
 // hand, how the work is shared out between the blocks, and any block size. The timings are in
-// tunes/tune_grad_norm.cu. The bfloat16 gradients' norm the trainer runs, 8 values a thread, is tested in
+// tests/fp32/tune_grad_norm.cu. The bfloat16 gradients' norm the trainer runs, 8 values a thread, is tested in
 // tests/bf16/test_grad_norm_bf16.cu.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header

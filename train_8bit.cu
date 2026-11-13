@@ -11,11 +11,11 @@
 //     ./train_8bit --steps 20 --tokens-per-step 32768 --val-every 10      # a quick try
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
-// {16, 1024}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 16 rows, as train_bf16.cu runs.
+// {64, 1024}, 524,288 / (GPUs x 65,536) of them: 1 on 8 GPUs, 8 on one. 64 rows, as train_bf16.cu runs.
 //
 //     zero the grads
 //     micro_batches times:   next batch → gpt2_8bit_train_step: forward, backward (each row's loss
-//                            1 / (micro_batches x 16,384), the grads adding up)
+//                            1 / (micro_batches x 65,536), the grads adding up)
 //     average the grads over the GPUs, each GPU its own slice (on one GPU: nothing to do)
 //     the norm of all the grads → AdamW on this GPU's slice, at this step's learning rate, clipped to norm 1
 //     every GPU's slice of the new params to every GPU (on one GPU: nothing to do)

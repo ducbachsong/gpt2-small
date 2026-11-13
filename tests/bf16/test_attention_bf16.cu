@@ -8,7 +8,7 @@
 // against PyTorch and against the steps; part 3 checks that each kernel's registers fit its block, and other
 // block sizes. Both need an H100 (WGMMA and TMA): on another GPU their tests are skipped. Built with
 // -arch=sm_90a. The numbers worked out by hand are
-// in tests/fp32/test_attention.cu (float: the same math). The timings are in tunes/tune_attention_bf16.cu.
+// in tests/fp32/test_attention.cu (float: the same math). The timings are in tests/bf16/tune_attention_bf16.cu.
 #include <torch/types.h>              // torch::scaled_dot_product_attention, torch::randn, backward(); before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

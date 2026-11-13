@@ -1,7 +1,7 @@
 // test_adamw_bf16.cu — tests for llmc/kernels/bf16/adamw_bf16.cuh (bfloat16 params, grads, m and v, a float master)
 // and llmc/model_bf16.cuh's AdamWBf16 on a bfloat16 model. Every check prints its test case, input, expected and
 // actual value, and ok; the first FAIL stops the program.
-// The timings are in tunes/tune_adamw_bf16.cu.
+// The timings are in tests/bf16/tune_adamw_bf16.cu.
 //
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls

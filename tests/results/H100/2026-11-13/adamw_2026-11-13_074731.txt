@@ -1,0 +1,73 @@
+log: tests/results/H100/adamw_2026-11-13_074731.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_updates_on_gpt2_small_size
+    time of one update, in ms:   step   my AdamW   PyTorch fused
+                                    1      1.913           8.713
+                                    2      0.984           1.190
+                                    3      0.980           1.177
+                                    4      0.977           1.185
+                                    5      0.976           1.174
+                                    6      0.978           1.173
+                                    7      0.979           1.175
+                                    8      0.978           1.190
+                                    9      0.978           1.192
+                                   10      0.979           1.187
+                                   11      0.979           1.183
+                                   12      0.980           1.185
+                                   13      0.979           1.190
+                                   14      0.979           1.186
+                                   15      0.979           1.190
+                                   16      0.981           1.194
+                                   17      0.980           1.180
+                                   18      0.980           1.173
+                                   19      0.978           1.190
+                                   20      0.980           1.192
+    average of steps 2..20:                0.979           1.184   PyTorch takes 1.21x as long
+
+time_20_updates
+    input: all_my_adamw_values(my_adamw_val)    expected: {-0.00364087, 0.00173137, 0.00416084, 0.0100808, 0.0300618, 0.0134542, 0.0142229, -0.042059, 0.0191707, 0.0209099, 0.0110212, 0.0208015, -0.0346837, -0.0027206, 0.0779031, -0.0438199, ... (124439808 values)}   actual: {-0.00364086, 0.00173137, 0.00416084, 0.0100808, 0.0300618, 0.0134542, 0.0142229, -0.042059, 0.0191707, 0.0209099, 0.0110212, 0.0208015, -0.0346837, -0.0027206, 0.0779031, -0.0438199, ... (124439808 values)}   difference: 1.104e-06 (at most 1e-05)   ok  (line 235)
+
+time_the_kernel_with_other_block_and_thread_counts
+    time in ms:   blocks   threads   float4s per thread     time   same result
+                      40       128                 6077    6.411   yes           <- a T4's pick, what it launched before
+                      40       256                 3039    3.415   yes        
+                      40       512                 1520    1.937   yes        
+                      40      1024                  760    1.280   yes        
+                     160       128                 1520    1.872   yes        
+                     160       256                  760    1.233   yes        
+                     160       512                  380    1.073   yes        
+                     160      1024                  190    1.172   yes        
+                     640       128                  380    1.023   yes        
+                     640       256                  190    1.040   yes        
+                     640       512                   95    1.062   yes        
+                     640      1024                   48    1.030   yes        
+                    2560       128                   95    1.036   yes        
+                    2560       256                   48    1.035   yes        
+                    2560       512                   24    1.023   yes        
+                    2560      1024                   12    1.011   yes        
+                   10240       128                   24    1.020   yes        
+                   10240       256                   12    1.012   yes        
+                   10240       512                    6    1.007   yes        
+                   10240      1024                    3    0.997   yes        
+                   40960       128                    6    1.002   yes        
+                   40960       256                    3    0.990   yes        
+                   40960       512                    2    0.996   yes        
+                   40960      1024                    1    1.018   yes        
+                  121524       128                    2    0.985   yes        
+                  121524       256                    1    0.978   yes           <- what adamw_update launches: one float4 per thread
+                  121524       512                    1    1.072   yes        
+                  121524      1024                    1    1.258   yes        
+                     132       128                 1842    2.091   yes        
+                     132       256                  921    1.295   yes        
+                     132       512                  461    1.035   yes        
+                     132      1024                  231    1.031   yes        
+                     264       128                  921    1.301   yes        
+                     264       256                  461    1.036   yes        
+                     264       512                  231    1.032   yes        
+                     264      1024                  116    1.031   yes        
+    fastest       121524 blocks x  256 threads: 0.978 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 371)
+
+all tunes done

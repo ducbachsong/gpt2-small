@@ -1,0 +1,45 @@
+log: tests/results/H100/grad_norm_bf16_2026-11-13_061624.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_8_values_against_4_values
+    249.0 MB read; this GPU's peak 3939 GB/s
+    run                               ms     GB/s    MBU   norm
+    GradNormBf16                  0.0796     3129    79%   11156.078125
+    GradNormBf16, 2 bytes in      0.0795     3132    80%   11156.078125
+    GradNorm (4 values)           0.0966     2578    65%   11156.079102
+    GradNorm (4 values) takes 1.21x GradNormBf16's time
+    input: norms_list[0]                        expected: 11156.1 +/- 0.111561   actual: 11156.1   ok  (line 87)
+    input: norms_list[1]                        expected: 11156.1 +/- 11.1561   actual: 11156.1   ok  (line 88)
+
+time_the_kernel_with_other_block_and_thread_counts
+    249.0 MB read; this GPU's peak 3939 GB/s
+    blocks   threads        ms     GB/s    MBU   same norm
+       128       256    0.2424     1027    26%   yes      
+       128       512    0.1358     1833    47%   yes      
+       128      1024    0.0888     2804    71%   yes      
+       256       256    0.1347     1848    47%   yes      
+       256       512    0.0891     2794    71%   yes      
+       256      1024    0.0794     3136    80%   yes      
+       512       256    0.0888     2804    71%   yes      
+       512       512    0.0785     3171    81%   yes      
+       512      1024    0.0795     3133    80%   yes         <- what GradNormBf16 launches
+      1024       256    0.0796     3127    79%   yes      
+      1024       512    0.0794     3136    80%   yes      
+      1024      1024    0.0822     3029    77%   yes      
+      2048       256    0.0820     3035    77%   yes      
+      2048       512    0.0828     3006    76%   yes      
+      2048      1024    0.0892     2790    71%   yes      
+       132       256    0.2358     1056    27%   yes      
+       132       512    0.1333     1868    47%   yes      
+       132      1024    0.0891     2795    71%   yes      
+       264       256    0.1328     1874    48%   yes      
+       264       512    0.0887     2806    71%   yes      
+       264      1024    0.0805     3092    78%   yes      
+       528       256    0.0897     2774    70%   yes      
+       528       512    0.0790     3149    80%   yes      
+       528      1024    0.0801     3109    79%   yes      
+    fastest   512 blocks x  512 threads: 0.0785 ms, 3171 GB/s, MBU 81%
+    input: launches_with_the_same_result_val    expected: 24   actual: 24   ok  (line 172)
+
+all tunes done

@@ -509,8 +509,12 @@ attention_product_kernel(const __grid_constant__ CUtensorMap left_map_val, const
     // 5. walk the sum: TMA brings each step's tiles one step ahead, the tensor cores add their product
     float sums_list[ATTENTION_PRODUCT_COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // this thread's part of the square
     int total_steps_val = CEIL_DIV(k_end_index_val - first_k_index_val, ATTENTION_PRODUCT_BLOCK_K);
-    AttentionProductBarrier::arrival_token tokens_list[ATTENTION_PRODUCT_TILE_SETS];
-    tokens_list[0] = attention_product_ask_for_tiles<LEFT_TURNED, RIGHT_TURNED>(
+    // each set's token: two variables, not an array, so they stay in registers (an array picked by a step's set,
+    // known only at run time, goes to local memory)
+    static_assert(ATTENTION_PRODUCT_TILE_SETS == 2, "the tokens are written for two sets of tiles");
+    AttentionProductBarrier::arrival_token set_0_token_val;
+    AttentionProductBarrier::arrival_token set_1_token_val;
+    set_0_token_val = attention_product_ask_for_tiles<LEFT_TURNED, RIGHT_TURNED>(
         left_tiles_list[0], right_tiles_list[0], tiles_barriers_list[0], &left_map_val, &right_map_val,
         left_head_first_value_index_val, left_head_first_line_index_val, right_head_first_value_index_val,
         right_head_first_line_index_val, block_first_row_index_val, block_first_column_index_val, first_k_index_val);
@@ -521,14 +525,14 @@ attention_product_kernel(const __grid_constant__ CUtensorMap left_map_val, const
         // a. the next step's tiles, asked for now: they arrive during the WGMMAs below. The other set is free:
         //    the step before this one read it, and every thread is past that step's end
         if (step_index_val + 1 < total_steps_val)
-            tokens_list[next_set_index_val] = attention_product_ask_for_tiles<LEFT_TURNED, RIGHT_TURNED>(
+            (next_set_index_val == 0 ? set_0_token_val : set_1_token_val) = attention_product_ask_for_tiles<LEFT_TURNED, RIGHT_TURNED>(
                 left_tiles_list[next_set_index_val], right_tiles_list[next_set_index_val], tiles_barriers_list[next_set_index_val],
                 &left_map_val, &right_map_val, left_head_first_value_index_val, left_head_first_line_index_val,
                 right_head_first_value_index_val, right_head_first_line_index_val, block_first_row_index_val,
                 block_first_column_index_val, step_first_k_index_val + ATTENTION_PRODUCT_BLOCK_K);
 
         // b. wait until this step's tiles are in
-        tiles_barriers_list[set_index_val].wait(std::move(tokens_list[set_index_val]));
+        tiles_barriers_list[set_index_val].wait(std::move(set_index_val == 0 ? set_0_token_val : set_1_token_val));
 
         // c. the tensor cores: one WGMMA per HARDWARE_WGMMA_K_BF16 values of k the step has, at most
         //    ATTENTION_PRODUCT_BLOCK_K_STEPS. A tile's values of k past the sum's end are another head's, or

@@ -1,7 +1,7 @@
 // test_adamw_8bit.cu — tests for llmc/kernels/8bit/adamw_8bit.cuh (bfloat16 params and grads, a float master, m and
 // v in 8 bits). Every check prints its test case, input, expected and actual value, and ok; the first FAIL stops
 // the program.
-// The timings are in tunes/tune_adamw_8bit.cu.
+// The timings are in tests/8bit/tune_adamw_8bit.cu.
 //
 #include <ATen/ops/_foreach_add.h>    // at::_foreach_add_: +1 on every step count; libtorch before any CUDA header
 #include <ATen/ops/_fused_adamw.h>    // at::_fused_adamw_: PyTorch's fused AdamW, the op fused=True calls

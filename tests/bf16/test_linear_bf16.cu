@@ -6,7 +6,7 @@
 // backward; part 2 checks numbers worked out by hand; part 3 checks that bias_grad's kernel fits its block. The
 // products are tested in tests/test_wgmma_matmul_bf16.cu. Run it on an H100 (compute capability 9.0), built with
 // -arch=sm_90a in place of -arch=native. The float layer is tested in tests/test_linear.cu. The timings on GPT-2
-// small's 5 linear layers are in tunes/tune_linear_bf16.cu.
+// small's 5 linear layers are in tests/bf16/tune_linear_bf16.cu.
 #include <torch/types.h>              // torch::linear, torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
@@ -374,6 +374,30 @@ static void whole_numbers_come_out_exact_on_mlp_up_sizes(void)
     ASSERT_EQ(values_of(bias_grad_tensor), std::vector<float>(out_features_val, 4096.0f));
 }
 
+static void every_row_chunk_count_gives_the_column_sums(void)
+{
+    // Expect: random output_grad {1000, 776} (rows no chunk count divides, 776 columns: 12 blocks of 64 and one of 8),
+    // bias_grad starting at 0.5: with the rows cut into 1, 3, 64 and 1000 chunks (1000: a row each) and 2000 (more
+    // chunks than rows: the last ones empty), bias_grad = 0.5 + each column's sum, within BFLOAT16_TOLERANCE of PyTorch's
+    // float column sums. Every count adds the same values in another order.
+    // 1. random values; PyTorch's column sums
+    std::vector<float> output_grad_list = random_values({1000, 776});
+    Tensor output_grad_tensor = bf16_tensor_of({1000, 776}, output_grad_list);
+    torch::Tensor expected_tensor = pytorch_copy_of(output_grad_tensor).sum(0) + 0.5;
+    print_test_name(__func__);
+    // 2. each chunk count
+    const int row_chunks_list[] = {1, 3, 64, 1000, 2000};
+    for (int row_chunks_val : row_chunks_list)
+    {
+        Tensor bias_grad_tensor = Tensor::zeros({776}, DType::BFloat16).fill_(0.5);
+        linear_bf16_bias_grad(bias_grad_tensor, output_grad_tensor, row_chunks_val);
+        torch::Tensor mine_tensor = pytorch_copy_of(bias_grad_tensor);
+        double difference_val = (mine_tensor - expected_tensor).abs().max().item<double>() / expected_tensor.abs().max().item<double>();
+        printf("    %d chunks:\n", row_chunks_val);
+        ASSERT_NEAR(difference_val, 0.0, BFLOAT16_TOLERANCE);
+    }
+}
+
 // ══ part 3: the kernels fit their launch ══════════════════════════════════════
 
 static void every_kernel_fits_its_block(void)
@@ -386,15 +410,20 @@ static void every_kernel_fits_its_block(void)
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
     //
     // The products' kernels are checked in tests/test_wgmma_matmul_bf16.cu.
-    // 1. what the compiler wrote down
-    cudaFuncAttributes attributes_val;
-    cudaCheck(cudaFuncGetAttributes(&attributes_val, (const void *)linear_bf16_bias_grad_kernel));
-    print_test_name(__func__);
-    printf("    linear_bf16_bias_grad_kernel: %d registers per thread, largest block %d threads, %zu bytes local memory\n",
-           attributes_val.numRegs, attributes_val.maxThreadsPerBlock, attributes_val.localSizeBytes);
-    // 2. check
-    ASSERT_EQ(attributes_val.maxThreadsPerBlock >= LINEAR_BF16_BIAS_GRAD_THREADS_PER_BLOCK, true);
-    ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
+    const void *kernels_list[] = {(const void *)linear_bf16_bias_grad_kernel, (const void *)linear_bf16_bias_grad_sums_kernel};
+    const char *names_list[] = {"linear_bf16_bias_grad_kernel", "linear_bf16_bias_grad_sums_kernel"};
+    for (int kernel_index_val = 0; kernel_index_val < 2; kernel_index_val++)
+    {
+        // 1. what the compiler wrote down
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, kernels_list[kernel_index_val]));
+        print_test_name(__func__);
+        printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory\n", names_list[kernel_index_val],
+               attributes_val.numRegs, attributes_val.maxThreadsPerBlock, attributes_val.localSizeBytes);
+        // 2. check
+        ASSERT_EQ(attributes_val.maxThreadsPerBlock >= LINEAR_BF16_BIAS_GRAD_THREADS_PER_BLOCK, true);
+        ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -413,6 +442,7 @@ int main(void)
     identity_weight_gives_back_the_input_in_every_square();
     weight_grad_is_output_grad_turned_round_when_input_is_the_identity();
     whole_numbers_come_out_exact_on_mlp_up_sizes();
+    every_row_chunk_count_gives_the_column_sums();
 
     every_kernel_fits_its_block();
 

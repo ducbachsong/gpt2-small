@@ -5,7 +5,7 @@
 // Part 1 checks against PyTorch's float product of the same values: GPT-2 small's 5 linear layers, the
 // backward's two products (left or right turned round), and sizes no square divides; part 2 checks numbers that
 // must come out exactly, and that a turned tensor gives the same bits as the plain one; part 3 checks that the
-// kernels' registers fit their block. Run it on an sm_80 GPU or later (A100, 4090, H100, ...). The timings are in tunes/tune_mma_matmul_bf16.cu.
+// kernels' registers fit their block. Run it on an sm_80 GPU or later (A100, 4090, H100, ...). The timings are in tests/bf16/tune_mma_matmul_bf16.cu.
 #include <torch/types.h>              // torch::randn, torch::matmul; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

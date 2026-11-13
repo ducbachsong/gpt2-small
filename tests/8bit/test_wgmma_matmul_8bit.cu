@@ -4,11 +4,12 @@
 // stops the program.
 //
 // Part 1 checks the product against PyTorch's float product of the same rounded values, on GPT-2 small's 5 linear
-// layers, a backward product (both copies rounded from turned matrices) and sizes no square divides, and how far 8
-// bits move it from the values before rounding; part 2 checks numbers that must come out exactly; part 3 checks
+// layers, a backward product (both copies rounded from turned matrices), sizes no square divides and the two
+// longest sums of a step (50,304 and 65,536 terms, with the tensor cores' sum moved into float as it goes, at every
+// promotion setting), and how far 8 bits move it from the values before rounding; part 2 checks numbers that must come out exactly; part 3 checks
 // that the kernel's registers fit its block. The rounding itself is tested in tests/test_round_8bit.cu. Run it on an H100 (compute capability 9.0), built with -arch=sm_90a in place of
 // -arch=native. The
-// timings are in tunes/tune_wgmma_matmul_8bit.cu.
+// timings are in tests/8bit/tune_wgmma_matmul_8bit.cu.
 #include <torch/types.h>              // torch::randn, torch::matmul, float8_e4m3fn; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR
@@ -181,6 +182,49 @@ static void matches_pytorch_with_sizes_no_tile_divides(void)
     matmul_matches_pytorch(__func__, 100, 200, 144, true);
 }
 
+static void a_long_sum_matches_pytorch_on_gpt2_head_input_grad(void)
+{
+    // Expect: the head's input_grad shape, {256, 50304} · {768, 50304}ᵀ: 50,304 terms in every sum, the longest of
+    // a step. The tensor cores' sum is moved into float every WGMMA_MATMUL_8BIT_PROMOTION_STEPS steps, so the late
+    // small terms are not lost: within 1e-2 of PyTorch's float product of the same rounded values, as the short sums.
+    matmul_matches_pytorch(__func__, 256, GPT2_EMBED_DIM, GPT2_PADDED_VOCAB_SIZE, false);
+}
+
+static void a_long_sum_matches_pytorch_on_a_weight_grad_of_64_rows(void)
+{
+    // Expect: a weight_grad at 64 rows of 1024 tokens a micro-batch, {768, 65536} · {768, 65536}ᵀ: one term per
+    // token, 65,536 in every sum. Within 1e-2, as the head's.
+    matmul_matches_pytorch(__func__, GPT2_EMBED_DIM, GPT2_EMBED_DIM, 16 * GPT2_ROWS, false);
+}
+
+static void every_promotion_stays_near_pytorch_on_a_long_sum(void)
+{
+    // Expect: {256, 768} · {256, 50304}ᵀ-shaped random values, 50,304 terms a sum, with the tensor cores' sum moved
+    // into float every 1, 2, 4, 8 and 16 steps: each within 1e-2 of PyTorch's float product of the same rounded
+    // values. Never moving it (0, the whole sum in the tensor cores, as before) is printed, not checked: how far
+    // it lands is the FP8 tensor cores' own adding, which tune_wgmma_matmul_8bit sweeps.
+    // 1. random values, rounded; PyTorch's product of the copies
+    torch::manual_seed(7);
+    RoundedMatrix left_val(random_bf16_tensor({256, GPT2_PADDED_VOCAB_SIZE}));
+    RoundedMatrix right_val(random_bf16_tensor({GPT2_EMBED_DIM, GPT2_PADDED_VOCAB_SIZE}));
+    torch::Tensor expected_tensor = left_val.turned_back().matmul(right_val.turned_back().t());
+    Tensor output_tensor = Tensor::zeros({256, GPT2_EMBED_DIM}, DType::BFloat16);
+    // 2. never: printed
+    print_test_name(__func__);
+    wgmma_matmul_8bit(output_tensor, left_val.rounded_tensor, left_val.scales_tensor, right_val.rounded_tensor,
+                      right_val.scales_tensor, Tensor(), false, WgmmaMatmul8bitStore(), 0);
+    printf("    never moved (0): largest difference %.5f of the largest value\n", relative_difference_on_gpu(output_tensor, expected_tensor));
+    // 3. each promotion: checked
+    const int promotions_list[] = {1, 2, 4, 8, 16};
+    for (int promotion_steps_val : promotions_list)
+    {
+        wgmma_matmul_8bit(output_tensor, left_val.rounded_tensor, left_val.scales_tensor, right_val.rounded_tensor,
+                          right_val.scales_tensor, Tensor(), false, WgmmaMatmul8bitStore(), promotion_steps_val);
+        printf("    moved every %d steps:\n", promotion_steps_val);
+        ASSERT_NEAR(relative_difference_on_gpu(output_tensor, expected_tensor), 0.0, BFLOAT16_TOLERANCE);
+    }
+}
+
 static void stays_near_pytorch_on_the_values_before_rounding(void)
 {
     // Expect: the qkv shape, {4096, 768} · {2304, 768}ᵀ, PyTorch in float on the bfloat16 values as they were,
@@ -283,6 +327,9 @@ int main(void)
     matches_pytorch_on_gpt2_head();
     matches_pytorch_on_gpt2_qkv_weight_grad();
     matches_pytorch_with_sizes_no_tile_divides();
+    a_long_sum_matches_pytorch_on_gpt2_head_input_grad();
+    a_long_sum_matches_pytorch_on_a_weight_grad_of_64_rows();
+    every_promotion_stays_near_pytorch_on_a_long_sum();
     stays_near_pytorch_on_the_values_before_rounding();
 
     times_the_identity_gives_right_turned_round();

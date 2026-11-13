@@ -1,0 +1,119 @@
+log: tests/results/H100/mma_matmul_bf16_2026-11-13_080033.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_products_of_one_shape
+    qkv: rows 4096, columns 2304, sum_length 768: 14.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.106      136.4     14.1%
+        fma_matmul_bf16 (CUDA cores)       0.464       31.2      3.2%
+        PyTorch (cuBLAS)                   0.044      330.3     34.2%
+    PyTorch takes 0.41x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00318232   ok  (line 129)
+    qkv input_grad: rows 4096, columns 768, sum_length 2304, right turned: 14.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.138      104.9     10.9%
+        fma_matmul_bf16 (CUDA cores)       0.542       26.8      2.8%
+        PyTorch (cuBLAS)                   0.040      366.3     38.0%
+    PyTorch takes 0.29x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00195942   ok  (line 129)
+    qkv weight_grad: rows 2304, columns 768, sum_length 4096, left turned, right turned: 14.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.133      109.0     11.3%
+        fma_matmul_bf16 (CUDA cores)       0.523       27.7      2.9%
+        PyTorch (cuBLAS)                   0.042      345.0     35.8%
+    PyTorch takes 0.32x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00317834   ok  (line 129)
+    attention output: rows 4096, columns 768, sum_length 768: 4.8 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.045      108.5     11.2%
+        fma_matmul_bf16 (CUDA cores)       0.188       25.7      2.7%
+        PyTorch (cuBLAS)                   0.025      195.0     20.2%
+    PyTorch takes 0.56x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00286003   ok  (line 129)
+    attention output input_grad: rows 4096, columns 768, sum_length 768, right turned: 4.8 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.052       92.2      9.5%
+        fma_matmul_bf16 (CUDA cores)       0.185       26.2      2.7%
+        PyTorch (cuBLAS)                   0.025      193.6     20.1%
+    PyTorch takes 0.48x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00307371   ok  (line 129)
+    attention output weight_grad: rows 768, columns 768, sum_length 4096, left turned, right turned: 4.8 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.130       37.0      3.8%
+        fma_matmul_bf16 (CUDA cores)       0.522        9.3      1.0%
+        PyTorch (cuBLAS)                   0.027      176.0     18.2%
+    PyTorch takes 0.21x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00270316   ok  (line 129)
+    mlp up: rows 4096, columns 3072, sum_length 768: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.123      157.3     16.3%
+        fma_matmul_bf16 (CUDA cores)       0.550       35.2      3.6%
+        PyTorch (cuBLAS)                   0.053      363.0     37.6%
+    PyTorch takes 0.43x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00318232   ok  (line 129)
+    mlp up input_grad: rows 4096, columns 768, sum_length 3072, right turned: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.181      106.9     11.1%
+        fma_matmul_bf16 (CUDA cores)       0.723       26.7      2.8%
+        PyTorch (cuBLAS)                   0.046      416.2     43.1%
+    PyTorch takes 0.26x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00338458   ok  (line 129)
+    mlp up weight_grad: rows 3072, columns 768, sum_length 4096, left turned, right turned: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.227       85.3      8.8%
+        fma_matmul_bf16 (CUDA cores)       0.957       20.2      2.1%
+        PyTorch (cuBLAS)                   0.049      393.8     40.8%
+    PyTorch takes 0.22x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00310539   ok  (line 129)
+    mlp down: rows 4096, columns 768, sum_length 3072: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.150      128.8     13.3%
+        fma_matmul_bf16 (CUDA cores)       0.736       26.3      2.7%
+        PyTorch (cuBLAS)                   0.051      382.6     39.6%
+    PyTorch takes 0.34x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00307492   ok  (line 129)
+    mlp down input_grad: rows 4096, columns 3072, sum_length 768, right turned: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.153      126.4     13.1%
+        fma_matmul_bf16 (CUDA cores)       0.541       35.7      3.7%
+        PyTorch (cuBLAS)                   0.057      341.1     35.3%
+    PyTorch takes 0.37x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.0030213   ok  (line 129)
+    mlp down weight_grad: rows 768, columns 3072, sum_length 4096, left turned, right turned: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.227       85.1      8.8%
+        fma_matmul_bf16 (CUDA cores)       0.937       20.6      2.1%
+        PyTorch (cuBLAS)                   0.050      384.3     39.8%
+    PyTorch takes 0.22x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.0030734   ok  (line 129)
+    head: rows 4096, columns 50304, sum_length 768: 316.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    1.754      180.4     18.7%
+        fma_matmul_bf16 (CUDA cores)       8.591       36.8      3.8%
+        PyTorch (cuBLAS)                   0.647      489.3     50.7%
+    PyTorch takes 0.37x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00317506   ok  (line 129)
+    head input_grad: rows 4096, columns 768, sum_length 50304, right turned: 316.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    2.719      116.4     12.1%
+        fma_matmul_bf16 (CUDA cores)      11.974       26.4      2.7%
+        PyTorch (cuBLAS)                   0.620      510.7     52.9%
+    PyTorch takes 0.23x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00325594   ok  (line 129)
+    head weight_grad: rows 50304, columns 768, sum_length 4096, left turned, right turned: 316.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    1.866      169.6     17.6%
+        fma_matmul_bf16 (CUDA cores)       8.297       38.1      4.0%
+        PyTorch (cuBLAS)                   0.618      511.9     53.0%
+    PyTorch takes 0.33x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00275244   ok  (line 129)
+    worklog 4096^3: rows 4096, columns 4096, sum_length 4096: 137.4 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        mine (mma.sync)                    0.734      187.2     19.4%
+        fma_matmul_bf16 (CUDA cores)       3.783       36.3      3.8%
+        PyTorch (cuBLAS)                   0.273      503.9     52.2%
+    PyTorch takes 0.37x as long as mine
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.0028654   ok  (line 129)
+
+all tunes done

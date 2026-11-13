@@ -1,0 +1,24 @@
+log: tests/results/H100/layer_norm_8bit_2026-11-13_074644.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_8bit_forward_against_bf16_and_round_8bit
+    this GPU's peak 3939 GB/s; the two copies the same bits: yes
+    run                          MB        ms     GB/s    MBU
+    layer_norm_8bit_forward      15.8    0.0119     1326    34%
+    layer_norm_bf16_forward      12.6    0.0198      637    16%
+    round_8bit of the output      9.5    0.0093     1016    26%
+    output and copy:   in one kernel 0.0119 ms   LayerNorm then round_8bit 0.0291 ms   over 25 LayerNorms: 0.430 ms saved
+    input: same_val                             expected: true   actual: true   ok  (line 135)
+
+time_forward_with_other_thread_counts
+    15.8 MB asked for; this GPU's peak 3939 GB/s
+    threads   blocks        ms     GB/s    MBU   same result
+         32     4096    0.0122     1288    33%   yes        
+         64     2048    0.0120     1315    33%   yes        
+        128     1024    0.0118     1334    34%   yes        
+        256      512    0.0117     1346    34%   yes           <- the default
+        512      256    0.0117     1353    34%   yes        
+    input: launches_with_the_same_result_val    expected: 5   actual: 5   ok  (line 193)
+
+all tunes done

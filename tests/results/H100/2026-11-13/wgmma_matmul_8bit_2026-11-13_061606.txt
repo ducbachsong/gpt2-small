@@ -1,0 +1,67 @@
+log: tests/results/H100/wgmma_matmul_8bit_2026-11-13_061606.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_products_of_one_shape
+    qkv: left {4096, 768}, right {2304, 768}: 14.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.012
+        rounding right                     0.011
+        mine (E4M3)                        0.047      305.4     31.6%
+        wgmma_matmul_bf16 (bf16)           0.066      218.4     22.6%
+        mma_matmul_8bit (E4M3, mma)        0.103      140.7     14.6%
+        PyTorch (cuBLAS, bf16)             0.044      329.8     34.2%
+    PyTorch takes 0.93x as long as mine; with right rounded once and left each time, mine and the rounding of left take 0.060 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00370082   ok  (line 147)
+    attention output: left {4096, 768}, right {768, 768}: 4.8 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.010
+        rounding right                     0.009
+        mine (E4M3)                        0.020      236.4     24.5%
+        wgmma_matmul_bf16 (bf16)           0.025      192.5     19.9%
+        mma_matmul_8bit (E4M3, mma)        0.045      106.6     11.0%
+        PyTorch (cuBLAS, bf16)             0.026      187.9     19.5%
+    PyTorch takes 1.26x as long as mine; with right rounded once and left each time, mine and the rounding of left take 0.030 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00353619   ok  (line 147)
+    mlp up: left {4096, 768}, right {3072, 768}: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.012
+        rounding right                     0.011
+        mine (E4M3)                        0.061      318.7     33.0%
+        wgmma_matmul_bf16 (bf16)           0.077      252.5     26.2%
+        mma_matmul_8bit (E4M3, mma)        0.122      158.1     16.4%
+        PyTorch (cuBLAS, bf16)             0.053      363.5     37.7%
+    PyTorch takes 0.88x as long as mine; with right rounded once and left each time, mine and the rounding of left take 0.073 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00386555   ok  (line 147)
+    mlp down: left {4096, 3072}, right {768, 3072}: 19.3 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.025
+        rounding right                     0.015
+        mine (E4M3)                        0.039      500.6     51.9%
+        wgmma_matmul_bf16 (bf16)           0.064      302.9     31.4%
+        mma_matmul_8bit (E4M3, mma)        0.129      150.4     15.6%
+        PyTorch (cuBLAS, bf16)             0.048      404.7     41.9%
+    PyTorch takes 1.24x as long as mine; with right rounded once and left each time, mine and the rounding of left take 0.063 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00513768   ok  (line 147)
+    head: left {4096, 768}, right {50304, 768}: 316.5 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.013
+        rounding right                     0.048
+        mine (E4M3)                        0.988      320.4     33.2%
+        wgmma_matmul_bf16 (bf16)           1.758      180.0     18.6%
+        mma_matmul_8bit (E4M3, mma)        2.220      142.6     14.8%
+        PyTorch (cuBLAS, bf16)             0.654      484.0     50.1%
+    PyTorch takes 0.66x as long as mine; with right rounded once and left each time, mine and the rounding of left take 1.001 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00387705   ok  (line 147)
+    worklog 4096^3: left {4096, 4096}, right {4096, 4096}: 137.4 GFLOP
+    average of steps 3..20:                ms     TFLOPS   of bf16 peak
+        rounding left                      0.034
+        rounding right                     0.035
+        mine (E4M3)                        0.223      616.8     63.9%
+        wgmma_matmul_bf16 (bf16)           0.421      326.4     33.8%
+        mma_matmul_8bit (E4M3, mma)        0.722      190.4     19.7%
+        PyTorch (cuBLAS, bf16)             0.282      487.3     50.5%
+    PyTorch takes 1.27x as long as mine; with right rounded once and left each time, mine and the rounding of left take 0.257 ms
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00532379   ok  (line 147)
+
+all tunes done

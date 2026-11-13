@@ -6,7 +6,7 @@
 // gradients it was given), and against fp32/grad_norm.cuh's bfloat16 path (4 values a thread); part 2 checks numbers
 // worked out by hand (the cases of tests/fp32/test_grad_norm.cu, and the values before the first 16-byte boundary a
 // GPU's slice can start with), how the work is shared out between the blocks, and any block size. Any GPU. The
-// timings are in tunes/tune_grad_norm_bf16.cu.
+// timings are in tests/bf16/tune_grad_norm_bf16.cu.
 #include <ATen/ops/_foreach_norm.h>   // at::_foreach_norm: what Python's clip_grad_norm_ uses
 #include <torch/nn/utils/clip_grad.h> // torch::nn::utils::clip_grad_norm_; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed

@@ -5,7 +5,7 @@
 // Part 1 checks against PyTorch's embedding (with autograd for the backward) and against fp32/encoder.cuh's bfloat16
 // path (4 values a thread): the same bits; part 2 checks numbers worked out by hand; part 3 checks that each kernel's
 // registers fit a block of ENCODER_BF16_THREADS, and that any block size gives the same result. Any GPU. The timings
-// are in tunes/tune_encoder_bf16.cu.
+// are in tests/bf16/tune_encoder_bf16.cu.
 #include <torch/types.h>              // torch::embedding, torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include <random>                     // std::mt19937: random token ids

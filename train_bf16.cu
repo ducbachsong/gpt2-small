@@ -15,13 +15,13 @@
 //     ./train_bf16 --checkpoint-dir ckpt --resume ckpt                    # on from the newest (checkpoint.cuh)
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
-// {16, 1024}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 16 rows, not 4: bigger products
-// for the tensor cores and 4 times fewer launches per step; with flash attention a block keeps 94 MB per 4
-// rows, so 16 rows take about 6 GB of an 80 GB GPU (T4: --batch-size 4).
+// {64, 1024}, 524,288 / (GPUs x 65,536) of them: 1 on 8 GPUs, 8 on one. 64 rows: the best MFU tune_model
+// found on an H100 NVL (16.3%, against 16.2% at 16 rows and 15.5% at 4: bigger products for the tensor cores and
+// fewer launches per step); its activations take about 34 GB of the GPU (T4: --batch-size 4).
 //
 //     zero the grads
 //     micro_batches times:   next batch → gpt2_bf16_train_step: forward, backward (each row's loss
-//                            1 / (micro_batches x 16,384), the grads adding up)
+//                            1 / (micro_batches x 65,536), the grads adding up)
 //     average the grads over the GPUs, each GPU its own slice (on one GPU: nothing to do)
 //     the norm of all the grads → AdamW on this GPU's slice, at this step's learning rate, clipped to norm 1
 //     every GPU's slice of the new params to every GPU (on one GPU: nothing to do)

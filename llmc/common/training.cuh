@@ -20,7 +20,7 @@
 struct TrainConfig {
     std::string train_files = "data/fineweb10B/fineweb_train_%06d.bin";
     std::string val_files = "data/fineweb10B/fineweb_val_%06d.bin";
-    size_t batch_size = 16;                  // rows per micro-batch, on each GPU
+    size_t batch_size = 64;                  // rows per micro-batch, on each GPU: tune_model's best MFU on an H100 NVL
     size_t seq_len = 1024;                   // tokens per row
     size_t tokens_per_step = 524288;         // all GPUs together: 2^19, GPT-2 small's ~0.5M (GPT-3 paper, llm.c)
     int steps = -1;                          // -1: one pass over the train files, 19,073 for 10B tokens

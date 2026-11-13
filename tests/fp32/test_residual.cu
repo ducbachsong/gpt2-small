@@ -4,7 +4,7 @@
 //
 // Part 1 checks both against PyTorch's + with autograd for the backward; part 2 checks numbers worked out
 // by hand; part 3 checks that each kernel's registers fit its block, and that any block size gives the same
-// bits. The timings are in tunes/tune_residual.cu.
+// bits. The timings are in tests/fp32/tune_residual.cu.
 // (The C# trainer had no residual test: TorchSharp's + was trusted.) The model's bfloat16 residual add, 8 values a
 // thread, is tested in tests/bf16/test_residual_bf16.cu.
 #include <torch/types.h>              // torch::randn, backward(); libtorch before any CUDA header

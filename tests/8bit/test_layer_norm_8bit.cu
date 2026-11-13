@@ -6,7 +6,7 @@
 // Part 1 checks the bfloat16 output against layer_norm_bf16's, the copy against round_8bit's on that output, and the
 // backward against layer_norm_bf16's; part 2 checks numbers worked out by hand; part 3 checks that the forward's
 // registers fit its block, and that any block size gives the same bits. Any GPU. The timings are in
-// tunes/tune_layer_norm_8bit.cu.
+// tests/8bit/tune_layer_norm_8bit.cu.
 #include <torch/types.h>              // torch::from_blob, float8_e4m3fn; libtorch before any CUDA header
 #include "../test_helpers.h"          // ASSERT_EQ, ASSERT_NEAR
 #include "../../llmc/kernels/8bit/layer_norm_8bit.cuh"

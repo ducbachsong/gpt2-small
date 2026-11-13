@@ -25,7 +25,8 @@
 #include "../../common/tensor.cuh"
 
 #define LAYER_NORM_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // forward's default: 8 warps, one row each; 0.012 ms against 0.013 for 16 on an H100 PCIe, bfloat16
-#define LAYER_NORM_BACKWARD_BLOCKS 80                                            // backward: blocks in every launch
+#define LAYER_NORM_BACKWARD_BLOCKS 256                                           // backward in float: blocks in every launch; 0.045 ms against 0.082 for 80 on an H100 NVL
+#define LAYER_NORM_BACKWARD_BF16_BLOCKS 80                                       // backward in bfloat16: each block rounds its sums into weight_grad and bias_grad, so more blocks are slower (0.343 ms for 256)
 #define LAYER_NORM_BACKWARD_THREADS_PER_BLOCK (16 * HARDWARE_THREADS_PER_WARP)   // backward's default: 16 warps; fastest in bfloat16 on an H100 PCIe
 #define LAYER_NORM_EPS 1e-5f                                                     // added to the variance, as GPT-2 does
 
@@ -167,11 +168,11 @@ inline void layer_norm_backward(const Tensor& input_grad_tensor, const Tensor& w
     check_threads_per_block(threads_per_block_val, "LayerNorm");
     layer_norm_check_shapes(output_grad_tensor, mean_tensor, rstd_tensor, input_tensor, weight_tensor, bias_grad_tensor);
     layer_norm_check_shapes(input_grad_tensor, mean_tensor, rstd_tensor, input_tensor, weight_grad_tensor, bias_grad_tensor);
-    // 2. launch: LAYER_NORM_BACKWARD_BLOCKS blocks, one warp per row, the block's bias_grad and weight_grad in
-    //    shared memory
+    // 2. launch: LAYER_NORM_BACKWARD_BLOCKS blocks (LAYER_NORM_BACKWARD_BF16_BLOCKS in bfloat16), one warp per row,
+    //    the block's bias_grad and weight_grad in shared memory
     size_t rows_val = input_tensor.size(0) * input_tensor.size(1);
     size_t embed_dim_val = input_tensor.size(2);
-    int blocks_val = LAYER_NORM_BACKWARD_BLOCKS;
+    int blocks_val = input_tensor.dtype() == DType::BFloat16 ? LAYER_NORM_BACKWARD_BF16_BLOCKS : LAYER_NORM_BACKWARD_BLOCKS;
     size_t shared_bytes_val = 2 * embed_dim_val * sizeof(float);
     if (input_tensor.dtype() == DType::BFloat16)
         layer_norm_backward_kernel<<<blocks_val, threads_per_block_val, shared_bytes_val>>>(

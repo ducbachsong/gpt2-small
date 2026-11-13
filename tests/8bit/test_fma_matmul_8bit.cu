@@ -7,7 +7,7 @@
 // layers, a backward product (both copies rounded from turned matrices) and sizes no square divides, and how far 8
 // bits move it from the values before rounding; part 2 checks numbers that must come out exactly; part 3 checks
 // that the kernel's registers fit its block. The rounding itself is tested in tests/test_round_8bit.cu. Any GPU. The
-// timings are in tunes/tune_fma_matmul_8bit.cu.
+// timings are in tests/8bit/tune_fma_matmul_8bit.cu.
 #include <torch/types.h>              // torch::randn, torch::matmul, float8_e4m3fn; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

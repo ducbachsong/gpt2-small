@@ -33,6 +33,27 @@
 #include "kernels/fp32/classifier.cuh"             // the softmax and the loss from the bfloat16 logits
 #include "kernels/bf16/adamw_bf16.cuh"            // AdamWBf16's update
 
+// Each GPT-2 product's setting (wgmma_matmul_bf16.cuh's WgmmaMatmulBf16Setting<warpgroups, columns, sets of tiles,
+// splits of the sum, block order>): the square, the sets of tiles and the splits that suit its shape, from
+// tune_wgmma_matmul_bf16's sweep at a training micro-batch (it prints these lines; these from an H100 NVL,
+// 2026-11-13: a step's products 32.20 ms against 34.82 all at the defaults). A layer's three: its forward,
+// its backward's input_grad (right turned) and weight_grad (both turned, the sum over the micro-batch's rows).
+#define MODEL_BF16_QKV_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 64>
+#define MODEL_BF16_QKV_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 1>
+#define MODEL_BF16_QKV_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 4>
+#define MODEL_BF16_ATTENTION_OUTPUT_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
+#define MODEL_BF16_ATTENTION_OUTPUT_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 1>
+#define MODEL_BF16_ATTENTION_OUTPUT_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 64, 4, 8, 16>
+#define MODEL_BF16_MLP_UP_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
+#define MODEL_BF16_MLP_UP_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 4>
+#define MODEL_BF16_MLP_UP_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 128, 3, 4, 16>
+#define MODEL_BF16_MLP_DOWN_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 4>
+#define MODEL_BF16_MLP_DOWN_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
+#define MODEL_BF16_MLP_DOWN_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 128, 3, 4, 64>
+#define MODEL_BF16_HEAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
+#define MODEL_BF16_HEAD_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 4, 1, 64>
+#define MODEL_BF16_HEAD_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 4, 1, 16>
+
 /// Everything the model works in: mean, rstd, attention_logsumexp and the per-row tensors float, the rest
 /// bfloat16. Kept for the backward: the model's tensors, and a block's as lists, one tensor per layer
 /// (ln1_output[l] is layer l's); with flash attention, attention_logsumexp in place of attention_probs. With the
@@ -199,17 +220,19 @@ inline void block_bf16_forward(const Tensor& output, const Tensor& input, const 
     size_t l = layer;
     // the attention branch
     layer_norm_bf16_forward(a.ln1_output[l], a.ln1_mean[l], a.ln1_rstd[l], input, params.ln1_weight, params.ln1_bias);
-    linear_bf16_forward(a.qkv[l], a.ln1_output[l], params.qkv_weight, params.qkv_bias);
+    linear_bf16_forward<MODEL_BF16_QKV_SETTING>(a.qkv[l], a.ln1_output[l], params.qkv_weight, params.qkv_bias);
     if (a.flash_attention) attention_bf16_flash_forward(a.attention_output[l], a.attention_logsumexp[l], a.qkv[l]);
     else attention_bf16_forward(a.attention_output[l], a.attention_probs[l], a.qkv[l]);
-    linear_bf16_forward(a.branch_output_scratch, a.attention_output[l], params.attention_out_weight,
-                        params.attention_out_bias);
+    linear_bf16_forward<MODEL_BF16_ATTENTION_OUTPUT_SETTING>(a.branch_output_scratch, a.attention_output[l],
+                                                             params.attention_out_weight, params.attention_out_bias);
     residual_bf16_forward(a.residual2[l], input, a.branch_output_scratch);
     // the MLP branch; mlp_up and GELU in one product: GELU as each pair of mlp_up_output is stored
     layer_norm_bf16_forward(a.ln2_output[l], a.ln2_mean[l], a.ln2_rstd[l], a.residual2[l], params.ln2_weight,
                             params.ln2_bias);
-    gelu_bf16_forward(a.mlp_up_output[l], a.gelu_output[l], a.ln2_output[l], params.mlp_up_weight, params.mlp_up_bias);
-    linear_bf16_forward(a.branch_output_scratch, a.gelu_output[l], params.mlp_down_weight, params.mlp_down_bias);
+    gelu_bf16_forward<MODEL_BF16_MLP_UP_SETTING>(a.mlp_up_output[l], a.gelu_output[l], a.ln2_output[l], params.mlp_up_weight,
+                                                 params.mlp_up_bias);
+    linear_bf16_forward<MODEL_BF16_MLP_DOWN_SETTING>(a.branch_output_scratch, a.gelu_output[l], params.mlp_down_weight,
+                                                     params.mlp_down_bias);
     residual_bf16_forward(output, a.residual2[l], a.branch_output_scratch);
 }
 
@@ -229,15 +252,18 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_bf16_backward(a.residual2_grad_scratch, a.branch_output_grad_scratch, output_grad);
     // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored
-    gelu_bf16_backward(a.mlp_up_output_grad_scratch, param_grads.mlp_down_weight, param_grads.mlp_down_bias,
+    gelu_bf16_backward<MODEL_BF16_MLP_DOWN_INPUT_GRAD_SETTING, MODEL_BF16_MLP_DOWN_WEIGHT_GRAD_SETTING>(
+                       a.mlp_up_output_grad_scratch, param_grads.mlp_down_weight, param_grads.mlp_down_bias,
                        a.branch_output_grad_scratch, a.gelu_output[l], params.mlp_down_weight, a.mlp_up_output[l]);
-    linear_bf16_backward(a.ln_output_grad_scratch, param_grads.mlp_up_weight, param_grads.mlp_up_bias,
+    linear_bf16_backward<MODEL_BF16_MLP_UP_INPUT_GRAD_SETTING, MODEL_BF16_MLP_UP_WEIGHT_GRAD_SETTING>(
+                         a.ln_output_grad_scratch, param_grads.mlp_up_weight, param_grads.mlp_up_bias,
                          a.mlp_up_output_grad_scratch, a.ln2_output[l], params.mlp_up_weight);
     layer_norm_bf16_backward(a.residual2_grad_scratch, param_grads.ln2_weight, param_grads.ln2_bias,
                              a.ln_output_grad_scratch, a.residual2[l], params.ln2_weight, a.ln2_mean[l], a.ln2_rstd[l]);
     // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_bf16_backward(input_grad, a.branch_output_grad_scratch, a.residual2_grad_scratch);
-    linear_bf16_backward(a.attention_output_grad_scratch, param_grads.attention_out_weight,
+    linear_bf16_backward<MODEL_BF16_ATTENTION_OUTPUT_INPUT_GRAD_SETTING, MODEL_BF16_ATTENTION_OUTPUT_WEIGHT_GRAD_SETTING>(
+                         a.attention_output_grad_scratch, param_grads.attention_out_weight,
                          param_grads.attention_out_bias, a.branch_output_grad_scratch, a.attention_output[l],
                          params.attention_out_weight);
     if (a.flash_attention)
@@ -246,7 +272,8 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
     else
         attention_bf16_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.qkv[l], a.attention_probs[l],
                                 a.attention_probs_grad_scratch);
-    linear_bf16_backward(a.ln_output_grad_scratch, param_grads.qkv_weight, param_grads.qkv_bias, a.qkv_grad_scratch,
+    linear_bf16_backward<MODEL_BF16_QKV_INPUT_GRAD_SETTING, MODEL_BF16_QKV_WEIGHT_GRAD_SETTING>(
+                         a.ln_output_grad_scratch, param_grads.qkv_weight, param_grads.qkv_bias, a.qkv_grad_scratch,
                          a.ln1_output[l], params.qkv_weight);
     layer_norm_bf16_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, a.ln_output_grad_scratch, input,
                              params.ln1_weight, a.ln1_mean[l], a.ln1_rstd[l]);
@@ -271,7 +298,7 @@ inline void gpt2_bf16_forward(const GPT2ActivationsBf16& activations, const Tens
     }
     layer_norm_bf16_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
                             params.lnf_bias);
-    linear_bf16_forward(a.logits, a.lnf_output, params.wte, Tensor());     // the head: no bias
+    linear_bf16_forward<MODEL_BF16_HEAD_SETTING>(a.logits, a.lnf_output, params.wte, Tensor());     // the head: no bias
     classifier_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
 
@@ -291,7 +318,8 @@ inline void gpt2_bf16_backward(const GPT2Params& param_grads, const Tensor& toke
     a.losses_grad_scratch.fill_(1.0 / ((double)micro_batches * a.losses.numel()));
     classifier_backward(a.logits_grad_scratch, a.losses_grad_scratch, a.logits, targets, a.max_of_each_row,
                         a.sum_of_each_row, config.vocab_size);
-    linear_bf16_backward(a.lnf_output_grad_scratch, param_grads.wte, Tensor(), a.logits_grad_scratch, a.lnf_output,
+    linear_bf16_backward<MODEL_BF16_HEAD_INPUT_GRAD_SETTING, MODEL_BF16_HEAD_WEIGHT_GRAD_SETTING>(
+                         a.lnf_output_grad_scratch, param_grads.wte, Tensor(), a.logits_grad_scratch, a.lnf_output,
                          params.wte);
     Tensor output_grad = a.residual_grads_scratch[0];
     Tensor input_grad = a.residual_grads_scratch[1];

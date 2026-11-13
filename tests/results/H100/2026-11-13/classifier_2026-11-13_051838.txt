@@ -1,0 +1,95 @@
+log: tests/results/H100/classifier_2026-11-13_051838.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         0.267         0.478             1.572              2.189
+        GB/s                      3085.3        3450.0
+    PyTorch takes, against mine:                                    5.88x              4.58x
+    input: relative_difference_on_gpu(losses_tensor, pytorch_losses_tensor) expected: 0 +/- 1e-05   actual: 6.35781e-08   ok  (line 147)
+    input: relative_difference_on_gpu(logits_grad_tensor, pytorch_logits_tensor.grad()) expected: 0 +/- 1e-05   actual: 6.98492e-10   ok  (line 148)
+
+time_each_kernel_with_other_block_and_thread_counts
+    forward, time in ms:    blocks   threads   rows per block    float     bf16   same result
+                                40       128              103    5.106    5.035   yes        
+                                40       256              103    2.669    2.638   yes        
+                                40       512              103    1.476    1.481   yes        
+                                40      1024              103    0.951    0.974   yes        
+                                80       128               52    2.550    2.505   yes        
+                                80       256               52    1.338    1.319   yes        
+                                80       512               52    0.752    0.744   yes        
+                                80      1024               52    0.493    0.497   yes        
+                               160       128               26    1.296    1.271   yes        
+                               160       256               26    0.704    0.682   yes        
+                               160       512               26    0.449    0.456   yes        
+                               160      1024               26    0.411    0.419   yes        
+                               320       128               13    0.680    0.654   yes        
+                               320       256               13    0.397    0.371   yes        
+                               320       512               13    0.317    0.322   yes        
+                               320      1024               13    0.334    0.310   yes        
+                               640       128                7    0.401    0.372   yes        
+                               640       256                7    0.287    0.286   yes        
+                               640       512                7    0.315    0.269   yes        
+                               640      1024                7    0.285    0.259   yes        
+                              1280       128                4    0.289    0.294   yes        
+                              1280       256                4    0.301    0.274   yes        
+                              1280       512                4    0.277    0.249   yes        
+                              1280      1024                4    0.277    0.256   yes        
+                              4096       128                1    0.266    0.247   yes        
+                              4096       256                1    0.261    0.239   yes           <- what classifier_forward launches
+                              4096       512                1    0.259    0.238   yes        
+                              4096      1024                1    0.268    0.250   yes        
+                               132       128               32    1.550    1.505   yes        
+                               132       256               32    0.823    0.798   yes        
+                               132       512               32    0.478    0.456   yes        
+                               132      1024               32    0.333    0.309   yes        
+                               264       128               16    0.811    0.785   yes        
+                               264       256               16    0.459    0.436   yes        
+                               264       512               16    0.316    0.295   yes        
+                               264      1024               16    0.289    0.269   yes        
+    fastest forward          4096 blocks x  512 threads: 0.259 ms
+    fastest bf16 forward     4096 blocks x  512 threads: 0.238 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 313)
+    backward, time in ms:   blocks   threads   float4s per thread    float     bf16   same result
+                                40       128                10061    7.009    6.726   yes        
+                                40       256                 5031    3.707    3.564   yes        
+                                40       512                 2516    2.052    2.016   yes        
+                                40      1024                 1258    1.261    1.254   yes        
+                               160       128                 2516    1.965    1.812   yes        
+                               160       256                 1258    1.134    1.049   yes        
+                               160       512                  629    0.718    0.676   yes        
+                               160      1024                  315    0.590    0.561   yes        
+                               640       128                  629    0.667    0.581   yes        
+                               640       256                  315    0.538    0.401   yes        
+                               640       512                  158    0.578    0.441   yes        
+                               640      1024                   79    0.549    0.364   yes        
+                              2560       128                  158    0.569    0.411   yes        
+                              2560       256                   79    0.532    0.366   yes        
+                              2560       512                   40    0.494    0.357   yes        
+                              2560      1024                   20    0.490    0.357   yes        
+                             10240       128                   40    0.490    0.353   yes        
+                             10240       256                   20    0.485    0.350   yes        
+                             10240       512                   10    0.482    0.351   yes        
+                             10240      1024                    5    0.482    0.365   yes        
+                             40960       128                   10    0.479    0.350   yes           <- what classifier_backward launches
+                             40960       256                    5    0.474    0.355   yes        
+                             40960       512                    3    0.487    0.367   yes        
+                             40960      1024                    2    0.528    0.407   yes        
+                            201216       128                    2    0.490    0.364   yes        
+                            201216       256                    1    0.529    0.389   yes           <- one float4 per thread: a T4's pick, what it launched before
+                            201216       512                    1    0.602    0.474   yes        
+                            201216      1024                    1    0.738    0.614   yes        
+                               132       128                 3049    2.303    2.130   yes        
+                               132       256                 1525    1.306    1.180   yes        
+                               132       512                  763    0.756    0.704   yes        
+                               132      1024                  382    0.547    0.417   yes        
+                               264       128                 1525    1.297    1.165   yes        
+                               264       256                  763    0.753    0.669   yes        
+                               264       512                  382    0.551    0.426   yes        
+                               264      1024                  191    0.482    0.368   yes        
+    fastest backward        40960 blocks x  256 threads: 0.474 ms
+    fastest bf16 backward   40960 blocks x  128 threads: 0.350 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 380)
+
+all tunes done

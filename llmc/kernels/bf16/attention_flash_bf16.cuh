@@ -766,8 +766,7 @@ inline void attention_bf16_flash_check_shapes(const Tensor& output_tensor, const
         fprintf(stderr, "error: flash attention needs bfloat16 output {batch_size, seq_len, num_heads * %d} and qkv "
                         "{batch_size, seq_len, 3 * num_heads * %d} with seq_len a multiple of %d, a float logsumexp "
                         "{batch_size, num_heads, seq_len}, output and qkv starting on %d bytes, and a GPU of compute "
-                        "capability %d.%d (an H100: WGMMA and TMA)
-",
+                        "capability %d.%d (an H100: WGMMA and TMA)\n",
                 FLASH_HEAD_SIZE, FLASH_HEAD_SIZE, FLASH_TILE, HARDWARE_TMA_BYTES_PER_CELL, HARDWARE_WGMMA_CAPABILITY / 10,
                 HARDWARE_WGMMA_CAPABILITY % 10);
         exit(EXIT_FAILURE);

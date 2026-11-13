@@ -1,0 +1,114 @@
+log: tests/results/H100/grad_norm_2026-11-13_051857.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_norms_on_gpt2_small_size
+    2 tensors, 124439808 values
+    time of one norm, in ms:   step   my GradNorm   PyTorch per tensor   PyTorch foreach
+                                  1         0.719               54.839            10.938
+                                  2         0.150                0.178             0.225
+                                  3         0.146                0.170             0.197
+                                  4         0.145                0.164             0.201
+                                  5         0.145                0.169             0.198
+                                  6         0.145                0.170             0.207
+                                  7         0.145                0.164             0.199
+                                  8         0.143                0.171             0.202
+                                  9         0.145                0.165             0.194
+                                 10         0.144                0.167             0.198
+                                 11         0.144                0.166             0.198
+                                 12         0.146                0.167             0.194
+                                 13         0.147                0.170             0.202
+                                 14         0.146                0.166             0.197
+                                 15         0.145                0.163             0.200
+                                 16         0.145                0.168             0.195
+                                 17         0.144                0.165             0.197
+                                 18         0.145                0.166             0.196
+                                 19         0.144                0.169             0.197
+                                 20         0.145                0.166             0.198
+    average of steps 2..20:                 0.145                0.168             0.200
+    memory read, in GB/s:                    3431                 2970              2491
+    PyTorch takes, against mine:                               1.16x             1.38x
+
+time_20_norms
+    input: grad_norm_tensor.item()              expected: 11155.1 +/- 0.111551   actual: 11155.1   ok  (line 110)
+    input: foreach_norm_tensor.item<double>()   expected: 11155.1 +/- 0.111551   actual: 11155.1   ok  (line 111)
+
+time_20_norms_on_gpt2_small_148_tensors
+    input: param_shapes_list.size()             expected: 148   actual: 148   ok  (line 151)
+    148 tensors, 124439808 values
+    time of one norm, in ms:   step   my GradNorm   PyTorch per tensor   PyTorch foreach
+                                  1         0.168                1.813             0.428
+                                  2         0.148                1.606             0.332
+                                  3         0.148                1.559             0.338
+                                  4         0.147                1.504             0.333
+                                  5         0.146                1.448             0.331
+                                  6         0.146                1.413             0.319
+                                  7         0.144                1.426             0.327
+                                  8         0.145                1.461             0.328
+                                  9         0.145                1.470             0.322
+                                 10         0.145                1.430             0.322
+                                 11         0.145                1.435             0.337
+                                 12         0.144                1.454             0.330
+                                 13         0.145                1.458             0.329
+                                 14         0.145                1.399             0.318
+                                 15         0.145                1.409             0.327
+                                 16         0.145                1.375             0.333
+                                 17         0.146                1.428             0.314
+                                 18         0.146                1.379             0.316
+                                 19         0.144                1.379             0.318
+                                 20         0.144                1.388             0.314
+    average of steps 2..20:                 0.145                1.443             0.326
+    memory read, in GB/s:                    3422                  345              1528
+    PyTorch takes, against mine:                               9.92x             2.24x
+
+time_20_norms
+    input: grad_norm_tensor.item()              expected: 11155.1 +/- 0.111551   actual: 11155.1   ok  (line 110)
+    input: foreach_norm_tensor.item<double>()   expected: 11155.1 +/- 0.111551   actual: 11155.1   ok  (line 111)
+
+time_the_kernel_with_other_block_and_thread_counts
+    time in ms:   blocks   threads   float4s per thread    float    GB/s     bf16    GB/s   same result
+                      40       128                 6077    2.678     186    2.617      95   yes        
+                      40       256                 3039    1.336     373    1.309     190   yes        
+                      40       512                 1520    0.679     733    0.652     382   yes        
+                      40      1024                  760    0.354    1407    0.335     744   yes        
+                      80       128                 3039    1.322     377    1.296     192   yes        
+                      80       256                 1520    0.673     739    0.649     383   yes        
+                      80       512                  760    0.352    1415    0.333     748   yes        
+                      80      1024                  380    0.204    2441    0.177    1409   yes        
+                     160       128                 1520    0.672     740    0.649     384   yes        
+                     160       256                  760    0.352    1413    0.334     746   yes        
+                     160       512                  380    0.203    2449    0.176    1417   yes        
+                     160      1024                  190    0.151    3307    0.103    2419   yes        
+                     320       128                  760    0.352    1414    0.333     747   yes        
+                     320       256                  380    0.203    2455    0.175    1419   yes        
+                     320       512                  190    0.150    3309    0.103    2424   yes        
+                     320      1024                   95    0.165    3009    0.110    2255   yes        
+                     512       128                  475    0.239    2081    0.216    1154   yes        
+                     512       256                  238    0.160    3119    0.121    2053   yes        
+                     512       512                  119    0.144    3447    0.083    3012   yes        
+                     512      1024                   60    0.144    3457    0.083    2993   yes           <- what GradNorm::compute launches
+                    1024       128                  238    0.161    3086    0.123    2026   yes        
+                    1024       256                  119    0.145    3440    0.083    2996   yes        
+                    1024       512                   60    0.143    3476    0.083    2995   yes        
+                    1024      1024                   30    0.146    3408    0.086    2908   yes        
+                    2048       128                  119    0.147    3379    0.086    2890   yes        
+                    2048       256                   60    0.145    3424    0.086    2903   yes        
+                    2048       512                   30    0.146    3417    0.086    2907   yes        
+                    2048      1024                   15    0.148    3360    0.091    2749   yes        
+                    4096       128                   60    0.156    3200    0.095    2630   yes        
+                    4096       256                   30    0.150    3327    0.090    2767   yes        
+                    4096       512                   15    0.148    3357    0.092    2718   yes        
+                    4096      1024                    8    0.155    3221    0.103    2423   yes        
+                     132       128                 1842    0.810     615    0.785     317   yes        
+                     132       256                  921    0.422    1179    0.401     621   yes        
+                     132       512                  461    0.235    2118    0.210    1188   yes        
+                     132      1024                  231    0.160    3108    0.119    2098   yes        
+                     264       128                  921    0.423    1177    0.401     621   yes        
+                     264       256                  461    0.235    2116    0.210    1186   yes        
+                     264       512                  231    0.159    3126    0.118    2102   yes        
+                     264      1024                  116    0.145    3425    0.083    2982   yes        
+    fastest        1024 blocks x  512 threads: 0.143 ms
+    fastest bf16    512 blocks x  512 threads: 0.083 ms
+    input: launches_with_the_same_result_val    expected: 40   actual: 40   ok  (line 284)
+
+all tunes done

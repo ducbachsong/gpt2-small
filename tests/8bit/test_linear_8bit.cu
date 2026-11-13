@@ -9,7 +9,7 @@
 // come out exactly. linear_8bit has no kernel of its own: round_8bit is tested in tests/8bit/test_round_8bit.cu, the
 // products in tests/8bit/test_wgmma_matmul_8bit.cu, bias_grad's kernel in tests/test_linear_bf16.cu. Run it on an H100
 // (compute capability 9.0), built with -arch=sm_90a in place of -arch=native. The timings on GPT-2 small's 5
-// linear layers are in tunes/tune_linear_8bit.cu.
+// linear layers are in tests/8bit/tune_linear_8bit.cu.
 #include <torch/types.h>              // torch::linear, torch::randn, float8_e4m3fn, backward(); before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

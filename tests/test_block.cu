@@ -4,7 +4,7 @@
 // program.
 //
 // Part 1 checks a block against the same block written in PyTorch, with autograd for the backward, in float
-// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tunes/tune_block.cu.
+// and in bfloat16; part 2 checks what can be worked out by hand. The timing is in tests/tune_block.cu.
 #include <memory>                     // std::unique_ptr
 #include <torch/types.h>              // torch::layer_norm, torch::linear, scaled_dot_product_attention; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed

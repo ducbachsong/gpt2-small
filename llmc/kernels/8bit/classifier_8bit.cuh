@@ -176,7 +176,8 @@ classifier_8bit_logits_kernel(const __grid_constant__ CUtensorMap lnf_output_map
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < WGMMA_MATMUL_8BIT_BLOCK_K / HARDWARE_WGMMA_K_E4M3; k_step_index_val++)
             wgmma_matmul_8bit_multiply_add(sums_list, lnf_output_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3,
-                                           wte_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3);
+                                           wte_tile_list + k_step_index_val * HARDWARE_WGMMA_K_E4M3,
+                                           1);   // always add onto: the sum is only embed_dim long, short enough for the tensor cores
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");   // the step's WGMMAs as one group
         asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");   // ... done
 

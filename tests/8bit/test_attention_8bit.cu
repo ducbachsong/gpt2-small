@@ -8,7 +8,7 @@
 // part 2 checks attention against PyTorch in float, on the rounded values (only bfloat16's roundings apart)
 // and on the values before rounding (what 8 bits cost); part 3 checks that the backward writes over qkv_grad,
 // that each kernel's registers fit its block, and other block sizes. The timings are in
-// tunes/tune_attention_8bit.cu.
+// tests/8bit/tune_attention_8bit.cu.
 #include <torch/types.h>              // torch::scaled_dot_product_attention, torch::randn, backward(); before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR

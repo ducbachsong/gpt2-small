@@ -6,7 +6,7 @@
 // round_8bit's, the forward against the bfloat16 encoder within 8-bit rounding, and the backward against the bfloat16
 // encoder's; part 2 checks numbers worked out by hand; part 3 checks that the gather's registers fit a block of
 // ENCODER_8BIT_THREADS, and that any block size gives the same bits. Any GPU. The timings are in
-// tunes/tune_encoder_8bit.cu.
+// tests/8bit/tune_encoder_8bit.cu.
 #include <torch/types.h>              // torch::embedding, torch::randn, float8_e4m3fn; libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include <random>                     // std::mt19937: random token ids

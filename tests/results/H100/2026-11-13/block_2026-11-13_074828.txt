@@ -1,0 +1,12 @@
+log: tests/results/H100/block_2026-11-13_074828.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         0.369         1.204             0.303              0.598
+    PyTorch takes, against mine:                                    0.82x              0.50x
+    input: list_of(mine_val.output_tensor)      expected: {-1.35077, 1.63364, -0.507971, 0.790846, 1.03043, 1.68474, -0.678238, 1.17715, -0.985608, -0.887879, -2.38287, -0.448497, 1.46089, 0.0708258, -3.15476, 0.0297417, ... (3145728 values)}   actual: {-1.35156, 1.63281, -0.507812, 0.785156, 1.03906, 1.6875, -0.675781, 1.17969, -0.980469, -0.898438, -2.375, -0.449219, 1.46875, 0.0664062, -3.17188, 0.0336914, ... (3145728 values)}   difference: 0.0062598 (at most 0.03)   ok  (line 255)
+    input: list_of(mine_val.input_grad_tensor)  expected: {-1.81877, 0.290264, -0.427872, -0.539285, 0.813314, -2.2858, 1.77289, 3.49353, -0.659522, -0.770361, 2.18142, 1.06545, -0.927746, 2.07856, 0.398471, -0.0716755, ... (3145728 values)}   actual: {-1.80469, 0.296875, -0.427734, -0.539062, 0.792969, -2.28125, 1.78125, 3.5, -0.652344, -0.761719, 2.17188, 1.05469, -0.929688, 2.07812, 0.396484, -0.078125, ... (3145728 values)}   difference: 0.00593348 (at most 0.03)   ok  (line 256)
+
+all tunes done

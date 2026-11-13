@@ -10,7 +10,7 @@
 // values before rounding (how far 8 bits move it); part 2 checks numbers worked out by hand; part 3 checks that the
 // logits kernel's registers fit its block. The loss and logits_grad kernels are classifier_bf16.cuh's, tested with
 // other block sizes in tests/test_classifier_bf16.cu. Run it on an H100 (compute capability 9.0), built with
-// -arch=sm_90a in place of -arch=native. The timings are in tunes/tune_classifier_8bit.cu.
+// -arch=sm_90a in place of -arch=native. The timings are in tests/8bit/tune_classifier_8bit.cu.
 #include <torch/types.h>              // torch::cross_entropy_loss, torch::randn, float8_e4m3fn, backward(); before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include <cmath>                      // std::log, std::exp: the hand-worked losses
@@ -205,11 +205,13 @@ static void forward_and_backward_match_pytorch(const char *test_ptr, size_t batc
     mine_val.targets_tensor = random_targets_on_gpu({batch_size_val, seq_len_val}, vocab_size_val);
     mine_val.forward();
 
-    // 2. the unfused path on the forward's copies: wgmma_matmul_8bit, then fp32/classifier.cuh's softmax on my logits
+    // 2. the unfused path on the forward's copies: wgmma_matmul_8bit, then fp32/classifier.cuh's softmax on my logits.
+    //    Promotion 0: the fused head keeps its embed_dim-long sum in the tensor cores, never moved into float, so
+    //    the unfused product adds the same way and the logits match to the last bit
     const Linear8bitProductCopies &copies_val = mine_val.scratch_val.output_copies;
     Tensor unfused_logits_tensor = Tensor::zeros({rows_val, padded_vocab_size_val}, DType::BFloat16);
     wgmma_matmul_8bit(unfused_logits_tensor, copies_val.left_8bit_tensor, copies_val.left_scales_tensor,
-                      copies_val.right_8bit_tensor, copies_val.right_scales_tensor);
+                      copies_val.right_8bit_tensor, copies_val.right_scales_tensor, Tensor(), false, WgmmaMatmul8bitStore(), 0);
     Tensor unfused_losses_tensor = Tensor::zeros({batch_size_val, seq_len_val});
     Tensor unfused_max_tensor = Tensor::zeros({batch_size_val, seq_len_val});
     Tensor unfused_sum_tensor = Tensor::zeros({batch_size_val, seq_len_val});

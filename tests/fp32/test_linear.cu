@@ -6,7 +6,7 @@
 // worked out by hand; part 3 checks that bias_grad's kernel fits its block. The products are
 // fma_matmul_bf16.cuh's in float, tested in its own file; any GPU. The bfloat16 layer is tested in
 // tests/bf16/test_linear_bf16.cu, the 8-bit one in tests/test_linear_8bit.cu. The timings on GPT-2 small's 5 linear
-// layers are in tunes/tune_linear.cu. (The C# trainer had no linear test: TorchSharp's was trusted.)
+// layers are in tests/fp32/tune_linear.cu. (The C# trainer had no linear test: TorchSharp's was trusted.)
 #include <torch/types.h>              // torch::linear, torch::randn, backward(); libtorch before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ, ASSERT_NEAR, sample_data

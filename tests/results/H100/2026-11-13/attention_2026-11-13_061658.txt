@@ -1,0 +1,54 @@
+log: tests/results/H100/attention_2026-11-13_061658.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         0.778         2.680             0.388              0.864
+    PyTorch takes, against mine:                                    0.50x              0.32x
+    mine keeps 0.2 MB for the backward (logsumexp), against the steps' 201.3 MB of attention_probs
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_output_tensor) expected: 0 +/- 1e-05   actual: 4.97102e-07   ok  (line 153)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_qkv_tensor.grad()) expected: 0 +/- 1e-05   actual: 1.4933e-06   ok  (line 154)
+
+time_row_dot_kernel_with_other_block_and_thread_counts
+    time in ms:   blocks   threads   rows per warp   row_dot   same result
+                      40       128             308     0.174   yes        
+                      40       256             154     0.094   yes        
+                      40       512              77     0.054   yes        
+                      40      1024              39     0.036   yes        
+                      80       128             154     0.091   yes        
+                      80       256              77     0.051   yes        
+                      80       512              39     0.031   yes        
+                      80      1024              20     0.022   yes        
+                     160       128              77     0.050   yes        
+                     160       256              39     0.030   yes        
+                     160       512              20     0.022   yes        
+                     160      1024              10     0.020   yes        
+                     320       128              39     0.029   yes        
+                     320       256              20     0.020   yes        
+                     320       512              10     0.017   yes        
+                     320      1024               5     0.016   yes        
+                     640       128              20     0.019   yes        
+                     640       256              10     0.015   yes        
+                     640       512               5     0.016   yes        
+                     640      1024               3     0.016   yes        
+                    1280       128              10     0.016   yes        
+                    1280       256               5     0.015   yes        
+                    1280       512               3     0.015   yes        
+                    1280      1024               2     0.016   yes        
+                    6144       128               2     0.015   yes        
+                    6144       256               1     0.016   yes           <- what attention_flash_backward launches: one warp per row
+                    6144       512               1     0.018   yes        
+                    6144      1024               1     0.023   yes        
+                     132       128              94     0.058   yes        
+                     132       256              47     0.034   yes        
+                     132       512              24     0.022   yes        
+                     132      1024              12     0.017   yes        
+                     264       128              47     0.034   yes        
+                     264       256              24     0.021   yes        
+                     264       512              12     0.017   yes        
+                     264      1024               6     0.015   yes        
+    fastest   1280 blocks x  256 threads: 0.015 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 247)
+
+all tunes done

@@ -4,7 +4,7 @@
 //
 // Part 1 checks the scales and the E4M3s against PyTorch's float8_e4m3fn; part 2 checks that a turned matrix
 // gives the same bits as rounding the matrix turned round first; part 3 checks that each kernel's registers fit
-// its block, and other block sizes. Any GPU. The timings are in tunes/tune_round_8bit.cu.
+// its block, and other block sizes. Any GPU. The timings are in tests/8bit/tune_round_8bit.cu.
 #include <torch/types.h>              // torch::randn, float8_e4m3fn; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ
@@ -187,13 +187,15 @@ static void every_kernel_fits_its_block(void)
 
 static void any_block_size_gives_the_same_bits(void)
 {
-    // Expect: random {300, 768}, rounded as it sits and as a turned matrix, with block sizes 32, 128, 512 and 1024
+    // Expect: random {304, 768}, rounded as it sits and as a turned matrix, with block sizes 32, 128, 512 and 1024
     // (one warp up to HARDWARE_MAX_THREADS_PER_BLOCK): the same E4M3s and scales as the default's, to the last bit.
     // As it sits each row is one warp's; turned, the warps share a column, and the largest is the same in any order.
+    // 304 rows: turned, they are the row length, which must be a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE (16);
+    // 304 is not one of the turning's 32-row tiles, so the last tile is part-full.
     const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     // 1. random values; the default's roundings
     torch::manual_seed(5);
-    Tensor values_tensor = random_bf16_tensor({300, GPT2_EMBED_DIM});
+    Tensor values_tensor = random_bf16_tensor({304, GPT2_EMBED_DIM});
     torch::Tensor usual_tensor = RoundedMatrix(values_tensor).turned_back();
     torch::Tensor usual_turned_tensor = RoundedMatrix(values_tensor, true).turned_back();
     // 2. each block size against them

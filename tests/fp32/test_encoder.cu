@@ -5,7 +5,7 @@
 // Part 1 checks both against PyTorch's embedding, with autograd for the backward; part 2
 // checks numbers worked out by hand; part 3 checks that each kernel's registers fit a block
 // of ENCODER_THREADS, and that any block size gives the same result. The timings are in
-// tunes/tune_encoder.cu. (The C# trainer had no encoder test: TorchSharp's embedding was trusted.) The model's
+// tests/fp32/tune_encoder.cu. (The C# trainer had no encoder test: TorchSharp's embedding was trusted.) The model's
 // bfloat16 encoder, 8 values a thread, is tested in tests/bf16/test_encoder_bf16.cu; the 8-bit one in
 // tests/8bit/test_encoder_8bit.cu.
 //

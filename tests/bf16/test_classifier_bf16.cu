@@ -8,7 +8,7 @@
 // against the unfused path (linear_bf16_forward's logits, to the bit, then fp32/classifier.cuh's softmax on them);
 // part 2 checks numbers worked out by hand; part 3 checks that each kernel's registers fit its block, and other
 // block sizes. Run it on an H100 (compute capability 9.0), built with -arch=sm_90a in place of -arch=native. The
-// timings are in tunes/tune_classifier_bf16.cu.
+// timings are in tests/bf16/tune_classifier_bf16.cu.
 #include <torch/types.h>              // torch::cross_entropy_loss, torch::randn, backward(); before any CUDA header
 #include <torch/utils.h>              // torch::manual_seed
 #include <cmath>                      // std::log, std::exp: the hand-worked losses
@@ -143,11 +143,14 @@ struct ClassifierTensors
         wte_grad_tensor = Tensor::zeros(wte_tensor.shape(), DType::BFloat16);
     }
 
-    /// Runs classifier_bf16_forward, the loss kernel at this block size (the default if not given).
-    void forward(int threads_per_block_val = CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK)
+    /// Runs classifier_bf16_forward, the loss kernel at this block size and the logits kernel in this tile order (the
+    /// defaults if not given).
+    void forward(int threads_per_block_val = CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK,
+                 int tile_rows_per_group_val = CLASSIFIER_BF16_TILE_ROWS_PER_GROUP)
     {
         classifier_bf16_forward(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, tile_max_tensor, tile_sum_tensor,
-                                logits_tensor, lnf_output_tensor, wte_tensor, targets_tensor, vocab_size_val, threads_per_block_val);
+                                logits_tensor, lnf_output_tensor, wte_tensor, targets_tensor, vocab_size_val, threads_per_block_val,
+                                tile_rows_per_group_val);
     }
 
     /// Runs classifier_bf16_backward into logits_grad, logits_grad at this block size (the default if not given).
@@ -401,6 +404,38 @@ static void any_block_size_gives_the_same_bits(void)
     }
 }
 
+static void every_tile_order_gives_the_same_bits(void)
+{
+    // Expect: random values, 320 rows (5 rows of tiles), embed_dim 768, vocab_size 1000 padded to 1024 (16 tiles
+    // across). The logits kernel's blocks in groups of 1 (row after row), 2, 3, 4 and 64 rows of tiles, down a group
+    // first (the last group gets the rows left): every tile is worked out the same way whichever block runs it when,
+    // and each tile's (max, sum) is stored in its own place, so logits, losses, row_max and row_sum are the
+    // default order's to the last bit.
+    // 1. random values; the default order's results
+    const int tile_rows_per_group_list[] = {1, 2, 3, 4, 64};
+    torch::manual_seed(11);
+    ClassifierTensors usual_val(5, 64, GPT2_EMBED_DIM, 1000, 1024);
+    usual_val.lnf_output_tensor = random_bf16_tensor(usual_val.lnf_output_tensor.shape());
+    usual_val.wte_tensor = random_bf16_tensor(usual_val.wte_tensor.shape(), WTE_STD);
+    usual_val.targets_tensor = random_targets_on_gpu({5, 64}, 1000);
+    usual_val.forward();
+    print_test_name(__func__);
+    // 2. each order, from the same values, against the default's
+    for (int tile_rows_per_group_val : tile_rows_per_group_list)
+    {
+        ClassifierTensors tensors_val(5, 64, GPT2_EMBED_DIM, 1000, 1024);
+        tensors_val.lnf_output_tensor = usual_val.lnf_output_tensor;
+        tensors_val.wte_tensor = usual_val.wte_tensor;
+        tensors_val.targets_tensor = usual_val.targets_tensor;
+        tensors_val.forward(CLASSIFIER_BF16_LOSS_THREADS_PER_BLOCK, tile_rows_per_group_val);
+        printf("    groups of %d rows of tiles:\n", tile_rows_per_group_val);
+        ASSERT_EQ(values_of(tensors_val.logits_tensor), values_of(usual_val.logits_tensor));
+        ASSERT_EQ(tensors_val.losses_tensor.tolist(), usual_val.losses_tensor.tolist());
+        ASSERT_EQ(tensors_val.max_of_each_row_tensor.tolist(), usual_val.max_of_each_row_tensor.tolist());
+        ASSERT_EQ(tensors_val.sum_of_each_row_tensor.tolist(), usual_val.sum_of_each_row_tensor.tolist());
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -416,6 +451,7 @@ int main(void)
 
     every_kernel_fits_its_block();
     any_block_size_gives_the_same_bits();
+    every_tile_order_gives_the_same_bits();
 
     printf("\nall tests passed\n");
     return 0;

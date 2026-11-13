@@ -69,8 +69,10 @@ struct GeluBf16BackwardEpilogue {
 };
 
 // ── forward and backward ──────────────────────────────────────────────────────
+template <typename SETTING = WgmmaMatmulBf16Setting<>>
 void gelu_bf16_forward(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& input_tensor,
                        const Tensor& weight_tensor, const Tensor& bias_tensor);
+template <typename INPUT_GRAD_SETTING = WgmmaMatmulBf16Setting<>, typename WEIGHT_GRAD_SETTING = WgmmaMatmulBf16Setting<>>
 void gelu_bf16_backward(const Tensor& gelu_input_grad_tensor, const Tensor& weight_grad_tensor,
                         const Tensor& bias_grad_tensor, const Tensor& output_grad_tensor,
                         const Tensor& gelu_output_tensor, const Tensor& weight_tensor, const Tensor& gelu_input_tensor);
@@ -91,13 +93,15 @@ void gelu_bf16_check_beside(const char* name_ptr, const Tensor& beside_tensor, c
 ///   input_tensor         {..., in_features} bfloat16: ln2's output in GPT-2's MLP
 ///   weight_tensor        {out_features, in_features} bfloat16
 ///   bias_tensor          {out_features} bfloat16, or Tensor() for none
+/// SETTING: the product's WgmmaMatmulBf16Setting (wgmma_matmul_bf16.cuh's); not given: the defaults.
+template <typename SETTING>
 inline void gelu_bf16_forward(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& input_tensor,
                               const Tensor& weight_tensor, const Tensor& bias_tensor) {
     // 1. check gelu_output beside gelu_input; any of it wrong: stop with an error
     gelu_bf16_check_beside("gelu_bf16_forward", gelu_output_tensor, "gelu_output", gelu_input_tensor, "gelu_input");
 
     // 2. gelu_input = input · weightᵀ + bias, each pair's gelu into gelu_output as it is stored
-    linear_bf16_forward(gelu_input_tensor, input_tensor, weight_tensor, bias_tensor,
+    linear_bf16_forward<SETTING>(gelu_input_tensor, input_tensor, weight_tensor, bias_tensor,
                         GeluBf16ForwardEpilogue{gelu_output_tensor.data_ptr<nv_bfloat16>()});
 }
 
@@ -116,6 +120,8 @@ inline void gelu_bf16_forward(const Tensor& gelu_input_tensor, const Tensor& gel
 ///   gelu_output_tensor       {..., in_features} bfloat16: the linear's input, the forward's GELU output
 ///   weight_tensor            {out_features, in_features} bfloat16: mlp_down's weight in GPT-2's MLP
 ///   gelu_input_tensor        gelu_output's shape, bfloat16: the forward's GELU input
+/// INPUT_GRAD_SETTING, WEIGHT_GRAD_SETTING: the two products' WgmmaMatmulBf16Setting; not given: the defaults.
+template <typename INPUT_GRAD_SETTING, typename WEIGHT_GRAD_SETTING>
 inline void gelu_bf16_backward(const Tensor& gelu_input_grad_tensor, const Tensor& weight_grad_tensor,
                                const Tensor& bias_grad_tensor, const Tensor& output_grad_tensor,
                                const Tensor& gelu_output_tensor, const Tensor& weight_tensor, const Tensor& gelu_input_tensor) {
@@ -123,7 +129,8 @@ inline void gelu_bf16_backward(const Tensor& gelu_input_grad_tensor, const Tenso
     gelu_bf16_check_beside("gelu_bf16_backward", gelu_input_tensor, "gelu_input", gelu_output_tensor, "gelu_output");
 
     // 2. the linear's backward, its input_grad times gelu' as each pair is stored
-    linear_bf16_backward(gelu_input_grad_tensor, weight_grad_tensor, bias_grad_tensor, output_grad_tensor, gelu_output_tensor,
+    linear_bf16_backward<INPUT_GRAD_SETTING, WEIGHT_GRAD_SETTING>(gelu_input_grad_tensor, weight_grad_tensor, bias_grad_tensor,
+                                                                  output_grad_tensor, gelu_output_tensor,
                          weight_tensor, GeluBf16BackwardEpilogue{gelu_input_tensor.data_ptr<nv_bfloat16>()});
 }
 

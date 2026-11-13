@@ -451,6 +451,15 @@ int main(void)
 {
     start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     remove("writing");                                       // one left by a stopped run would make loaders wait
+    // the numbered files an earlier run left: a loader would find them as files already written (file 2 of
+    // `growing` or `ends`, file 1 of `first`), so the cases that wait for a new file would not wait
+    for (const char *prefix_ptr : {"test_dataloader_growing", "test_dataloader_half", "test_dataloader_first", "test_dataloader_ends"})
+        for (int file_index_val = 0; file_index_val <= 3; file_index_val++)
+        {
+            char path_list[64];
+            snprintf(path_list, sizeof(path_list), "%s_%06d.bin", prefix_ptr, file_index_val);
+            remove(path_list);
+        }
     // the error cases first: fork() before this program has touched the GPU
     no_files_is_an_error();
     a_file_smaller_than_a_batch_is_refused();

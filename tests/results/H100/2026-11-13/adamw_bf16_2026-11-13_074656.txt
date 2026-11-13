@@ -1,0 +1,46 @@
+log: tests/results/H100/adamw_bf16_2026-11-13_074656.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   100.0 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_the_kernel_with_other_block_and_thread_counts
+    time in ms:   blocks   threads   float4s per thread     time   same result
+                      40       128                 6077    5.917   yes        
+                      40       256                 3039    3.167   yes        
+                      40       512                 1520    1.800   yes        
+                      40      1024                  760    1.122   yes        
+                     160       128                 1520    1.720   yes        
+                     160       256                  760    1.033   yes        
+                     160       512                  380    0.795   yes        
+                     160      1024                  190    0.876   yes        
+                     640       128                  380    0.779   yes        
+                     640       256                  190    0.753   yes        
+                     640       512                   95    0.776   yes        
+                     640      1024                   48    0.742   yes        
+                    2560       128                   95    0.749   yes        
+                    2560       256                   48    0.748   yes        
+                    2560       512                   24    0.740   yes        
+                    2560      1024                   12    0.740   yes        
+                   10240       128                   24    0.743   yes        
+                   10240       256                   12    0.734   yes        
+                   10240       512                    6    0.730   yes        
+                   10240      1024                    3    0.729   yes        
+                   40960       128                    6    0.728   yes        
+                   40960       256                    3    0.720   yes        
+                   40960       512                    2    0.724   yes        
+                   40960      1024                    1    0.778   yes        
+                  121524       128                    2    0.720   yes        
+                  121524       256                    1    0.712   yes           <- what adamw_update_bf16 launches: one float4 per thread
+                  121524       512                    1    0.806   yes        
+                  121524      1024                    1    1.013   yes        
+                     132       128                 1842    1.924   yes        
+                     132       256                  921    1.119   yes        
+                     132       512                  461    0.820   yes        
+                     132      1024                  231    0.743   yes        
+                     264       128                  921    1.125   yes        
+                     264       256                  461    0.820   yes        
+                     264       512                  231    0.743   yes        
+                     264      1024                  116    0.746   yes        
+    fastest       121524 blocks x  256 threads: 0.712 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 172)
+
+all tunes done
