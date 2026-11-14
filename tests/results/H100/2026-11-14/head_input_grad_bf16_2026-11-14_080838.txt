@@ -1,0 +1,76 @@
+log: tests/results/H100/head_input_grad_bf16_2026-11-14_080838.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    head input grad: output {16384, 768}, a sum of 50304: 1265.9 GFLOP
+    average of steps 3..20:            ms     TFLOPS   of bf16 peak
+        mine (this file's setting)     3.075      411.7     42.7%
+        PyTorch (cuBLAS)               2.620      483.2     50.1%
+    cuBLAS takes 0.85x as long as mine
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      6.097 ms    207.6 TFLOPS
+        1 x  64 x 2      6.067 ms    208.7 TFLOPS
+        1 x  64 x 3      6.190 ms    204.5 TFLOPS
+        1 x  64 x 4      6.584 ms    192.3 TFLOPS
+        1 x 128 x 1      5.133 ms    246.6 TFLOPS
+        1 x 128 x 2      4.723 ms    268.0 TFLOPS
+        1 x 128 x 3      4.193 ms    301.9 TFLOPS
+        1 x 128 x 4      3.726 ms    339.7 TFLOPS
+        1 x 256 x 1      7.457 ms    169.8 TFLOPS
+        1 x 256 x 2      5.732 ms    220.8 TFLOPS
+        1 x 256 x 3      3.244 ms    390.2 TFLOPS
+        1 x 256 x 4      2.894 ms    437.4 TFLOPS   (this file's)
+        2 x  64 x 1      6.141 ms    206.1 TFLOPS
+        2 x  64 x 2      6.282 ms    201.5 TFLOPS
+        2 x  64 x 3      4.647 ms    272.4 TFLOPS
+        2 x  64 x 4      4.304 ms    294.2 TFLOPS
+        2 x 128 x 1      6.785 ms    186.6 TFLOPS
+        2 x 128 x 2      5.753 ms    220.0 TFLOPS
+        2 x 128 x 3      3.304 ms    383.1 TFLOPS
+        2 x 128 x 4      3.485 ms    363.2 TFLOPS
+        2 x 256 x 1      5.009 ms    252.7 TFLOPS
+        2 x 256 x 2      3.370 ms    375.7 TFLOPS
+        2 x 256 x 3      2.714 ms    466.5 TFLOPS
+    fastest: 2 x 256 x 3
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 256 x 3
+        clusters of 1,  1 rows a group, persistent          3.062 ms    413.4 TFLOPS
+        clusters of 1,  1 rows a group, one a square        3.074 ms    411.8 TFLOPS
+        clusters of 1,  4 rows a group, persistent          3.064 ms    413.2 TFLOPS
+        clusters of 1,  4 rows a group, one a square        3.084 ms    410.5 TFLOPS
+        clusters of 1, 16 rows a group, persistent          3.086 ms    410.2 TFLOPS
+        clusters of 1, 16 rows a group, one a square        3.095 ms    409.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent          3.082 ms    410.8 TFLOPS
+        clusters of 1, 64 rows a group, one a square        3.075 ms    411.7 TFLOPS
+        clusters of 2,  1 rows a group, persistent          3.077 ms    411.4 TFLOPS
+        clusters of 2,  1 rows a group, one a square        3.086 ms    410.2 TFLOPS
+        clusters of 2,  4 rows a group, persistent          3.074 ms    411.8 TFLOPS
+        clusters of 2,  4 rows a group, one a square        3.086 ms    410.2 TFLOPS
+        clusters of 2, 16 rows a group, persistent          3.080 ms    411.0 TFLOPS
+        clusters of 2, 16 rows a group, one a square        3.091 ms    409.5 TFLOPS
+        clusters of 2, 64 rows a group, persistent          3.155 ms    401.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square        3.172 ms    399.2 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 1 x 256 x 4
+        producer 40 registers, 0 steps in flight      3.231 ms    391.8 TFLOPS
+        producer 40 registers, 1 steps in flight      2.933 ms    431.7 TFLOPS
+        producer 40 registers, 2 steps in flight      3.058 ms    414.0 TFLOPS
+        producer 40 registers, 3 steps in flight      5.674 ms    223.1 TFLOPS
+
+    for llmc/kernels/bf16/prod/head_input_grad_bf16.cuh:
+#define HEAD_INPUT_GRAD_BF16_ROW_GROUPS 2
+#define HEAD_INPUT_GRAD_BF16_COLUMNS 256
+#define HEAD_INPUT_GRAD_BF16_STAGES 3
+#define HEAD_INPUT_GRAD_BF16_BLOCK_ROWS_PER_GROUP 1
+#define HEAD_INPUT_GRAD_BF16_CLUSTER 1
+#define HEAD_INPUT_GRAD_BF16_BLOCKS 0
+#define HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS 40
+#define HEAD_INPUT_GRAD_BF16_IN_FLIGHT 1
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again)
+
+all tunes done

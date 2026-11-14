@@ -464,7 +464,10 @@ __device__ __forceinline__ void wgmma_matmul_bf16_barrier_arrive(uint64_t* barri
 }
 
 /// Arrives once at the same barrier in another block of the cluster (or this one): the barrier at this address of
-/// block cluster_block_val's shared memory.
+/// block cluster_block_val's shared memory. Released at the block's scope (.cta, as CUTLASS does), not the
+/// cluster's: what it orders is this block's own reads of the set (the WGMMAs, already waited for); .release.cluster
+/// made every arrival wait on a cluster-wide fence, and clusters of 2 took twice as long (H100 PCIe, 2 x 256: qkv
+/// 0.250 ms against 0.139 ms with .cta, the head 5.46 against 2.55)
 ///
 ///   barrier_ptr         the barrier, as it sits in this block
 ///   cluster_block_val   which block of the cluster: 0 .. CLUSTER - 1
@@ -472,7 +475,7 @@ __device__ __forceinline__ void wgmma_matmul_bf16_barrier_arrive_in_cluster(uint
     asm volatile("{\n"
                  ".reg .b32 remote_address;\n"
                  "mapa.shared::cluster.u32 remote_address, %0, %1;\n"
-                 "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote_address], %2;\n"
+                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remote_address], %2;\n"
                  "}\n"
                  ::"r"(wgmma_matmul_bf16_shared_address(barrier_ptr)), "r"(cluster_block_val), "r"(1) : "memory");
 }

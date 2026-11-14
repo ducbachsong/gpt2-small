@@ -1,0 +1,76 @@
+log: tests/results/H100/attention_output_bf16_2026-11-14_080821.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    attention output: output {16384, 768}, a sum of 768: 19.3 GFLOP
+    average of steps 3..20:            ms     TFLOPS   of bf16 peak
+        mine (this file's setting)     0.051      379.1     39.3%
+        PyTorch (cuBLAS)               0.051      380.4     39.4%
+    cuBLAS takes 1.00x as long as mine
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      0.084 ms    229.6 TFLOPS
+        1 x  64 x 2      0.084 ms    230.0 TFLOPS
+        1 x  64 x 3      0.069 ms    280.5 TFLOPS
+        1 x  64 x 4      0.066 ms    294.7 TFLOPS
+        1 x 128 x 1      0.072 ms    269.1 TFLOPS
+        1 x 128 x 2      0.068 ms    286.0 TFLOPS
+        1 x 128 x 3      0.055 ms    353.8 TFLOPS
+        1 x 128 x 4      0.065 ms    298.7 TFLOPS
+        1 x 256 x 1      0.090 ms    214.4 TFLOPS
+        1 x 256 x 2      0.074 ms    261.7 TFLOPS
+        1 x 256 x 3      0.057 ms    338.2 TFLOPS
+        1 x 256 x 4      0.050 ms    385.5 TFLOPS   (this file's)
+        2 x  64 x 1      0.074 ms    261.2 TFLOPS
+        2 x  64 x 2      0.076 ms    255.3 TFLOPS
+        2 x  64 x 3      0.066 ms    294.9 TFLOPS
+        2 x  64 x 4      0.076 ms    254.4 TFLOPS
+        2 x 128 x 1      0.081 ms    239.9 TFLOPS
+        2 x 128 x 2      0.071 ms    273.2 TFLOPS
+        2 x 128 x 3      0.054 ms    355.8 TFLOPS
+        2 x 128 x 4      0.049 ms    391.2 TFLOPS
+        2 x 256 x 1      0.067 ms    288.3 TFLOPS
+        2 x 256 x 2      0.051 ms    375.8 TFLOPS
+        2 x 256 x 3      0.045 ms    429.3 TFLOPS
+    fastest: 2 x 256 x 3
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 256 x 3
+        clusters of 1,  1 rows a group, persistent          0.041 ms    473.5 TFLOPS
+        clusters of 1,  1 rows a group, one a square        0.050 ms    385.3 TFLOPS
+        clusters of 1,  4 rows a group, persistent          0.042 ms    458.2 TFLOPS
+        clusters of 1,  4 rows a group, one a square        0.050 ms    385.8 TFLOPS
+        clusters of 1, 16 rows a group, persistent          0.044 ms    443.9 TFLOPS
+        clusters of 1, 16 rows a group, one a square        0.050 ms    383.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent          0.044 ms    442.5 TFLOPS
+        clusters of 1, 64 rows a group, one a square        0.050 ms    386.9 TFLOPS
+        clusters of 2,  1 rows a group, persistent          0.045 ms    430.7 TFLOPS
+        clusters of 2,  1 rows a group, one a square        0.057 ms    340.2 TFLOPS
+        clusters of 2,  4 rows a group, persistent          0.045 ms    430.8 TFLOPS
+        clusters of 2,  4 rows a group, one a square        0.057 ms    340.9 TFLOPS
+        clusters of 2, 16 rows a group, persistent          0.046 ms    421.7 TFLOPS
+        clusters of 2, 16 rows a group, one a square        0.056 ms    346.5 TFLOPS
+        clusters of 2, 64 rows a group, persistent          0.046 ms    419.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square        0.058 ms    335.9 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 1 x 256 x 4
+        producer 40 registers, 0 steps in flight      0.062 ms    312.7 TFLOPS
+        producer 40 registers, 1 steps in flight      0.052 ms    373.5 TFLOPS
+        producer 40 registers, 2 steps in flight      0.058 ms    335.5 TFLOPS
+        producer 40 registers, 3 steps in flight      0.072 ms    268.5 TFLOPS
+
+    for llmc/kernels/bf16/prod/attention_output_bf16.cuh:
+#define ATTENTION_OUTPUT_BF16_ROW_GROUPS 2
+#define ATTENTION_OUTPUT_BF16_COLUMNS 256
+#define ATTENTION_OUTPUT_BF16_STAGES 3
+#define ATTENTION_OUTPUT_BF16_BLOCK_ROWS_PER_GROUP 1
+#define ATTENTION_OUTPUT_BF16_CLUSTER 1
+#define ATTENTION_OUTPUT_BF16_BLOCKS 0
+#define ATTENTION_OUTPUT_BF16_PRODUCER_REGISTERS 40
+#define ATTENTION_OUTPUT_BF16_IN_FLIGHT 1
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again)
+
+all tunes done
