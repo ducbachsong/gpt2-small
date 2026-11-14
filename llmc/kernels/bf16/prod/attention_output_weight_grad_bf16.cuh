@@ -22,21 +22,33 @@
 //         into one of STAGES sets of shared memory, once the consumers have freed it (the set's empty barrier)
 //     each consumer warpgroup waits for the set (its full barrier), adds its 64 rows' tile products into its sums
 //         with WGMMA, and frees the set a step later (one step's WGMMAs left running)
-//     at the square's end, each consumer warpgroup puts its sums into its room of shared memory as floats,
-//         STAGED_ROWS rows a round, and stores them row by row, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES neighbouring values a
-//         thread: added onto weight_grad, rounded once, one 8-byte store, a warp's stores one stretch of a row
-// SPLITS > 1: the sum (the micro-batch's rows) is split in SPLITS, each split a unit of its own, which writes its
-// float sums into its slice of a scratch; then attention_output_weight_grad_bf16_splits_sum_kernel adds the slices in order of the splits and
+//     before a square's walk, each consumer warpgroup's first thread asks TMA for its 64 rows of weight_grad as
+//         they are (the old values) into its room of shared memory, in TMA's swizzled layout: they come while the
+//         tensor cores work
+//     at the square's end, each thread adds its sums onto the old values in the room, rounded once to bfloat16,
+//         and one thread asks TMA to store the room, while the producer already brings the next square's tiles.
+//         (Stored row by row from a staged float copy, reading the old values then, the store held the tensor
+//         cores up: cuBLAS adds onto its output for nothing.)
+// SPLITS > 1: the sum (the micro-batch's rows) is split in SPLITS, each split a unit of its own, which puts its
+// float sums into its room STAGED_ROWS rows a round and writes them row by row, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES neighbouring
+// values a thread, into its slice of a scratch; then attention_output_weight_grad_bf16_splits_sum_kernel adds the slices in order of the splits and
 // onto weight_grad: a product of few squares and a long sum keeps every SM busy. Fixed for a launch, so the bits
 // never change between runs; they differ from 1 split's, whose sums are added in another order. The splits' code
 // is in the split kernel only (SPLIT), so the unsplit one carries none of it.
+// SPLITS 0: the count is chosen at each launch (attention_output_weight_grad_bf16_auto_splits) for this GPU: the blocks walk the pieces in
+// rounds, and a last round half empty leaves SMs idle, so the best count is the one whose pieces fill the
+// rounds: the least rounds x (a piece's steps + ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLIT_COST_STEPS, what a piece's float store and its share
+// of the splits' sum cost). Measured on an H100 PCIe (114 SMs), mlp up's weight_grad at 2 x 256 x 3 (72 squares
+// of 256 steps): 1 split 0.216 ms, 2 0.238, 3 0.183, 4 0.216, 5 0.240, 6 0.223; the rule gives 3. With 132 SMs
+// another count wins, so a fixed count is right on one GPU only. The count changes the order sums are added in:
+// the bits are the same from run to run on one GPU, not from one GPU model to another.
 // Clusters of CLUSTER blocks take squares one under the other and share each right tile: block 0's producer asks
 // TMA for it once, into every block's shared memory (multicast); every consumer warpgroup of the cluster frees a set
 // in every block. Its settings (the defines below, from tests/bf16/prod/tune_attention_output_weight_grad_bf16.cu):
 //     ROW_GROUPS            consumer warpgroups a block, 64 rows each: 1 or 2
 //     COLUMNS               a square's columns, its WGMMA's N: 64, 128 or 256
 //     STAGES                sets of tiles in shared memory: 1 to ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_MAX_STAGES
-//     SPLITS                splits of the sum: 1 (none) or more
+//     SPLITS                splits of the sum: 1 (none) or more; 0: chosen at each launch for this GPU
 //     BLOCK_ROWS_PER_GROUP  the squares' order: rows of squares the blocks run down before the next column
 //     CLUSTER               blocks a cluster: 1 or 2
 //     BLOCKS                blocks a launch: 0, as many as the GPU runs at once; ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ONE_A_SQUARE, one a square
@@ -58,11 +70,13 @@
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_COLUMNS 256                        // a square's columns, its WGMMA's N: 64, 128 or 256
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STAGES 3                           // sets of tiles in shared memory: 1 to ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_MAX_STAGES
-#define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLITS 4                           // splits of the sum: 1, none
+#define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (attention_output_weight_grad_bf16_auto_splits)
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ONE_A_SQUARE: one a square
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLITS_SUM_THREADS_PER_BLOCK 256     // the splits' sum's block size
+#define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLIT_COST_STEPS 15                  // SPLITS 0: what a split piece's float store and its share of the splits' sum cost, in steps of the walk (tune_attention_output_weight_grad_bf16 prints each count's time beside the rule's)
+#define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_MAX_AUTO_SPLITS 16                   // SPLITS 0: the most it picks
 // the walk's and the store's own numbers
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ONE_A_SQUARE (1 << 30)              // BLOCKS: more than any product's squares, so one block a square
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_MAX_ROW_GROUPS 2                     // the most: 2 x 128 threads, each warpgroup's sums up to 128 floats (COLUMNS 256), inside a block's registers
@@ -455,7 +469,14 @@ template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REG
 void attention_output_weight_grad_bf16_at(const Tensor& weight_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor, int splits_val,
             int block_rows_per_group_val, int blocks_val, int sum_threads_per_block_val = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLITS_SUM_THREADS_PER_BLOCK);
 
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_REGISTERS,
+          int IN_FLIGHT = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_IN_FLIGHT, int STAGED_ROWS = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STAGED_ROWS, int STAGED_ROW_PADDING = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STAGED_ROW_PADDING>
+int attention_output_weight_grad_bf16_auto_splits(size_t rows_val, size_t columns_val, size_t sum_length_val);
+
 // ── for it ────────────────────────────────────────────────────────────────────
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int STAGED_ROWS,
+          int STAGED_ROW_PADDING>
+int attention_output_weight_grad_bf16_blocks_at_once();
 template <int COLUMNS, int STAGED_ROWS, int STAGED_ROW_PADDING>
 __host__ __device__ constexpr size_t attention_output_weight_grad_bf16_room_bytes();
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int STAGED_ROWS, int STAGED_ROW_PADDING>
@@ -464,11 +485,13 @@ template <int STAGES, int ROW_GROUPS>
 constexpr size_t attention_output_weight_grad_bf16_barrier_bytes();
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int STAGED_ROWS,
           int STAGED_ROW_PADDING>
-void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map_val, const CUtensorMap& right_map_val, nv_bfloat16* output_ptr, float* split_sums_ptr,
+void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map_val, const CUtensorMap& right_map_val, const CUtensorMap& output_map_val,
+                nv_bfloat16* output_ptr, float* split_sums_ptr,
                 size_t rows_val, size_t columns_val, size_t sum_length_val, int splits_val, int block_rows_per_group_val, int blocks_val);
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_REGISTERS,
           int IN_FLIGHT = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_IN_FLIGHT, int STAGED_ROWS = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STAGED_ROWS, int STAGED_ROW_PADDING = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STAGED_ROW_PADDING>
 __global__ void attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
+                           const __grid_constant__ CUtensorMap output_map_val,
                            nv_bfloat16* output_ptr, float* split_sums_ptr, int rows_val, int columns_val, int sum_length_val,
                            int splits_val, int block_rows_per_group_val);
 __global__ void attention_output_weight_grad_bf16_splits_sum_kernel(nv_bfloat16* output_ptr, const float* split_sums_ptr, size_t rows_val, size_t columns_val,
@@ -493,7 +516,8 @@ inline void attention_output_weight_grad_bf16(const Tensor& weight_grad_tensor, 
 /// added onto weight_grad by attention_output_weight_grad_bf16_splits_sum_kernel.
 ///
 ///   weight_grad_tensor, output_grad_tensor, input_tensor   as in attention_output_weight_grad_bf16
-///   splits_val                  blocks a square's sum is split over (at least 1; more than the steps: one a step)
+///   splits_val                  blocks a square's sum is split over (more than the steps: one a step); 0: chosen
+///                               for this GPU (attention_output_weight_grad_bf16_auto_splits)
 ///   block_rows_per_group_val    the squares' order: rows of squares a group runs down (at least 1)
 ///   blocks_val                  blocks launched: 0, as many as the GPU runs at once; more than the squares: one a square
 ///   sum_threads_per_block_val   the splits' sum's block size; not given: ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLITS_SUM_THREADS_PER_BLOCK
@@ -518,21 +542,26 @@ inline void attention_output_weight_grad_bf16_at(const Tensor& weight_grad_tenso
         fprintf(stderr, "error: attention_output_weight_grad_bf16 needs output_grad {..., out}, input {..., in} of output_grad's rows, weight_grad {out, in}\n");
         exit(EXIT_FAILURE);
     }
-    if (block_rows_per_group_val < 1 || splits_val < 1 || blocks_val < 0) {
-        fprintf(stderr, "error: attention_output_weight_grad_bf16's block_rows_per_group and splits must be 1 or more and blocks 0 or more; got %d, %d and %d\n",
+    if (block_rows_per_group_val < 1 || splits_val < 0 || blocks_val < 0) {
+        fprintf(stderr, "error: attention_output_weight_grad_bf16's block_rows_per_group must be 1 or more, splits and blocks 0 or more; got %d, %d and %d\n",
                 block_rows_per_group_val, splits_val, blocks_val);
         exit(EXIT_FAILURE);
     }
     size_t rows_val = out_features_val, columns_val = in_features_val;
+    if (splits_val == 0)
+        splits_val = attention_output_weight_grad_bf16_auto_splits<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS, STAGED_ROW_PADDING>(rows_val, columns_val, sum_length_val);
     int total_steps_val = (int)CEIL_DIV(sum_length_val, (size_t)ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCK_K);
     if (splits_val > total_steps_val) splits_val = total_steps_val > 0 ? total_steps_val : 1;   // at most one a step
 
     // 2. TMA's descriptions: left = output_grad sitting turned {sum_length, rows}, right = input sitting turned
-    //    {sum_length, columns}, both in boxes of {64 k, 64 lines}
+    //    {sum_length, columns}, both in boxes of {64 k, 64 lines}; weight_grad {rows, columns} in boxes of {64 rows, 64
+    //    columns}, for its old values in and the new ones out
     CUtensorMap left_map_val = attention_output_weight_grad_bf16_tensor_map(output_grad_tensor.data_ptr<nv_bfloat16>(), sum_length_val, rows_val,
                                                            ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCK_K);
     CUtensorMap right_map_val = attention_output_weight_grad_bf16_tensor_map(input_tensor.data_ptr<nv_bfloat16>(), sum_length_val, columns_val,
                                                             ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCK_K);
+
+    CUtensorMap output_map_val = attention_output_weight_grad_bf16_tensor_map(weight_grad_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
 
     // 3. split: the scratch, a {rows, columns} slice of float sums per split, made the first time and grown when the
     //    product needs more; then the kernel, split or not
@@ -542,7 +571,7 @@ inline void attention_output_weight_grad_bf16_at(const Tensor& weight_grad_tenso
         if ((size_t)split_sums_tensor.numel() < (size_t)splits_val * rows_val * columns_val)
             split_sums_tensor = Tensor::empty({(size_t)splits_val * rows_val * columns_val});
         attention_output_weight_grad_bf16_launch<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, true, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS, STAGED_ROW_PADDING>(
-            left_map_val, right_map_val, output_ptr, split_sums_tensor.data(), rows_val, columns_val, sum_length_val, splits_val,
+            left_map_val, right_map_val, output_map_val, output_ptr, split_sums_tensor.data(), rows_val, columns_val, sum_length_val, splits_val,
             block_rows_per_group_val, blocks_val);
         // 4. the splits' sums in order, onto weight_grad, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES values a thread
         check_threads_per_block(sum_threads_per_block_val, "attention_output_weight_grad_bf16_splits_sum_kernel");
@@ -552,18 +581,71 @@ inline void attention_output_weight_grad_bf16_at(const Tensor& weight_grad_tenso
         cudaCheck(cudaGetLastError());
     } else {
         attention_output_weight_grad_bf16_launch<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, false, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS, STAGED_ROW_PADDING>(
-            left_map_val, right_map_val, output_ptr, nullptr, rows_val, columns_val, sum_length_val, 1, block_rows_per_group_val, blocks_val);
+            left_map_val, right_map_val, output_map_val, output_ptr, nullptr, rows_val, columns_val, sum_length_val, 1,
+            block_rows_per_group_val, blocks_val);
     }
+}
+
+/// Gives the split count SPLITS 0 stands for: the one whose pieces fill the blocks' rounds best on this GPU. The
+/// blocks the GPU runs at once walk the pieces in rounds; a count's cost is its rounds x (a piece's steps + what
+/// a split piece's store costs, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLIT_COST_STEPS; none unsplit). The least cost wins, the smaller count on a tie.
+///
+///   rows_val, columns_val, sum_length_val   the product's sizes: weight_grad {rows, columns}, the sum over sum_length
+/// The template parameters: as in attention_output_weight_grad_bf16_at.
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int STAGED_ROWS, int STAGED_ROW_PADDING>
+inline int attention_output_weight_grad_bf16_auto_splits(size_t rows_val, size_t columns_val, size_t sum_length_val) {
+    // 1. the units of work unsplit (a cluster's squares), the clusters running at once, the steps of a square
+    size_t units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M));
+    size_t clusters_at_once_val = (size_t)attention_output_weight_grad_bf16_blocks_at_once<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, true, PRODUCER_REGISTERS, IN_FLIGHT,
+                                                         STAGED_ROWS, STAGED_ROW_PADDING>() / CLUSTER;
+    if (clusters_at_once_val < 1) clusters_at_once_val = 1;
+    size_t steps_val = CEIL_DIV(sum_length_val, (size_t)ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_BLOCK_K);
+    // 2. each count's cost in steps: rounds x (a piece's steps + the split store's)
+    int best_splits_val = 1;
+    size_t best_cost_val = CEIL_DIV(units_val, clusters_at_once_val) * steps_val;
+    for (int splits_val = 2; splits_val <= ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_MAX_AUTO_SPLITS && (size_t)splits_val <= steps_val; splits_val++) {
+        size_t cost_val = CEIL_DIV(units_val * splits_val, clusters_at_once_val) * (CEIL_DIV(steps_val, (size_t)splits_val) + ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_SPLIT_COST_STEPS);
+        if (cost_val < best_cost_val) {
+            best_cost_val = cost_val;
+            best_splits_val = splits_val;
+        }
+    }
+    return best_splits_val;
 }
 
 // ── for it ────────────────────────────────────────────────────────────────────
 
-/// Gives a consumer warpgroup's room for the store: a round of the staged floats, rounded up to whole
-/// HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atoms.
+/// Gives how many of one kernel's blocks the GPU runs at once: SMs x the blocks an SM holds. The first time for
+/// each kernel, it also asks CUDA to allow the kernel's dynamic shared memory (past the 48 KB a block gets without
+/// asking).
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int STAGED_ROWS,
+          int STAGED_ROW_PADDING>
+inline int attention_output_weight_grad_bf16_blocks_at_once() {
+    constexpr size_t SHARED_BYTES = attention_output_weight_grad_bf16_shared_bytes<COLUMNS, STAGES, ROW_GROUPS, STAGED_ROWS, STAGED_ROW_PADDING>();
+    constexpr int THREADS = (ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
+    static int blocks_at_once_val = 0;                       // one for each kernel this template makes
+    if (blocks_at_once_val == 0) {
+        auto kernel_ptr = attention_output_weight_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS,
+                                     STAGED_ROW_PADDING>;
+        int device_index_val = 0, total_sms_val = 0, blocks_per_sm_val = 0;
+        cudaCheck(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SHARED_BYTES));
+        cudaCheck(cudaGetDevice(&device_index_val));
+        cudaCheck(cudaDeviceGetAttribute(&total_sms_val, cudaDevAttrMultiProcessorCount, device_index_val));
+        cudaCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_val, kernel_ptr, THREADS, SHARED_BYTES));
+        blocks_at_once_val = total_sms_val * (blocks_per_sm_val > 0 ? blocks_per_sm_val : 1);
+    }
+    return blocks_at_once_val;
+}
+
+/// Gives a consumer warpgroup's room for the store: its 64 rows as bfloat16 for TMA (unsplit), or a round of the
+/// staged floats (split), whichever is larger, rounded up to whole HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atoms (TMA's
+/// swizzle needs each box on one).
 template <int COLUMNS, int STAGED_ROWS, int STAGED_ROW_PADDING>
 __host__ __device__ constexpr size_t attention_output_weight_grad_bf16_room_bytes() {
-    return CEIL_DIV(STAGED_ROWS * (COLUMNS + STAGED_ROW_PADDING) * sizeof(float), (size_t)HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) *
-           HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
+    return CEIL_DIV((STAGED_ROWS * (COLUMNS + STAGED_ROW_PADDING) * sizeof(float) > HARDWARE_WGMMA_M * COLUMNS * sizeof(nv_bfloat16)
+                         ? STAGED_ROWS * (COLUMNS + STAGED_ROW_PADDING) * sizeof(float)
+                         : HARDWARE_WGMMA_M * COLUMNS * sizeof(nv_bfloat16)),
+                    (size_t)HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) * HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
 }
 
 /// Gives the dynamic shared memory a block takes: STAGES sets of tiles (a left tile a consumer warpgroup and the
@@ -575,40 +657,36 @@ constexpr size_t attention_output_weight_grad_bf16_shared_bytes() {
 }
 
 /// Gives the static shared memory a block takes besides: its barriers, 8 bytes each (two a set of tiles, one a
-/// consumer warpgroup for its store). The dynamic and this together must fit HARDWARE_MAX_SHARED_BYTES_PER_BLOCK.
+/// consumer warpgroup for its store, and one for weight_grad's old rows). The dynamic and this together must fit
+/// HARDWARE_MAX_SHARED_BYTES_PER_BLOCK.
 template <int STAGES, int ROW_GROUPS>
 constexpr size_t attention_output_weight_grad_bf16_barrier_bytes() {
-    return (size_t)(2 * STAGES + ROW_GROUPS) * sizeof(uint64_t);
+    return (size_t)(2 * STAGES + 2 * ROW_GROUPS) * sizeof(uint64_t);
 }
 
 /// Launches one attention_output_weight_grad_bf16_kernel: clusters of CLUSTER blocks, each block a producer and ROW_GROUPS consumer warpgroups,
-/// with the dynamic shared memory its sets of tiles and its store take. The first time for each kernel: asks CUDA
-/// to allow that much, and asks how many of its blocks the GPU runs at once.
+/// with the dynamic shared memory its sets of tiles and its store take; as many blocks as the GPU runs at once
+/// (attention_output_weight_grad_bf16_blocks_at_once), or blocks_val.
 ///
 ///   left_map_val, right_map_val          TMA's descriptions of left's and right's tiles
+///   output_map_val                       ... and weight_grad's
 ///   output_ptr, split_sums_ptr           weight_grad; the splits' scratch (SPLIT), or nullptr
 ///   rows_val, columns_val, sum_length_val   the product's sizes
 ///   splits_val, block_rows_per_group_val, blocks_val   as in attention_output_weight_grad_bf16_at
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int STAGED_ROWS,
           int STAGED_ROW_PADDING>
-inline void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map_val, const CUtensorMap& right_map_val, nv_bfloat16* output_ptr, float* split_sums_ptr,
+inline void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map_val, const CUtensorMap& right_map_val, const CUtensorMap& output_map_val,
+                nv_bfloat16* output_ptr, float* split_sums_ptr,
                        size_t rows_val, size_t columns_val, size_t sum_length_val, int splits_val, int block_rows_per_group_val, int blocks_val) {
     constexpr size_t SHARED_BYTES = attention_output_weight_grad_bf16_shared_bytes<COLUMNS, STAGES, ROW_GROUPS, STAGED_ROWS, STAGED_ROW_PADDING>();
     constexpr int THREADS = (ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
     static_assert(SHARED_BYTES + attention_output_weight_grad_bf16_barrier_bytes<STAGES, ROW_GROUPS>() <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK,
                   "the sets of tiles, the store's room and the barriers fit a block's shared memory");
-    // 1. the first time: the shared memory allowed, and the blocks the GPU runs at once
+    // 1. the kernel, and the blocks the GPU runs at once (the first time: its shared memory allowed)
     auto kernel_ptr = attention_output_weight_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS,
                                  STAGED_ROW_PADDING>;
-    static int blocks_at_once_val = 0;                       // one for each kernel this template makes
-    if (blocks_at_once_val == 0) {
-        int device_index_val = 0, total_sms_val = 0, blocks_per_sm_val = 0;
-        cudaCheck(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SHARED_BYTES));
-        cudaCheck(cudaGetDevice(&device_index_val));
-        cudaCheck(cudaDeviceGetAttribute(&total_sms_val, cudaDevAttrMultiProcessorCount, device_index_val));
-        cudaCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_val, kernel_ptr, THREADS, SHARED_BYTES));
-        blocks_at_once_val = total_sms_val * (blocks_per_sm_val > 0 ? blocks_per_sm_val : 1);
-    }
+    int blocks_at_once_val = attention_output_weight_grad_bf16_blocks_at_once<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, STAGED_ROWS,
+                                                STAGED_ROW_PADDING>();
     // 2. the clusters: a cluster's unit of work is CLUSTER squares one under the other, for one split; the blocks
     //    asked for in whole clusters, at least one, at most one a unit
     size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M)) *
@@ -619,7 +697,7 @@ inline void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map
     unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
     // 3. launch; with clusters, by cudaLaunchKernelEx, which takes the cluster's size
     if (CLUSTER == 1) {
-        kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_ptr, split_sums_ptr, (int)rows_val,
+        kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val, output_ptr, split_sums_ptr, (int)rows_val,
                                                                 (int)columns_val, (int)sum_length_val, splits_val, block_rows_per_group_val);
         cudaCheck(cudaGetLastError());
     } else {
@@ -634,17 +712,18 @@ inline void attention_output_weight_grad_bf16_launch(const CUtensorMap& left_map
         config_val.dynamicSmemBytes = SHARED_BYTES;
         config_val.attrs = attributes_list;
         config_val.numAttrs = 1;
-        cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_ptr, split_sums_ptr, (int)rows_val,
+        cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val, output_ptr, split_sums_ptr, (int)rows_val,
                                      (int)columns_val, (int)sum_length_val, splits_val, block_rows_per_group_val));
     }
 }
 
 /// Walks this block's squares of weight_grad, square after square (persistent), with a producer warpgroup and
-/// ROW_GROUPS consumer warpgroups (see the top of the file), and adds each square onto weight_grad (SPLIT: writes
-/// it into its split's slice of the scratch).
+/// ROW_GROUPS consumer warpgroups (see the top of the file), and adds each square onto weight_grad through TMA
+/// (SPLIT: writes it into its split's slice of the scratch).
 ///
 ///   left_map_val, right_map_val            TMA's descriptions of left's and right's tiles
-///   output_ptr                             weight_grad {rows, columns}: added onto (not SPLIT)
+///   output_map_val                         ... and weight_grad's: its old rows in, the new ones out (not SPLIT)
+///   output_ptr                             weight_grad {rows, columns} (unused: TMA reads and writes it by output_map_val)
 ///   split_sums_ptr                         SPLIT: the scratch {splits, rows, columns}; otherwise nullptr
 ///   rows_val, columns_val, sum_length_val  the product's sizes
 ///   splits_val                             the splits of the sum (1 when not SPLIT)
@@ -653,7 +732,7 @@ template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int 
           int STAGED_ROW_PADDING>
 __global__ void __launch_bounds__((ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
-           nv_bfloat16* output_ptr, float* split_sums_ptr, int rows_val, int columns_val, int sum_length_val,
+           const __grid_constant__ CUtensorMap output_map_val, nv_bfloat16* output_ptr, float* split_sums_ptr, int rows_val, int columns_val, int sum_length_val,
            int splits_val, int block_rows_per_group_val) {
     constexpr bool LEFT_TURNED = true;                                                                      // output_grad {sum_length, rows}: turned
     constexpr bool RIGHT_TURNED = true;                                                                     // input {sum_length, columns}: turned
@@ -673,6 +752,7 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
     static_assert(HARDWARE_WGMMA_M % STAGED_ROWS == 0, "a warpgroup's 64 rows are staged in whole rounds");
     static_assert(STAGED_ROW_PADDING % HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP == 0, "a staged row stays on 16 bytes: its float4 reads");
     constexpr int STORES_PER_ROW = COLUMNS / ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES;                                              // a row's 8-byte stores
+    constexpr int OUTPUT_BOXES = COLUMNS / ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_VALUES;                                                  // TMA boxes across a warpgroup's 64 rows
     constexpr int PRODUCER_THREADS = ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_PRODUCER_WARPGROUPS * HARDWARE_WARPGROUP_THREADS;
     // the registers (the worklog's kernel 5b): a block of THREADS gets LAUNCH_REGISTERS a thread, too few for 2
     // consumer warpgroups' 128 sums each; the producer needs few, so with 2 it gives back all but
@@ -692,6 +772,7 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
     __shared__ uint64_t full_barriers_list[STAGES];          // set s's bytes are in
     __shared__ uint64_t empty_barriers_list[STAGES];         // every consumer of the cluster is done with set s
     __shared__ uint64_t store_barriers_list[ROW_GROUPS];     // consumer warpgroup g's threads are all at the same point of its store
+    __shared__ uint64_t old_barriers_list[ROW_GROUPS];       // consumer warpgroup g's 64 rows of the old weight_grad are in its room
     uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(attention_output_weight_grad_bf16_shared_list);
     nv_bfloat16* tiles_ptr = reinterpret_cast<nv_bfloat16*>(
         attention_output_weight_grad_bf16_shared_list + (HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM - shared_address_val % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM);
@@ -715,6 +796,9 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
 #pragma unroll
         for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++)
             attention_output_weight_grad_bf16_barrier_init(&store_barriers_list[row_group_index_val], HARDWARE_WARPGROUP_THREADS);   // every thread of the warpgroup
+#pragma unroll
+        for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++)
+            attention_output_weight_grad_bf16_barrier_init(&old_barriers_list[row_group_index_val], 1);   // the warpgroup's first thread, and the bytes
         attention_output_weight_grad_bf16_fence_for_tma();                     // the barriers visible to TMA
     }
     __syncthreads();
@@ -802,8 +886,10 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
         int lane_index_val = threadIdx.x % HARDWARE_THREADS_PER_WARP;
         int thread_first_row_in_group_val = warp_index_val * HARDWARE_WGMMA_M_PER_WARP + lane_index_val / HARDWARE_WGMMA_THREADS_PER_ROW;
         int thread_pair_column_index_val = HARDWARE_WGMMA_COLUMNS_PER_THREAD * (lane_index_val % HARDWARE_WGMMA_THREADS_PER_ROW);
-        float* staged_ptr = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(staged_rooms_ptr) + row_group_index_val * attention_output_weight_grad_bf16_room_bytes<COLUMNS, STAGED_ROWS, STAGED_ROW_PADDING>());
+        uint8_t* room_ptr = reinterpret_cast<uint8_t*>(staged_rooms_ptr) + row_group_index_val * attention_output_weight_grad_bf16_room_bytes<COLUMNS, STAGED_ROWS, STAGED_ROW_PADDING>();
+        float* staged_ptr = reinterpret_cast<float*>(room_ptr);                    // SPLIT: the room as staged floats
         uint32_t store_phase_val = 0;                                              // the store barrier's phase to wait for next
+        uint32_t old_phase_val = 0;                                                // ... and the old rows' barrier's
         // this warpgroup is done with a step's set: its first thread arrives at the set's empty barrier in every block
         // of the cluster
         auto free_set_val = [&](int set_index_val) {
@@ -829,6 +915,19 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
             place_unit_val(unit_index_val, block_first_row_index_val, block_first_column_index_val, split_index_val, first_step_index_val,
                            total_steps_val);
             int group_first_row_index_val = block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M;
+            // unsplit: before the walk, the warpgroup's first thread asks TMA for its 64 rows of the old weight_grad,
+            // into its room (once TMA has read the room for the unit before), so they come while the tensor cores
+            // work; past the edges TMA gives 0s
+            if constexpr (!SPLIT)
+                if (warpgroup_first_thread_val) {
+                    attention_output_weight_grad_bf16_store_wait_read();
+                    attention_output_weight_grad_bf16_barrier_expect(&old_barriers_list[row_group_index_val], (uint32_t)(OUTPUT_BOXES * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_BOX_BYTES));
+#pragma unroll
+                    for (int box_index_val = 0; box_index_val < OUTPUT_BOXES; box_index_val++)
+                        attention_output_weight_grad_bf16_copy_tile(reinterpret_cast<nv_bfloat16*>(room_ptr + box_index_val * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_BOX_BYTES), &output_map_val,
+                                      block_first_column_index_val + box_index_val * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_VALUES, group_first_row_index_val,
+                                      &old_barriers_list[row_group_index_val]);
+                }
             float sums_list[COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // this thread's part of its warpgroup's 64 rows
             for (int step_index_val = 0; step_index_val < total_steps_val; step_index_val++) {
                 // a. wait until this step's set is full: its barrier's phase is the set's lap
@@ -858,7 +957,47 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
                 free_set_val((walk_step_index_val + step_index_val) % STAGES);
             walk_step_index_val += total_steps_val;
 
-            // e. the store, STAGED_ROWS of this warpgroup's rows a round
+            // e. unsplit: the old rows are in the room (every thread waits). Each thread adds its pairs onto the room's
+            //    pair at the same place (box b: columns 64 b on, rows of 128 bytes, the 16-byte cell c of row r at c XOR
+            //    r % 8, as TMA's 128-byte swizzle has it), rounded once to bfloat16, makes its writes visible to TMA, and
+            //    the first thread asks TMA to store the boxes; past the edges TMA writes nothing. Then on to the next
+            //    unit: nobody waits for the store
+            if constexpr (!SPLIT) {
+                attention_output_weight_grad_bf16_barrier_wait(&old_barriers_list[row_group_index_val], old_phase_val);
+                old_phase_val ^= 1;
+#pragma unroll
+                for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
+                    int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
+                    int box_index_val = column_in_square_val / ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_VALUES;
+                    int column_in_box_val = column_in_square_val % ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_VALUES;
+                    int cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL;
+                    int byte_in_cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) % HARDWARE_TMA_BYTES_PER_CELL;
+#pragma unroll
+                    for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {   // rows group and group + 8
+                        int row_in_group_val = thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
+                        int swizzled_cell_val = cell_val ^ (row_in_group_val % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN);
+                        nv_bfloat162* room_pair_ptr = reinterpret_cast<nv_bfloat162*>(
+                            room_ptr + box_index_val * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
+                            swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val);
+                        float2 old_val = __bfloat1622float2(*room_pair_ptr);
+                        *room_pair_ptr = __floats2bfloat162_rn(
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] + old_val.x,
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] + old_val.y);
+                    }
+                }
+                attention_output_weight_grad_bf16_fence_for_tma();                                               // this thread's writes visible to TMA
+                meet_warpgroup_val();                                              // every thread's
+                if (warpgroup_first_thread_val) {
+#pragma unroll
+                    for (int box_index_val = 0; box_index_val < OUTPUT_BOXES; box_index_val++)
+                        attention_output_weight_grad_bf16_store_box(&output_map_val, block_first_column_index_val + box_index_val * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_ROW_VALUES, group_first_row_index_val,
+                                      room_ptr + box_index_val * ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_BOX_BYTES);
+                    attention_output_weight_grad_bf16_store_commit();
+                }
+                continue;
+            }
+
+            // f. split: the store, STAGED_ROWS of this warpgroup's rows a round, into its split's slice
             meet_warpgroup_val();                                                  // every thread done with the room's last round
             for (int round_index_val = 0; round_index_val < STORE_ROUNDS; round_index_val++) {
                 // the round's sums into the warpgroup's room as floats, each thread's pairs at their row and column:
@@ -877,9 +1016,9 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
                 }
                 meet_warpgroup_val();                                              // the round's rows are in the room
 
-                // the rows out, row by row, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES neighbouring values a thread: + weight_grad, rounded once,
-                // one 8-byte store; nothing past the edges (columns is a multiple of 8, so a thread's 4 values are all
-                // in or all out). SPLIT: the 4 float sums into the split's slice of the scratch as they are
+                // the rows out, row by row, ATTENTION_OUTPUT_WEIGHT_GRAD_BF16_STORE_VALUES neighbouring values a thread: the 4 float sums into the
+                // split's slice of the scratch as they are, one 16-byte store; nothing past the edges (columns is a
+                // multiple of 8, so a thread's 4 values are all in or all out)
                 for (int store_index_val = warpgroup_thread_index_val; store_index_val < STAGED_ROWS * STORES_PER_ROW;
                      store_index_val += HARDWARE_WARPGROUP_THREADS) {
                     int row_in_round_val = store_index_val / STORES_PER_ROW;
@@ -889,23 +1028,18 @@ attention_output_weight_grad_bf16_kernel(const __grid_constant__ CUtensorMap lef
                     if (row_index_val >= rows_val || column_index_val >= columns_val) continue;
                     float4 values_val = *reinterpret_cast<const float4*>(staged_ptr + row_in_round_val * STAGED_ROW_FLOATS + column_in_square_val);
                     size_t output_index_val = (size_t)row_index_val * columns_val + column_index_val;
-                    if constexpr (SPLIT) {
-                        *reinterpret_cast<float4*>(split_sums_ptr + (size_t)split_index_val * rows_val * columns_val + output_index_val) = values_val;
-                    } else {
-                        nv_bfloat162* output_pairs_ptr = reinterpret_cast<nv_bfloat162*>(output_ptr + output_index_val);
-                        float2 first_old_val = __bfloat1622float2(output_pairs_ptr[0]);
-                        float2 second_old_val = __bfloat1622float2(output_pairs_ptr[1]);
-                        nv_bfloat162 pairs_list[2] = {__floats2bfloat162_rn(values_val.x + first_old_val.x, values_val.y + first_old_val.y),
-                                                      __floats2bfloat162_rn(values_val.z + second_old_val.x, values_val.w + second_old_val.y)};
-                        *reinterpret_cast<uint2*>(output_pairs_ptr) = *reinterpret_cast<const uint2*>(pairs_list);
-                    }
+                    *reinterpret_cast<float4*>(split_sums_ptr + (size_t)split_index_val * rows_val * columns_val + output_index_val) = values_val;
                 }
                 meet_warpgroup_val();                                              // every thread has read the room: the next round may write it
             }
         }
     }
 
-    // 5. with clusters: every thread of the cluster meets before any block leaves, so no block's shared memory goes
+    // 5. unsplit: the consumers' TMA stores all written before the block leaves
+    if constexpr (!SPLIT)
+        if (threadIdx.x >= PRODUCER_THREADS && (threadIdx.x - PRODUCER_THREADS) % HARDWARE_WARPGROUP_THREADS == 0) attention_output_weight_grad_bf16_store_wait_all();
+
+    // 6. with clusters: every thread of the cluster meets before any block leaves, so no block's shared memory goes
     //    while another block may still write into it (the right tile's multicast, the arrivals at its empty
     //    barriers). Not .aligned: the producer's threads come from a branch only its thread 0 took
     if (CLUSTER > 1) attention_output_weight_grad_bf16_cluster_sync<false>();

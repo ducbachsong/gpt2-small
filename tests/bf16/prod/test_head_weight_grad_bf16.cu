@@ -127,6 +127,15 @@ static void reference(const Outputs &outputs_val, const Operands &operands_val
         WgmmaMatmulBf16Store(), splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP);
 }
 
+/// Gives this file's split count for output {rows, columns} with a sum of sum_length: its define, or, when that is 0
+/// (chosen at each launch), what head_weight_grad_bf16_auto_splits picks on this GPU.
+static int files_splits(size_t rows_val, size_t columns_val, size_t sum_length_val)
+{
+    if (HEAD_WEIGHT_GRAD_BF16_SPLITS > 0)
+        return HEAD_WEIGHT_GRAD_BF16_SPLITS;
+    return head_weight_grad_bf16_auto_splits<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(rows_val, columns_val, sum_length_val);
+}
+
 /// Gives PyTorch's float product of the same values: the output mine must be near.
 static torch::Tensor pytorch_expected(const Operands &operands_val)
 {
@@ -175,11 +184,12 @@ static void matches_pytorch_with_sizes_no_tile_divides(void)
 static void every_split_count_matches_pytorch(void)
 {
     // Expect: output {ODD_ROWS, ODD_COLUMNS}, a sum of ODD_SUM_LENGTH (17 steps), added onto random old values: split
-    // in 1, 2, 3, 4, 8 and 32 (more than the steps: one a step), each within 1e-2 of PyTorch's old + the product.
+    // in 0 (chosen for this GPU), 1, 2, 3, 4, 8 and 32 (more than the steps: one a step), each within 1e-2 of
+    // PyTorch's old + the product.
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 1);
     torch::Tensor expected_tensor = pytorch_expected(operands_val);
     print_test_name(__func__);
-    for (int splits_val : {1, 2, 3, 4, 8, 32})
+    for (int splits_val : {0, 1, 2, 3, 4, 8, 32})
     {
         Outputs outputs_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
         mine_at<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(outputs_val, operands_val, splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP,
@@ -196,18 +206,18 @@ static void gives_wgmma_matmul_bf16s_bits(void)
     // Expect: at GPT-2 small's size and at sizes no square divides, head_weight_grad_bf16 at its setting gives the same bits as
     // wgmma_matmul_bf16 at the same setting
     // : the same sums in the same order, rounded once the same way, so training gives the same numbers.
-    // At this file's split count, and at 3.
+    // At this file's split count, at 3, and at 0 (the count chosen for this GPU: wgmma_matmul_bf16 given the same one).
     print_test_name(__func__);
     const size_t sizes_list[2][3] = {{GPT2_PADDED_VOCAB_SIZE, GPT2_EMBED_DIM, GPT2_ROWS}, {ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH}};
     for (const auto &size_val : sizes_list)
     {
         Operands operands_val = random_operands(size_val[0], size_val[1], size_val[2], 2);
-        for (int splits_val : {HEAD_WEIGHT_GRAD_BF16_SPLITS, 3})
+        for (int splits_val : {files_splits(size_val[0], size_val[1], size_val[2]), 3, 0})
         {
             Outputs mine_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
             Outputs reference_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
             mine_at<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(mine_val, operands_val, splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_WEIGHT_GRAD_BF16_BLOCKS);
-            reference(reference_val, operands_val, splits_val);
+            reference(reference_val, operands_val, splits_val > 0 ? splits_val : files_splits(size_val[0], size_val[1], size_val[2]));
             printf("    rows %zu, columns %zu, sum_length %zu, %d splits:\n", size_val[0], size_val[1], size_val[2], splits_val);
             ASSERT_EQ(same_bits(mine_val, reference_val), true);
         }
@@ -270,7 +280,7 @@ static void every_square_gives_the_default_bits(void)
     // At this file's split count and at 3.
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 3);
     print_test_name(__func__);
-    for (int splits_val : {HEAD_WEIGHT_GRAD_BF16_SPLITS, 3})
+    for (int splits_val : {files_splits(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH), 3})
     {
         Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
         mine_at<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(default_val, operands_val, splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_WEIGHT_GRAD_BF16_BLOCKS);
@@ -293,7 +303,7 @@ static void every_order_block_count_and_cluster_gives_the_default_bits(void)
     // At this file's split count and at 3.
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 4);
     print_test_name(__func__);
-    for (int splits_val : {HEAD_WEIGHT_GRAD_BF16_SPLITS, 3})
+    for (int splits_val : {files_splits(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH), 3})
     {
         Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
         mine_at<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(default_val, operands_val, splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_WEIGHT_GRAD_BF16_BLOCKS);
@@ -428,7 +438,7 @@ static void every_variant_gives_the_default_bits(void)
     // gives the bits of this file's setting: they move registers, waits and shared memory, never a sum.
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 5);
     print_test_name(__func__);
-    for (int splits_val : {HEAD_WEIGHT_GRAD_BF16_SPLITS, 3})
+    for (int splits_val : {files_splits(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH), 3})
     {
         Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
         mine_at<HEAD_WEIGHT_GRAD_BF16_ROW_GROUPS, HEAD_WEIGHT_GRAD_BF16_COLUMNS, HEAD_WEIGHT_GRAD_BF16_STAGES, HEAD_WEIGHT_GRAD_BF16_CLUSTER>(default_val, operands_val, splits_val, HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_WEIGHT_GRAD_BF16_BLOCKS);

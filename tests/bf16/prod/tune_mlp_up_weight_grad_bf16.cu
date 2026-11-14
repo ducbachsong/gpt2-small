@@ -334,13 +334,13 @@ static Choice time_each_choice(const Product &product_val, int square_index_val)
 {
     // Prints, at part 2's fastest square, each cluster (1, 2), block order (1, 4, 16, 64 rows of squares a group) and
     // block count (as many as run at once, one a square)
-    // and split count (1, 2, 4, 8, 16)
+    // and split count (0: chosen for this GPU by mlp_up_weight_grad_bf16_auto_splits; 1 to 8, 12, 16)
     // , all taking turns over SWEEP_ROUNDS rounds; gives the fastest.
     std::vector<Choice> choices_list;
     for (int cluster_val : {1, 2})
         for (int block_rows_per_group_val : {1, 4, 16, 64})
             for (int blocks_val : {0, MLP_UP_WEIGHT_GRAD_BF16_ONE_A_SQUARE})
-                for (int splits_val : {1, 2, 4, 8, 16})
+                for (int splits_val : {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16})
                     choices_list.push_back({cluster_val, block_rows_per_group_val, blocks_val, splits_val});
     const Square &square_val = SQUARES_LIST[square_index_val];
     std::vector<double> totals_list(choices_list.size(), 0.0);

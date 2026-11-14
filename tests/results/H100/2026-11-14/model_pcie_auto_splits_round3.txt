@@ -1,0 +1,26 @@
+log: tests/results/H100/model_2026-11-14_124031.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+find_the_micro_batch_with_the_best_mfu
+    124475904 parameters, 860.1M flops a token at T = 1024; this GPU's peak 819 TFLOPS in bfloat16
+    rows   activations GB   ms a micro-batch   ms a step of 524288   tokens/s   TFLOPS    MFU
+       1             0.60               7.71                 3949     132768    114.2   13.9%
+       2             1.16               9.89                 2531     207166    178.2   21.7%
+       4             2.14              15.33                 1962     267246    229.9   28.0%
+       8             4.28              28.04                 1795     292159    251.3   30.7%
+      16             8.57              52.92                 1693     309601    266.3   32.5%
+      32            17.14              99.99                 1600     327720    281.9   34.4%
+      64            34.29             197.87                 1583     331213    284.9   34.8%
+     128            68.56             391.40                 1566     334878    288.0   35.1%
+     256   would need about 137.1 GB, with 83.6 GB free: stop
+     136            72.87             415.72                 1565     334991    288.1   35.2%
+    best: --batch-size 136, 334991 tokens/s, 288.1 TFLOPS, MFU 35.2% (--tokens-per-step must be a multiple of GPUs x rows x 1024)
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         4.589        10.684             5.237             11.518
+    PyTorch takes, against mine:                                    1.14x              1.08x
+    input: (double)gpt2_mean_loss(mine_val.activations_val) expected: 11.329 +/- 0.05   actual: 11.329   ok  (line 299)
+
+all tunes done
