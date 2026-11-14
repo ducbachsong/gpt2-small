@@ -1,0 +1,28 @@
+report_run.sh on an H100 PCIe (114 SMs), 2026-11-14, code at 1e46c42; the machine went down after, so only these
+lines (~/logs/report.txt, as printed) came back. Each product: its tune's part 1, this file's setting then PyTorch's
+bfloat16 matmul (cuBLAS), ms, taking turns. Then tune_model of the cuBLAS version (a986a3f) and of 1e46c42 taking
+turns: tokens/s and ms a step at 64 rows | the best micro-batch. Then one micro-batch of 4 rows: my forward, my
+backward, PyTorch forward, PyTorch backward (ms).
+qkv 0.145 0.141 
+qkv_input_grad 0.144 0.141 
+qkv_weight_grad 0.130 0.127 
+attention_output 0.059 0.058 
+attention_output_input_grad 0.055 0.054 
+attention_output_weight_grad 0.057 0.070 
+mlp_up 0.310 0.184 
+mlp_up_input_grad 0.187 0.174 
+mlp_up_weight_grad 0.175 0.167 
+mlp_down 0.202 0.180 
+mlp_down_input_grad 0.306 0.176 
+mlp_down_weight_grad 0.176 0.166 
+head 3.054 3.002 
+head_input_grad 3.106 2.750 
+head_weight_grad 3.076 2.775 
+model cublas 1: 266421 1968 | best: --batch-size 128, 268290 tokens/s, 230.8 TFLOPS, MFU 28.2%
+model new 1: 330226 1588 | best: --batch-size 136, 334410 tokens/s, 287.6 TFLOPS, MFU 35.1%
+model cublas 2: 264822 1980 | best: --batch-size 128, 266598 tokens/s, 229.3 TFLOPS, MFU 28.0%
+model new 2: 330426 1587 | best: --batch-size 136, 333729 tokens/s, 287.0 TFLOPS, MFU 35.0%
+model cublas 3: 264394 1983 | best: --batch-size 128, 266466 tokens/s, 229.2 TFLOPS, MFU 28.0%
+model new 3: 329539 1591 | best: --batch-size 136, 335308 tokens/s, 288.4 TFLOPS, MFU 35.2%
+steps cublas:         ms                         4.887        13.255             5.402             11.303
+steps new:         ms                         4.568        10.621             5.323             11.460
