@@ -402,6 +402,60 @@ static void flash_backward_writes_over_qkv_grad_the_same_every_time(void)
     ASSERT_EQ(torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), first_tensor), true);
 }
 
+/// One flash attention backward on these tensors with KEY_GRAD_STAGES and QUERY_GRAD_STAGES sets of tiles: what the
+/// check below calls for each pair of stage counts.
+///
+///   flash_val   the tensors: qkv_grad written, the rest read
+template <int KEY_GRAD_STAGES, int QUERY_GRAD_STAGES>
+static void flash_backward_at(FlashTensors &flash_val)
+{
+    attention_bf16_flash_backward<KEY_GRAD_STAGES, QUERY_GRAD_STAGES>(flash_val.qkv_grad_tensor, flash_val.output_grad_tensor,
+                                                                      flash_val.output_tensor, flash_val.qkv_tensor,
+                                                                      flash_val.logsumexp_tensor, flash_val.row_dot_tensor);
+}
+
+/// A pair of stage counts, and the backward made for them.
+struct StageSetting
+{
+    int key_grad_stages_val;
+    int query_grad_stages_val;
+    void (*backward_ptr)(FlashTensors &);
+};
+
+static const StageSetting STAGE_SETTINGS_LIST[] = {
+    {1, 1, flash_backward_at<1, 1>}, {1, 2, flash_backward_at<1, 2>}, {1, 3, flash_backward_at<1, 3>}, {1, 4, flash_backward_at<1, 4>},
+    {2, 1, flash_backward_at<2, 1>}, {2, 2, flash_backward_at<2, 2>}, {2, 3, flash_backward_at<2, 3>}, {2, 4, flash_backward_at<2, 4>},
+    {3, 1, flash_backward_at<3, 1>}, {3, 2, flash_backward_at<3, 2>}, {3, 3, flash_backward_at<3, 3>}, {3, 4, flash_backward_at<3, 4>},
+    {4, 1, flash_backward_at<4, 1>}, {4, 2, flash_backward_at<4, 2>}, {4, 3, flash_backward_at<4, 3>}, {4, 4, flash_backward_at<4, 4>},
+};
+
+static void every_stage_count_gives_the_same_bits(void)
+{
+    // Expect: random bfloat16 qkv and output_grad, {2, 12, 1024}: 16 tiles a head, so walks of 1 to 16 steps, longer
+    // and shorter than the sets. The backward with key_grad's and query_grad's sets of tiles each 1, 2, 3 and 4
+    // gives the default's qkv_grad to the last bit, the 7s it started with all written over: the same tiles, the
+    // same sums in the same order; only when TMA brings the tiles changes.
+    if (!flash_runs_here(__func__))
+        return;
+    // 1. random qkv and output_grad; the default's backward
+    torch::manual_seed(0);
+    FlashTensors flash_val(2, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
+    flash_val.qkv_tensor = random_tensor_on_gpu(flash_val.qkv_tensor.shape()).to(DType::BFloat16);
+    flash_val.output_grad_tensor = random_tensor_on_gpu(flash_val.output_tensor.shape()).to(DType::BFloat16);
+    flash_val.forward();
+    flash_val.backward();
+    torch::Tensor expected_tensor = pytorch_copy_of(flash_val.qkv_grad_tensor);
+    print_test_name(__func__);
+    // 2. every pair of stage counts against it
+    for (const StageSetting &setting_val : STAGE_SETTINGS_LIST)
+    {
+        flash_val.qkv_grad_tensor.fill_(7.0);
+        setting_val.backward_ptr(flash_val);
+        printf("    key_grad %d sets, query_grad %d sets:\n", setting_val.key_grad_stages_val, setting_val.query_grad_stages_val);
+        ASSERT_EQ(torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor), true);
+    }
+}
+
 // ══ part 3: the kernels fit their launch, and any block size works ═══════════
 
 static void every_kernel_fits_its_block(void)
@@ -426,8 +480,8 @@ static void every_kernel_fits_its_block(void)
                                                   (const void *)attention_bf16_softmax_backward_kernel,
                                                   (const void *)attention_bf16_flash_forward_kernel,
                                                   (const void *)attention_bf16_flash_row_dot_kernel,
-                                                  (const void *)attention_bf16_flash_key_grad_kernel,
-                                                  (const void *)attention_bf16_flash_query_grad_kernel};
+                                                  (const void *)attention_bf16_flash_key_grad_kernel<ATTENTION_FLASH_BF16_KEY_GRAD_STAGES>,
+                                                  (const void *)attention_bf16_flash_query_grad_kernel<ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES>};
     const char *names_list[kernel_count_val] = {
         "attention_product_kernel<false, false>", "attention_product_kernel<false, true>",
         "attention_product_kernel<true, true>", "attention_bf16_softmax_forward_kernel",
@@ -519,6 +573,7 @@ int main(void)
     flash_matches_on_gpt2_heads_of_256_tokens();
     flash_matches_on_gpt2_small_size();
     flash_backward_writes_over_qkv_grad_the_same_every_time();
+    every_stage_count_gives_the_same_bits();
 
     every_kernel_fits_its_block();
     any_block_size_gives_the_same_bits();

@@ -8,8 +8,8 @@
 //     the attention is flash attention (attention_flash_bf16.cuh) when attention_bf16_flash_fits (head_size 64,
 //         seq_len a multiple of 64, sm_80 or later); otherwise the steps (attention_bf16.cuh), which keep the
 //         attention weights {B, NH, T, T}
-// The head's logits are bfloat16; the classifier (fp32/classifier.cuh) works out the softmax and the loss from them
-// in float.
+// The head's logits are bfloat16; bf16/softmax_loss_bf16.cuh works out the softmax and the loss from them in float,
+// and in a training micro-batch (gpt2_bf16_forward_backward) the logits' gradient in the same pass over them.
 // The params and grads live in AdamWBf16, with AdamW's float master, m and v for this GPU's slice; the model reads
 // and writes views of them (GPT2Params):
 //     model_buffer   [ params | grads | m | v ]     bfloat16
@@ -30,29 +30,30 @@
 #include "kernels/bf16/layer_norm_bf16.cuh"
 #include "kernels/bf16/linear_bf16.cuh"
 #include "kernels/bf16/residual_bf16.cuh"
-#include "kernels/fp32/classifier.cuh"             // the softmax and the loss from the bfloat16 logits
+#include "kernels/bf16/softmax_loss_bf16.cuh"      // the softmax, the loss and its gradient from the bfloat16 logits
 #include "kernels/bf16/adamw_bf16.cuh"            // AdamWBf16's update
 
 // Each GPT-2 product's setting (wgmma_matmul_bf16.cuh's WgmmaMatmulBf16Setting<warpgroups, columns, sets of tiles,
-// splits of the sum, block order>): the square, the sets of tiles and the splits that suit its shape, from
-// tune_wgmma_matmul_bf16's sweep at a training micro-batch (it prints these lines; these from an H100 NVL,
-// 2026-11-13: a step's products 32.20 ms against 34.82 all at the defaults). A layer's three: its forward,
-// its backward's input_grad (right turned) and weight_grad (both turned, the sum over the micro-batch's rows).
-#define MODEL_BF16_QKV_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 64>
-#define MODEL_BF16_QKV_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 1>
-#define MODEL_BF16_QKV_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 4>
-#define MODEL_BF16_ATTENTION_OUTPUT_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
-#define MODEL_BF16_ATTENTION_OUTPUT_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 1>
-#define MODEL_BF16_ATTENTION_OUTPUT_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 64, 4, 8, 16>
-#define MODEL_BF16_MLP_UP_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
-#define MODEL_BF16_MLP_UP_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 4>
-#define MODEL_BF16_MLP_UP_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 128, 3, 4, 16>
-#define MODEL_BF16_MLP_DOWN_SETTING WgmmaMatmulBf16Setting<1, 256, 1, 1, 4>
-#define MODEL_BF16_MLP_DOWN_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
-#define MODEL_BF16_MLP_DOWN_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 128, 3, 4, 64>
-#define MODEL_BF16_HEAD_SETTING WgmmaMatmulBf16Setting<2, 128, 3, 1, 16>
-#define MODEL_BF16_HEAD_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 4, 1, 64>
-#define MODEL_BF16_HEAD_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 4, 1, 16>
+// splits of the sum, block order, blocks a cluster, blocks>): from tune_wgmma_matmul_bf16's sweep at a training
+// micro-batch (it prints these lines), on an H100 PCIe, 2026-11-14: a step's products 30.08 ms against 59.53 all at
+// the defaults (cuBLAS: 27.9). Blocks 0: as many as the GPU runs at once (persistent); 1073741824: one a square. A
+// layer's three: its forward, its backward's input_grad (right turned) and weight_grad (both turned, the sum over
+// the micro-batch's rows).
+#define MODEL_BF16_QKV_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 16, 1, 0>
+#define MODEL_BF16_QKV_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 16, 1, 0>
+#define MODEL_BF16_QKV_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 64, 1, 1073741824>
+#define MODEL_BF16_ATTENTION_OUTPUT_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 16, 1, 0>
+#define MODEL_BF16_ATTENTION_OUTPUT_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 16, 1, 0>
+#define MODEL_BF16_ATTENTION_OUTPUT_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 128, 4, 4, 4, 1, 1073741824>
+#define MODEL_BF16_MLP_UP_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 4, 1, 0>
+#define MODEL_BF16_MLP_UP_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 4, 1, 0>
+#define MODEL_BF16_MLP_UP_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 4, 1, 1, 0>
+#define MODEL_BF16_MLP_DOWN_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 16, 1, 0>
+#define MODEL_BF16_MLP_DOWN_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 4, 1, 0>
+#define MODEL_BF16_MLP_DOWN_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 64, 1, 1073741824>
+#define MODEL_BF16_HEAD_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 16, 1, 0>
+#define MODEL_BF16_HEAD_INPUT_GRAD_SETTING WgmmaMatmulBf16Setting<1, 256, 4, 1, 16, 1, 0>
+#define MODEL_BF16_HEAD_WEIGHT_GRAD_SETTING WgmmaMatmulBf16Setting<2, 256, 3, 1, 16, 1, 1073741824>
 
 /// Everything the model works in: mean, rstd, attention_logsumexp and the per-row tensors float, the rest
 /// bfloat16. Kept for the backward: the model's tensors, and a block's as lists, one tensor per layer
@@ -68,7 +69,7 @@ struct GPT2ActivationsBf16 {
     Tensor lnf_rstd;                                        // {B, T}
     Tensor logits;                                          // {B, T, padded_vocab_size}
     Tensor losses;                                          // {B, T}
-    Tensor max_of_each_row;                                 // {B, T}
+    Tensor max_of_each_row;                                 // {B, T}: row_max · log2 e, as softmax_loss_bf16 keeps it
     Tensor sum_of_each_row;                                 // {B, T}
     // ── kept for the backward: one per layer ──
     std::vector<Tensor> ln1_output;                         // {B, T, D}
@@ -94,7 +95,6 @@ struct GPT2ActivationsBf16 {
     Tensor qkv_grad_scratch;                                // {B, T, 3D}
     Tensor attention_probs_grad_scratch;                    // {B, NH, T, T}: the attention steps'; none with flash
     Tensor attention_row_dot_scratch;                       // {B, NH, T} float: flash attention's; none without
-    Tensor losses_grad_scratch;                             // {B, T} float: 1 / (B x T) each
     Tensor logits_grad_scratch;                             // {B, T, padded_vocab_size}
     Tensor lnf_output_grad_scratch;                         // {B, T, D}
     Tensor residual_grads_scratch[2];                       // {B, T, D}: a block's output_grad and input_grad, in turns
@@ -115,6 +115,9 @@ void gpt2_bf16_forward(const GPT2ActivationsBf16& activations, const Tensor& tok
 void gpt2_bf16_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
                         const GPT2Params& params, const GPT2ActivationsBf16& activations, const GPT2Config& config,
                         size_t micro_batches = 1);
+void gpt2_bf16_forward_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
+                                const GPT2Params& params, const GPT2ActivationsBf16& activations, const GPT2Config& config,
+                                size_t micro_batches = 1);
 float gpt2_bf16_train_step(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
                            const GPT2Params& params, const GPT2ActivationsBf16& activations, const GPT2Config& config,
                            size_t micro_batches = 1);
@@ -200,7 +203,6 @@ inline GPT2ActivationsBf16::GPT2ActivationsBf16(size_t batch_size, size_t seq_le
     qkv_grad_scratch = Tensor::zeros({B, T, 3 * D}, bf16);
     if (flash_attention) attention_row_dot_scratch = Tensor::zeros({B, NH, T});
     else attention_probs_grad_scratch = Tensor::zeros({B, NH, T, T}, bf16);
-    losses_grad_scratch = Tensor::zeros({B, T});
     logits_grad_scratch = Tensor::zeros({B, T, config.padded_vocab_size}, bf16);
     lnf_output_grad_scratch = Tensor::zeros({B, T, D}, bf16);
     residual_grads_scratch[0] = Tensor::zeros({B, T, D}, bf16), residual_grads_scratch[1] = Tensor::zeros({B, T, D}, bf16);
@@ -281,14 +283,12 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
 
 // ── the whole model ───────────────────────────────────────────────────────────
 
-/// Works out each row's loss into activations.losses, keeping what the backward needs.
+/// Works out the logits from the tokens: the encoder, the blocks, LayerNorm f and the head; what the forward and a
+/// training micro-batch share.
 ///
-///   activations          written
-///   token_ids, targets   {batch_size, seq_len} ints, every id < vocab_size
-///   params               the model's, bfloat16
-///   config               the sizes
-inline void gpt2_bf16_forward(const GPT2ActivationsBf16& activations, const Tensor& token_ids, const Tensor& targets,
-                              const GPT2Params& params, const GPT2Config& config) {
+///   activations, token_ids, params   as in gpt2_bf16_forward
+inline void gpt2_bf16_forward_to_logits(const GPT2ActivationsBf16& activations, const Tensor& token_ids,
+                                        const GPT2Params& params) {
     const GPT2ActivationsBf16& a = activations;
     size_t num_layers = params.blocks.size();
     encoder_bf16_forward(a.encoded, token_ids, params.wte, params.wpe);
@@ -299,25 +299,29 @@ inline void gpt2_bf16_forward(const GPT2ActivationsBf16& activations, const Tens
     layer_norm_bf16_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
                             params.lnf_bias);
     linear_bf16_forward<MODEL_BF16_HEAD_SETTING>(a.logits, a.lnf_output, params.wte, Tensor());     // the head: no bias
-    classifier_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
 
-/// Adds every parameter's gradient onto param_grads for the mean loss: the forward's steps the other way.
+/// Works out each row's loss into activations.losses, keeping what the backward needs.
 ///
-///   param_grads                   added onto: 0 before a step's first backward
-///   token_ids, targets            the forward's
-///   params, activations           the forward's; activations' scratch used
-///   config                        the sizes
-///   micro_batches                 per step: each row's losses_grad is 1 / (micro_batches x B x T)
-inline void gpt2_bf16_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
-                               const GPT2Params& params, const GPT2ActivationsBf16& activations,
-                               const GPT2Config& config, size_t micro_batches) {
+///   activations          written
+///   token_ids, targets   {batch_size, seq_len} ints, every id < vocab_size
+///   params               the model's, bfloat16
+///   config               the sizes
+inline void gpt2_bf16_forward(const GPT2ActivationsBf16& activations, const Tensor& token_ids, const Tensor& targets,
+                              const GPT2Params& params, const GPT2Config& config) {
+    const GPT2ActivationsBf16& a = activations;
+    gpt2_bf16_forward_to_logits(a, token_ids, params);
+    softmax_loss_bf16_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
+}
+
+/// Adds every parameter's gradient onto param_grads from the logits' gradient on: the head's backward, LayerNorm
+/// f's, the blocks' the other way, the encoder's; what the backward and a training micro-batch share.
+///
+///   param_grads, token_ids, params, activations   as in gpt2_bf16_backward; activations.logits_grad_scratch read
+inline void gpt2_bf16_backward_from_logits_grad(const GPT2Params& param_grads, const Tensor& token_ids,
+                                                const GPT2Params& params, const GPT2ActivationsBf16& activations) {
     const GPT2ActivationsBf16& a = activations;
     size_t num_layers = params.blocks.size();
-    // loss = sum of the row losses / (micro_batches x B x T)
-    a.losses_grad_scratch.fill_(1.0 / ((double)micro_batches * a.losses.numel()));
-    classifier_backward(a.logits_grad_scratch, a.losses_grad_scratch, a.logits, targets, a.max_of_each_row,
-                        a.sum_of_each_row, config.vocab_size);
     linear_bf16_backward<MODEL_BF16_HEAD_INPUT_GRAD_SETTING, MODEL_BF16_HEAD_WEIGHT_GRAD_SETTING>(
                          a.lnf_output_grad_scratch, param_grads.wte, Tensor(), a.logits_grad_scratch, a.lnf_output,
                          params.wte);
@@ -334,15 +338,49 @@ inline void gpt2_bf16_backward(const GPT2Params& param_grads, const Tensor& toke
     encoder_bf16_backward(param_grads.wte, param_grads.wpe, output_grad, token_ids);
 }
 
-/// Runs one micro-batch of a training step: the forward, then the backward adding every parameter's
-/// gradient onto param_grads. Gives the micro-batch's mean loss, so waits for the GPU.
+/// Adds every parameter's gradient onto param_grads for the mean loss, after gpt2_bf16_forward: the logits'
+/// gradient from the forward's row_max and row_sum, then the rest the other way.
+///
+///   param_grads                   added onto: 0 before a step's first backward
+///   token_ids, targets            the forward's
+///   params, activations           the forward's; activations' scratch used
+///   config                        the sizes
+///   micro_batches                 per step: each row's loss_grad is 1 / (micro_batches x B x T)
+inline void gpt2_bf16_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
+                               const GPT2Params& params, const GPT2ActivationsBf16& activations,
+                               const GPT2Config& config, size_t micro_batches) {
+    const GPT2ActivationsBf16& a = activations;
+    // loss = sum of the row losses / (micro_batches x B x T)
+    float loss_grad_val = (float)(1.0 / ((double)micro_batches * a.losses.numel()));
+    softmax_loss_bf16_backward(a.logits_grad_scratch, a.logits, targets, a.max_of_each_row, a.sum_of_each_row,
+                               config.vocab_size, loss_grad_val);
+    gpt2_bf16_backward_from_logits_grad(param_grads, token_ids, params, a);
+}
+
+/// Runs one training micro-batch on the GPU: the forward to the logits, the loss and the logits' gradient in one
+/// pass over them (softmax_loss_bf16_forward_backward: the logits read from memory once, not twice), then the rest
+/// of the backward. The same results as gpt2_bf16_forward then gpt2_bf16_backward, to the last bit.
+///
+///   param_grads, token_ids, targets, params, activations, config, micro_batches   as in gpt2_bf16_backward
+inline void gpt2_bf16_forward_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
+                                       const GPT2Params& params, const GPT2ActivationsBf16& activations,
+                                       const GPT2Config& config, size_t micro_batches) {
+    const GPT2ActivationsBf16& a = activations;
+    gpt2_bf16_forward_to_logits(a, token_ids, params);
+    float loss_grad_val = (float)(1.0 / ((double)micro_batches * a.losses.numel()));
+    softmax_loss_bf16_forward_backward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits_grad_scratch, a.logits,
+                                       targets, config.vocab_size, loss_grad_val);
+    gpt2_bf16_backward_from_logits_grad(param_grads, token_ids, params, a);
+}
+
+/// Runs one micro-batch of a training step (gpt2_bf16_forward_backward) and gives its mean loss, so waits for the
+/// GPU.
 ///
 ///   param_grads, token_ids, targets, params, activations, config, micro_batches   as in gpt2_bf16_backward
 inline float gpt2_bf16_train_step(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
                                   const GPT2Params& params, const GPT2ActivationsBf16& activations, const GPT2Config& config,
                                   size_t micro_batches) {
-    gpt2_bf16_forward(activations, token_ids, targets, params, config);
-    gpt2_bf16_backward(param_grads, token_ids, targets, params, activations, config, micro_batches);
+    gpt2_bf16_forward_backward(param_grads, token_ids, targets, params, activations, config, micro_batches);
     return gpt2_mean_loss(activations);
 }
 

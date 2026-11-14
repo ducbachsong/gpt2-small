@@ -282,7 +282,7 @@ static const ProductSetting PRODUCT_SETTINGS_LIST[] = {
     {1, 256, 1, product_at<256, 1, 1>}, {1, 256, 2, product_at<256, 2, 1>}, {1, 256, 3, product_at<256, 3, 1>}, {1, 256, 4, product_at<256, 4, 1>},
     {2, 64, 1, product_at<64, 1, 2>}, {2, 64, 2, product_at<64, 2, 2>}, {2, 64, 3, product_at<64, 3, 2>}, {2, 64, 4, product_at<64, 4, 2>},
     {2, 128, 1, product_at<128, 1, 2>}, {2, 128, 2, product_at<128, 2, 2>}, {2, 128, 3, product_at<128, 3, 2>}, {2, 128, 4, product_at<128, 4, 2>},
-    {2, 256, 1, product_at<256, 1, 2>}, {2, 256, 2, product_at<256, 2, 2>}, {2, 256, 3, product_at<256, 3, 2>}, {2, 256, 4, product_at<256, 4, 2>},
+    {2, 256, 1, product_at<256, 1, 2>}, {2, 256, 2, product_at<256, 2, 2>}, {2, 256, 3, product_at<256, 3, 2>},
 };
 
 /// For random L {rows, sum_length} and R {columns, sum_length}, each plain and turned round: every setting's product,
@@ -394,6 +394,65 @@ static void every_block_order_gives_the_default_bits(void)
             ASSERT_EQ(torch::equal(pytorch_copy_of(output_tensor), expected_tensor), true);
         }
     }
+}
+
+/// One product at the default square and sets of tiles, in clusters of cluster_val blocks, blocks_val blocks, the
+/// sum split in splits_val: what the check below calls.
+///
+///   output_tensor, left_tensor, right_tensor, left_turned_val, right_turned_val   as in wgmma_matmul_bf16
+///   cluster_val, blocks_val, splits_val                                           as in wgmma_matmul_bf16_at
+static void clustered_product(const Tensor &output_tensor, const Tensor &left_tensor, const Tensor &right_tensor, bool left_turned_val,
+                              bool right_turned_val, int cluster_val, int blocks_val, int splits_val)
+{
+    if (cluster_val == 2)
+        wgmma_matmul_bf16_at<WGMMA_MATMUL_BF16_ROW_GROUPS, WGMMA_MATMUL_BF16_COLUMNS, WGMMA_MATMUL_BF16_STAGES, 2>(
+            output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val, right_turned_val, WgmmaMatmulBf16Store(),
+            splits_val, WGMMA_MATMUL_BF16_BLOCK_ROWS_PER_GROUP, WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
+    else
+        wgmma_matmul_bf16_at<WGMMA_MATMUL_BF16_ROW_GROUPS, WGMMA_MATMUL_BF16_COLUMNS, WGMMA_MATMUL_BF16_STAGES, 1>(
+            output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val, right_turned_val, WgmmaMatmulBf16Store(),
+            splits_val, WGMMA_MATMUL_BF16_BLOCK_ROWS_PER_GROUP, WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
+}
+
+static void every_cluster_and_block_count_gives_the_same_bits(void)
+{
+    // Expect: L {296, 336}, R {520, 336}: 5 rows of squares of 64 rows (the last part-full; in clusters of 2, 3 units,
+    // the last one's second square mostly past the rows: 0s from TMA, nothing stored), 6 steps. In clusters of 1 and
+    // of 2 blocks (the right tile asked for once for both), with 1, 2, 5 blocks (persistent: a block walks many
+    // squares, its sets of tiles going round across them), as many as the GPU runs at once (0) and one a square, every
+    // way, plain or turned, is the same product to the last bit: 1 cluster of 1 block's, the 7s all written over.
+    // The same with the sum split in 3 (against 1 block's split in 3). Who works out a square changes, never a sum.
+    // 1. random L and R, their turned-round copies
+    torch::manual_seed(15);
+    Tensor left_tensor = random_tensor({296, 336});
+    Tensor right_tensor = random_tensor({520, 336});
+    Tensor left_turned_tensor = tensor_from_pytorch(pytorch_copy_of(left_tensor).t(), DType::BFloat16);
+    Tensor right_turned_tensor = tensor_from_pytorch(pytorch_copy_of(right_tensor).t(), DType::BFloat16);
+    print_test_name(__func__);
+    // 2. each way and split: one block's product, then every cluster size and block count against it
+    const int blocks_list[] = {0, 1, 2, 5, 1 << 30};
+    for (int splits_val : {1, 3})
+        for (int way_index_val = 0; way_index_val < 4; way_index_val++)
+        {
+            bool left_turned_val = (way_index_val & 1) != 0;
+            bool right_turned_val = (way_index_val & 2) != 0;
+            const Tensor &left_used_tensor = left_turned_val ? left_turned_tensor : left_tensor;
+            const Tensor &right_used_tensor = right_turned_val ? right_turned_tensor : right_tensor;
+            Tensor one_block_tensor = Tensor::zeros({296, 520}, DType::BFloat16);
+            clustered_product(one_block_tensor, left_used_tensor, right_used_tensor, left_turned_val, right_turned_val, 1, 1, splits_val);
+            torch::Tensor expected_tensor = pytorch_copy_of(one_block_tensor);
+            for (int cluster_val : {1, 2})
+                for (int blocks_val : blocks_list)
+                {
+                    Tensor output_tensor = Tensor::zeros({296, 520}, DType::BFloat16);
+                    output_tensor.fill_(7.0);
+                    clustered_product(output_tensor, left_used_tensor, right_used_tensor, left_turned_val, right_turned_val, cluster_val,
+                                      blocks_val, splits_val);
+                    printf("    left %s, right %s, %d splits, clusters of %d, %d blocks:\n", left_turned_val ? "turned" : "plain",
+                           right_turned_val ? "turned" : "plain", splits_val, cluster_val, blocks_val);
+                    ASSERT_EQ(torch::equal(pytorch_copy_of(output_tensor), expected_tensor), true);
+                }
+        }
 }
 
 // ══ part 2c: the sum split over blocks ════════════════════════════════════════
@@ -551,15 +610,21 @@ static void add_kernels_of_setting(std::vector<const void *> &kernels_list, std:
     {
         names_list.push_back(std::string("wgmma_matmul_bf16_kernel<") + way_ptr + ", " + std::to_string(ROW_GROUPS) + " warpgroups, " +
                              std::to_string(COLUMNS) + " columns, " + std::to_string(STAGES) + " sets>");
-        threads_list.push_back(ROW_GROUPS * HARDWARE_WARPGROUP_THREADS);
+        threads_list.push_back((WGMMA_MATMUL_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS);   // the producer and the consumers
     }
 }
 
+static const size_t MOST_SPILL_OF_THE_LARGEST_SQUARE = 16;   // bytes the 2 warpgroups x 256 columns kernels may spill (see below)
+
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: each of the kernels (one per turned flags, warpgroups, columns and sets of tiles: 96) can be launched
-    // with its warpgroups' threads, and nothing is spilled, the 128 sums a thread of 256 columns included; the
-    // splits' sum with up to HARDWARE_MAX_THREADS_PER_BLOCK, the largest it may be given:
+    // Expect: each of the kernels (one per turned flags, warpgroups, columns and sets of tiles that fit a block's
+    // shared memory: 92; and the default square in clusters of 2) can be launched
+    // with its warpgroups' threads (the producer's and the consumers'), and nothing is spilled; the splits' sum with up
+    // to HARDWARE_MAX_THREADS_PER_BLOCK, the largest it may be given. Save 2 warpgroups x 256 columns: 384 threads get 168
+    // registers each, and the 128 sums a consumer thread holds, with the TMA store's addresses, leave a word or two over:
+    // at most MOST_SPILL_OF_THE_LARGEST_SQUARE bytes (8 with the producer at 40 registers; 12 to 32 at 24, 32, 48), a
+    // cost the tune measures (qkv at 2 x 256 x 3: 0.125 ms on an H100 PCIe, cuBLAS 0.136).
     // cudaFuncGetAttributes' numRegs (registers per thread), maxThreadsPerBlock (the largest block) and
     // localSizeBytes (0 if nothing spills), read without running anything. The tiles are dynamic shared memory, so
     // sharedSizeBytes is only the barriers.
@@ -589,7 +654,16 @@ static void every_kernel_fits_its_block(void)
     add_kernels_of_setting<256, 1, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_setting<256, 2, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_setting<256, 3, 2>(kernels_list, names_list, threads_list);
-    add_kernels_of_setting<256, 4, 2>(kernels_list, names_list, threads_list);
+    // the default square in clusters of 2: the same block, the right tile shared
+    kernels_list.push_back((const void *)wgmma_matmul_bf16_kernel<false, false, WgmmaMatmulBf16Store, WGMMA_MATMUL_BF16_COLUMNS,
+                                                                  WGMMA_MATMUL_BF16_STAGES, WGMMA_MATMUL_BF16_ROW_GROUPS, 2>);
+    kernels_list.push_back((const void *)wgmma_matmul_bf16_kernel<true, true, WgmmaMatmulBf16Store, WGMMA_MATMUL_BF16_COLUMNS,
+                                                                  WGMMA_MATMUL_BF16_STAGES, WGMMA_MATMUL_BF16_ROW_GROUPS, 2>);
+    for (const char *way_ptr : {"false, false", "true, true"})
+    {
+        names_list.push_back(std::string("wgmma_matmul_bf16_kernel<") + way_ptr + ", the default square, clusters of 2>");
+        threads_list.push_back((WGMMA_MATMUL_BF16_PRODUCER_WARPGROUPS + WGMMA_MATMUL_BF16_ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS);
+    }
     kernels_list.push_back((const void *)wgmma_matmul_bf16_splits_sum_kernel<WgmmaMatmulBf16Store>);   // the splits' sum, any block size
     names_list.push_back("wgmma_matmul_bf16_splits_sum_kernel<WgmmaMatmulBf16Store>");
     threads_list.push_back(HARDWARE_MAX_THREADS_PER_BLOCK);
@@ -602,9 +676,10 @@ static void every_kernel_fits_its_block(void)
         printf("    %s: %d registers per thread, largest block %d threads, %zu bytes local memory, %zu bytes shared memory\n",
                names_list[kernel_index_val].c_str(), attributes_val.numRegs, attributes_val.maxThreadsPerBlock,
                attributes_val.localSizeBytes, attributes_val.sharedSizeBytes);
-        // 2. check
+        // 2. check; 2 warpgroups x 256 columns may spill MOST_SPILL_OF_THE_LARGEST_SQUARE bytes
         ASSERT_EQ(attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val], true);
-        ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
+        bool largest_square_val = names_list[kernel_index_val].find("2 warpgroups, 256 columns") != std::string::npos;
+        ASSERT_EQ(attributes_val.localSizeBytes <= (largest_square_val ? MOST_SPILL_OF_THE_LARGEST_SQUARE : (size_t)0), true);
     }
 }
 
@@ -632,6 +707,7 @@ int main(void)
     every_setting_gives_the_default_bits_with_fewer_steps_than_sets();
     every_setting_matches_pytorch_on_gpt2_qkv_weight_grad();
     every_block_order_gives_the_default_bits();
+    every_cluster_and_block_count_gives_the_same_bits();
 
     every_split_count_matches_pytorch_with_bias_and_add_onto();
     every_split_count_matches_pytorch_on_gpt2_attention_output_weight_grad();

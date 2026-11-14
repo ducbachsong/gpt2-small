@@ -40,6 +40,10 @@ __host__ __device__ constexpr int bits_for_values(unsigned long long count) {
 #define HARDWARE_BF16_PER_REGISTER (HARDWARE_REGISTER_BYTES / 2)     // 2 bfloat16s (2 bytes each)
 #define HARDWARE_E4M3_PER_REGISTER (HARDWARE_REGISTER_BYTES / 1)     // 4 E4M3s (1 byte each)
 #define HARDWARE_FLOATS_PER_REGISTER (HARDWARE_REGISTER_BYTES / 4)   // 1 float (4 bytes)
+#define HARDWARE_REGISTERS_PER_SM 65536                      // an SM's registers, shared by the threads of its blocks (sm_80 and on)
+#define HARDWARE_REGISTER_ALLOCATION_UNIT 8                  // a thread's registers come in multiples of 8
+#define HARDWARE_SETMAXNREG_MIN 24                           // setmaxnreg (sm_90): a warpgroup's registers a thread, at least 24 ...
+#define HARDWARE_SETMAXNREG_MAX 256                          // ... at most 256
 
 // mma.sync (sm_80 or later): one warp makes C {M, N} += A {M, K} · B {K, N}. Its threads first load their parts of A
 // and B into registers, then hand them to the tensor core; C comes back in their registers too.

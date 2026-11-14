@@ -403,9 +403,7 @@ static void find_the_micro_batch_with_the_best_mfu(void)
 
         // one micro-batch as the training loop runs it, warmed up, then timed
         auto micro_batch_val = [&] {
-            gpt2_bf16_forward(activations_val, token_ids_tensor, targets_tensor, params_val, config_val);
-            gpt2_bf16_backward(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, config_val);
-            gpt2_mean_loss(activations_val);                    // read back to the CPU, as the training loop does
+            gpt2_bf16_train_step(grads_val, token_ids_tensor, targets_tensor, params_val, activations_val, config_val);
         };
         warm_up_gpu(micro_batch_val);
         double total_ms_val = 0.0;

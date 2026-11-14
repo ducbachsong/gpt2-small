@@ -1,0 +1,73 @@
+log: tests/results/H100/attention_bf16_2026-11-13_130531.txt
+GPU: NVIDIA H100 NVL   compute 9.0   132 SMs   99.9 GB   peak memory bandwidth 3939 GB/s   peak bfloat16 965 TFLOPS   CUDA 12.8
+
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   my forward   my backward   PyTorch forward   PyTorch backward
+        ms                         0.222         0.238             0.088              0.187
+    PyTorch takes, against mine:                                    0.40x              0.79x
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_output_tensor.to(torch::kFloat)) expected: 0 +/- 0.02   actual: 0.00434783   ok  (line 204)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_qkv_tensor.grad().to(torch::kFloat)) expected: 0 +/- 0.05   actual: 0.00305316   ok  (line 206)
+
+time_flash_against_the_steps_and_pytorch
+    average of steps 3..20, ms:   forward   backward   both
+        flash attention             0.047      0.108  0.155
+        the steps                   0.219      0.238  0.457
+        PyTorch (flash)             0.091      0.196  0.287
+    the steps take 2.95x as long as flash attention, PyTorch 1.85x
+    input: totals_list[0] + totals_list[1] < totals_list[2] + totals_list[3] expected: true   actual: true   ok  (line 263)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_output_tensor.to(torch::kFloat)) expected: 0 +/- 0.02   actual: 0.00108696   ok  (line 264)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_qkv_tensor.grad().to(torch::kFloat)) expected: 0 +/- 0.05   actual: 0.00143678   ok  (line 266)
+
+time_each_backward_stage_count
+    backward ms, average of rounds 3..20, {16, 1024} tokens; key_grad's sets down, query_grad's across
+                    1        2        3        4
+    1           0.375    0.375    0.378    0.402
+    2           0.374    0.375    0.375    0.400
+    3           0.377    0.377    0.376    0.403
+    4           0.400    0.401    0.403    0.425
+    fastest: key_grad 2 sets, query_grad 1 sets, 0.374 ms; the default (2, 2) 0.375 ms, 1.00x as long; 1 and 1 0.375 ms
+
+time_each_softmax_kernel_with_other_block_and_thread_counts
+    time in ms:   blocks   threads   rows per warp   forward   backward   same result
+                      40       128             308     2.166      1.305   yes        
+                      40       256             154     1.154      0.700   yes        
+                      40       512              77     0.671      0.411   yes        
+                      40      1024              39     0.463      0.289   yes        
+                      80       128             154     1.128      0.678   yes           <- a T4's pick for the backward, what it launched before
+                      80       256              77     0.618      0.376   yes        
+                      80       512              39     0.370      0.232   yes        
+                      80      1024              20     0.264      0.171   yes        
+                     160       128              77     0.615      0.372   yes        
+                     160       256              39     0.356      0.222   yes        
+                     160       512              20     0.262      0.167   yes        
+                     160      1024              10     0.239      0.162   yes        
+                     320       128              39     0.349      0.215   yes        
+                     320       256              20     0.224      0.146   yes        
+                     320       512              10     0.208      0.137   yes        
+                     320      1024               5     0.169      0.123   yes        
+                     640       128              20     0.218      0.142   yes        
+                     640       256              10     0.182      0.124   yes        
+                     640       512               5     0.161      0.122   yes        
+                     640      1024               3     0.145      0.112   yes        
+                    1280       128              10     0.178      0.123   yes        
+                    1280       256               5     0.161      0.115   yes        
+                    1280       512               3     0.145      0.105   yes        
+                    1280      1024               2     0.135      0.103   yes        
+                    6144       128               2     0.137      0.098   yes        
+                    6144       256               1     0.132      0.093   yes           <- what attention_bf16_forward and _backward launch: one warp per row
+                    6144       512               1     0.132      0.098   yes        
+                    6144      1024               1     0.134      0.103   yes        
+                     132       128              94     0.674      0.414   yes        
+                     132       256              47     0.392      0.244   yes        
+                     132       512              24     0.231      0.150   yes        
+                     132      1024              12     0.161      0.108   yes        
+                     264       128              47     0.391      0.242   yes        
+                     264       256              24     0.229      0.146   yes        
+                     264       512              12     0.163      0.109   yes        
+                     264      1024               6     0.147      0.112   yes        
+    fastest forward     6144 blocks x  256 threads: 0.132 ms
+    fastest backward    6144 blocks x  256 threads: 0.093 ms
+    input: launches_with_the_same_result_val    expected: 36   actual: 36   ok  (line 503)
+
+all tunes done

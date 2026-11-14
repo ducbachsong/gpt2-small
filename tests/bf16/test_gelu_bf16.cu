@@ -277,8 +277,8 @@ static void gelu_input_grad_can_be_gelu_input_itself(void)
 static void every_kernel_fits_its_block(void)
 {
     // Expect: wgmma_matmul_bf16_kernel made with GELU's epilogues, the forward's (neither side turned: mlp_up's
-    // output) and the backward's (right turned: mlp_down's input_grad), can be launched with one warpgroup (128
-    // threads), and nothing is spilled: the epilogue adds a few registers to the 32 sums. cudaFuncGetAttributes reads
+    // output) and the backward's (right turned: mlp_down's input_grad), can be launched with the product's block (its producer and
+    // consumer warpgroups), and nothing is spilled: the epilogue adds a few registers to the 32 sums. cudaFuncGetAttributes reads
     // what the compiler wrote down, without running anything:
     //
     //     numRegs              registers per thread
@@ -299,7 +299,9 @@ static void every_kernel_fits_its_block(void)
                names_list[kernel_index_val], attributes_val.numRegs, attributes_val.maxThreadsPerBlock,
                attributes_val.localSizeBytes);
         // 2. check
-        ASSERT_EQ(attributes_val.maxThreadsPerBlock >= HARDWARE_WARPGROUP_THREADS, true);
+        ASSERT_EQ(attributes_val.maxThreadsPerBlock >=
+                      (WGMMA_MATMUL_BF16_PRODUCER_WARPGROUPS + WGMMA_MATMUL_BF16_ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS,
+                  true);   // the product's block: its producer and consumer warpgroups
         ASSERT_EQ(attributes_val.localSizeBytes, (size_t)0);
     }
 }

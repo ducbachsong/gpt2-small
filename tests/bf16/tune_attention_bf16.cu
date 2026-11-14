@@ -267,6 +267,87 @@ static void time_flash_against_the_steps_and_pytorch(void)
                 BFLOAT16_GRAD_TOLERANCE);
 }
 
+/// One flash attention backward on these tensors with KEY_GRAD_STAGES and QUERY_GRAD_STAGES sets of tiles: what the
+/// sweep below times for each pair of stage counts.
+///
+///   flash_val   the tensors: qkv_grad written, the rest read
+template <int KEY_GRAD_STAGES, int QUERY_GRAD_STAGES>
+static void flash_backward_at(FlashTensors &flash_val)
+{
+    attention_bf16_flash_backward<KEY_GRAD_STAGES, QUERY_GRAD_STAGES>(flash_val.qkv_grad_tensor, flash_val.output_grad_tensor,
+                                                                      flash_val.output_tensor, flash_val.qkv_tensor,
+                                                                      flash_val.logsumexp_tensor, flash_val.row_dot_tensor);
+}
+
+/// A pair of stage counts, and the backward made for them.
+struct StageSetting
+{
+    int key_grad_stages_val;
+    int query_grad_stages_val;
+    void (*backward_ptr)(FlashTensors &);
+};
+
+static const StageSetting STAGE_SETTINGS_LIST[] = {
+    {1, 1, flash_backward_at<1, 1>}, {1, 2, flash_backward_at<1, 2>}, {1, 3, flash_backward_at<1, 3>}, {1, 4, flash_backward_at<1, 4>},
+    {2, 1, flash_backward_at<2, 1>}, {2, 2, flash_backward_at<2, 2>}, {2, 3, flash_backward_at<2, 3>}, {2, 4, flash_backward_at<2, 4>},
+    {3, 1, flash_backward_at<3, 1>}, {3, 2, flash_backward_at<3, 2>}, {3, 3, flash_backward_at<3, 3>}, {3, 4, flash_backward_at<3, 4>},
+    {4, 1, flash_backward_at<4, 1>}, {4, 2, flash_backward_at<4, 2>}, {4, 3, flash_backward_at<4, 3>}, {4, 4, flash_backward_at<4, 4>},
+};
+
+#define TRAINING_BATCH_SIZE 16        // a training micro-batch: 16 rows of 1024 tokens
+
+static void time_each_backward_stage_count(void)
+{
+    // Prints flash attention's backward on a training micro-batch of GPT-2 small, {16, 1024} tokens, 12 heads of 64,
+    // with key_grad's and query_grad's sets of tiles each 1 to ATTENTION_FLASH_BF16_MAX_STAGES, taking turns over
+    // SWEEP_ROUNDS rounds, rounds WARM_UP_STEPS + 1 on averaged; then the fastest against the default. 1 and 1:
+    // ask, wait, work, as before the sets. row_dot is the same in every one.
+    if (!flash_runs_here(__func__))
+        return;
+    // 1. random bfloat16 qkv and output_grad, and the forward the backward reads
+    torch::manual_seed(0);
+    FlashTensors flash_val(TRAINING_BATCH_SIZE, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
+    flash_val.qkv_tensor = random_tensor_on_gpu(flash_val.qkv_tensor.shape()).to(DType::BFloat16);
+    flash_val.output_grad_tensor = random_tensor_on_gpu(flash_val.output_tensor.shape()).to(DType::BFloat16);
+    flash_val.forward();
+    // 2. SWEEP_ROUNDS rounds, each timing every pair once
+    const int setting_count_val = (int)(sizeof(STAGE_SETTINGS_LIST) / sizeof(STAGE_SETTINGS_LIST[0]));
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    std::vector<double> totals_list(setting_count_val, 0.0);
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+        for (int setting_index_val = 0; setting_index_val < setting_count_val; setting_index_val++)
+        {
+            float milliseconds_val = gpu_milliseconds([&] { STAGE_SETTINGS_LIST[setting_index_val].backward_ptr(flash_val); });
+            if (round_index_val > WARM_UP_STEPS)
+                totals_list[setting_index_val] += milliseconds_val;
+        }
+    // 3. the table: key_grad's sets down, query_grad's across; the fastest and the default
+    int best_index_val = 0;
+    int default_index_val = 0;
+    print_test_name(__func__);
+    printf("    backward ms, average of rounds %d..%d, {%d, %d} tokens; key_grad's sets down, query_grad's across\n    %-8s",
+           WARM_UP_STEPS + 1, SWEEP_ROUNDS, TRAINING_BATCH_SIZE, GPT2_SEQ_LEN, "");
+    for (int query_stages_val = 1; query_stages_val <= ATTENTION_FLASH_BF16_MAX_STAGES; query_stages_val++)
+        printf(" %8d", query_stages_val);
+    for (int setting_index_val = 0; setting_index_val < setting_count_val; setting_index_val++)
+    {
+        const StageSetting &setting_val = STAGE_SETTINGS_LIST[setting_index_val];
+        if (setting_val.query_grad_stages_val == 1)
+            printf("\n    %-8d", setting_val.key_grad_stages_val);
+        printf(" %8.3f", totals_list[setting_index_val] / averaged_val);
+        if (totals_list[setting_index_val] < totals_list[best_index_val])
+            best_index_val = setting_index_val;
+        if (setting_val.key_grad_stages_val == ATTENTION_FLASH_BF16_KEY_GRAD_STAGES &&
+            setting_val.query_grad_stages_val == ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES)
+            default_index_val = setting_index_val;
+    }
+    printf("\n    fastest: key_grad %d sets, query_grad %d sets, %.3f ms; the default (%d, %d) %.3f ms, %.2fx as long; 1 and 1 %.3f ms\n",
+           STAGE_SETTINGS_LIST[best_index_val].key_grad_stages_val, STAGE_SETTINGS_LIST[best_index_val].query_grad_stages_val,
+           totals_list[best_index_val] / averaged_val, ATTENTION_FLASH_BF16_KEY_GRAD_STAGES, ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES,
+           totals_list[default_index_val] / averaged_val, totals_list[default_index_val] / totals_list[best_index_val],
+           totals_list[0] / averaged_val);
+}
+
 // ══ part 2: other block and thread counts ═════════════════════════════════════
 
 static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
@@ -429,6 +510,7 @@ int main(void)
     start_tune_log(__FILE__);                   // the console, and tests/results/<GPU>/<kernel>_<date>_<time>.txt
     time_20_steps_on_gpt2_small_size();
     time_flash_against_the_steps_and_pytorch();
+    time_each_backward_stage_count();
     time_each_softmax_kernel_with_other_block_and_thread_counts();
 
     printf("\nall tunes done\n");

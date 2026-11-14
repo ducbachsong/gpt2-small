@@ -28,6 +28,9 @@
 #include "wgmma_matmul_bf16.cuh"     // the TMA tile description, the WGMMA descriptor and the tile x tile WGMMA
 
 #define ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // row_dot's default: one warp per row
+#define ATTENTION_FLASH_BF16_KEY_GRAD_STAGES 2                                              // key_grad's default sets of query tiles: 1 to ATTENTION_FLASH_BF16_MAX_STAGES (tune_attention_bf16 sweeps it)
+#define ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES 2                                            // query_grad's default sets of key tiles: the same
+#define ATTENTION_FLASH_BF16_MAX_STAGES 4                                                   // the most: key_grad's 4 sets are 10 tiles, 82 KB
 
 // WGMMA m64n64k16 fed by TMA, the tensor-core product the kernels are built on: its HARDWARE_WGMMA_* and
 // HARDWARE_TMA_* numbers are in cuda_common.h. The index math is written for these numbers: change them together
@@ -40,6 +43,8 @@
 #define FLASH_HEAD_GROUPS (FLASH_HEAD_SIZE / HARDWARE_WGMMA_GROUP_COLUMNS)   // groups of C across a head row
 #define FLASH_TILE_GROUPS (FLASH_TILE / HARDWARE_WGMMA_GROUP_COLUMNS)        // groups of C across a tile of keys or queries
 #define FLASH_TILE_BYTES (FLASH_TILE * FLASH_HEAD_SIZE * sizeof(nv_bfloat16))   // a tile in shared memory: what one TMA copy brings
+#define FLASH_LN_2 0.6931471805599453f                         // ln(2): 2^x = e^(x ln 2), to give logsumexp in natural units
+#define FLASH_LOG2_E 1.4426950408889634f                       // log2(e): exp(x) = 2^(x log2 e), and the tensor cores' neighbours have only 2^x
 static_assert(HARDWARE_WGMMA_K_BF16 == 2 * HARDWARE_WGMMA_GROUP_COLUMNS, "two groups of C side by side make one A {16, 16}");
 static_assert(FLASH_HEAD_SIZE == 2 * HARDWARE_THREADS_PER_WARP, "row_dot: each lane takes 2 values of a head row");
 static_assert(FLASH_HEAD_SIZE == WGMMA_MATMUL_BF16_ROW_VALUES, "a tile's row, a head row, is one swizzled row: wgmma_matmul_bf16_tensor_map's box");
@@ -50,6 +55,7 @@ static_assert(FLASH_HEAD_GROUPS == WGMMA_MATMUL_BF16_COLUMN_GROUPS && FLASH_TILE
 // ── forward and backward ──────────────────────────────────────────────────────
 bool attention_bf16_flash_fits(size_t seq_len_val, size_t head_size_val);
 void attention_bf16_flash_forward(const Tensor& output_tensor, const Tensor& logsumexp_tensor, const Tensor& qkv_tensor);
+template <int KEY_GRAD_STAGES = ATTENTION_FLASH_BF16_KEY_GRAD_STAGES, int QUERY_GRAD_STAGES = ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES>
 void attention_bf16_flash_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
                                    const Tensor& output_tensor, const Tensor& qkv_tensor, const Tensor& logsumexp_tensor,
                                    const Tensor& row_dot_tensor,
@@ -71,16 +77,22 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
 __global__ void attention_bf16_flash_row_dot_kernel(float* row_dot_ptr, const nv_bfloat16* output_grad_ptr,
                                                     const nv_bfloat16* output_ptr, int num_heads_val, int seq_len_val,
                                                     size_t rows_val);
+template <int STAGES>
 __global__ void __launch_bounds__(FLASH_THREADS)
 attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map_val,
                                      const __grid_constant__ CUtensorMap output_grad_map_val, nv_bfloat16* qkv_grad_ptr,
                                      const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
                                      int seq_len_val, float scale_val);
+template <int STAGES>
 __global__ void __launch_bounds__(FLASH_THREADS)
 attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_map_val,
                                        const __grid_constant__ CUtensorMap output_grad_map_val, nv_bfloat16* qkv_grad_ptr,
                                        const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
                                        int seq_len_val, float scale_val);
+template <int STAGES>
+size_t attention_bf16_flash_key_grad_shared_bytes();
+template <int STAGES>
+size_t attention_bf16_flash_query_grad_shared_bytes();
 
 /// Tells if flash attention can run here: head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE, and a
 /// GPU with WGMMA and TMA (compute capability HARDWARE_WGMMA_CAPABILITY / 10 exactly: an H100).
@@ -138,6 +150,11 @@ inline void attention_bf16_flash_forward(const Tensor& output_tensor, const Tens
 ///   threads_per_block_val                 row_dot's block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                                         ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK. The tile kernels' is always
 ///                                         FLASH_THREADS.
+/// KEY_GRAD_STAGES, QUERY_GRAD_STAGES: the sets of tiles each tile kernel keeps, 1 to ATTENTION_FLASH_BF16_MAX_STAGES
+/// (not given: ATTENTION_FLASH_BF16_KEY_GRAD_STAGES, _QUERY_GRAD_STAGES). Thread 0 asks TMA for the tiles of
+/// STAGES steps of the walk before it, and for each next one as a set is freed, so they come while the tensor cores
+/// work (1: ask, wait, work). The tiles are the same, so the bits are too.
+template <int KEY_GRAD_STAGES, int QUERY_GRAD_STAGES>
 inline void attention_bf16_flash_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
                                           const Tensor& output_tensor, const Tensor& qkv_tensor,
                                           const Tensor& logsumexp_tensor, const Tensor& row_dot_tensor,
@@ -164,13 +181,27 @@ inline void attention_bf16_flash_backward(const Tensor& qkv_grad_tensor, const T
     CUtensorMap output_grad_map_val = wgmma_matmul_bf16_tensor_map(output_grad_tensor.data_ptr<nv_bfloat16>(),
                                                                    batch_size_val * seq_len_val, output_grad_tensor.size(2),
                                                                    FLASH_TILE);
-    // 4. key_grad and value_grad, then query_grad: one block per tile of each head
+    // 4. key_grad and value_grad, then query_grad: one block per tile of each head, their sets of tiles in dynamic
+    //    shared memory (the first time for each, CUDA asked to allow it past the 48 KB a block gets without asking)
+    static_assert(KEY_GRAD_STAGES >= 1 && KEY_GRAD_STAGES <= ATTENTION_FLASH_BF16_MAX_STAGES &&
+                      QUERY_GRAD_STAGES >= 1 && QUERY_GRAD_STAGES <= ATTENTION_FLASH_BF16_MAX_STAGES,
+                  "the stages are 1 to ATTENTION_FLASH_BF16_MAX_STAGES");
+    size_t key_grad_shared_bytes_val = attention_bf16_flash_key_grad_shared_bytes<KEY_GRAD_STAGES>();
+    size_t query_grad_shared_bytes_val = attention_bf16_flash_query_grad_shared_bytes<QUERY_GRAD_STAGES>();
+    static bool allowed_val = false;                         // one for each pair of stages this template makes
+    if (!allowed_val) {
+        cudaCheck(cudaFuncSetAttribute(attention_bf16_flash_key_grad_kernel<KEY_GRAD_STAGES>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)key_grad_shared_bytes_val));
+        cudaCheck(cudaFuncSetAttribute(attention_bf16_flash_query_grad_kernel<QUERY_GRAD_STAGES>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)query_grad_shared_bytes_val));
+        allowed_val = true;
+    }
     dim3 grid_val((unsigned)(seq_len_val / FLASH_TILE), (unsigned)(batch_size_val * num_heads_val));
-    attention_bf16_flash_key_grad_kernel<<<grid_val, FLASH_THREADS>>>(
+    attention_bf16_flash_key_grad_kernel<KEY_GRAD_STAGES><<<grid_val, FLASH_THREADS, key_grad_shared_bytes_val>>>(
         qkv_map_val, output_grad_map_val, qkv_grad_tensor.data_ptr<nv_bfloat16>(), logsumexp_tensor.data(),
         row_dot_tensor.data(), (int)num_heads_val, (int)seq_len_val, scale_val);
     cudaCheck(cudaGetLastError());
-    attention_bf16_flash_query_grad_kernel<<<grid_val, FLASH_THREADS>>>(
+    attention_bf16_flash_query_grad_kernel<QUERY_GRAD_STAGES><<<grid_val, FLASH_THREADS, query_grad_shared_bytes_val>>>(
         qkv_map_val, output_grad_map_val, qkv_grad_tensor.data_ptr<nv_bfloat16>(), logsumexp_tensor.data(),
         row_dot_tensor.data(), (int)num_heads_val, (int)seq_len_val, scale_val);
     cudaCheck(cudaGetLastError());
@@ -217,6 +248,19 @@ __device__ __forceinline__ void flash_wgmma_wait() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
 
+/// Closes the WGMMAs issued since the last group as one group, without waiting: the tensor cores run it while
+/// the threads go on.
+__device__ __forceinline__ void flash_wgmma_commit() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+
+/// Waits until at most LEFT_RUNNING of the committed groups are still running (groups finish in the order they
+/// were committed): the sums of every older group can be read after this.
+template <int LEFT_RUNNING>
+__device__ __forceinline__ void flash_wgmma_wait_until() {
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(LEFT_RUNNING) : "memory");
+}
+
 /// sums {64, 64} += left tile {64, 16} · right tile {64, 16}ᵀ on the tensor cores, for the whole warpgroup, both
 /// tiles read from shared memory as they sit: wgmma_matmul_bf16.cuh's, neither side turned. Asynchronous: done
 /// only after flash_wgmma_wait.
@@ -254,6 +298,17 @@ __device__ __forceinline__ void flash_multiply_add_registers(float (&sums_list)[
           "+f"(sums_list[4][0]), "+f"(sums_list[4][1]), "+f"(sums_list[4][2]), "+f"(sums_list[4][3]), "+f"(sums_list[5][0]), "+f"(sums_list[5][1]), "+f"(sums_list[5][2]), "+f"(sums_list[5][3]),
           "+f"(sums_list[6][0]), "+f"(sums_list[6][1]), "+f"(sums_list[6][2]), "+f"(sums_list[6][3]), "+f"(sums_list[7][0]), "+f"(sums_list[7][1]), "+f"(sums_list[7][2]), "+f"(sums_list[7][3])
         : "r"(a_ptr[0]), "r"(a_ptr[1]), "r"(a_ptr[2]), "r"(a_ptr[3]), "l"(right_descriptor_val), "r"(1));
+}
+
+/// Gives 2^x by the special function unit's one instruction (ex2.approx.ftz: about 2 ulp, values under 2^-126 to
+/// 0): exp(y) is flash_exp2(y log2 e), and a backward step folds log2 e into the scale and logsumexp so each
+/// attention_prob is one FFMA and this.
+///
+///   x_val   the power
+__device__ __forceinline__ float flash_exp2(float x_val) {
+    float result_val;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result_val) : "f"(x_val));
+    return result_val;
 }
 
 /// Gives two floats as one register of two bfloat16s, rounded: an A register.
@@ -326,7 +381,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
 
     float output_list[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};    // {HARDWARE_WGMMA_M, FLASH_HEAD_SIZE}
     // rows group, group + HARDWARE_WGMMA_ROWS_PER_WARP
-    float row_max_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {-INFINITY, -INFINITY};
+    float row_max_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {-INFINITY, -INFINITY};   // in powers of 2: score · scale · log2 e
+    float scale_log2_val = scale_val * FLASH_LOG2_E;                                  // exp(score · scale) = 2^(score · scale · log2 e)
     float row_sum_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {0.0f, 0.0f};
     // 2. walk the key tiles up to this block's own
     for (int key_block_index_val = 0; key_block_index_val <= query_block_index_val; key_block_index_val++) {
@@ -348,28 +404,37 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
             flash_multiply_add_tiles(score_list, query_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
                                      key_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
         flash_wgmma_wait();
-        // F3: the scale and the mask; then each row's largest score
+        // F3: on the diagonal tile (the block's own keys), -inf where the key comes after the query; then each row's
+        // largest score, unscaled (the scale is positive, so the largest is the same)
+        if (key_block_index_val == query_block_index_val)
+#pragma unroll
+            for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
+#pragma unroll
+                for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
+                    int thread_row_index_val = c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD;
+                    int token_index_val = warp_first_token_index_val + group_index_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
+                    int key_token_index_val = key_block_index_val * FLASH_TILE + group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS +
+                                              pair_column_index_val + c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
+                    score_list[group_column_index_val][c_value_index_val] =
+                        key_token_index_val <= token_index_val ? score_list[group_column_index_val][c_value_index_val] : -INFINITY;
+                }
         float tile_max_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {-INFINITY, -INFINITY};
 #pragma unroll
         for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
 #pragma unroll
             for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
                 int thread_row_index_val = c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD;
-                int token_index_val = warp_first_token_index_val + group_index_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                int key_token_index_val = key_block_index_val * FLASH_TILE + group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS +
-                                          pair_column_index_val + c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
-                score_list[group_column_index_val][c_value_index_val] =
-                    key_token_index_val <= token_index_val ? score_list[group_column_index_val][c_value_index_val] * scale_val : -INFINITY;
                 tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], score_list[group_column_index_val][c_value_index_val]);
             }
-        // F4: the online softmax: the new max (over the row's HARDWARE_WGMMA_THREADS_PER_ROW lanes), the output and sum
-        // moved onto it, then the attention_probs
+        // F4: the online softmax in powers of 2: the new max (over the row's HARDWARE_WGMMA_THREADS_PER_ROW lanes) as
+        // score · scale · log2 e, the output and sum moved onto it, then the attention_probs, exp2(score · scale ·
+        // log2 e - max): one FFMA and one ex2 each
 #pragma unroll
         for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
             tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], __shfl_xor_sync(HARDWARE_WARP_ALL_LANES, tile_max_list[thread_row_index_val], 1));
             tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], __shfl_xor_sync(HARDWARE_WARP_ALL_LANES, tile_max_list[thread_row_index_val], 2));
-            float new_max_val = fmaxf(row_max_list[thread_row_index_val], tile_max_list[thread_row_index_val]);   // finite: every row sees key 0
-            float correction_val = __expf(row_max_list[thread_row_index_val] - new_max_val);     // 0 on the first tile
+            float new_max_val = fmaxf(row_max_list[thread_row_index_val], tile_max_list[thread_row_index_val] * scale_log2_val);   // finite: every row sees key 0
+            float correction_val = flash_exp2(row_max_list[thread_row_index_val] - new_max_val);     // 0 on the first tile
             row_max_list[thread_row_index_val] = new_max_val;
             row_sum_list[thread_row_index_val] *= correction_val;
 #pragma unroll
@@ -384,7 +449,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
             for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
                 int thread_row_index_val = c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD;
                 score_list[group_column_index_val][c_value_index_val] =
-                    __expf(score_list[group_column_index_val][c_value_index_val] - row_max_list[thread_row_index_val]);   // a masked score gives 0
+                    flash_exp2(fmaf(score_list[group_column_index_val][c_value_index_val], scale_log2_val,
+                                    -row_max_list[thread_row_index_val]));   // a masked score gives 0
                 row_sum_list[thread_row_index_val] += score_list[group_column_index_val][c_value_index_val];
             }
         // F5: output += attention_probs · value tile: the attention_probs from the score registers as A, the value
@@ -415,7 +481,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
                 output_list[group_column_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * one_over_sum_val,
                 output_list[group_column_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * one_over_sum_val);
         if (lane_index_val % HARDWARE_WGMMA_THREADS_PER_ROW == 0)
-            logsumexp_ptr[(size_t)blockIdx.y * seq_len_val + token_index_val] = row_max_list[thread_row_index_val] + logf(row_sum_list[thread_row_index_val]);
+            logsumexp_ptr[(size_t)blockIdx.y * seq_len_val + token_index_val] =   // natural units: max · ln 2 + ln sum
+                row_max_list[thread_row_index_val] * FLASH_LN_2 + logf(row_sum_list[thread_row_index_val]);
     }
 }
 
@@ -449,6 +516,40 @@ __global__ void attention_bf16_flash_row_dot_kernel(float* row_dot_ptr, const nv
     }
 }
 
+/// Gives key_grad's dynamic shared memory at STAGES sets: the key and value tiles, STAGES sets of a query and an
+/// output_grad tile, then each set's logsumexp and row_dot rows (FLASH_TILE floats each), and one atom of room to
+/// start the tiles on one (TMA's 128-byte swizzle repeats every HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM bytes).
+template <int STAGES>
+inline size_t attention_bf16_flash_key_grad_shared_bytes() {
+    return (2 + 2 * STAGES) * FLASH_TILE_BYTES + 2 * STAGES * FLASH_TILE * sizeof(float) + HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
+}
+
+/// Gives query_grad's dynamic shared memory at STAGES sets: the query and output_grad tiles, STAGES sets of a key
+/// and a value tile, and one atom of room to start them on one.
+template <int STAGES>
+inline size_t attention_bf16_flash_query_grad_shared_bytes() {
+    return (2 + 2 * STAGES) * FLASH_TILE_BYTES + HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
+}
+
+/// Gives the first HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM-byte atom of a block's dynamic shared memory, where its
+/// tiles start: dynamic shared memory starts wherever the static ends.
+///
+///   shared_list   the block's dynamic shared memory
+__device__ __forceinline__ nv_bfloat16* flash_first_atom(uint8_t* shared_list) {
+    uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(shared_list);
+    return reinterpret_cast<nv_bfloat16*>(shared_list + (HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM - shared_address_val % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) %
+                                                            HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM);
+}
+
+/// Waits, the whole block, until TMA has brought the tiles thread 0 asked for with this barrier (it said how many
+/// bytes when it asked): every thread arrives, and all wait for the bytes.
+///
+///   asked_barrier_val   the barrier, in shared memory
+__device__ __forceinline__ void flash_wait_for_asked(FlashBarrier& asked_barrier_val) {
+    FlashBarrier::arrival_token token_val = asked_barrier_val.arrive();
+    asked_barrier_val.wait(std::move(token_val));
+}
+
 /// Works out key_grad and value_grad for FLASH_TILE keys of one head, one warpgroup. The key and value tiles stay
 /// in shared memory; the block walks the queries FLASH_TILE at a time from its own tile on (TMA brings the query
 /// and output_grad tiles), making the attention_probs again, turned round:
@@ -465,21 +566,26 @@ __global__ void attention_bf16_flash_row_dot_kernel(float* row_dot_ptr, const nv
 ///   qkv_grad_ptr                            the key and value parts written
 ///   logsumexp_ptr, row_dot_ptr              one float per row
 ///   num_heads_val, seq_len_val, scale_val   the shape, and 1 / sqrt(FLASH_HEAD_SIZE)
+template <int STAGES>
 __global__ void __launch_bounds__(FLASH_THREADS)
 attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map_val,
                                      const __grid_constant__ CUtensorMap output_grad_map_val, nv_bfloat16* qkv_grad_ptr,
                                      const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
                                      int seq_len_val, float scale_val) {
     namespace cde = cuda::device::experimental;
-    // the tiles, in TMA's swizzled layout, and the barrier that says they arrived
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 grad_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ float logsumexp_tile_list[FLASH_TILE];
-    __shared__ float row_dot_tile_list[FLASH_TILE];
+    // the tiles, in TMA's swizzled layout, in dynamic shared memory from its first atom on: key, value, then
+    // STAGES sets of a query and an output_grad tile; after the tiles, each set's logsumexp and row_dot rows; a
+    // barrier for key and value, and one for each set
+    constexpr int TILE_VALUES = FLASH_TILE * FLASH_HEAD_SIZE;
+    constexpr uint32_t SET_BYTES = 2 * FLASH_TILE_BYTES + 2 * FLASH_TILE * sizeof(float);   // what TMA brings a step
+    extern __shared__ __align__(16) uint8_t flash_shared_list[];
 #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ FlashBarrier tiles_barrier_val;
+    __shared__ FlashBarrier key_value_barrier_val;
+    __shared__ FlashBarrier sets_barriers_list[STAGES];
+    nv_bfloat16* key_tile_ptr = flash_first_atom(flash_shared_list);
+    nv_bfloat16* value_tile_ptr = key_tile_ptr + TILE_VALUES;
+    nv_bfloat16* sets_ptr = key_tile_ptr + 2 * TILE_VALUES;                          // set s: query at 2 s tiles on, output_grad after
+    float* rows_ptr = reinterpret_cast<float*>(key_tile_ptr + (2 + 2 * STAGES) * TILE_VALUES);   // set s: logsumexp at 2 s rows on, row_dot after
     int warp_index_val = threadIdx.x / HARDWARE_THREADS_PER_WARP;
     int lane_index_val = threadIdx.x % HARDWARE_THREADS_PER_WARP;
     int group_index_val = lane_index_val / HARDWARE_WGMMA_THREADS_PER_ROW;
@@ -495,94 +601,155 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
     int key_first_column_index_val = query_first_column_index_val + embed_dim_val;
     int value_first_column_index_val = query_first_column_index_val + 2 * embed_dim_val;
     int warp_first_key_index_val = key_block_index_val * FLASH_TILE + warp_index_val * HARDWARE_WGMMA_M_PER_WARP;
+    float scale_log2_val = scale_val * FLASH_LOG2_E;                         // exp(score · scale) = 2^(score · scale · log2 e)
 
-    // 1. the barrier, by one thread; then this block's key and value tiles, kept for the whole walk
+    int query_steps_val = seq_len_val / FLASH_TILE - key_block_index_val;    // the query tiles from this block's own on
+
+    // 1. the barriers, by one thread
     if (threadIdx.x == 0) {
-        init(&tiles_barrier_val, blockDim.x);                 // every thread arrives once a load
-        cde::fence_proxy_async_shared_cta();                  // the barrier visible to TMA
+        init(&key_value_barrier_val, blockDim.x);                // every thread arrives once a use
+#pragma unroll
+        for (int set_index_val = 0; set_index_val < STAGES; set_index_val++)
+            init(&sets_barriers_list[set_index_val], blockDim.x);
+        cde::fence_proxy_async_shared_cta();                     // the barriers visible to TMA
     }
     __syncthreads();
+
+    // what thread 0 does to ask for one step's set: tell its barrier how many bytes are coming (no arrival: every
+    // thread arrives when it waits), then ask TMA for the query and output_grad tiles, and for the queries'
+    // logsumexp and row_dot rows (a plain bulk copy, FLASH_TILE floats each)
+    auto ask_for_step_val = [&](int step_index_val) {
+        int set_index_val = step_index_val % STAGES;
+        int query_block_index_val = key_block_index_val + step_index_val;
+        int tile_first_row_index_val = head_first_row_index_val + query_block_index_val * FLASH_TILE;
+        size_t first_row_index_val = (size_t)blockIdx.y * seq_len_val + query_block_index_val * FLASH_TILE;
+        nv_bfloat16* set_query_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
+        float* set_rows_ptr = rows_ptr + 2 * set_index_val * FLASH_TILE;
+        cuda::device::barrier_expect_tx(sets_barriers_list[set_index_val], SET_BYTES);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(set_query_tile_ptr, &qkv_map_val, query_first_column_index_val,
+                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(set_query_tile_ptr + TILE_VALUES, &output_grad_map_val,
+                                                      query_first_column_index_val, tile_first_row_index_val,
+                                                      sets_barriers_list[set_index_val]);
+        cde::cp_async_bulk_global_to_shared(set_rows_ptr, logsumexp_ptr + first_row_index_val, FLASH_TILE * sizeof(float),
+                                            sets_barriers_list[set_index_val]);
+        cde::cp_async_bulk_global_to_shared(set_rows_ptr + FLASH_TILE, row_dot_ptr + first_row_index_val,
+                                            FLASH_TILE * sizeof(float), sets_barriers_list[set_index_val]);
+    };
+
+    // 2. this block's key and value tiles, kept for the whole walk, and the first STAGES steps' sets
     if (threadIdx.x == 0) {
         int tile_first_row_index_val = head_first_row_index_val + key_block_index_val * FLASH_TILE;
-        cde::cp_async_bulk_tensor_2d_global_to_shared(key_tile_list, &qkv_map_val, key_first_column_index_val,
-                                                      tile_first_row_index_val, tiles_barrier_val);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(value_tile_list, &qkv_map_val, value_first_column_index_val,
-                                                      tile_first_row_index_val, tiles_barrier_val);
+        cuda::device::barrier_expect_tx(key_value_barrier_val, 2 * FLASH_TILE_BYTES);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(key_tile_ptr, &qkv_map_val, key_first_column_index_val,
+                                                      tile_first_row_index_val, key_value_barrier_val);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(value_tile_ptr, &qkv_map_val, value_first_column_index_val,
+                                                      tile_first_row_index_val, key_value_barrier_val);
+        for (int step_index_val = 0; step_index_val < STAGES && step_index_val < query_steps_val; step_index_val++)
+            ask_for_step_val(step_index_val);
     }
-    flash_wait_for_tiles(tiles_barrier_val, 2 * FLASH_TILE_BYTES);
+    flash_wait_for_asked(key_value_barrier_val);
 
-    // 2. walk the query tiles from this block's own on
+    // 3. walk the query tiles from this block's own on, each step's set asked for STAGES steps before
     float key_grad_list[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
     float value_grad_list[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
-    for (int query_block_index_val = key_block_index_val; query_block_index_val < seq_len_val / FLASH_TILE; query_block_index_val++) {
-        __syncthreads();                                            // every thread is done with the last tiles
-        if (threadIdx.x == 0) {
-            int tile_first_row_index_val = head_first_row_index_val + query_block_index_val * FLASH_TILE;
-            cde::cp_async_bulk_tensor_2d_global_to_shared(query_tile_list, &qkv_map_val, query_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
-            cde::cp_async_bulk_tensor_2d_global_to_shared(grad_tile_list, &output_grad_map_val, query_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
-        }
-        if (threadIdx.x < FLASH_TILE) {
-            size_t row_index_val = (size_t)blockIdx.y * seq_len_val + query_block_index_val * FLASH_TILE + threadIdx.x;
-            logsumexp_tile_list[threadIdx.x] = logsumexp_ptr[row_index_val];
-            row_dot_tile_list[threadIdx.x] = row_dot_ptr[row_index_val];
-        }
-        flash_wait_for_tiles(tiles_barrier_val, 2 * FLASH_TILE_BYTES);
-        __syncthreads();                                            // the queries' logsumexp and row_dot are in too
+    for (int step_index_val = 0; step_index_val < query_steps_val; step_index_val++) {
+        int query_block_index_val = key_block_index_val + step_index_val;
+        int set_index_val = step_index_val % STAGES;
+        const nv_bfloat16* query_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
+        const nv_bfloat16* grad_tile_ptr = query_tile_ptr + TILE_VALUES;
+        const float* logsumexp_tile_ptr = rows_ptr + 2 * set_index_val * FLASH_TILE;
+        const float* row_dot_tile_ptr = logsumexp_tile_ptr + FLASH_TILE;
+        flash_wait_for_asked(sets_barriers_list[set_index_val]);
 
-        // the scores turned round {HARDWARE_WGMMA_M keys, FLASH_TILE queries} = key tile · query tileᵀ, and B2:
-        // attention_probs_gradᵀ = value tile · output_grad tileᵀ
+        // a. two groups on the tensor cores: the scores turned round {HARDWARE_WGMMA_M keys, FLASH_TILE queries} =
+        //    key tile · query tileᵀ, then B2: attention_probs_gradᵀ = value tile · output_grad tileᵀ
         float attention_prob_list[FLASH_TILE_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
         float score_grad_list[FLASH_TILE_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
         flash_wgmma_begin();
 #pragma unroll
-        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++) {
-            flash_multiply_add_tiles(attention_prob_list, key_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     query_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
-            flash_multiply_add_tiles(score_grad_list, value_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     grad_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
-        }
-        flash_wgmma_wait();
-        // the attention_probs turned round, then B4-B6: scores_gradᵀ in attention_probs_gradᵀ's place
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
+            flash_multiply_add_tiles(attention_prob_list, key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
+                                     query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+        flash_wgmma_commit();
+#pragma unroll
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
+            flash_multiply_add_tiles(score_grad_list, value_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
+                                     grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+        flash_wgmma_commit();
+
+        // b. the scores in (B2 still running): the attention_probs turned round, exp2(score · scale · log2 e -
+        //    logsumexp · log2 e); on the diagonal tile (the block's own queries) 0 where the query comes before the
+        //    key; packed as A
+        flash_wgmma_wait_until<1>();
 #pragma unroll
         for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
 #pragma unroll
             for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
-                int key_token_index_val = warp_first_key_index_val + group_index_val +
-                                          (c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD) * HARDWARE_WGMMA_ROWS_PER_WARP;
                 int column_index_val = group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + pair_column_index_val +
                                        c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
-                int token_index_val = query_block_index_val * FLASH_TILE + column_index_val;
                 attention_prob_list[group_column_index_val][c_value_index_val] =
-                    token_index_val >= key_token_index_val
-                        ? __expf(attention_prob_list[group_column_index_val][c_value_index_val] * scale_val - logsumexp_tile_list[column_index_val])
-                        : 0.0f;
-                score_grad_list[group_column_index_val][c_value_index_val] =
-                    attention_prob_list[group_column_index_val][c_value_index_val] *
-                    (score_grad_list[group_column_index_val][c_value_index_val] - row_dot_tile_list[column_index_val]);
+                    flash_exp2(fmaf(attention_prob_list[group_column_index_val][c_value_index_val], scale_log2_val,
+                                    -logsumexp_tile_ptr[column_index_val] * FLASH_LOG2_E));
             }
-        // B3: value_grad += attention_probsᵀ · output_grad tile, and B8: key_grad += scores_gradᵀ · query tile: A
-        // from the registers, the tiles turned round, FLASH_TILE_K_STEPS WGMMAs each down the queries
-        uint32_t prob_a_list[FLASH_TILE_K_STEPS][HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16];
-        uint32_t score_grad_a_list[FLASH_TILE_K_STEPS][HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16];
+        if (query_block_index_val == key_block_index_val)
 #pragma unroll
-        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++) {
+            for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
+#pragma unroll
+                for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
+                    int key_row_val = warp_index_val * HARDWARE_WGMMA_M_PER_WARP + group_index_val +
+                                      (c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD) * HARDWARE_WGMMA_ROWS_PER_WARP;
+                    int column_index_val = group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + pair_column_index_val +
+                                           c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
+                    attention_prob_list[group_column_index_val][c_value_index_val] =
+                        column_index_val >= key_row_val ? attention_prob_list[group_column_index_val][c_value_index_val] : 0.0f;
+                }
+        uint32_t prob_a_list[FLASH_TILE_K_STEPS][HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16];
+#pragma unroll
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_c_to_a(prob_a_list[k_step_index_val], attention_prob_list, k_step_index_val);
-            flash_c_to_a(score_grad_a_list[k_step_index_val], score_grad_list, k_step_index_val);
-        }
+
+        // c. B3 on the tensor cores: value_grad += attention_probsᵀ · output_grad tile (A from the registers, the tile
+        //    turned round, FLASH_TILE_K_STEPS WGMMAs down the queries)
         flash_wgmma_begin();
 #pragma unroll
-        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++) {
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(value_grad_list, prob_a_list[k_step_index_val],
-                                         grad_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+        flash_wgmma_commit();
+
+        // d. B2 in (B3 still running): B4-B6, scores_gradᵀ in attention_probs_gradᵀ's place, packed as A
+        flash_wgmma_wait_until<1>();
+#pragma unroll
+        for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
+#pragma unroll
+            for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
+                int column_index_val = group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + pair_column_index_val +
+                                       c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
+                score_grad_list[group_column_index_val][c_value_index_val] =
+                    attention_prob_list[group_column_index_val][c_value_index_val] *
+                    (score_grad_list[group_column_index_val][c_value_index_val] - row_dot_tile_ptr[column_index_val]);
+            }
+        uint32_t score_grad_a_list[FLASH_TILE_K_STEPS][HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16];
+#pragma unroll
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
+            flash_c_to_a(score_grad_a_list[k_step_index_val], score_grad_list, k_step_index_val);
+
+        // e. B8 on the tensor cores: key_grad += scores_gradᵀ · query tile; then wait for B3 and B8
+        flash_wgmma_begin();
+#pragma unroll
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(key_grad_list, score_grad_a_list[k_step_index_val],
-                                         query_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
-        }
+                                         query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
         flash_wgmma_wait();
+
+        // every thread done with this set: thread 0 asks for the step STAGES on into it
+        __syncthreads();
+        if (threadIdx.x == 0 && step_index_val + STAGES < query_steps_val)
+            ask_for_step_val(step_index_val + STAGES);
     }
 
-    // 3. into qkv_grad: each token's row is query, key, value parts of embed_dim each
+    // 4. into qkv_grad: each token's row is query, key, value parts of embed_dim each
 #pragma unroll
     for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
         int key_token_index_val = warp_first_key_index_val + group_index_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
@@ -611,19 +778,23 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
 ///
 ///   qkv_grad_ptr   the query part written
 ///   the others     as in attention_bf16_flash_key_grad_kernel
+template <int STAGES>
 __global__ void __launch_bounds__(FLASH_THREADS)
 attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_map_val,
                                        const __grid_constant__ CUtensorMap output_grad_map_val, nv_bfloat16* qkv_grad_ptr,
                                        const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
                                        int seq_len_val, float scale_val) {
     namespace cde = cuda::device::experimental;
-    // the tiles, in TMA's swizzled layout, and the barrier that says they arrived
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 grad_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
+    // the tiles, in TMA's swizzled layout, in dynamic shared memory from its first atom on: query, output_grad,
+    // then STAGES sets of a key and a value tile; a barrier for query and output_grad, and one for each set
+    constexpr int TILE_VALUES = FLASH_TILE * FLASH_HEAD_SIZE;
+    extern __shared__ __align__(16) uint8_t flash_shared_list[];
 #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ FlashBarrier tiles_barrier_val;
+    __shared__ FlashBarrier query_grad_barrier_val;
+    __shared__ FlashBarrier sets_barriers_list[STAGES];
+    nv_bfloat16* query_tile_ptr = flash_first_atom(flash_shared_list);
+    nv_bfloat16* grad_tile_ptr = query_tile_ptr + TILE_VALUES;
+    nv_bfloat16* sets_ptr = query_tile_ptr + 2 * TILE_VALUES;                        // set s: key at 2 s tiles on, value after
     int warp_index_val = threadIdx.x / HARDWARE_THREADS_PER_WARP;
     int lane_index_val = threadIdx.x % HARDWARE_THREADS_PER_WARP;
     int group_index_val = lane_index_val / HARDWARE_WGMMA_THREADS_PER_ROW;
@@ -640,21 +811,45 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
     int value_first_column_index_val = query_first_column_index_val + 2 * embed_dim_val;
     int warp_first_token_index_val = query_block_index_val * FLASH_TILE + warp_index_val * HARDWARE_WGMMA_M_PER_WARP;
 
-    // 1. the barrier, by one thread; then this block's query and output_grad tiles, kept for the whole walk, and
-    //    this thread's rows' logsumexp and row_dot
+    int key_steps_val = query_block_index_val + 1;                          // the key tiles up to this block's own
+    float scale_log2_val = scale_val * FLASH_LOG2_E;                         // exp(score · scale) = 2^(score · scale · log2 e)
+
+    // 1. the barriers, by one thread
     if (threadIdx.x == 0) {
-        init(&tiles_barrier_val, blockDim.x);                 // every thread arrives once a load
-        cde::fence_proxy_async_shared_cta();                  // the barrier visible to TMA
+        init(&query_grad_barrier_val, blockDim.x);               // every thread arrives once a use
+#pragma unroll
+        for (int set_index_val = 0; set_index_val < STAGES; set_index_val++)
+            init(&sets_barriers_list[set_index_val], blockDim.x);
+        cde::fence_proxy_async_shared_cta();                     // the barriers visible to TMA
     }
     __syncthreads();
+
+    // what thread 0 does to ask for one step's set: tell its barrier how many bytes are coming (no arrival: every
+    // thread arrives when it waits), then ask TMA for the key and value tiles
+    auto ask_for_step_val = [&](int step_index_val) {
+        int set_index_val = step_index_val % STAGES;
+        int tile_first_row_index_val = head_first_row_index_val + step_index_val * FLASH_TILE;
+        nv_bfloat16* set_key_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
+        cuda::device::barrier_expect_tx(sets_barriers_list[set_index_val], 2 * FLASH_TILE_BYTES);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(set_key_tile_ptr, &qkv_map_val, key_first_column_index_val,
+                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(set_key_tile_ptr + TILE_VALUES, &qkv_map_val, value_first_column_index_val,
+                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
+    };
+
+    // 2. this block's query and output_grad tiles, kept for the whole walk, the first STAGES steps' sets, and this
+    //    thread's rows' logsumexp and row_dot
     if (threadIdx.x == 0) {
         int tile_first_row_index_val = head_first_row_index_val + query_block_index_val * FLASH_TILE;
-        cde::cp_async_bulk_tensor_2d_global_to_shared(query_tile_list, &qkv_map_val, query_first_column_index_val,
-                                                      tile_first_row_index_val, tiles_barrier_val);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(grad_tile_list, &output_grad_map_val, query_first_column_index_val,
-                                                      tile_first_row_index_val, tiles_barrier_val);
+        cuda::device::barrier_expect_tx(query_grad_barrier_val, 2 * FLASH_TILE_BYTES);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(query_tile_ptr, &qkv_map_val, query_first_column_index_val,
+                                                      tile_first_row_index_val, query_grad_barrier_val);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(grad_tile_ptr, &output_grad_map_val, query_first_column_index_val,
+                                                      tile_first_row_index_val, query_grad_barrier_val);
+        for (int step_index_val = 0; step_index_val < STAGES && step_index_val < key_steps_val; step_index_val++)
+            ask_for_step_val(step_index_val);
     }
-    flash_wait_for_tiles(tiles_barrier_val, 2 * FLASH_TILE_BYTES);
+    flash_wait_for_asked(query_grad_barrier_val);
     // rows group, group + HARDWARE_WGMMA_ROWS_PER_WARP
     float row_logsumexp_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
     float row_dot_of_row_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
@@ -662,54 +857,70 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
     for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
         size_t row_index_val = (size_t)blockIdx.y * seq_len_val + warp_first_token_index_val + group_index_val +
                                thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-        row_logsumexp_list[thread_row_index_val] = logsumexp_ptr[row_index_val];
+        row_logsumexp_list[thread_row_index_val] = logsumexp_ptr[row_index_val] * FLASH_LOG2_E;   // in powers of 2, as exp2 takes
         row_dot_of_row_list[thread_row_index_val] = row_dot_ptr[row_index_val];
     }
 
-    // 2. walk the key tiles up to this block's own
+    // 3. walk the key tiles up to this block's own, each step's set asked for STAGES steps before
     float query_grad_list[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
-    for (int key_block_index_val = 0; key_block_index_val <= query_block_index_val; key_block_index_val++) {
-        __syncthreads();                                            // every thread is done with the last tiles
-        if (threadIdx.x == 0) {
-            int tile_first_row_index_val = head_first_row_index_val + key_block_index_val * FLASH_TILE;
-            cde::cp_async_bulk_tensor_2d_global_to_shared(key_tile_list, &qkv_map_val, key_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
-            cde::cp_async_bulk_tensor_2d_global_to_shared(value_tile_list, &qkv_map_val, value_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
-        }
-        flash_wait_for_tiles(tiles_barrier_val, 2 * FLASH_TILE_BYTES);
+    for (int key_block_index_val = 0; key_block_index_val < key_steps_val; key_block_index_val++) {
+        int set_index_val = key_block_index_val % STAGES;
+        const nv_bfloat16* key_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
+        const nv_bfloat16* value_tile_ptr = key_tile_ptr + TILE_VALUES;
+        flash_wait_for_asked(sets_barriers_list[set_index_val]);
 
-        // the scores {HARDWARE_WGMMA_M queries, FLASH_TILE keys} = query tile · key tileᵀ, and B2:
-        // attention_probs_grad = output_grad tile · value tileᵀ
+        // a. two groups on the tensor cores: the scores {HARDWARE_WGMMA_M queries, FLASH_TILE keys} = query tile ·
+        //    key tileᵀ, then B2: attention_probs_grad = output_grad tile · value tileᵀ
         float attention_prob_list[FLASH_TILE_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
         float score_grad_list[FLASH_TILE_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};
         flash_wgmma_begin();
 #pragma unroll
-        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++) {
-            flash_multiply_add_tiles(attention_prob_list, query_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     key_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
-            flash_multiply_add_tiles(score_grad_list, grad_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     value_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
-        }
-        flash_wgmma_wait();
-        // the attention_probs, then B4-B6: scores_grad in attention_probs_grad's place
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
+            flash_multiply_add_tiles(attention_prob_list, query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
+                                     key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+        flash_wgmma_commit();
+#pragma unroll
+        for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
+            flash_multiply_add_tiles(score_grad_list, grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
+                                     value_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+        flash_wgmma_commit();
+
+        // b. the scores in (B2 still running): the attention_probs, exp2(score · scale · log2 e - logsumexp · log2 e);
+        //    on the diagonal tile (the block's own keys) 0 where the key comes after the query
+        flash_wgmma_wait_until<1>();
+#pragma unroll
+        for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
+#pragma unroll
+            for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++)
+                attention_prob_list[group_column_index_val][c_value_index_val] =
+                    flash_exp2(fmaf(attention_prob_list[group_column_index_val][c_value_index_val], scale_log2_val,
+                                    -row_logsumexp_list[c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD]));
+        if (key_block_index_val == query_block_index_val)
+#pragma unroll
+            for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
+#pragma unroll
+                for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
+                    int query_row_val = warp_index_val * HARDWARE_WGMMA_M_PER_WARP + group_index_val +
+                                        (c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD) * HARDWARE_WGMMA_ROWS_PER_WARP;
+                    int key_column_val = group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + pair_column_index_val +
+                                         c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
+                    attention_prob_list[group_column_index_val][c_value_index_val] =
+                        key_column_val <= query_row_val ? attention_prob_list[group_column_index_val][c_value_index_val] : 0.0f;
+                }
+
+        // c. B2 in: B4-B6, scores_grad in attention_probs_grad's place
+        flash_wgmma_wait_until<0>();
 #pragma unroll
         for (int group_column_index_val = 0; group_column_index_val < FLASH_TILE_GROUPS; group_column_index_val++)
 #pragma unroll
             for (int c_value_index_val = 0; c_value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; c_value_index_val++) {
                 int thread_row_index_val = c_value_index_val / HARDWARE_WGMMA_COLUMNS_PER_THREAD;
-                int token_index_val = warp_first_token_index_val + group_index_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                int key_token_index_val = key_block_index_val * FLASH_TILE + group_column_index_val * HARDWARE_WGMMA_GROUP_COLUMNS +
-                                          pair_column_index_val + c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
-                float attention_prob_val =
-                    key_token_index_val <= token_index_val
-                        ? __expf(attention_prob_list[group_column_index_val][c_value_index_val] * scale_val - row_logsumexp_list[thread_row_index_val])
-                        : 0.0f;
                 score_grad_list[group_column_index_val][c_value_index_val] =
-                    attention_prob_val * (score_grad_list[group_column_index_val][c_value_index_val] - row_dot_of_row_list[thread_row_index_val]);
+                    attention_prob_list[group_column_index_val][c_value_index_val] *
+                    (score_grad_list[group_column_index_val][c_value_index_val] - row_dot_of_row_list[thread_row_index_val]);
             }
-        // B7: query_grad += scores_grad · key tile: A from the registers, the key tile turned round,
-        // FLASH_TILE_K_STEPS WGMMAs down its tokens
+        // d. B7 on the tensor cores: query_grad += scores_grad · key tile (A from the registers, the key tile turned
+        //    round, FLASH_TILE_K_STEPS WGMMAs down its tokens); then wait for it
         uint32_t score_grad_a_list[FLASH_TILE_K_STEPS][HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16];
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
@@ -718,11 +929,16 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(query_grad_list, score_grad_a_list[k_step_index_val],
-                                         key_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
         flash_wgmma_wait();
+
+        // every thread done with this set: thread 0 asks for the step STAGES on into it
+        __syncthreads();
+        if (threadIdx.x == 0 && key_block_index_val + STAGES < key_steps_val)
+            ask_for_step_val(key_block_index_val + STAGES);
     }
 
-    // 3. into qkv_grad's query part
+    // 4. into qkv_grad's query part
 #pragma unroll
     for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
         int token_index_val = warp_first_token_index_val + group_index_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;

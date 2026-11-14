@@ -169,17 +169,24 @@ static void time_20_products_of_each_shape(void)
 
 #define GPT2_LAYERS 12                // a step runs each layer's products once per layer, the head's once
 
-/// One product at COLUMNS, STAGES and ROW_GROUPS, the layout, the splits and the block order given at run time:
+/// One product at COLUMNS, STAGES and ROW_GROUPS, the layout, the splits, the block order, the cluster (1 or 2) and
+/// the blocks given at run time:
 /// what the sweeps time for each setting.
 ///
 ///   output_tensor, left_tensor, right_tensor, left_turned_val, right_turned_val   as in wgmma_matmul_bf16
-///   splits_val, block_rows_per_group_val                                          as in wgmma_matmul_bf16_at
+///   splits_val, block_rows_per_group_val, cluster_val, blocks_val                 as in wgmma_matmul_bf16_at
 template <int COLUMNS, int STAGES, int ROW_GROUPS>
 static void product_at(const Tensor &output_tensor, const Tensor &left_tensor, const Tensor &right_tensor, bool left_turned_val,
-                       bool right_turned_val, int splits_val, int block_rows_per_group_val)
+                       bool right_turned_val, int splits_val, int block_rows_per_group_val, int cluster_val, int blocks_val)
 {
-    wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES>(output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val,
-                                                      right_turned_val, WgmmaMatmulBf16Store(), splits_val, block_rows_per_group_val);
+    if (cluster_val == 2)
+        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 2>(output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val,
+                                                             right_turned_val, WgmmaMatmulBf16Store(), splits_val, block_rows_per_group_val,
+                                                             WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
+    else
+        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 1>(output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val,
+                                                             right_turned_val, WgmmaMatmulBf16Store(), splits_val, block_rows_per_group_val,
+                                                             WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
 }
 
 /// A setting of the product: its warpgroups (64 rows each), its square's columns, its sets of tiles, and the product
@@ -189,7 +196,7 @@ struct ProductSetting
     int row_groups_val;
     int columns_val;
     int stages_val;
-    void (*product_ptr)(const Tensor &, const Tensor &, const Tensor &, bool, bool, int, int);
+    void (*product_ptr)(const Tensor &, const Tensor &, const Tensor &, bool, bool, int, int, int, int);
 };
 
 static const ProductSetting PRODUCT_SETTINGS_LIST[] = {
@@ -198,7 +205,7 @@ static const ProductSetting PRODUCT_SETTINGS_LIST[] = {
     {1, 256, 1, product_at<256, 1, 1>}, {1, 256, 2, product_at<256, 2, 1>}, {1, 256, 3, product_at<256, 3, 1>}, {1, 256, 4, product_at<256, 4, 1>},
     {2, 64, 1, product_at<64, 1, 2>}, {2, 64, 2, product_at<64, 2, 2>}, {2, 64, 3, product_at<64, 3, 2>}, {2, 64, 4, product_at<64, 4, 2>},
     {2, 128, 1, product_at<128, 1, 2>}, {2, 128, 2, product_at<128, 2, 2>}, {2, 128, 3, product_at<128, 3, 2>}, {2, 128, 4, product_at<128, 4, 2>},
-    {2, 256, 1, product_at<256, 1, 2>}, {2, 256, 2, product_at<256, 2, 2>}, {2, 256, 3, product_at<256, 3, 2>}, {2, 256, 4, product_at<256, 4, 2>},
+    {2, 256, 1, product_at<256, 1, 2>}, {2, 256, 2, product_at<256, 2, 2>}, {2, 256, 3, product_at<256, 3, 2>},
 };
 
 #define GPT2_SHAPE_COUNT (sizeof(GPT2_SHAPES_LIST) / sizeof(GPT2_SHAPES_LIST[0]))
@@ -246,7 +253,8 @@ static void time_each_setting_on_gpt2_products(void)
                 const ProductSetting &setting_val = PRODUCT_SETTINGS_LIST[setting_index_val];
                 float milliseconds_val = gpu_milliseconds([&] {
                     setting_val.product_ptr(output_tensor, left_tensor, right_tensor, shape_val.left_turned_val, shape_val.right_turned_val,
-                                            WGMMA_MATMUL_BF16_SPLITS, WGMMA_MATMUL_BF16_BLOCK_ROWS_PER_GROUP);
+                                            WGMMA_MATMUL_BF16_SPLITS, WGMMA_MATMUL_BF16_BLOCK_ROWS_PER_GROUP, WGMMA_MATMUL_BF16_CLUSTER,
+                                            WGMMA_MATMUL_BF16_BLOCKS);
                 });
                 if (round_index_val > WARM_UP_STEPS)
                     totals_list[setting_index_val] += milliseconds_val;
@@ -309,27 +317,32 @@ static std::pair<Tensor, Tensor> random_operands_of(const ProductShape &shape_va
     return {left_tensor, right_tensor};
 }
 
+static const int SPLITS_LIST[] = {1, 2, 4, 8, 16};                 // part 3's splits of the sum
+static const double MAX_SPLIT_SCRATCH_BYTES = 4e9;                  // ... skipped when their scratch would pass 4 GB (an 80 GB GPU)
+static const int BLOCK_ROWS_PER_GROUP_LIST[] = {1, 4, 16, 64};      // ... and its block orders
+#define ORDER_COUNT ((int)(sizeof(BLOCK_ROWS_PER_GROUP_LIST) / sizeof(BLOCK_ROWS_PER_GROUP_LIST[0])))
+static int best_choice_index_list[GPT2_SHAPE_COUNT];               // part 3's fastest splits and order of each product, for part 3b
+
 static void time_each_split_and_block_order_at_each_products_square(void)
 {
     // Prints, for each of GPT-2 small's 15 products at its fastest square from part 2, the time of every split count
     // (1, 2, 4, 8, 16) with every block order (groups of 1, 4, 16, 64 rows of squares), taking turns over
     // SWEEP_ROUNDS rounds, rounds WARM_UP_STEPS + 1 on averaged, and the fastest; then a step's worth (each layer's
-    // products GPT2_LAYERS times, the head's once) at each product's fastest, against all at the defaults; then
-    // model_bf16.cuh's 15 setting lines, to paste in.
-    const int splits_list[] = {1, 2, 4, 8, 16};
-    const int block_rows_per_group_list[] = {1, 4, 16, 64};
-    const int splits_count_val = (int)(sizeof(splits_list) / sizeof(splits_list[0]));
-    const int order_count_val = (int)(sizeof(block_rows_per_group_list) / sizeof(block_rows_per_group_list[0]));
+    // products GPT2_LAYERS times, the head's once) at each product's fastest, against all at the defaults. Clusters
+    // of WGMMA_MATMUL_BF16_CLUSTER and WGMMA_MATMUL_BF16_BLOCKS blocks: part 3b sweeps those.
+    const int *splits_list = SPLITS_LIST;
+    const int *block_rows_per_group_list = BLOCK_ROWS_PER_GROUP_LIST;
+    const int splits_count_val = (int)(sizeof(SPLITS_LIST) / sizeof(SPLITS_LIST[0]));
+    const int order_count_val = ORDER_COUNT;
     const int choice_count_val = splits_count_val * order_count_val;
     const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
-    int best_choice_index_list[GPT2_SHAPE_COUNT] = {};
     double default_step_val = 0.0;
     double best_step_val = 0.0;
     print_test_name(__func__);
     printf("    ms, average of rounds %d..%d, at each product's square; splits/rows of squares a group runs down\n    %-34s %9s",
            WARM_UP_STEPS + 1, SWEEP_ROUNDS, "product", "square");
-    for (int splits_val : splits_list)
-        for (int block_rows_per_group_val : block_rows_per_group_list)
+    for (int splits_val : SPLITS_LIST)
+        for (int block_rows_per_group_val : BLOCK_ROWS_PER_GROUP_LIST)
         {
             char label_list[16];
             snprintf(label_list, sizeof(label_list), "%d/%d", splits_val, block_rows_per_group_val);
@@ -347,15 +360,24 @@ static void time_each_split_and_block_order_at_each_products_square(void)
         // 2. random left and right, as they sit
         std::pair<Tensor, Tensor> operands_val = random_operands_of(shape_val);
         Tensor output_tensor = Tensor::zeros({shape_val.rows_val, shape_val.columns_val}, DType::BFloat16);
-        // 3. SWEEP_ROUNDS rounds, each timing every split count and order once
+        // 3. SWEEP_ROUNDS rounds, each timing every split count and order once; a split count whose scratch (a float
+        //    slice of output a split) would pass MAX_SPLIT_SCRATCH_BYTES is left out, its time infinite: the head's
+        //    16 splits are 53 GB, and it has squares enough for every SM without them
         std::vector<double> totals_list(choice_count_val, 0.0);
+        for (int choice_index_val = 0; choice_index_val < choice_count_val; choice_index_val++)
+            if ((double)splits_list[choice_index_val / order_count_val] * shape_val.rows_val * shape_val.columns_val * sizeof(float) >
+                MAX_SPLIT_SCRATCH_BYTES)
+                totals_list[choice_index_val] = INFINITY;
         for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
             for (int choice_index_val = 0; choice_index_val < choice_count_val; choice_index_val++)
             {
+                if (totals_list[choice_index_val] == INFINITY)
+                    continue;
                 float milliseconds_val = gpu_milliseconds([&] {
                     setting_val.product_ptr(output_tensor, operands_val.first, operands_val.second, shape_val.left_turned_val,
                                             shape_val.right_turned_val, splits_list[choice_index_val / order_count_val],
-                                            block_rows_per_group_list[choice_index_val % order_count_val]);
+                                            block_rows_per_group_list[choice_index_val % order_count_val], WGMMA_MATMUL_BF16_CLUSTER,
+                                            WGMMA_MATMUL_BF16_BLOCKS);
                 });
                 if (round_index_val > WARM_UP_STEPS)
                     totals_list[choice_index_val] += milliseconds_val;
@@ -368,7 +390,10 @@ static void time_each_split_and_block_order_at_each_products_square(void)
         int fastest_index_val = 0;
         for (int choice_index_val = 0; choice_index_val < choice_count_val; choice_index_val++)
         {
-            printf(" %7.3f", totals_list[choice_index_val] / averaged_val);
+            if (totals_list[choice_index_val] == INFINITY)
+                printf(" %7s", "-");
+            else
+                printf(" %7.3f", totals_list[choice_index_val] / averaged_val);
             if (totals_list[choice_index_val] < totals_list[fastest_index_val])
                 fastest_index_val = choice_index_val;
         }
@@ -378,7 +403,77 @@ static void time_each_split_and_block_order_at_each_products_square(void)
         best_step_val += weight_val * totals_list[fastest_index_val] / averaged_val;
     }
 
-    // 5. a step's worth, and the lines for model_bf16.cuh
+    // 5. a step's worth
+    printf("    a step's products, one micro-batch: %.2f ms at each product's fastest; %.2f ms all at the defaults, %.2fx as long\n",
+           best_step_val, default_step_val, default_step_val / best_step_val);
+}
+
+// ══ part 3b: clusters and persistent blocks swept, at each product's setting ═══
+
+#define ONE_BLOCK_A_SQUARE (1 << 30)  // blocks asked for: more than any product's squares, so one a square (not persistent)
+
+static void time_each_cluster_and_block_count_at_each_products_setting(void)
+{
+    // Prints, for each of GPT-2 small's 15 products at its fastest square (part 2), splits and block order (part 3), the
+    // time in clusters of 1 and of 2 blocks (the right tile asked for once for both), each with as many blocks as the
+    // GPU runs at once (0: persistent, a block walks many squares) and with one a square, taking turns over
+    // SWEEP_ROUNDS rounds, rounds WARM_UP_STEPS + 1 on averaged, and the fastest; then a step's worth (each layer's
+    // products GPT2_LAYERS times, the head's once) at each product's fastest, against all at the defaults; then
+    // model_bf16.cuh's 15 setting lines, to paste in.
+    const int cluster_list[] = {1, 1, 2, 2};
+    const int blocks_list[] = {0, ONE_BLOCK_A_SQUARE, 0, ONE_BLOCK_A_SQUARE};
+    const char *labels_list[] = {"1, at once", "1, a square", "2, at once", "2, a square"};
+    const int choice_count_val = 4;
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    int best_index_list[GPT2_SHAPE_COUNT] = {};
+    double default_step_val = 0.0;
+    double best_step_val = 0.0;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d; clusters of, blocks\n    %-34s", WARM_UP_STEPS + 1, SWEEP_ROUNDS, "product");
+    for (const char *label_ptr : labels_list)
+        printf(" %12s", label_ptr);
+    printf("   fastest\n");
+    for (size_t shape_index_val = 0; shape_index_val < GPT2_SHAPE_COUNT; shape_index_val++)
+    {
+        // 1. the product, its weight in a step, its setting so far
+        const ProductShape &shape_val = GPT2_SHAPES_LIST[shape_index_val];
+        if (shape_val.setting_name_ptr == nullptr)
+            continue;
+        double weight_val = strncmp(shape_val.name_ptr, "head", 4) == 0 ? 1.0 : (double)GPT2_LAYERS;
+        const ProductSetting &setting_val = PRODUCT_SETTINGS_LIST[fastest_setting_index_list[shape_index_val]];
+        int splits_val = SPLITS_LIST[best_choice_index_list[shape_index_val] / ORDER_COUNT];
+        int block_rows_per_group_val = BLOCK_ROWS_PER_GROUP_LIST[best_choice_index_list[shape_index_val] % ORDER_COUNT];
+        std::pair<Tensor, Tensor> operands_val = random_operands_of(shape_val);
+        Tensor output_tensor = Tensor::zeros({shape_val.rows_val, shape_val.columns_val}, DType::BFloat16);
+        // 2. SWEEP_ROUNDS rounds, each timing every choice once
+        std::vector<double> totals_list(choice_count_val, 0.0);
+        for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+            for (int choice_index_val = 0; choice_index_val < choice_count_val; choice_index_val++)
+            {
+                float milliseconds_val = gpu_milliseconds([&] {
+                    setting_val.product_ptr(output_tensor, operands_val.first, operands_val.second, shape_val.left_turned_val,
+                                            shape_val.right_turned_val, splits_val, block_rows_per_group_val,
+                                            cluster_list[choice_index_val], blocks_list[choice_index_val]);
+                });
+                if (round_index_val > WARM_UP_STEPS)
+                    totals_list[choice_index_val] += milliseconds_val;
+            }
+        // 3. the row and its fastest; the step's totals
+        int fastest_index_val = 0;
+        printf("    %-34s", shape_val.name_ptr);
+        for (int choice_index_val = 0; choice_index_val < choice_count_val; choice_index_val++)
+        {
+            printf(" %12.3f", totals_list[choice_index_val] / averaged_val);
+            if (totals_list[choice_index_val] < totals_list[fastest_index_val])
+                fastest_index_val = choice_index_val;
+        }
+        printf("   %s\n", labels_list[fastest_index_val]);
+        best_index_list[shape_index_val] = fastest_index_val;
+        default_step_val += weight_val * default_milliseconds_list[shape_index_val];
+        best_step_val += weight_val * totals_list[fastest_index_val] / averaged_val;
+    }
+
+    // 4. a step's worth, and the lines for model_bf16.cuh
     printf("    a step's products, one micro-batch: %.2f ms at each product's fastest; %.2f ms all at the defaults, %.2fx as long\n",
            best_step_val, default_step_val, default_step_val / best_step_val);
     printf("    for llmc/model_bf16.cuh:\n");
@@ -389,9 +484,10 @@ static void time_each_split_and_block_order_at_each_products_square(void)
             continue;
         const ProductSetting &setting_val = PRODUCT_SETTINGS_LIST[fastest_setting_index_list[shape_index_val]];
         int choice_index_val = best_choice_index_list[shape_index_val];
-        printf("#define %s WgmmaMatmulBf16Setting<%d, %d, %d, %d, %d>\n", shape_val.setting_name_ptr, setting_val.row_groups_val,
-               setting_val.columns_val, setting_val.stages_val, splits_list[choice_index_val / order_count_val],
-               block_rows_per_group_list[choice_index_val % order_count_val]);
+        printf("#define %s WgmmaMatmulBf16Setting<%d, %d, %d, %d, %d, %d, %d>\n", shape_val.setting_name_ptr, setting_val.row_groups_val,
+               setting_val.columns_val, setting_val.stages_val, SPLITS_LIST[choice_index_val / ORDER_COUNT],
+               BLOCK_ROWS_PER_GROUP_LIST[choice_index_val % ORDER_COUNT], cluster_list[best_index_list[shape_index_val]],
+               blocks_list[best_index_list[shape_index_val]]);
     }
 }
 
@@ -474,6 +570,7 @@ int main(void)
     time_20_products_of_each_shape();
     time_each_setting_on_gpt2_products();
     time_each_split_and_block_order_at_each_products_square();
+    time_each_cluster_and_block_count_at_each_products_setting();
     time_each_splits_sum_block_size();
 
     printf("\nall tunes done\n");

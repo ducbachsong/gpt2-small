@@ -386,6 +386,47 @@ static void forward_and_backward_in_bfloat16(void)
     forward_and_backward_match_pytorch(__func__, two_layer_config(), 2, 64, DType::BFloat16, BFLOAT16_TOLERANCE);
 }
 
+static void forward_backward_gives_forward_then_backward_in_bfloat16(void)
+{
+    // Expect: bfloat16, forward_and_backward_in_bfloat16's model. A training micro-batch's one pass
+    // (gpt2_bf16_forward_backward: the loss and the logits' gradient in one kernel, the logits read once) against
+    // gpt2_bf16_forward then gpt2_bf16_backward on the same values: the same losses, row max and row sum and the
+    // same logits_grad to the last bit (the same kernel code, the same rows), and every parameter's gradient within
+    // one bfloat16 rounding, 1/256 of its largest value: the rest of the backward is the same code on the same
+    // logits_grad, but layer_norm_bf16's backward adds its warps' sums with shared-memory atomics, in whatever order,
+    // so a value can come out a step apart (one of block 0's ln1_weight's 768 did, by 3e-8), and the encoder adds
+    // wte's with atomics too.
+    // 1. the fused micro-batch; its results kept
+    torch::manual_seed(0);
+    GPT2Tensors mine_val(two_layer_config(), 2, 64, DType::BFloat16);
+    mine_val.fill_random_values();
+    const GPT2ActivationsBf16 &activations_val = *mine_val.bf16_activations_ptr;
+    gpt2_bf16_forward_backward(mine_val.grads_val, mine_val.token_ids_tensor, mine_val.targets_tensor, mine_val.params_val,
+                               activations_val, mine_val.config_val);
+    std::vector<float> fused_losses_list = list_of(activations_val.losses);
+    std::vector<float> fused_max_list = list_of(activations_val.max_of_each_row);
+    std::vector<float> fused_sum_list = list_of(activations_val.sum_of_each_row);
+    std::vector<float> fused_logits_grad_list = list_of(activations_val.logits_grad_scratch);
+    std::vector<std::vector<float>> fused_grads_list = mine_val.grad_lists();
+    // 2. the forward, then the backward, from 0 gradients
+    mine_val.grad_buffer_val.flat().zero_();
+    activations_val.logits_grad_scratch.zero_();
+    mine_val.forward();
+    mine_val.backward();
+    print_test_name(__func__);
+    ASSERT_EQ(list_of(activations_val.losses), fused_losses_list);
+    ASSERT_EQ(list_of(activations_val.max_of_each_row), fused_max_list);
+    ASSERT_EQ(list_of(activations_val.sum_of_each_row), fused_sum_list);
+    ASSERT_EQ(list_of(activations_val.logits_grad_scratch) == fused_logits_grad_list, true);
+    std::vector<Tensor> grads_list = mine_val.grads_val.tensors();
+    std::vector<std::string> names_list = param_names(mine_val.config_val);
+    for (size_t param_index_val = 0; param_index_val < grads_list.size(); param_index_val++)
+    {
+        printf("    %s's gradient:\n", names_list[param_index_val].c_str());
+        ASSERT_NEAR(list_of(grads_list[param_index_val]), fused_grads_list[param_index_val], 1.0 / 256.0);
+    }
+}
+
 // ══ part 2: worked out by hand ════════════════════════════════════════════════
 
 static void shapes_are_gpt2s_with_the_matrices_first(void)
@@ -588,6 +629,7 @@ int main(void)
     matches_pytorch_with_small_odd_sizes();
     matches_pytorch_on_gpt2_widths();
     forward_and_backward_in_bfloat16();
+    forward_backward_gives_forward_then_backward_in_bfloat16();
 
     shapes_are_gpt2s_with_the_matrices_first();
     params_are_views_in_shapes_order();
