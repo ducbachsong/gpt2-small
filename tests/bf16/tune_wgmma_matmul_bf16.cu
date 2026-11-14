@@ -175,16 +175,19 @@ static void time_20_products_of_each_shape(void)
 ///
 ///   output_tensor, left_tensor, right_tensor, left_turned_val, right_turned_val   as in wgmma_matmul_bf16
 ///   splits_val, block_rows_per_group_val, cluster_val, blocks_val                 as in wgmma_matmul_bf16_at
+/// A weight_grad (both sides turned) is added onto output, as the model's are: its store reads the old output too.
 template <int COLUMNS, int STAGES, int ROW_GROUPS>
 static void product_at(const Tensor &output_tensor, const Tensor &left_tensor, const Tensor &right_tensor, bool left_turned_val,
                        bool right_turned_val, int splits_val, int block_rows_per_group_val, int cluster_val, int blocks_val)
 {
     if (cluster_val == 2)
-        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 2>(output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val,
+        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 2>(output_tensor, left_tensor, right_tensor, Tensor(), left_turned_val && right_turned_val,
+                                                             left_turned_val,
                                                              right_turned_val, WgmmaMatmulBf16Store(), splits_val, block_rows_per_group_val,
                                                              WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
     else
-        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 1>(output_tensor, left_tensor, right_tensor, Tensor(), false, left_turned_val,
+        wgmma_matmul_bf16_at<ROW_GROUPS, COLUMNS, STAGES, 1>(output_tensor, left_tensor, right_tensor, Tensor(), left_turned_val && right_turned_val,
+                                                             left_turned_val,
                                                              right_turned_val, WgmmaMatmulBf16Store(), splits_val, block_rows_per_group_val,
                                                              WGMMA_MATMUL_BF16_SPLITS_SUM_THREADS_PER_BLOCK, blocks_val);
 }

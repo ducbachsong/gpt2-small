@@ -35,17 +35,27 @@
 /// The forward's epilogue: stores gelu of each pair of the linear's results in gelu_output, at the same index; the
 /// pair itself is stored in gelu_input by the product.
 struct GeluBf16ForwardEpilogue {
+    static constexpr int WGMMA_SIDE = WGMMA_MATMUL_BF16_SIDE_WRITTEN;   // gelu_output beside the product: both stored by TMA
     nv_bfloat16* gelu_output_ptr;                    // gelu_input's shape: written
+
+    /// Gives the tensor beside the product: gelu_output, for TMA's store.
+    nv_bfloat16* side_ptr() const { return gelu_output_ptr; }
+
+    /// Gives gelu of the pair, rounded to bfloat16 first as gelu_input holds it: what gelu_output gets.
+    ///
+    ///   pair_val    two neighbouring results of the linear (bias added), in float
+    __device__ __forceinline__ float2 side_of(float2 pair_val) const {
+        float2 x_val = __bfloat1622float2(__floats2bfloat162_rn(pair_val.x, pair_val.y));
+        return make_float2(gelu_value(x_val.x), gelu_value(x_val.y));
+    }
 
     /// Writes gelu of the pair, rounded to bfloat16 first as gelu_input holds it; gives the pair back to be stored.
     ///
     ///   pair_val    two neighbouring results of the linear (bias added), in float
     ///   index_val   the first one's index in gelu_input and gelu_output
     __device__ __forceinline__ float2 operator()(float2 pair_val, size_t index_val) const {
-        // 1. the pair as gelu_input will hold it
-        float2 x_val = __bfloat1622float2(__floats2bfloat162_rn(pair_val.x, pair_val.y));
-        // 2. gelu of each, stored beside it
-        *reinterpret_cast<nv_bfloat162*>(gelu_output_ptr + index_val) = __floats2bfloat162_rn(gelu_value(x_val.x), gelu_value(x_val.y));
+        float2 gelu_val = side_of(pair_val);
+        *reinterpret_cast<nv_bfloat162*>(gelu_output_ptr + index_val) = __floats2bfloat162_rn(gelu_val.x, gelu_val.y);
         return pair_val;
     }
 };
@@ -53,18 +63,28 @@ struct GeluBf16ForwardEpilogue {
 /// The backward's epilogue: multiplies each pair of the second linear's input_grad (gelu_output's gradient) by
 /// gelu' of the forward's gelu_input at the same index, so what is stored is gelu_input's gradient.
 struct GeluBf16BackwardEpilogue {
+    static constexpr int WGMMA_SIDE = WGMMA_MATMUL_BF16_SIDE_READ;      // gelu_input beside the product: brought by TMA
     const nv_bfloat16* gelu_input_ptr;               // the forward's gelu_input: read
+
+    /// Gives the tensor beside the product: gelu_input, for TMA to bring.
+    const nv_bfloat16* side_ptr() const { return gelu_input_ptr; }
+
+    /// Gives the pair, rounded to bfloat16 first as the unfused path stores gelu_output_grad, times gelu' of the
+    /// pair's gelu_input.
+    ///
+    ///   pair_val   two neighbouring values of gelu_output's gradient, in float
+    ///   x_val      the same two of gelu_input, in float
+    __device__ __forceinline__ float2 with_side(float2 pair_val, float2 x_val) const {
+        float2 output_grad_val = __bfloat1622float2(__floats2bfloat162_rn(pair_val.x, pair_val.y));
+        return make_float2(output_grad_val.x * gelu_slope(x_val.x), output_grad_val.y * gelu_slope(x_val.y));
+    }
 
     /// Gives the pair, rounded to bfloat16 first as the unfused path stores gelu_output_grad, times gelu'(gelu_input).
     ///
     ///   pair_val    two neighbouring values of gelu_output's gradient, in float
     ///   index_val   the first one's index in gelu_input and gelu_input_grad
     __device__ __forceinline__ float2 operator()(float2 pair_val, size_t index_val) const {
-        // 1. gelu_output's gradient as the unfused path stores it, and the pair's gelu_input
-        float2 output_grad_val = __bfloat1622float2(__floats2bfloat162_rn(pair_val.x, pair_val.y));
-        float2 x_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(gelu_input_ptr + index_val));
-        // 2. times gelu'
-        return make_float2(output_grad_val.x * gelu_slope(x_val.x), output_grad_val.y * gelu_slope(x_val.y));
+        return with_side(pair_val, __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(gelu_input_ptr + index_val)));
     }
 };
 

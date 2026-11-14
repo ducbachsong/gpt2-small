@@ -59,7 +59,12 @@
 // by TMA, and nobody waits for them: measured on an H100 PCIe, the staged store below held the tensor cores up as
 // long as the walk itself on a sum of 768 (qkv 0.157 ms, 0.081 with no store at all); stored straight from the
 // registers, each row's 16 bytes of a 32-byte sector made it slower still (0.197).
-// The store, the others (add_onto, splits, GELU's epilogues): each consumer warpgroup puts its sums (+ bias) into
+// An epilogue with a tensor of its own beside output says so by WGMMA_SIDE, and gives side_ptr() (the tensor) and
+// side_of (WGMMA_MATMUL_BF16_SIDE_WRITTEN: what it writes there for each pair) or with_side (_READ: output from each
+// pair and the side's pair). Written: after output, the side's values go through the room and TMA too. Read: before
+// the walk TMA brings the side's 64 rows into the room, and each pair's output is worked out there. GELU's two do
+// (gelu_bf16.cuh); an epilogue with no WGMMA_SIDE is stored as below.
+// The store, the others (add_onto, splits, an epilogue with no WGMMA_SIDE): each consumer warpgroup puts its sums (+ bias) into
 // its own room of shared memory as floats,
 // WGMMA_MATMUL_BF16_STAGED_ROWS rows a round, and stores them row by row, WGMMA_MATMUL_BF16_STORE_VALUES neighbouring
 // values a thread: the epilogue is called on each pair there, so its own reads and writes of other tensors are
@@ -123,6 +128,10 @@
 #define WGMMA_MATMUL_BF16_VALUE_MULTIPLE ((int)(HARDWARE_TMA_BYTES_PER_CELL / sizeof(nv_bfloat16)))       // a matrix row's multiple: whole 16-byte cells, 8
 #define WGMMA_MATMUL_BF16_LEFT_TILE_VALUES (HARDWARE_WGMMA_M * WGMMA_MATMUL_BF16_BLOCK_K)                  // a left tile: 64 rows of 64 k
 #define WGMMA_MATMUL_BF16_STAGED_ROW_PADDING 8                                                    // floats past COLUMNS in a staged row: the 8 rows a warp writes start in other banks, rows stay on 16 bytes
+#define WGMMA_MATMUL_BF16_SIDE_STAGED -1                                                           // an epilogue's WGMMA_SIDE: none given, stored by the staged store
+#define WGMMA_MATMUL_BF16_SIDE_NONE 0                                                             // ... no tensor of its own (the plain store): stored by TMA
+#define WGMMA_MATMUL_BF16_SIDE_WRITTEN 1                                                          // ... writes one beside output (side_of each value): both stored by TMA
+#define WGMMA_MATMUL_BF16_SIDE_READ 2                                                             // ... reads one beside output (with_side each value): brought by TMA, then output stored by TMA
 #define WGMMA_MATMUL_BF16_STORE_VALUES 4                                                          // neighbouring values a thread stores at once: two pairs, 8 bytes
 static_assert(WGMMA_MATMUL_BF16_BLOCK_COLUMNS == WGMMA_MATMUL_BF16_ROW_VALUES, "a 64-column tile turned round is one swizzled row");
 static_assert(WGMMA_MATMUL_BF16_BLOCK_K % HARDWARE_WGMMA_K_BF16 == 0, "each step is whole WGMMAs");
@@ -131,11 +140,24 @@ static_assert(HARDWARE_WGMMA_M == WGMMA_MATMUL_BF16_ROW_VALUES, "a turned left t
 
 /// The plain epilogue: each pair of results is stored as it is.
 struct WgmmaMatmulBf16Store {
+    static constexpr int WGMMA_SIDE = WGMMA_MATMUL_BF16_SIDE_NONE;   // no tensor of its own: stored by TMA
+
     /// Gives the pair back unchanged.
     ///
     ///   pair_val    two neighbouring results, in float
     ///   index_val   the first one's index in output (unused)
     __device__ __forceinline__ float2 operator()(float2 pair_val, size_t index_val) const { return pair_val; }
+};
+
+/// Gives an epilogue's WGMMA_SIDE (WGMMA_MATMUL_BF16_SIDE_*): how its product is stored. An epilogue that gives none:
+/// WGMMA_MATMUL_BF16_SIDE_STAGED, the staged store calling its operator() on each pair.
+template <typename EPILOGUE, typename = void>
+struct WgmmaMatmulBf16SideOf {
+    static constexpr int value = WGMMA_MATMUL_BF16_SIDE_STAGED;
+};
+template <typename EPILOGUE>
+struct WgmmaMatmulBf16SideOf<EPILOGUE, std::void_t<decltype(EPILOGUE::WGMMA_SIDE)>> {
+    static constexpr int value = EPILOGUE::WGMMA_SIDE;
 };
 
 /// A product's setting, as one type a caller names once (model_bf16.cuh: one per GPT-2 product): the square's
@@ -204,7 +226,8 @@ template <bool LEFT_TURNED, bool RIGHT_TURNED, typename EPILOGUE = WgmmaMatmulBf
           int STAGES = WGMMA_MATMUL_BF16_STAGES, int ROW_GROUPS = WGMMA_MATMUL_BF16_ROW_GROUPS, int CLUSTER = WGMMA_MATMUL_BF16_CLUSTER>
 __global__ void __launch_bounds__((WGMMA_MATMUL_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
-                         const __grid_constant__ CUtensorMap output_map_val, nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr,
+                         const __grid_constant__ CUtensorMap output_map_val,
+                         const __grid_constant__ CUtensorMap side_map_val, nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr,
                          int rows_val, int columns_val, int sum_length_val, bool add_onto_val, EPILOGUE epilogue_val,
                          int block_rows_per_group_val, int splits_val, float* split_sums_ptr);
 template <typename EPILOGUE>
@@ -213,7 +236,7 @@ __global__ void wgmma_matmul_bf16_splits_sum_kernel(nv_bfloat16* output_ptr, con
                                                     int splits_val, bool add_onto_val, EPILOGUE epilogue_val);
 template <bool LEFT_TURNED, bool RIGHT_TURNED, typename EPILOGUE, int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER>
 void wgmma_matmul_bf16_launch(size_t total_units_val, int blocks_val, const CUtensorMap& left_map_val, const CUtensorMap& right_map_val,
-                              const CUtensorMap& output_map_val,
+                              const CUtensorMap& output_map_val, const CUtensorMap& side_map_val,
                               nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr, int rows_val, int columns_val,
                               int sum_length_val, bool add_onto_val, const EPILOGUE& epilogue_val, int block_rows_per_group_val,
                               int splits_val, float* split_sums_ptr);
@@ -295,6 +318,11 @@ inline void wgmma_matmul_bf16_at(const Tensor& output_tensor, const Tensor& left
 
     //    and the output's, for the TMA store: boxes of {64 rows, 64 columns}, the same swizzle
     CUtensorMap output_map_val = wgmma_matmul_bf16_tensor_map(output_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
+    //    and the epilogue's side tensor's, if it has one (output's shape): the same boxes
+    CUtensorMap side_map_val = output_map_val;
+    if constexpr (WgmmaMatmulBf16SideOf<EPILOGUE>::value == WGMMA_MATMUL_BF16_SIDE_WRITTEN ||
+                  WgmmaMatmulBf16SideOf<EPILOGUE>::value == WGMMA_MATMUL_BF16_SIDE_READ)
+        side_map_val = wgmma_matmul_bf16_tensor_map(epilogue_val.side_ptr(), rows_val, columns_val, HARDWARE_WGMMA_M);
 
     // 3. split: the scratch, a {rows, columns} slice of float sums per split, made the first time and grown when a
     //    product needs more; the bias goes in the splits' sum, not the blocks
@@ -316,22 +344,22 @@ inline void wgmma_matmul_bf16_at(const Tensor& output_tensor, const Tensor& left
     size_t total_units_val = total_unit_columns_val * total_unit_rows_val * (size_t)splits_val;
     if (!left_turned_val && !right_turned_val)
         wgmma_matmul_bf16_launch<false, false, EPILOGUE, COLUMNS, STAGES, ROW_GROUPS, CLUSTER>(
-            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, output_ptr, block_bias_ptr, (int)rows_val,
+            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, block_bias_ptr, (int)rows_val,
             (int)columns_val,
             (int)sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val, splits_val, split_sums_ptr);
     else if (!left_turned_val && right_turned_val)
         wgmma_matmul_bf16_launch<false, true, EPILOGUE, COLUMNS, STAGES, ROW_GROUPS, CLUSTER>(
-            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, output_ptr, block_bias_ptr, (int)rows_val,
+            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, block_bias_ptr, (int)rows_val,
             (int)columns_val,
             (int)sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val, splits_val, split_sums_ptr);
     else if (left_turned_val && !right_turned_val)
         wgmma_matmul_bf16_launch<true, false, EPILOGUE, COLUMNS, STAGES, ROW_GROUPS, CLUSTER>(
-            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, output_ptr, block_bias_ptr, (int)rows_val,
+            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, block_bias_ptr, (int)rows_val,
             (int)columns_val,
             (int)sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val, splits_val, split_sums_ptr);
     else
         wgmma_matmul_bf16_launch<true, true, EPILOGUE, COLUMNS, STAGES, ROW_GROUPS, CLUSTER>(
-            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, output_ptr, block_bias_ptr, (int)rows_val,
+            total_units_val, blocks_val, left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, block_bias_ptr, (int)rows_val,
             (int)columns_val,
             (int)sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val, splits_val, split_sums_ptr);
 
@@ -356,7 +384,7 @@ inline void wgmma_matmul_bf16_at(const Tensor& output_tensor, const Tensor& left
 ///   the others                    as in wgmma_matmul_bf16_kernel
 template <bool LEFT_TURNED, bool RIGHT_TURNED, typename EPILOGUE, int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER>
 inline void wgmma_matmul_bf16_launch(size_t total_units_val, int blocks_val, const CUtensorMap& left_map_val, const CUtensorMap& right_map_val,
-                              const CUtensorMap& output_map_val,
+                              const CUtensorMap& output_map_val, const CUtensorMap& side_map_val,
                                      nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr, int rows_val, int columns_val,
                                      int sum_length_val, bool add_onto_val, const EPILOGUE& epilogue_val, int block_rows_per_group_val,
                                      int splits_val, float* split_sums_ptr) {
@@ -382,7 +410,7 @@ inline void wgmma_matmul_bf16_launch(size_t total_units_val, int blocks_val, con
     unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
     // 3. launch; with clusters, by cudaLaunchKernelEx, which takes the cluster's size
     if (CLUSTER == 1) {
-        kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val, output_ptr, bias_ptr, rows_val, columns_val,
+        kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, bias_ptr, rows_val, columns_val,
                                                                 sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val,
                                                                 splits_val, split_sums_ptr);
         cudaCheck(cudaGetLastError());
@@ -398,7 +426,7 @@ inline void wgmma_matmul_bf16_launch(size_t total_units_val, int blocks_val, con
         config_val.dynamicSmemBytes = SHARED_BYTES;
         config_val.attrs = attributes_list;
         config_val.numAttrs = 1;
-        cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val, output_ptr, bias_ptr, rows_val, columns_val,
+        cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val, side_map_val, output_ptr, bias_ptr, rows_val, columns_val,
                                      sum_length_val, add_onto_val, epilogue_val, block_rows_per_group_val, splits_val, split_sums_ptr));
     }
 }
@@ -516,7 +544,8 @@ __device__ __forceinline__ void wgmma_matmul_bf16_copy_tile_to_cluster(nv_bfloat
 template <bool LEFT_TURNED, bool RIGHT_TURNED, typename EPILOGUE, int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER>
 __global__ void __launch_bounds__((WGMMA_MATMUL_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
-                         const __grid_constant__ CUtensorMap output_map_val, nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr,
+                         const __grid_constant__ CUtensorMap output_map_val,
+                         const __grid_constant__ CUtensorMap side_map_val, nv_bfloat16* output_ptr, const nv_bfloat16* bias_ptr,
                          int rows_val, int columns_val, int sum_length_val, bool add_onto_val, EPILOGUE epilogue_val,
                          int block_rows_per_group_val, int splits_val, float* split_sums_ptr) {
     namespace cde = cuda::device::experimental;
@@ -554,6 +583,7 @@ wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const
     __shared__ uint64_t full_barriers_list[STAGES];          // set s's bytes are in
     __shared__ uint64_t empty_barriers_list[STAGES];         // every consumer of the cluster is done with set s
     __shared__ uint64_t store_barriers_list[ROW_GROUPS];     // consumer warpgroup g's threads are all at the same point of its store
+    __shared__ uint64_t side_barriers_list[ROW_GROUPS];      // a read side: consumer warpgroup g's 64 rows of it are in its room
     uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(wgmma_matmul_bf16_shared_list);
     nv_bfloat16* tiles_ptr = reinterpret_cast<nv_bfloat16*>(
         wgmma_matmul_bf16_shared_list + (HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM - shared_address_val % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM);
@@ -577,6 +607,9 @@ wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const
 #pragma unroll
         for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++)
             wgmma_matmul_bf16_barrier_init(&store_barriers_list[row_group_index_val], HARDWARE_WARPGROUP_THREADS);   // every thread of the warpgroup
+#pragma unroll
+        for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++)
+            wgmma_matmul_bf16_barrier_init(&side_barriers_list[row_group_index_val], 1);   // the warpgroup's first thread, and the bytes
         cde::fence_proxy_async_shared_cta();                          // the barriers visible to TMA
     }
     __syncthreads();
@@ -678,6 +711,10 @@ wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const
         uint8_t* room_ptr = reinterpret_cast<uint8_t*>(staged_rooms_ptr) + row_group_index_val * wgmma_matmul_bf16_room_bytes<COLUMNS>();
     float* staged_ptr = reinterpret_cast<float*>(room_ptr);
         uint32_t store_phase_val = 0;                                              // the store barrier's phase to wait for next
+        uint32_t side_phase_val = 0;                                               // ... and the side barrier's
+        constexpr int SIDE = WgmmaMatmulBf16SideOf<EPILOGUE>::value;               // how the epilogue's product is stored
+        constexpr int BOX_COLUMNS = WGMMA_MATMUL_BF16_ROW_VALUES;                  // the TMA store's box: 64 columns, one swizzled row of 128 bytes ...
+        constexpr int BOX_BYTES = HARDWARE_WGMMA_M * BOX_COLUMNS * sizeof(nv_bfloat16);   // ... by 64 rows: 8 KB
         // this warpgroup is done with a step's set: its first thread arrives at the set's empty barrier in every block
         // of the cluster
         auto free_set_val = [&](int set_index_val) {
@@ -702,6 +739,20 @@ wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const
             int block_first_row_index_val, block_first_column_index_val, split_index_val, first_step_index_val, total_steps_val;
             place_unit_val(unit_index_val, block_first_row_index_val, block_first_column_index_val, split_index_val, first_step_index_val,
                            total_steps_val);
+            int group_first_row_index_val = block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M;
+            bool tma_store_val = SIDE != WGMMA_MATMUL_BF16_SIDE_STAGED && !add_onto_val && split_sums_ptr == nullptr;
+            // a read side: before the walk, the warpgroup's first thread asks TMA for its 64 rows of it, into its room
+            // (once TMA has read the room for the unit before), so they come while the tensor cores work
+            if constexpr (SIDE == WGMMA_MATMUL_BF16_SIDE_READ)
+                if (tma_store_val && warpgroup_first_thread_val) {
+                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+                    wgmma_matmul_bf16_barrier_expect(&side_barriers_list[row_group_index_val], (uint32_t)(COLUMNS / BOX_COLUMNS * BOX_BYTES));
+#pragma unroll
+                    for (int box_index_val = 0; box_index_val < COLUMNS / BOX_COLUMNS; box_index_val++)
+                        wgmma_matmul_bf16_copy_tile(reinterpret_cast<nv_bfloat16*>(room_ptr + box_index_val * BOX_BYTES), &side_map_val,
+                                                    block_first_column_index_val + box_index_val * BOX_COLUMNS, group_first_row_index_val,
+                                                    &side_barriers_list[row_group_index_val]);
+                }
             float sums_list[COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // this thread's part of its warpgroup's 64 rows
             for (int step_index_val = 0; step_index_val < total_steps_val; step_index_val++) {
                 // a. wait until this step's set is full: its barrier's phase is the set's lap
@@ -731,49 +782,79 @@ wgmma_matmul_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const
                 free_set_val((walk_step_index_val + step_index_val) % STAGES);
             walk_step_index_val += total_steps_val;
 
-            // e. the plain epilogue (no add_onto, no splits): TMA stores the warpgroup's 64 rows. The warpgroup's first
-            //    thread waits until TMA has read the room for the unit before; then every thread writes its pairs (+
-            //    bias) as bfloat16 at their place in the room's boxes (box b: columns 64 b on, rows of 128 bytes, the
-            //    16-byte cell c of row r at c XOR r % 8, as TMA's 128-byte swizzle has it), makes them visible to TMA,
-            //    and the first thread asks TMA to store the boxes. Past the edges TMA writes nothing
-            int group_first_row_index_val = block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M;
-            if (std::is_same<EPILOGUE, WgmmaMatmulBf16Store>::value && !add_onto_val && split_sums_ptr == nullptr) {
-                constexpr int BOX_COLUMNS = WGMMA_MATMUL_BF16_ROW_VALUES;                                   // 64: one swizzled row of 128 bytes
-                constexpr int BOX_BYTES = HARDWARE_WGMMA_M * BOX_COLUMNS * sizeof(nv_bfloat16);             // 8 KB
-                if (warpgroup_first_thread_val)
-                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
-                meet_warpgroup_val();                                          // the room is free
+            // e. the epilogues stored by TMA (no add_onto, no splits): TMA stores the warpgroup's 64 rows. The room is
+            //    the warpgroup's first thread's to wait for: until TMA has read it for the unit before, or with a read
+            //    side, until the side's rows are in it (every thread waits). Then every thread writes its pairs (+
+            //    bias), or with a read side with_side(pair, the side's pair it reads at the same place), rounded once, as
+            //    bfloat16 at their place in the room's boxes (box b: columns 64 b on, rows of 128 bytes, the 16-byte
+            //    cell c of row r at c XOR r % 8, as TMA's 128-byte swizzle has it), makes them visible to TMA, and the
+            //    first thread asks TMA to store the boxes. A written side: then the same again, side_of(each pair) into
+            //    the room once TMA has read output's, and TMA stores the side. Past the edges TMA reads 0s and writes
+            //    nothing
+            if (tma_store_val) {
+                // the room's pair of each of this thread's pairs, and the pair (+ bias), handed to what_val, whose
+                // result is written there
+                auto write_room_val = [&](auto what_val) {
 #pragma unroll
-                for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
-                    int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
-                    int column_index_val = block_first_column_index_val + column_in_square_val;
-                    float2 bias_val = bias_ptr != nullptr && column_index_val < columns_val
-                                          ? __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(bias_ptr + column_index_val))
-                                          : make_float2(0.0f, 0.0f);
-                    int box_index_val = column_in_square_val / BOX_COLUMNS;
-                    int column_in_box_val = column_in_square_val % BOX_COLUMNS;
-                    int cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL;
-                    int byte_in_cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) % HARDWARE_TMA_BYTES_PER_CELL;
+                    for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
+                        int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
+                        int column_index_val = block_first_column_index_val + column_in_square_val;
+                        float2 bias_val = bias_ptr != nullptr && column_index_val < columns_val
+                                              ? __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(bias_ptr + column_index_val))
+                                              : make_float2(0.0f, 0.0f);
+                        int box_index_val = column_in_square_val / BOX_COLUMNS;
+                        int column_in_box_val = column_in_square_val % BOX_COLUMNS;
+                        int cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL;
+                        int byte_in_cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) % HARDWARE_TMA_BYTES_PER_CELL;
 #pragma unroll
-                    for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {   // rows group and group + 8
-                        int row_in_group_val = thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                        int swizzled_cell_val = cell_val ^ (row_in_group_val % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN);
-                        *reinterpret_cast<nv_bfloat162*>(room_ptr + box_index_val * BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
-                                                         swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val) =
-                            __floats2bfloat162_rn(sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] + bias_val.x,
-                                                  sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] + bias_val.y);
+                        for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {   // rows group and group + 8
+                            int row_in_group_val = thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
+                            int swizzled_cell_val = cell_val ^ (row_in_group_val % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN);
+                            nv_bfloat162* room_pair_ptr = reinterpret_cast<nv_bfloat162*>(
+                                room_ptr + box_index_val * BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
+                                swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val);
+                            float2 pair_val = make_float2(sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] + bias_val.x,
+                                                          sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] + bias_val.y);
+                            float2 result_val = what_val(pair_val, room_pair_ptr);
+                            *room_pair_ptr = __floats2bfloat162_rn(result_val.x, result_val.y);
+                        }
                     }
-                }
-                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");   // this thread's writes visible to TMA
-                meet_warpgroup_val();                                          // every thread's
-                if (warpgroup_first_thread_val) {
+                };
+                // the room's boxes stored by TMA into map_ptr's tensor, once every thread's writes are visible to it
+                auto store_room_val = [&](const CUtensorMap* map_ptr) {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");   // this thread's writes visible to TMA
+                    meet_warpgroup_val();                                          // every thread's
+                    if (warpgroup_first_thread_val) {
 #pragma unroll
-                    for (int box_index_val = 0; box_index_val < COLUMNS / BOX_COLUMNS; box_index_val++)
-                        asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n"
-                                     ::"l"(&output_map_val), "r"(block_first_column_index_val + box_index_val * BOX_COLUMNS),
-                                       "r"(group_first_row_index_val), "r"(wgmma_matmul_bf16_shared_address(room_ptr + box_index_val * BOX_BYTES))
-                                     : "memory");
-                    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+                        for (int box_index_val = 0; box_index_val < COLUMNS / BOX_COLUMNS; box_index_val++)
+                            asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n"
+                                         ::"l"(map_ptr), "r"(block_first_column_index_val + box_index_val * BOX_COLUMNS),
+                                           "r"(group_first_row_index_val), "r"(wgmma_matmul_bf16_shared_address(room_ptr + box_index_val * BOX_BYTES))
+                                         : "memory");
+                        asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+                    }
+                };
+                // the room free (TMA has read it): the first thread waits, then the warpgroup meets
+                auto wait_room_read_val = [&]() {
+                    if (warpgroup_first_thread_val)
+                        asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+                    meet_warpgroup_val();
+                };
+                if constexpr (SIDE == WGMMA_MATMUL_BF16_SIDE_READ) {
+                    wgmma_matmul_bf16_barrier_wait(&side_barriers_list[row_group_index_val], side_phase_val);   // the side's rows are in
+                    side_phase_val ^= 1;
+                    write_room_val([&](float2 pair_val, const nv_bfloat162* room_pair_ptr) {
+                        return epilogue_val.with_side(pair_val, __bfloat1622float2(*room_pair_ptr));
+                    });
+                } else {
+                    wait_room_read_val();
+                    write_room_val([](float2 pair_val, const nv_bfloat162*) { return pair_val; });
+                }
+                store_room_val(&output_map_val);
+                if constexpr (SIDE == WGMMA_MATMUL_BF16_SIDE_WRITTEN) {
+                    wait_room_read_val();
+                    write_room_val([&](float2 pair_val, const nv_bfloat162*) { return epilogue_val.side_of(pair_val); });
+                    store_room_val(&side_map_val);
                 }
                 continue;
             }
