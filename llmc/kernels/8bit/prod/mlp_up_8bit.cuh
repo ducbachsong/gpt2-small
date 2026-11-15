@@ -452,6 +452,7 @@ struct MlpUp8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void mlp_up_8bit(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const MlpUp8bitCopies& copies_val);
+void mlp_up_8bit_rounded(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& bias_tensor, const MlpUp8bitCopies& copies_val);
 void mlp_up_8bit_round(const MlpUp8bitCopies& copies_val, const Tensor& input_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_UP_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_UP_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = MLP_UP_8BIT_PROMOTION_STEPS
@@ -492,6 +493,16 @@ __global__ void mlp_up_8bit_kernel(const __grid_constant__ CUtensorMap left_map_
 ///   copies_val           MlpUp8bitCopies(rows, out_features, in_features): written
 inline void mlp_up_8bit(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const MlpUp8bitCopies& copies_val) {
     mlp_up_8bit_round(copies_val, input_tensor, weight_tensor);
+    mlp_up_8bit_rounded_at<MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_CLUSTER>(gelu_input_tensor, gelu_output_tensor, bias_tensor, copies_val,
+                                                                         MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by mlp_up_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in mlp_up_8bit, but the two it rounds: their copies are copies_val's
+inline void mlp_up_8bit_rounded(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& bias_tensor, const MlpUp8bitCopies& copies_val) {
     mlp_up_8bit_rounded_at<MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_CLUSTER>(gelu_input_tensor, gelu_output_tensor, bias_tensor, copies_val,
                                                                          MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_8BIT_BLOCKS);
 }

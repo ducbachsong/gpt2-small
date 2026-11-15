@@ -3,8 +3,9 @@
 // input, expected and actual value, and ok; the first FAIL stops the program.
 //
 // Part 1 checks the scales and the E4M3s against PyTorch's float8_e4m3fn; part 2 checks that a turned matrix
-// gives the same bits as rounding the matrix turned round first; part 3 checks that each kernel's registers fit
-// its block, and other block sizes. Any GPU. The timings are in tests/8bit/tune_round_8bit.cu.
+// gives the same bits as rounding the matrix turned round first, and that round_8bit_rows_and_columns gives both
+// roundings' bits from its two reads; part 3 checks that each kernel's registers fit its block, and other block
+// sizes. Any GPU. The timings are in tests/8bit/tune_round_8bit.cu.
 #include <torch/types.h>              // torch::randn, float8_e4m3fn; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"             // ASSERT_EQ
@@ -146,16 +147,69 @@ static void turned_gives_the_bits_of_the_turned_round_matrix(const char *test_pt
 static void turned_gives_the_bits_of_the_turned_round_matrix_on_gpt2_output_grad(void)
 {
     // Expect: the qkv layer's output_grad {4096, 2304} as weight_grad's left: rows 2304, row_length 4096. Each row's
-    // scale is the largest of a column of output_grad, read by round_8bit_turned_scales_kernel; the E4M3s come out
-    // of 32 x 32 tiles turned round. The same bits as round_8bit on output_gradᵀ.
+    // scale is the largest of a column of output_grad, an atomic max of each 128 x 128 tile's (round_8bit_largest_kernel);
+    // the E4M3s come out of the tiles turned round (round_8bit_tile_kernel). The same bits as round_8bit on output_gradᵀ.
     turned_gives_the_bits_of_the_turned_round_matrix(__func__, GPT2_ROWS, GPT2_QKV_DIM);
 }
 
 static void turned_gives_the_bits_of_the_turned_round_matrix_with_sizes_no_tile_divides(void)
 {
-    // Expect: input {80, 50}: rows 50 and row_length 80, neither a whole number of 32 x 32 tiles, so the tiles at
-    // the edges are part-full. The same bits.
-    turned_gives_the_bits_of_the_turned_round_matrix(__func__, 80, 50);
+    // Expect: input {208, 72}: rows 72 and row_length 208, neither a whole number of 128 x 128 tiles, so the tiles at
+    // the edges are part-full (the turned pieces of 16 past the input's rows not written). The same bits.
+    turned_gives_the_bits_of_the_turned_round_matrix(__func__, 208, 72);
+}
+
+/// Rounds random values {rows, columns} by round_8bit_rows_and_columns (both copies, then each alone), and by
+/// round_8bit as it sits and turned, and checks that each copy and its scales are the same to the last bit.
+static void rows_and_columns_give_the_bits_of_both_roundings(const char *test_ptr, size_t rows_val, size_t columns_val)
+{
+    // 1. random values, with row 0 all 0 (its scale 1); round_8bit's two copies
+    torch::manual_seed(3);
+    Tensor values_tensor = random_bf16_tensor({rows_val, columns_val});
+    values_tensor[0].fill_(0);
+    RoundedMatrix plain_val(values_tensor);
+    RoundedMatrix turned_val(values_tensor, true);
+    // 2. round_8bit_rows_and_columns: both, then rows alone, then columns alone
+    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor row_scales_tensor = Tensor::zeros({rows_val});
+    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor column_scales_tensor = Tensor::zeros({columns_val});
+    // the same bits: the Int32 copies compared as ints, on the CPU
+    auto same_ints_val = [](const Tensor &first_tensor, const Tensor &second_tensor) {
+        std::vector<int> first_list(first_tensor.numel()), second_list(second_tensor.numel());
+        cudaCheck(cudaMemcpy(first_list.data(), first_tensor.data_ptr(), first_list.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(second_list.data(), second_tensor.data_ptr(), second_list.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        return first_list == second_list;
+    };
+    print_test_name(test_ptr);
+    printf("    input {%zu, %zu}: both copies\n", rows_val, columns_val);
+    round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, values_tensor);
+    ASSERT_EQ(same_ints_val(rows_8bit_tensor, plain_val.rounded_tensor), true);
+    ASSERT_EQ(row_scales_tensor.tolist() == plain_val.scales_tensor.tolist(), true);
+    ASSERT_EQ(same_ints_val(columns_8bit_tensor, turned_val.rounded_tensor), true);
+    ASSERT_EQ(column_scales_tensor.tolist() == turned_val.scales_tensor.tolist(), true);
+    printf("    the row copy alone, then the turned copy alone\n");
+    rows_8bit_tensor.zero_(), row_scales_tensor.zero_(), columns_8bit_tensor.zero_(), column_scales_tensor.zero_();
+    round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, Tensor(), Tensor(), values_tensor);
+    ASSERT_EQ(same_ints_val(rows_8bit_tensor, plain_val.rounded_tensor), true);
+    ASSERT_EQ(row_scales_tensor.tolist() == plain_val.scales_tensor.tolist(), true);
+    round_8bit_rows_and_columns(Tensor(), Tensor(), columns_8bit_tensor, column_scales_tensor, values_tensor);
+    ASSERT_EQ(same_ints_val(columns_8bit_tensor, turned_val.rounded_tensor), true);
+    ASSERT_EQ(column_scales_tensor.tolist() == turned_val.scales_tensor.tolist(), true);
+}
+
+static void rows_and_columns_give_the_bits_of_both_roundings_on_qkv_output_grad(void)
+{
+    // Expect: the qkv layer's output_grad {4096, 2304}, which its input_grad rounds as it sits and its weight_grad
+    // turned: both copies from round_8bit_rows_and_columns's two reads, the same bits as round_8bit's two calls, and each
+    // copy alone too. Row 0 all 0: scale 1.
+    rows_and_columns_give_the_bits_of_both_roundings(__func__, GPT2_ROWS, GPT2_QKV_DIM);
+}
+
+static void rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_divides(void)
+{
+    // Expect: {208, 272}, no whole number of 128 x 128 tiles either way. The same bits.
+    rows_and_columns_give_the_bits_of_both_roundings(__func__, 208, 272);
 }
 
 // ══ part 3: the kernels fit their launch, and any block size works ═══════════
@@ -166,10 +220,10 @@ static void every_kernel_fits_its_block(void)
     // numRegs (registers per thread), maxThreadsPerBlock (the largest block) and localSizeBytes (0 if nothing
     // spills), read without running anything.
     const int kernel_count_val = 3;
-    const void *kernels_list[kernel_count_val] = {(const void *)round_8bit_kernel, (const void *)round_8bit_turned_scales_kernel,
-                                                  (const void *)round_8bit_turned_kernel};
-    const char *names_list[kernel_count_val] = {"round_8bit_kernel", "round_8bit_turned_scales_kernel", "round_8bit_turned_kernel"};
-    int threads_list[kernel_count_val] = {ROUND_8BIT_THREADS_PER_BLOCK, ROUND_8BIT_THREADS_PER_BLOCK, ROUND_8BIT_TURN_THREADS};
+    const void *kernels_list[kernel_count_val] = {(const void *)round_8bit_kernel, (const void *)round_8bit_largest_kernel,
+                                                  (const void *)round_8bit_tile_kernel};
+    const char *names_list[kernel_count_val] = {"round_8bit_kernel", "round_8bit_largest_kernel", "round_8bit_tile_kernel"};
+    int threads_list[kernel_count_val] = {ROUND_8BIT_THREADS_PER_BLOCK, ROUND_8BIT_TILE_THREADS, ROUND_8BIT_TILE_THREADS};
     for (int kernel_index_val = 0; kernel_index_val < kernel_count_val; kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -189,9 +243,9 @@ static void any_block_size_gives_the_same_bits(void)
 {
     // Expect: random {304, 768}, rounded as it sits and as a turned matrix, with block sizes 32, 128, 512 and 1024
     // (one warp up to HARDWARE_MAX_THREADS_PER_BLOCK): the same E4M3s and scales as the default's, to the last bit.
-    // As it sits each row is one warp's; turned, the warps share a column, and the largest is the same in any order.
-    // 304 rows: turned, they are the row length, which must be a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE (16);
-    // 304 is not one of the turning's 32-row tiles, so the last tile is part-full.
+    // As it sits each row is one warp's; turned, the block size does not apply (the tile kernels' is fixed), so the
+    // same launches. 304 rows: turned, they are the row length, which must be a multiple of
+    // ROUND_8BIT_ROW_LENGTH_MULTIPLE (16); 304 is not a whole number of the 128-row tiles, so the last is part-full.
     const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     // 1. random values; the default's roundings
     torch::manual_seed(5);
@@ -216,6 +270,8 @@ int main(void)
 
     turned_gives_the_bits_of_the_turned_round_matrix_on_gpt2_output_grad();
     turned_gives_the_bits_of_the_turned_round_matrix_with_sizes_no_tile_divides();
+    rows_and_columns_give_the_bits_of_both_roundings_on_qkv_output_grad();
+    rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_divides();
 
     every_kernel_fits_its_block();
     any_block_size_gives_the_same_bits();

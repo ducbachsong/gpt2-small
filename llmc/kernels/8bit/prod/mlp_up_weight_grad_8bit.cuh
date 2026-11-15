@@ -458,6 +458,7 @@ struct MlpUpWeightGrad8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void mlp_up_weight_grad_8bit(const Tensor& weight_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor, const MlpUpWeightGrad8bitCopies& copies_val);
+void mlp_up_weight_grad_8bit_rounded(const Tensor& weight_grad_tensor, const MlpUpWeightGrad8bitCopies& copies_val);
 void mlp_up_weight_grad_8bit_round(const MlpUpWeightGrad8bitCopies& copies_val, const Tensor& output_grad_tensor, const Tensor& input_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_UP_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_UP_WEIGHT_GRAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = MLP_UP_WEIGHT_GRAD_8BIT_PROMOTION_STEPS
@@ -502,6 +503,16 @@ __global__ void mlp_up_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_pt
 ///   copies_val           MlpUpWeightGrad8bitCopies(out_features, in_features, rows): written
 inline void mlp_up_weight_grad_8bit(const Tensor& weight_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor, const MlpUpWeightGrad8bitCopies& copies_val) {
     mlp_up_weight_grad_8bit_round(copies_val, output_grad_tensor, input_tensor);
+    mlp_up_weight_grad_8bit_rounded_at<MLP_UP_WEIGHT_GRAD_8BIT_ROW_GROUPS, MLP_UP_WEIGHT_GRAD_8BIT_COLUMNS, MLP_UP_WEIGHT_GRAD_8BIT_STAGES, MLP_UP_WEIGHT_GRAD_8BIT_CLUSTER>(weight_grad_tensor, copies_val,
+                                                                         MLP_UP_WEIGHT_GRAD_8BIT_SPLITS, MLP_UP_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_WEIGHT_GRAD_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by mlp_up_weight_grad_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in mlp_up_weight_grad_8bit, but the two it rounds: their copies are copies_val's
+inline void mlp_up_weight_grad_8bit_rounded(const Tensor& weight_grad_tensor, const MlpUpWeightGrad8bitCopies& copies_val) {
     mlp_up_weight_grad_8bit_rounded_at<MLP_UP_WEIGHT_GRAD_8BIT_ROW_GROUPS, MLP_UP_WEIGHT_GRAD_8BIT_COLUMNS, MLP_UP_WEIGHT_GRAD_8BIT_STAGES, MLP_UP_WEIGHT_GRAD_8BIT_CLUSTER>(weight_grad_tensor, copies_val,
                                                                          MLP_UP_WEIGHT_GRAD_8BIT_SPLITS, MLP_UP_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_WEIGHT_GRAD_8BIT_BLOCKS);
 }

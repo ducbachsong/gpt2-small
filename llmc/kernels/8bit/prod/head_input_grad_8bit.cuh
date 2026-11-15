@@ -445,6 +445,7 @@ struct HeadInputGrad8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void head_input_grad_8bit(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor, const HeadInputGrad8bitCopies& copies_val);
+void head_input_grad_8bit_rounded(const Tensor& input_grad_tensor, const HeadInputGrad8bitCopies& copies_val);
 void head_input_grad_8bit_round(const HeadInputGrad8bitCopies& copies_val, const Tensor& output_grad_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = HEAD_INPUT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = HEAD_INPUT_GRAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = HEAD_INPUT_GRAD_8BIT_PROMOTION_STEPS
@@ -481,6 +482,16 @@ __global__ void head_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap 
 ///   copies_val           HeadInputGrad8bitCopies(rows, in_features, out_features): written
 inline void head_input_grad_8bit(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor, const HeadInputGrad8bitCopies& copies_val) {
     head_input_grad_8bit_round(copies_val, output_grad_tensor, weight_tensor);
+    head_input_grad_8bit_rounded_at<HEAD_INPUT_GRAD_8BIT_ROW_GROUPS, HEAD_INPUT_GRAD_8BIT_COLUMNS, HEAD_INPUT_GRAD_8BIT_STAGES, HEAD_INPUT_GRAD_8BIT_CLUSTER>(input_grad_tensor, copies_val,
+                                                                         HEAD_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_INPUT_GRAD_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by head_input_grad_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in head_input_grad_8bit, but the two it rounds: their copies are copies_val's
+inline void head_input_grad_8bit_rounded(const Tensor& input_grad_tensor, const HeadInputGrad8bitCopies& copies_val) {
     head_input_grad_8bit_rounded_at<HEAD_INPUT_GRAD_8BIT_ROW_GROUPS, HEAD_INPUT_GRAD_8BIT_COLUMNS, HEAD_INPUT_GRAD_8BIT_STAGES, HEAD_INPUT_GRAD_8BIT_CLUSTER>(input_grad_tensor, copies_val,
                                                                          HEAD_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_INPUT_GRAD_8BIT_BLOCKS);
 }

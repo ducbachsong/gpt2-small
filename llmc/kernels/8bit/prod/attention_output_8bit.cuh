@@ -448,6 +448,7 @@ struct AttentionOutput8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void attention_output_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const AttentionOutput8bitCopies& copies_val);
+void attention_output_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const AttentionOutput8bitCopies& copies_val);
 void attention_output_8bit_round(const AttentionOutput8bitCopies& copies_val, const Tensor& input_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = ATTENTION_OUTPUT_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = ATTENTION_OUTPUT_8BIT_PROMOTION_STEPS
@@ -486,6 +487,16 @@ __global__ void attention_output_8bit_kernel(const __grid_constant__ CUtensorMap
 ///   copies_val           AttentionOutput8bitCopies(rows, out_features, in_features): written
 inline void attention_output_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const AttentionOutput8bitCopies& copies_val) {
     attention_output_8bit_round(copies_val, input_tensor, weight_tensor);
+    attention_output_8bit_rounded_at<ATTENTION_OUTPUT_8BIT_ROW_GROUPS, ATTENTION_OUTPUT_8BIT_COLUMNS, ATTENTION_OUTPUT_8BIT_STAGES, ATTENTION_OUTPUT_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
+                                                                         ATTENTION_OUTPUT_8BIT_BLOCK_ROWS_PER_GROUP, ATTENTION_OUTPUT_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by attention_output_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in attention_output_8bit, but the two it rounds: their copies are copies_val's
+inline void attention_output_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const AttentionOutput8bitCopies& copies_val) {
     attention_output_8bit_rounded_at<ATTENTION_OUTPUT_8BIT_ROW_GROUPS, ATTENTION_OUTPUT_8BIT_COLUMNS, ATTENTION_OUTPUT_8BIT_STAGES, ATTENTION_OUTPUT_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
                                                                          ATTENTION_OUTPUT_8BIT_BLOCK_ROWS_PER_GROUP, ATTENTION_OUTPUT_8BIT_BLOCKS);
 }

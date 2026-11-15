@@ -445,6 +445,7 @@ struct Head8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void head_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Head8bitCopies& copies_val);
+void head_8bit_rounded(const Tensor& output_tensor, const Head8bitCopies& copies_val);
 void head_8bit_round(const Head8bitCopies& copies_val, const Tensor& input_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = HEAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = HEAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = HEAD_8BIT_PROMOTION_STEPS
@@ -481,6 +482,16 @@ __global__ void head_8bit_kernel(const __grid_constant__ CUtensorMap left_map_va
 ///   copies_val           Head8bitCopies(rows, out_features, in_features): written
 inline void head_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Head8bitCopies& copies_val) {
     head_8bit_round(copies_val, input_tensor, weight_tensor);
+    head_8bit_rounded_at<HEAD_8BIT_ROW_GROUPS, HEAD_8BIT_COLUMNS, HEAD_8BIT_STAGES, HEAD_8BIT_CLUSTER>(output_tensor, copies_val,
+                                                                         HEAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by head_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in head_8bit, but the two it rounds: their copies are copies_val's
+inline void head_8bit_rounded(const Tensor& output_tensor, const Head8bitCopies& copies_val) {
     head_8bit_rounded_at<HEAD_8BIT_ROW_GROUPS, HEAD_8BIT_COLUMNS, HEAD_8BIT_STAGES, HEAD_8BIT_CLUSTER>(output_tensor, copies_val,
                                                                          HEAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_8BIT_BLOCKS);
 }

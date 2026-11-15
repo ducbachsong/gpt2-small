@@ -1,7 +1,8 @@
 // tune_round_8bit.cu — the timings of llmc/kernels/8bit/round_8bit.cuh, apart from tests/8bit/test_round_8bit.cu so the tests
 // only check numbers: time_rounding_with_other_block_and_thread_counts (a matrix as it sits),
-// time_turned_rounding_of_each_shape (turned matrices, as a linear layer's backward rounds output_grad and input).
-// With the bytes each moves, their GB/s and MBU.
+// time_turned_rounding_of_each_shape (turned matrices, as a linear layer's backward rounds output_grad and input),
+// time_both_copies_of_each_output_grad (round_8bit_rows_and_columns against two calls). With the bytes each moves,
+// their GB/s and MBU. Sizes: the 32 x 2,304 model's micro-batch of 8 rows of 2,048 tokens.
 //
 // Built as tests/8bit/test_round_8bit.cu is (see tests/README.md); what it prints also goes to
 // tests/results/<GPU>/round_8bit_<date>_<time>.txt. Any GPU.
@@ -11,8 +12,8 @@
 #include "../tune_helpers.h"            // gpu_milliseconds, warm_up_gpu, peak_gigabytes_per_second, gigabytes_per_second
 #include "../../llmc/kernels/8bit/round_8bit.cuh"
 
-#define GPT2_ROWS 4096                  // a micro-batch of 4 rows of 1024 tokens
-#define GPT2_EMBED_DIM 768              // GPT-2 small's widths
+#define GPT2_ROWS 16384                 // a micro-batch of 8 rows of 2048 tokens (the trainers' default)
+#define GPT2_EMBED_DIM 2304             // the model's width
 #define GPT2_QKV_DIM (3 * GPT2_EMBED_DIM)
 #define GPT2_MLP_DIM (4 * GPT2_EMBED_DIM)
 #define MEGA 1e6                        // bytes in an MB
@@ -60,7 +61,7 @@ static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &sca
 
 static void time_rounding_with_other_block_and_thread_counts(void)
 {
-    // Prints the time of round_8bit_kernel on x {4096, 768}, for 5 block counts x 5 thread counts, each the average
+    // Prints the time of round_8bit_kernel on x {16384, 2304}, for 5 block counts x 5 thread counts, each the average
     // of SWEEP_ROUNDS runs: as many as one warp per row needs, and this GPU's SM count x 1, 2, 4 and 8 (114 .. 912
     // on an H100 PCIe). The launches take turns: SWEEP_ROUNDS rounds, each timing every launch once. With the bytes
     // it moves (reads 2, writes 1 per value, and a scale per row), its GB/s and MBU.
@@ -172,7 +173,7 @@ static void time_turned_rounding_of_one_shape(const char *name_ptr, size_t row_l
     double values_val = (double)rows_val * row_length_val;
     double moved_list[2] = {values_val * (2 * sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + rows_val * sizeof(float),
                             values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + rows_val * sizeof(float)};
-    const char *sides_list[2] = {"turned (2 kernels)", "as it sits"};
+    const char *sides_list[2] = {"turned (tile kernels)", "as it sits"};
     double peak_val = peak_gigabytes_per_second();
     print_test_name(__func__);
     printf("    %s: rows %zu, row_length %zu\n", name_ptr, rows_val, row_length_val);
@@ -188,11 +189,83 @@ static void time_turned_rounding_of_one_shape(const char *name_ptr, size_t row_l
 
 static void time_turned_rounding_of_each_shape(void)
 {
-    // Prints, for each matrix a GPT-2 small layer's weight_grad would round turned (output_grad {4096, out} and
-    // input {4096, in}: rows out or in, row_length the 4096 rows), the turned rounding against rounding as it sits.
+    // Prints, for each matrix a layer's weight_grad rounds turned (output_grad {16384, out} and input {16384, in}:
+    // rows out or in, row_length the 16384 rows), the turned rounding against rounding as it sits.
     time_turned_rounding_of_one_shape("qkv output_grad", GPT2_ROWS, GPT2_QKV_DIM);
-    time_turned_rounding_of_one_shape("input x (768 wide)", GPT2_ROWS, GPT2_EMBED_DIM);
+    time_turned_rounding_of_one_shape("input x (2304 wide)", GPT2_ROWS, GPT2_EMBED_DIM);
     time_turned_rounding_of_one_shape("mlp up output_grad", GPT2_ROWS, GPT2_MLP_DIM);
+}
+
+// ══ part 3: both copies of one matrix ═════════════════════════════════════════
+
+/// Prints the average of 20 roundings (steps 3..20) of a random output_grad {rows, columns} into both copies, the
+/// row copy and the turned one: round_8bit_rows_and_columns (reads it twice) against round_8bit as it sits then
+/// turned (three reads), with the bytes each moves, GB/s and MBU; then checks both ways give the same bits.
+static void time_both_copies_of_one_shape(const char *name_ptr, size_t rows_val, size_t columns_val)
+{
+    // 1. random values; the copies
+    torch::manual_seed(0);
+    Tensor input_tensor = random_bf16_tensor({rows_val, columns_val});
+    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor row_scales_tensor = Tensor::zeros({rows_val});
+    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor column_scales_tensor = Tensor::zeros({columns_val});
+    // 2. time both ways, taking turns
+    double totals_list[2] = {0.0, 0.0};
+    for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
+    {
+        float together_ms_val = gpu_milliseconds([&] {
+            round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, input_tensor);
+        });
+        float apart_ms_val = gpu_milliseconds([&] {
+            round_8bit(rows_8bit_tensor, row_scales_tensor, input_tensor);
+            round_8bit(columns_8bit_tensor, column_scales_tensor, input_tensor, true);
+        });
+        if (step_index_val <= WARM_UP_STEPS)
+            continue;
+        totals_list[0] += together_ms_val;
+        totals_list[1] += apart_ms_val;
+    }
+    // 3. print: together reads 2 x 2 bytes a value, apart 3 x 2; both write 2 x 1
+    const int averaged_val = TIMED_STEPS - WARM_UP_STEPS;
+    double values_val = (double)rows_val * columns_val;
+    double scale_bytes_val = (double)(rows_val + columns_val) * sizeof(float);
+    double moved_list[2] = {values_val * (2 * sizeof(nv_bfloat16) + 2 * sizeof(__nv_fp8_e4m3)) + scale_bytes_val,
+                            values_val * (3 * sizeof(nv_bfloat16) + 2 * sizeof(__nv_fp8_e4m3)) + scale_bytes_val};
+    const char *sides_list[2] = {"rows_and_columns", "two round_8bit"};
+    double peak_val = peak_gigabytes_per_second();
+    print_test_name(__func__);
+    printf("    %s {%zu, %zu}: both copies\n", name_ptr, rows_val, columns_val);
+    printf("        %-20s       ms     MB     GB/s    MBU\n", "");
+    for (int side_index_val = 0; side_index_val < 2; side_index_val++)
+    {
+        double milliseconds_val = totals_list[side_index_val] / averaged_val;
+        double speed_val = gigabytes_per_second(moved_list[side_index_val], milliseconds_val);
+        printf("        %-20s %8.3f %6.1f %8.0f   %3.0f%%\n", sides_list[side_index_val], milliseconds_val,
+               moved_list[side_index_val] / MEGA, speed_val, 100.0 * speed_val / peak_val);
+    }
+    // 4. the same bits both ways
+    Tensor plain_8bit_tensor = Tensor::zeros(rows_8bit_tensor.shape(), DType::Int32);
+    Tensor plain_scales_tensor = Tensor::zeros({rows_val});
+    Tensor turned_8bit_tensor = Tensor::zeros(columns_8bit_tensor.shape(), DType::Int32);
+    Tensor turned_scales_tensor = Tensor::zeros({columns_val});
+    round_8bit(plain_8bit_tensor, plain_scales_tensor, input_tensor);
+    round_8bit(turned_8bit_tensor, turned_scales_tensor, input_tensor, true);
+    round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, input_tensor);
+    ASSERT_EQ(torch::equal(turned_back(rows_8bit_tensor, row_scales_tensor, (int64_t)rows_val, (int64_t)columns_val),
+                           turned_back(plain_8bit_tensor, plain_scales_tensor, (int64_t)rows_val, (int64_t)columns_val)), true);
+    ASSERT_EQ(torch::equal(turned_back(columns_8bit_tensor, column_scales_tensor, (int64_t)columns_val, (int64_t)rows_val),
+                           turned_back(turned_8bit_tensor, turned_scales_tensor, (int64_t)columns_val, (int64_t)rows_val)), true);
+}
+
+static void time_both_copies_of_each_output_grad(void)
+{
+    // Prints, for each output_grad a layer's backward rounds both ways (its input_grad as it sits, its weight_grad
+    // turned), round_8bit_rows_and_columns against two round_8bit calls: qkv's {16384, 6912}, mlp up's {16384, 9216},
+    // attention output's and mlp down's {16384, 2304}.
+    time_both_copies_of_one_shape("qkv output_grad", GPT2_ROWS, GPT2_QKV_DIM);
+    time_both_copies_of_one_shape("mlp up output_grad", GPT2_ROWS, GPT2_MLP_DIM);
+    time_both_copies_of_one_shape("2304-wide output_grad", GPT2_ROWS, GPT2_EMBED_DIM);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -202,6 +275,7 @@ int main(void)
     start_tune_log(__FILE__);                   // the console, and tests/results/<GPU>/<kernel>_<date>_<time>.txt
     time_rounding_with_other_block_and_thread_counts();
     time_turned_rounding_of_each_shape();
+    time_both_copies_of_each_output_grad();
 
     printf("\nall tunes done\n");
     return 0;

@@ -458,6 +458,7 @@ struct AttentionOutputWeightGrad8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void attention_output_weight_grad_8bit(const Tensor& weight_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor, const AttentionOutputWeightGrad8bitCopies& copies_val);
+void attention_output_weight_grad_8bit_rounded(const Tensor& weight_grad_tensor, const AttentionOutputWeightGrad8bitCopies& copies_val);
 void attention_output_weight_grad_8bit_round(const AttentionOutputWeightGrad8bitCopies& copies_val, const Tensor& output_grad_tensor, const Tensor& input_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_PROMOTION_STEPS
@@ -502,6 +503,16 @@ __global__ void attention_output_weight_grad_8bit_splits_sum_kernel(nv_bfloat16*
 ///   copies_val           AttentionOutputWeightGrad8bitCopies(out_features, in_features, rows): written
 inline void attention_output_weight_grad_8bit(const Tensor& weight_grad_tensor, const Tensor& output_grad_tensor, const Tensor& input_tensor, const AttentionOutputWeightGrad8bitCopies& copies_val) {
     attention_output_weight_grad_8bit_round(copies_val, output_grad_tensor, input_tensor);
+    attention_output_weight_grad_8bit_rounded_at<ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_ROW_GROUPS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_COLUMNS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_STAGES, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_CLUSTER>(weight_grad_tensor, copies_val,
+                                                                         ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_SPLITS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by attention_output_weight_grad_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in attention_output_weight_grad_8bit, but the two it rounds: their copies are copies_val's
+inline void attention_output_weight_grad_8bit_rounded(const Tensor& weight_grad_tensor, const AttentionOutputWeightGrad8bitCopies& copies_val) {
     attention_output_weight_grad_8bit_rounded_at<ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_ROW_GROUPS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_COLUMNS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_STAGES, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_CLUSTER>(weight_grad_tensor, copies_val,
                                                                          ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_SPLITS, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCKS);
 }

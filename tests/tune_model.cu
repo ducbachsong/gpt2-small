@@ -2,6 +2,7 @@
 // of 128, rows of 2,048 tokens, no linear bias), apart from tests/test_model.cu so the tests only check numbers:
 //     find_the_micro_batch_with_the_best_mfu   our bfloat16 model, then our 8-bit one: tokens/s and MFU at each
 //                                              --batch-size that fits, the best to train with
+//     eight_bit_gradients_follow_bfloat16s     the 8-bit model's gradients against the bfloat16 model's (cosine)
 //     time_against_pytorch                     PyTorch's model in bfloat16 on the same weights (cuBLAS for every
 //                                              product, its own flash attention), at the same rows: tokens/s against
 //                                              ours; and our loss against PyTorch's in float, once
@@ -295,6 +296,55 @@ static TokensPerSecond sweep_micro_batches(const char *model_name_ptr, const Mod
     return results_val;
 }
 
+/// Checks the 8-bit model's backward against the bfloat16 model's: one micro-batch of 1 row from gradients of 0, our
+/// bfloat16 model then our 8-bit one on the same weights and ids; each parameter's two gradients compared by their
+/// cosine similarity (a · b / |a| |b|, 1 for the same direction), in float by PyTorch. E4M3's rounding moves each
+/// value by up to 6%, which leaves a gradient's direction nearly as it was; a wrong copy (turned the wrong way, a
+/// scale on the wrong side) gives about 0. Prints the smallest and which tensor; expects it at least
+/// EIGHT_BIT_LEAST_COSINE. A gradient of 0 in both counts as the same.
+///
+///   buffers_val   the params (GPT-2's starting values) and grads (written over)
+///   config_val    the model
+static void eight_bit_gradients_follow_bfloat16s(const ModelBuffers &buffers_val, const GPT2Config &config_val)
+{
+    const double EIGHT_BIT_LEAST_COSINE = 0.9;
+    // 1. the ids, and both models' activations for 1 row
+    Tensor token_ids_tensor = Tensor::zeros({1, (size_t)SEQ_LEN}, DType::Int32);
+    Tensor targets_tensor = Tensor::zeros({1, (size_t)SEQ_LEN}, DType::Int32);
+    fill_ids(token_ids_tensor, targets_tensor, config_val.vocab_size);
+    // 2. the bfloat16 model's gradients, kept; then the 8-bit model's, in the same buffer
+    TensorBuffer bf16_grads_val = TensorBuffer::zeros_like(buffers_val.grad_buffer_val);
+    {
+        GPT2ActivationsBf16 activations_val(1, SEQ_LEN, config_val);
+        buffers_val.grad_buffer_val.flat().zero_();
+        gpt2_bf16_train_step(buffers_val.grads_val, token_ids_tensor, targets_tensor, buffers_val.params_val, activations_val, config_val, 1);
+        bf16_grads_val.flat().copy_(buffers_val.grad_buffer_val.flat());
+    }
+    {
+        GPT2Activations8bit activations_val(1, SEQ_LEN, config_val);
+        buffers_val.grad_buffer_val.flat().zero_();
+        gpt2_8bit_train_step(buffers_val.grads_val, token_ids_tensor, targets_tensor, buffers_val.params_val, activations_val, config_val, 1);
+    }
+    // 3. each tensor's cosine, the smallest kept
+    std::vector<Tensor> eight_list = buffers_val.grads_val.tensors();
+    double least_cosine_val = 2.0;
+    size_t least_index_val = 0;
+    for (size_t param_index_val = 0; param_index_val < eight_list.size(); param_index_val++)
+    {
+        torch::Tensor eight_tensor = pytorch_copy_of(eight_list[param_index_val]).flatten().to(torch::kDouble);
+        torch::Tensor bf16_tensor = pytorch_copy_of(bf16_grads_val.tensor(0, (int)param_index_val)).flatten().to(torch::kDouble);
+        double norms_val = eight_tensor.norm().item<double>() * bf16_tensor.norm().item<double>();
+        double cosine_val = norms_val > 0.0 ? (eight_tensor * bf16_tensor).sum().item<double>() / norms_val
+                                            : (eight_tensor.norm().item<double>() == bf16_tensor.norm().item<double>() ? 1.0 : 0.0);
+        if (cosine_val < least_cosine_val)
+            least_cosine_val = cosine_val, least_index_val = param_index_val;
+    }
+    print_test_name(__func__);
+    printf("    %zu gradients; the least alike: tensor %zu %s, cosine %.4f\n", eight_list.size(), least_index_val,
+           eight_list[least_index_val].shape().size() == 2 ? "(a matrix)" : "(a vector)", least_cosine_val);
+    ASSERT_EQ(least_cosine_val >= EIGHT_BIT_LEAST_COSINE, true);
+}
+
 // ══ part 2: against PyTorch (cuBLAS) ═══════════════════════════════════════════
 
 /// Times PyTorch's model in bfloat16 at rows_val rows on params_list, a micro-batch as a training loop runs it
@@ -409,6 +459,7 @@ int main(void)
     print_test_name("find_the_micro_batch_with_the_best_mfu");
     TokensPerSecond bf16_val = sweep_micro_batches<GPT2ActivationsBf16>("bfloat16", buffers_val, config_val, gpt2_bf16_train_step);
     TokensPerSecond eight_val = sweep_micro_batches<GPT2Activations8bit>("8-bit", buffers_val, config_val, gpt2_8bit_train_step);
+    eight_bit_gradients_follow_bfloat16s(buffers_val, config_val);
     time_against_pytorch(buffers_val, config_val, bf16_val, eight_val);
 
     printf("\nall tunes done\n");

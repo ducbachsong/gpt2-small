@@ -448,6 +448,7 @@ struct Qkv8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void qkv_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const Qkv8bitCopies& copies_val);
+void qkv_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const Qkv8bitCopies& copies_val);
 void qkv_8bit_round(const Qkv8bitCopies& copies_val, const Tensor& input_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = QKV_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = QKV_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = QKV_8BIT_PROMOTION_STEPS
@@ -486,6 +487,16 @@ __global__ void qkv_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val
 ///   copies_val           Qkv8bitCopies(rows, out_features, in_features): written
 inline void qkv_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const Qkv8bitCopies& copies_val) {
     qkv_8bit_round(copies_val, input_tensor, weight_tensor);
+    qkv_8bit_rounded_at<QKV_8BIT_ROW_GROUPS, QKV_8BIT_COLUMNS, QKV_8BIT_STAGES, QKV_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
+                                                                         QKV_8BIT_BLOCK_ROWS_PER_GROUP, QKV_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by qkv_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in qkv_8bit, but the two it rounds: their copies are copies_val's
+inline void qkv_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const Qkv8bitCopies& copies_val) {
     qkv_8bit_rounded_at<QKV_8BIT_ROW_GROUPS, QKV_8BIT_COLUMNS, QKV_8BIT_STAGES, QKV_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
                                                                          QKV_8BIT_BLOCK_ROWS_PER_GROUP, QKV_8BIT_BLOCKS);
 }

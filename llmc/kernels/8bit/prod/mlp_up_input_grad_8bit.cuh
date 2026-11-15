@@ -445,6 +445,7 @@ struct MlpUpInputGrad8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void mlp_up_input_grad_8bit(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor, const MlpUpInputGrad8bitCopies& copies_val);
+void mlp_up_input_grad_8bit_rounded(const Tensor& input_grad_tensor, const MlpUpInputGrad8bitCopies& copies_val);
 void mlp_up_input_grad_8bit_round(const MlpUpInputGrad8bitCopies& copies_val, const Tensor& output_grad_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_UP_INPUT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_UP_INPUT_GRAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = MLP_UP_INPUT_GRAD_8BIT_PROMOTION_STEPS
@@ -481,6 +482,16 @@ __global__ void mlp_up_input_grad_8bit_kernel(const __grid_constant__ CUtensorMa
 ///   copies_val           MlpUpInputGrad8bitCopies(rows, in_features, out_features): written
 inline void mlp_up_input_grad_8bit(const Tensor& input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor, const MlpUpInputGrad8bitCopies& copies_val) {
     mlp_up_input_grad_8bit_round(copies_val, output_grad_tensor, weight_tensor);
+    mlp_up_input_grad_8bit_rounded_at<MLP_UP_INPUT_GRAD_8BIT_ROW_GROUPS, MLP_UP_INPUT_GRAD_8BIT_COLUMNS, MLP_UP_INPUT_GRAD_8BIT_STAGES, MLP_UP_INPUT_GRAD_8BIT_CLUSTER>(input_grad_tensor, copies_val,
+                                                                         MLP_UP_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_INPUT_GRAD_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by mlp_up_input_grad_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in mlp_up_input_grad_8bit, but the two it rounds: their copies are copies_val's
+inline void mlp_up_input_grad_8bit_rounded(const Tensor& input_grad_tensor, const MlpUpInputGrad8bitCopies& copies_val) {
     mlp_up_input_grad_8bit_rounded_at<MLP_UP_INPUT_GRAD_8BIT_ROW_GROUPS, MLP_UP_INPUT_GRAD_8BIT_COLUMNS, MLP_UP_INPUT_GRAD_8BIT_STAGES, MLP_UP_INPUT_GRAD_8BIT_CLUSTER>(input_grad_tensor, copies_val,
                                                                          MLP_UP_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_INPUT_GRAD_8BIT_BLOCKS);
 }

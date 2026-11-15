@@ -448,6 +448,7 @@ struct MlpDown8bitCopies {
 
 // ── the product ───────────────────────────────────────────────────────────────
 void mlp_down_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const MlpDown8bitCopies& copies_val);
+void mlp_down_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const MlpDown8bitCopies& copies_val);
 void mlp_down_8bit_round(const MlpDown8bitCopies& copies_val, const Tensor& input_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_DOWN_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_DOWN_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = MLP_DOWN_8BIT_PROMOTION_STEPS
@@ -486,6 +487,16 @@ __global__ void mlp_down_8bit_kernel(const __grid_constant__ CUtensorMap left_ma
 ///   copies_val           MlpDown8bitCopies(rows, out_features, in_features): written
 inline void mlp_down_8bit(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, const MlpDown8bitCopies& copies_val) {
     mlp_down_8bit_round(copies_val, input_tensor, weight_tensor);
+    mlp_down_8bit_rounded_at<MLP_DOWN_8BIT_ROW_GROUPS, MLP_DOWN_8BIT_COLUMNS, MLP_DOWN_8BIT_STAGES, MLP_DOWN_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
+                                                                         MLP_DOWN_8BIT_BLOCK_ROWS_PER_GROUP, MLP_DOWN_8BIT_BLOCKS);
+}
+
+/// Works out the product at this file's setting (the defines above) on copies already made: by mlp_down_8bit_round, or
+/// shared with another product that rounds the same tensor (a linear layer's output_grad for its input_grad and
+/// its weight_grad, round_8bit_rows_and_columns), so the tensor is rounded once.
+///
+///   the tensors   as in mlp_down_8bit, but the two it rounds: their copies are copies_val's
+inline void mlp_down_8bit_rounded(const Tensor& output_tensor, const Tensor& bias_tensor, const MlpDown8bitCopies& copies_val) {
     mlp_down_8bit_rounded_at<MLP_DOWN_8BIT_ROW_GROUPS, MLP_DOWN_8BIT_COLUMNS, MLP_DOWN_8BIT_STAGES, MLP_DOWN_8BIT_CLUSTER>(output_tensor, bias_tensor, copies_val,
                                                                          MLP_DOWN_8BIT_BLOCK_ROWS_PER_GROUP, MLP_DOWN_8BIT_BLOCKS);
 }

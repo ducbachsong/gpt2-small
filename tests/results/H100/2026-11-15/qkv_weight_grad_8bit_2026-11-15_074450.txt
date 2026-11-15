@@ -1,0 +1,270 @@
+log: tests/results/H100/qkv_weight_grad_8bit_2026-11-15_074450.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    qkv weight grad: output {6912, 2304}, a sum of 16384: 521.8 GFLOP
+    average of steps 3..20:              ms     TFLOPS   of bf16 peak
+        mine, rounding included          1.228      424.9     51.8%
+        mine, the product alone          0.728      717.2     87.5%
+        PyTorch (cuBLAS, bfloat16)       1.014      514.5     62.8%
+    cuBLAS takes 0.83x as long as mine with the rounding, 1.39x as long as the product alone
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      1.890 ms    276.2 TFLOPS
+        1 x  64 x 2      1.878 ms    277.9 TFLOPS
+        1 x  64 x 3      1.182 ms    441.5 TFLOPS
+        1 x  64 x 4      1.049 ms    497.4 TFLOPS
+        1 x 128 x 1      2.222 ms    234.9 TFLOPS
+        1 x 128 x 2      2.132 ms    244.7 TFLOPS
+        1 x 128 x 3      1.304 ms    400.3 TFLOPS
+        1 x 128 x 4      0.963 ms    541.7 TFLOPS
+        2 x  64 x 1      2.292 ms    227.6 TFLOPS
+        2 x  64 x 2      2.393 ms    218.1 TFLOPS
+        2 x  64 x 3      1.407 ms    370.9 TFLOPS
+        2 x  64 x 4      1.088 ms    479.7 TFLOPS
+        2 x 128 x 1      1.469 ms    355.2 TFLOPS
+        2 x 128 x 2      1.408 ms    370.5 TFLOPS
+        2 x 128 x 3      0.877 ms    594.9 TFLOPS
+        2 x 128 x 4      0.720 ms    724.5 TFLOPS   (this file's)
+    fastest: 2 x 128 x 4
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        clusters of 1,  1 rows a group, persistent    ,  0 splits      0.745 ms    700.2 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  1 splits      0.741 ms    704.2 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  2 splits      0.889 ms    587.1 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  3 splits      0.916 ms    569.9 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  4 splits      0.981 ms    532.1 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  5 splits      1.040 ms    501.8 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  6 splits      1.110 ms    470.0 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  7 splits      1.179 ms    442.7 TFLOPS
+        clusters of 1,  1 rows a group, persistent    ,  8 splits      1.244 ms    419.4 TFLOPS
+        clusters of 1,  1 rows a group, persistent    , 12 splits      1.515 ms    344.4 TFLOPS
+        clusters of 1,  1 rows a group, persistent    , 16 splits      1.781 ms    293.0 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  0 splits      0.752 ms    693.7 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  1 splits      0.750 ms    696.2 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  2 splits      0.904 ms    577.2 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  3 splits      0.940 ms    555.3 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  4 splits      1.011 ms    516.3 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  5 splits      1.081 ms    482.7 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  6 splits      1.163 ms    448.8 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  7 splits      1.239 ms    421.0 TFLOPS
+        clusters of 1,  1 rows a group, one a square  ,  8 splits      1.316 ms    396.4 TFLOPS
+        clusters of 1,  1 rows a group, one a square  , 12 splits      1.630 ms    320.1 TFLOPS
+        clusters of 1,  1 rows a group, one a square  , 16 splits      1.939 ms    269.1 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  0 splits      0.755 ms    691.6 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  1 splits      0.753 ms    693.4 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  2 splits      0.889 ms    587.0 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  3 splits      0.921 ms    566.3 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  4 splits      0.989 ms    527.7 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  5 splits      1.051 ms    496.4 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  6 splits      1.126 ms    463.5 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  7 splits      1.192 ms    437.7 TFLOPS
+        clusters of 1,  4 rows a group, persistent    ,  8 splits      1.263 ms    413.3 TFLOPS
+        clusters of 1,  4 rows a group, persistent    , 12 splits      1.526 ms    342.0 TFLOPS
+        clusters of 1,  4 rows a group, persistent    , 16 splits      1.790 ms    291.5 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  0 splits      0.766 ms    680.8 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  1 splits      0.765 ms    682.1 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  2 splits      0.924 ms    564.8 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  3 splits      0.958 ms    545.0 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  4 splits      1.019 ms    512.0 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  5 splits      1.096 ms    476.2 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  6 splits      1.176 ms    443.6 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  7 splits      1.251 ms    417.2 TFLOPS
+        clusters of 1,  4 rows a group, one a square  ,  8 splits      1.327 ms    393.4 TFLOPS
+        clusters of 1,  4 rows a group, one a square  , 12 splits      1.632 ms    319.7 TFLOPS
+        clusters of 1,  4 rows a group, one a square  , 16 splits      1.939 ms    269.1 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  0 splits      0.769 ms    679.0 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  1 splits      0.766 ms    680.9 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  2 splits      0.908 ms    574.9 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  3 splits      0.938 ms    556.2 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  4 splits      1.000 ms    522.1 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  5 splits      1.069 ms    488.0 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  6 splits      1.137 ms    459.1 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  7 splits      1.209 ms    431.6 TFLOPS
+        clusters of 1, 16 rows a group, persistent    ,  8 splits      1.279 ms    408.1 TFLOPS
+        clusters of 1, 16 rows a group, persistent    , 12 splits      1.551 ms    336.5 TFLOPS
+        clusters of 1, 16 rows a group, persistent    , 16 splits      1.818 ms    287.0 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  0 splits      0.785 ms    664.9 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  1 splits      0.782 ms    667.2 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  2 splits      0.939 ms    555.5 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  3 splits      0.967 ms    539.5 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  4 splits      1.038 ms    502.8 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  5 splits      1.120 ms    465.9 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  6 splits      1.204 ms    433.4 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  7 splits      1.280 ms    407.8 TFLOPS
+        clusters of 1, 16 rows a group, one a square  ,  8 splits      1.363 ms    382.8 TFLOPS
+        clusters of 1, 16 rows a group, one a square  , 12 splits      1.687 ms    309.3 TFLOPS
+        clusters of 1, 16 rows a group, one a square  , 16 splits      2.005 ms    260.3 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  0 splits      0.843 ms    619.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  1 splits      0.841 ms    620.8 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  2 splits      1.022 ms    510.7 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  3 splits      1.086 ms    480.5 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  4 splits      1.104 ms    472.7 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  5 splits      1.125 ms    463.8 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  6 splits      1.189 ms    439.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  7 splits      1.248 ms    418.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent    ,  8 splits      1.311 ms    398.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent    , 12 splits      1.582 ms    329.9 TFLOPS
+        clusters of 1, 64 rows a group, persistent    , 16 splits      1.845 ms    282.9 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  0 splits      0.869 ms    600.5 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  1 splits      0.862 ms    605.0 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  2 splits      1.055 ms    494.8 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  3 splits      1.136 ms    459.3 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  4 splits      1.196 ms    436.3 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  5 splits      1.195 ms    436.7 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  6 splits      1.250 ms    417.6 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  7 splits      1.322 ms    394.6 TFLOPS
+        clusters of 1, 64 rows a group, one a square  ,  8 splits      1.393 ms    374.7 TFLOPS
+        clusters of 1, 64 rows a group, one a square  , 12 splits      1.702 ms    306.5 TFLOPS
+        clusters of 1, 64 rows a group, one a square  , 16 splits      1.994 ms    261.7 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  0 splits      0.811 ms    643.2 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  1 splits      0.809 ms    645.1 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  2 splits      0.948 ms    550.5 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  3 splits      0.983 ms    531.0 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  4 splits      1.040 ms    501.5 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  5 splits      1.092 ms    478.0 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  6 splits      1.157 ms    451.1 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  7 splits      1.217 ms    428.8 TFLOPS
+        clusters of 2,  1 rows a group, persistent    ,  8 splits      1.287 ms    405.3 TFLOPS
+        clusters of 2,  1 rows a group, persistent    , 12 splits      1.556 ms    335.4 TFLOPS
+        clusters of 2,  1 rows a group, persistent    , 16 splits      1.829 ms    285.3 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  0 splits      0.834 ms    625.7 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  1 splits      0.831 ms    627.9 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  2 splits      1.006 ms    518.9 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  3 splits      1.053 ms    495.5 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  4 splits      1.115 ms    468.1 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  5 splits      1.201 ms    434.5 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  6 splits      1.299 ms    401.8 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  7 splits      1.392 ms    374.9 TFLOPS
+        clusters of 2,  1 rows a group, one a square  ,  8 splits      1.485 ms    351.5 TFLOPS
+        clusters of 2,  1 rows a group, one a square  , 12 splits      1.874 ms    278.4 TFLOPS
+        clusters of 2,  1 rows a group, one a square  , 16 splits      2.252 ms    231.8 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  0 splits      0.797 ms    654.4 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  1 splits      0.795 ms    656.7 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  2 splits      0.949 ms    550.0 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  3 splits      0.970 ms    537.8 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  4 splits      1.035 ms    504.2 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  5 splits      1.083 ms    482.0 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  6 splits      1.160 ms    449.8 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  7 splits      1.214 ms    429.9 TFLOPS
+        clusters of 2,  4 rows a group, persistent    ,  8 splits      1.291 ms    404.3 TFLOPS
+        clusters of 2,  4 rows a group, persistent    , 12 splits      1.554 ms    335.8 TFLOPS
+        clusters of 2,  4 rows a group, persistent    , 16 splits      1.822 ms    286.5 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  0 splits      0.829 ms    629.9 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  1 splits      0.826 ms    631.5 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  2 splits      0.998 ms    522.7 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  3 splits      1.049 ms    497.3 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  4 splits      1.137 ms    459.1 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  5 splits      1.219 ms    428.0 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  6 splits      1.317 ms    396.1 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  7 splits      1.408 ms    370.7 TFLOPS
+        clusters of 2,  4 rows a group, one a square  ,  8 splits      1.500 ms    347.8 TFLOPS
+        clusters of 2,  4 rows a group, one a square  , 12 splits      1.890 ms    276.1 TFLOPS
+        clusters of 2,  4 rows a group, one a square  , 16 splits      2.269 ms    230.0 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  0 splits      0.800 ms    652.2 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  1 splits      0.799 ms    653.3 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  2 splits      0.960 ms    543.6 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  3 splits      0.988 ms    528.4 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  4 splits      1.043 ms    500.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  5 splits      1.082 ms    482.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  6 splits      1.160 ms    450.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  7 splits      1.213 ms    430.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent    ,  8 splits      1.285 ms    406.2 TFLOPS
+        clusters of 2, 16 rows a group, persistent    , 12 splits      1.550 ms    336.7 TFLOPS
+        clusters of 2, 16 rows a group, persistent    , 16 splits      1.816 ms    287.4 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  0 splits      0.834 ms    625.9 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  1 splits      0.832 ms    627.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  2 splits      1.019 ms    512.0 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  3 splits      1.077 ms    484.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  4 splits      1.114 ms    468.3 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  5 splits      1.198 ms    435.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  6 splits      1.297 ms    402.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  7 splits      1.392 ms    374.9 TFLOPS
+        clusters of 2, 16 rows a group, one a square  ,  8 splits      1.480 ms    352.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square  , 12 splits      1.856 ms    281.1 TFLOPS
+        clusters of 2, 16 rows a group, one a square  , 16 splits      2.226 ms    234.5 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  0 splits      0.845 ms    617.7 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  1 splits      0.843 ms    619.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  2 splits      1.027 ms    508.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  3 splits      1.087 ms    480.0 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  4 splits      1.099 ms    474.8 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  5 splits      1.125 ms    464.0 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  6 splits      1.191 ms    438.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  7 splits      1.243 ms    420.0 TFLOPS
+        clusters of 2, 64 rows a group, persistent    ,  8 splits      1.310 ms    398.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent    , 12 splits      1.571 ms    332.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent    , 16 splits      1.827 ms    285.7 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  0 splits      0.892 ms    585.0 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  1 splits      0.889 ms    587.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  2 splits      1.098 ms    475.1 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  3 splits      1.197 ms    436.1 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  4 splits      1.281 ms    407.2 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  5 splits      1.287 ms    405.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  6 splits      1.355 ms    385.1 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  7 splits      1.430 ms    364.8 TFLOPS
+        clusters of 2, 64 rows a group, one a square  ,  8 splits      1.522 ms    342.8 TFLOPS
+        clusters of 2, 64 rows a group, one a square  , 12 splits      1.882 ms    277.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square  , 16 splits      2.230 ms    234.0 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        producer 24 registers, 0 in flight, promotion 4, 32 staged rows, padding  8      0.710 ms    735.0 TFLOPS
+        producer 24 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.783 ms    666.6 TFLOPS
+        producer 24 registers, 2 in flight, promotion 4, 32 staged rows, padding  8      0.986 ms    529.4 TFLOPS
+        producer 24 registers, 3 in flight, promotion 4, 32 staged rows, padding  8      1.702 ms    306.7 TFLOPS
+        producer 32 registers, 0 in flight, promotion 4, 32 staged rows, padding  8      0.707 ms    738.0 TFLOPS
+        producer 32 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.791 ms    660.1 TFLOPS
+        producer 32 registers, 2 in flight, promotion 4, 32 staged rows, padding  8      1.010 ms    516.4 TFLOPS
+        producer 32 registers, 3 in flight, promotion 4, 32 staged rows, padding  8      1.738 ms    300.3 TFLOPS
+        producer 40 registers, 0 in flight, promotion 4, 32 staged rows, padding  8      0.716 ms    728.7 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.789 ms    661.7 TFLOPS
+        producer 40 registers, 2 in flight, promotion 4, 32 staged rows, padding  8      1.009 ms    517.0 TFLOPS
+        producer 40 registers, 3 in flight, promotion 4, 32 staged rows, padding  8      1.730 ms    301.6 TFLOPS
+        producer 48 registers, 0 in flight, promotion 4, 32 staged rows, padding  8      0.708 ms    737.1 TFLOPS
+        producer 48 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.790 ms    660.5 TFLOPS
+        producer 48 registers, 2 in flight, promotion 4, 32 staged rows, padding  8      1.015 ms    514.1 TFLOPS
+        producer 48 registers, 3 in flight, promotion 4, 32 staged rows, padding  8      1.742 ms    299.5 TFLOPS
+        producer 56 registers, 0 in flight, promotion 4, 32 staged rows, padding  8      0.713 ms    731.5 TFLOPS
+        producer 56 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.790 ms    660.2 TFLOPS
+        producer 56 registers, 2 in flight, promotion 4, 32 staged rows, padding  8      1.017 ms    513.3 TFLOPS
+        producer 56 registers, 3 in flight, promotion 4, 32 staged rows, padding  8      1.746 ms    298.9 TFLOPS
+        producer 40 registers, 1 in flight, promotion 0, 32 staged rows, padding  8      0.733 ms    711.8 TFLOPS
+        producer 40 registers, 1 in flight, promotion 1, 32 staged rows, padding  8      0.860 ms    606.7 TFLOPS
+        producer 40 registers, 1 in flight, promotion 2, 32 staged rows, padding  8      0.802 ms    651.0 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.788 ms    661.9 TFLOPS
+        producer 40 registers, 1 in flight, promotion 8, 32 staged rows, padding  8      0.759 ms    687.2 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 16 staged rows, padding  0      0.788 ms    662.1 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 16 staged rows, padding  4      0.787 ms    662.8 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 16 staged rows, padding  8      0.788 ms    662.5 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 16 staged rows, padding 16      0.785 ms    664.8 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding  0      0.784 ms    665.6 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding  4      0.783 ms    666.5 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding  8      0.783 ms    666.3 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 32 staged rows, padding 16      0.783 ms    666.4 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 64 staged rows, padding  0      0.783 ms    666.6 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 64 staged rows, padding  4      0.782 ms    667.0 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 64 staged rows, padding  8      0.782 ms    667.7 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4, 64 staged rows, padding 16      0.781 ms    668.1 TFLOPS
+    (the promotion changes the bits a little: every 4 steps was as accurate as every step on an H100 NVL; 0, never,
+     keeps the whole sum in the tensor cores, less accurate over a long sum)
+
+    for llmc/kernels/8bit/prod/qkv_weight_grad_8bit.cuh:
+#define QKV_WEIGHT_GRAD_8BIT_ROW_GROUPS 2
+#define QKV_WEIGHT_GRAD_8BIT_COLUMNS 128
+#define QKV_WEIGHT_GRAD_8BIT_STAGES 4
+#define QKV_WEIGHT_GRAD_8BIT_SPLITS 1
+#define QKV_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1
+#define QKV_WEIGHT_GRAD_8BIT_CLUSTER 1
+#define QKV_WEIGHT_GRAD_8BIT_BLOCKS 0
+#define QKV_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 32
+#define QKV_WEIGHT_GRAD_8BIT_IN_FLIGHT 0
+#define QKV_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 0
+#define QKV_WEIGHT_GRAD_8BIT_STAGED_ROWS 64
+#define QKV_WEIGHT_GRAD_8BIT_STAGED_ROW_PADDING 16
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion
+     changes the bits: take a faster one only if the tests stay within their tolerances)
+
+all tunes done
