@@ -4,7 +4,8 @@
 // Part 1 checks against PyTorch's float product of the same values, at GPT-2 small's size and at sizes no square
 // divides; part 2 checks the bits: the same as wgmma_matmul_bf16 (the general product this kernel was split from) at
 // the same setting, and the same at every square, block order, block count, cluster, producer register count and
-// steps in flight (weight_grads: and staged rows and padding)
+// steps in flight (weight_grads: and staged rows and padding); stream-K (its own bits: near PyTorch's, the same every
+// run, and the default's when no square is shared)
 // Part 3 checks that the kernels' registers fit their block. Run it on an H100 (compute capability 9.0), built with
 // -arch=sm_90a. The timings are in tune_head_input_grad_bf16.cu.
 #include <torch/types.h>              // torch::randn, torch::matmul; before CUDA headers
@@ -28,6 +29,8 @@ static const double BFLOAT16_TOLERANCE = 1e-2;
 #define ODD_ROWS 200                  // sizes no square divides: 3 x 64 + 8 rows, ...
 #define ODD_COLUMNS 264               // ... 4 x 64 + 8 columns ...
 #define ODD_SUM_LENGTH 1032           // ... and 16 steps of 64 values of k + 8
+#define MODEL_ROWS 4096               // the 32 x 2,304 model's head on 2 rows of 2048 tokens: 9 x 32 squares of 128 x 256,
+#define MODEL_EMBED_DIM 2304          // 2 full rounds on 114 SMs and 60 squares left over, shared by stream-K
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -95,12 +98,12 @@ static Outputs fresh_outputs(const Operands &operands_val, size_t rows_val, size
 
 /// Runs head_input_grad_bf16 at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = HEAD_INPUT_GRAD_BF16_IN_FLIGHT
+          int IN_FLIGHT = HEAD_INPUT_GRAD_BF16_IN_FLIGHT, int STREAM_K = HEAD_INPUT_GRAD_BF16_STREAM_K
           >
 static void mine_at(const Outputs &outputs_val, const Operands &operands_val,
                     int block_rows_per_group_val, int blocks_val)
 {
-    head_input_grad_bf16_at<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>(outputs_val.output_tensor, operands_val.output_grad_tensor, operands_val.weight_tensor,
+    head_input_grad_bf16_at<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, STREAM_K>(outputs_val.output_tensor, operands_val.output_grad_tensor, operands_val.weight_tensor,
                                                  block_rows_per_group_val, blocks_val);
 }
 
@@ -108,6 +111,14 @@ static void mine_at(const Outputs &outputs_val, const Operands &operands_val,
 static void mine(const Outputs &outputs_val, const Operands &operands_val)
 {
     head_input_grad_bf16(outputs_val.output_tensor, operands_val.output_grad_tensor, operands_val.weight_tensor);
+}
+
+/// Runs head_input_grad_bf16 at this file's setting with each square whole (no stream-K): the walk the bits checks
+/// below compare, each value's sum in one piece as the general kernel's.
+static void whole(const Outputs &outputs_val, const Operands &operands_val)
+{
+    mine_at<HEAD_INPUT_GRAD_BF16_ROW_GROUPS, HEAD_INPUT_GRAD_BF16_COLUMNS, HEAD_INPUT_GRAD_BF16_STAGES, HEAD_INPUT_GRAD_BF16_CLUSTER, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>(outputs_val, operands_val,
+                                                                                                      HEAD_INPUT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_INPUT_GRAD_BF16_BLOCKS);
 }
 
 /// Runs the same product with wgmma_matmul_bf16 (the general kernel) at this file's setting
@@ -169,7 +180,8 @@ static void matches_pytorch_with_sizes_no_tile_divides(void)
 
 static void gives_wgmma_matmul_bf16s_bits(void)
 {
-    // Expect: at GPT-2 small's size and at sizes no square divides, head_input_grad_bf16 at its setting gives the same bits as
+    // Expect: at GPT-2 small's size and at sizes no square divides, head_input_grad_bf16 at its setting, each square
+    // whole (stream-K's split sums: stream_k_matches_pytorch_and_itself), gives the same bits as
     // wgmma_matmul_bf16 at the same setting
     // : the same sums in the same order, rounded once the same way, so training gives the same numbers.
     print_test_name(__func__);
@@ -179,7 +191,7 @@ static void gives_wgmma_matmul_bf16s_bits(void)
         Operands operands_val = random_operands(size_val[0], size_val[1], size_val[2], 2);
         Outputs mine_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
         Outputs reference_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
-        mine(mine_val, operands_val);
+        whole(mine_val, operands_val);
         reference(reference_val, operands_val);
         printf("    rows %zu, columns %zu, sum_length %zu:\n", size_val[0], size_val[1], size_val[2]);
         ASSERT_EQ(same_bits(mine_val, reference_val), true);
@@ -192,9 +204,9 @@ static void square_at(const Outputs &outputs_val, const Operands &operands_val, 
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS, STAGES, 2>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS, STAGES, 2, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS, STAGES, 1>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS, STAGES, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square that fits a block's shared memory, and its run.
@@ -241,7 +253,7 @@ static void every_square_gives_the_default_bits(void)
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 3);
     print_test_name(__func__);
     Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
-    mine(default_val, operands_val);
+    whole(default_val, operands_val);
     for (const Square &square_val : SQUARES_LIST)
     {
         Outputs outputs_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
@@ -260,7 +272,7 @@ static void every_order_block_count_and_cluster_gives_the_default_bits(void)
     print_test_name(__func__);
     {
         Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
-        mine(default_val, operands_val);
+        whole(default_val, operands_val);
         for (int cluster_val : {1, 2})
             for (int block_rows_per_group_val : {1, 4, 16, 64})
                 for (int blocks_val : {0, 1, 3, HEAD_INPUT_GRAD_BF16_ONE_A_SQUARE})
@@ -324,7 +336,8 @@ static void every_variant_gives_the_default_bits(void)
 {
     // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH, at this file's square, cluster, order and
     // blocks: every producer register count (24 to 56) and steps in flight (0 to 3)
-    // gives the bits of this file's setting: they move registers, waits and shared memory, never a sum.
+    // gives the bits of this file's setting (with stream-K: the same pieces at the same block count, added in the
+    // same order): they move registers, waits and shared memory, never a sum.
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 5);
     print_test_name(__func__);
     Outputs default_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
@@ -338,6 +351,71 @@ static void every_variant_gives_the_default_bits(void)
     }
 }
 
+/// One stream-K square (warpgroups x COLUMNS x STAGES, clusters of 1) at a block order and block count: what the
+/// stream-K check below calls.
+template <int ROW_GROUPS, int COLUMNS, int STAGES>
+static void stream_k_at(const Outputs &outputs_val, const Operands &operands_val, int block_rows_per_group_val, int blocks_val)
+{
+    mine_at<ROW_GROUPS, COLUMNS, STAGES, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 1>(outputs_val, operands_val,
+                                                                                                                    block_rows_per_group_val, blocks_val);
+}
+
+/// A stream-K square and its run.
+struct StreamKSquare
+{
+    int row_groups_val;
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Outputs &, const Operands &, int, int);
+};
+
+/// The stream-K squares: this file's and two smaller ones (more squares, so more of them whole).
+static const StreamKSquare STREAM_K_SQUARES_LIST[] = {
+    {HEAD_INPUT_GRAD_BF16_ROW_GROUPS, HEAD_INPUT_GRAD_BF16_COLUMNS, HEAD_INPUT_GRAD_BF16_STAGES,
+     stream_k_at<HEAD_INPUT_GRAD_BF16_ROW_GROUPS, HEAD_INPUT_GRAD_BF16_COLUMNS, HEAD_INPUT_GRAD_BF16_STAGES>},
+    {2, 128, 4, stream_k_at<2, 128, 4>},
+    {1, 128, 4, stream_k_at<1, 128, 4>},
+};
+
+static void stream_k_matches_pytorch_and_itself(void)
+{
+    // Expect: at sizes no square divides, GPT-2 small's and the 32 x 2,304 model's head, every stream-K square at block
+    // orders 1 and 16 and block counts as many as run at once (the leftover squares' steps shared by all of them:
+    // at the odd size 4 squares of 17 steps over every block, a step or so each, up to 17 pieces a square), 1 (no
+    // square shared), 3 and 7: within 1e-2 of PyTorch's float product; run again, the same bits (each square's pieces
+    // added in the same order whoever finishes first); with 1 block, the bits of this file's setting (every square
+    // whole, the default's sums).
+    print_test_name(__func__);
+    const size_t sizes_list[3][3] = {{ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH},
+                                     {GPT2_ROWS, GPT2_EMBED_DIM, GPT2_PADDED_VOCAB_SIZE},
+                                     {MODEL_ROWS, MODEL_EMBED_DIM, GPT2_PADDED_VOCAB_SIZE}};
+    for (const auto &size_val : sizes_list)
+    {
+        Operands operands_val = random_operands(size_val[0], size_val[1], size_val[2], 7);
+        torch::Tensor expected_tensor = pytorch_expected(operands_val);
+        Outputs default_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
+        whole(default_val, operands_val);
+        for (const StreamKSquare &square_val : STREAM_K_SQUARES_LIST)
+            for (int block_rows_per_group_val : {1, 16})
+                for (int blocks_val : {0, 1, 3, 7})
+                {
+                    if (size_val[0] != ODD_ROWS && blocks_val == 1)
+                        continue;                                // one block for a whole large product: slow, and the odd size covers it
+                    Outputs first_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
+                    Outputs second_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
+                    square_val.run_ptr(first_val, operands_val, block_rows_per_group_val, blocks_val);
+                    square_val.run_ptr(second_val, operands_val, block_rows_per_group_val, blocks_val);
+                    printf("    rows %zu, columns %zu, sum_length %zu: stream-K %d x %d x %d sets, %d rows a group, %d blocks:\n", size_val[0],
+                           size_val[1], size_val[2], square_val.row_groups_val, square_val.columns_val, square_val.stages_val,
+                           block_rows_per_group_val, blocks_val);
+                    ASSERT_NEAR(relative_difference_on_gpu(first_val.output_tensor, expected_tensor), 0.0, BFLOAT16_TOLERANCE);
+                    ASSERT_EQ(same_bits(first_val, second_val), true);
+                    if (blocks_val == 1)
+                        ASSERT_EQ(same_bits(first_val, default_val), true);
+                }
+    }
+}
+
 // ══ part 3: the kernels fit their launch ══════════════════════════════════════
 
 static const size_t MOST_SPILL_OF_THE_LARGEST_SQUARE = 16;   // bytes the 2 warpgroups x 256 columns kernels may spill (see below)
@@ -347,8 +425,8 @@ static const size_t MOST_SPILL_OF_THE_LARGEST_SQUARE = 16;   // bytes the 2 warp
 template <int COLUMNS, int STAGES, int ROW_GROUPS>
 static void add_kernels_of_square(std::vector<const void *> &kernels_list, std::vector<std::string> &names_list, std::vector<int> &threads_list)
 {
-    kernels_list.push_back((const void *)head_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 1>);
-    kernels_list.push_back((const void *)head_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 2>);
+    kernels_list.push_back((const void *)head_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>);
+    kernels_list.push_back((const void *)head_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 2, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>);
     for (const char *kind_ptr : {"clusters of 1", "clusters of 2"})
     {
         names_list.push_back(std::string("head_input_grad_bf16_kernel<") + std::to_string(ROW_GROUPS) + " warpgroups, " + std::to_string(COLUMNS) +
@@ -390,6 +468,21 @@ static void every_kernel_fits_its_block(void)
     add_kernels_of_square<256, 1, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_square<256, 2, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_square<256, 3, 2>(kernels_list, names_list, threads_list);
+    // the stream-K squares (clusters of 1): the scratch's writes and adds next to the sums
+    const void *stream_k_kernels_list[] = {
+        (const void *)head_input_grad_bf16_kernel<256, 3, 2, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 1>,
+        (const void *)head_input_grad_bf16_kernel<128, 4, 2, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 1>,
+        (const void *)head_input_grad_bf16_kernel<128, 4, 1, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 1>};
+    const char *stream_k_names_list[] = {"head_input_grad_bf16_kernel<stream-K, 2 warpgroups, 256 columns, 3 sets>",
+                                         "head_input_grad_bf16_kernel<stream-K, 2 warpgroups, 128 columns, 4 sets>",
+                                         "head_input_grad_bf16_kernel<stream-K, 1 warpgroups, 128 columns, 4 sets>"};
+    const int stream_k_row_groups_list[] = {2, 2, 1};
+    for (int stream_k_index_val = 0; stream_k_index_val < 3; stream_k_index_val++)
+    {
+        kernels_list.push_back(stream_k_kernels_list[stream_k_index_val]);
+        names_list.push_back(stream_k_names_list[stream_k_index_val]);
+        threads_list.push_back((HEAD_INPUT_GRAD_BF16_PRODUCER_WARPGROUPS + stream_k_row_groups_list[stream_k_index_val]) * HARDWARE_WARPGROUP_THREADS);
+    }
     for (size_t kernel_index_val = 0; kernel_index_val < kernels_list.size(); kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -417,6 +510,7 @@ int main(void)
     every_square_gives_the_default_bits();
     every_order_block_count_and_cluster_gives_the_default_bits();
     every_variant_gives_the_default_bits();
+    stream_k_matches_pytorch_and_itself();
 
     every_kernel_fits_its_block();
 

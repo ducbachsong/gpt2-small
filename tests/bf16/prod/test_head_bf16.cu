@@ -27,6 +27,9 @@ static const double BFLOAT16_TOLERANCE = 1e-2;
 #define GPT2_PADDED_VOCAB_SIZE 50304
 #define ODD_ROWS 200                  // sizes no square divides: 3 x 64 + 8 rows, ...
 #define ODD_COLUMNS 264               // ... 4 x 64 + 8 columns ...
+// the sets of tiles for the cooperative walk's checks (the general kernel's, and this file's square in clusters): the
+// sets never change a bit, and ping-pong's 4 (a set holding one left tile) do not fit a cooperative block
+#define COOPERATIVE_STAGES (HEAD_BF16_STAGES < 3 ? HEAD_BF16_STAGES : 3)
 #define ODD_SUM_LENGTH 1032           // ... and 16 steps of 64 values of k + 8
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -95,12 +98,12 @@ static Outputs fresh_outputs(const Operands &operands_val, size_t rows_val, size
 
 /// Runs head_bf16 at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = HEAD_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = HEAD_BF16_IN_FLIGHT
+          int IN_FLIGHT = HEAD_BF16_IN_FLIGHT, int PINGPONG = HEAD_BF16_PINGPONG
           >
 static void mine_at(const Outputs &outputs_val, const Operands &operands_val,
                     int block_rows_per_group_val, int blocks_val)
 {
-    head_bf16_at<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>(outputs_val.output_tensor, operands_val.input_tensor, operands_val.weight_tensor,
+    head_bf16_at<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PINGPONG>(outputs_val.output_tensor, operands_val.input_tensor, operands_val.weight_tensor,
                                                  block_rows_per_group_val, blocks_val);
 }
 
@@ -115,7 +118,7 @@ static void mine(const Outputs &outputs_val, const Operands &operands_val)
 static void reference(const Outputs &outputs_val, const Operands &operands_val
                       )
 {
-    wgmma_matmul_bf16_at<HEAD_BF16_ROW_GROUPS, HEAD_BF16_COLUMNS, HEAD_BF16_STAGES, HEAD_BF16_CLUSTER>(
+    wgmma_matmul_bf16_at<HEAD_BF16_ROW_GROUPS, HEAD_BF16_COLUMNS, COOPERATIVE_STAGES, HEAD_BF16_CLUSTER>(
         outputs_val.output_tensor, operands_val.input_tensor, operands_val.weight_tensor, Tensor(), false, false, false,
         WgmmaMatmulBf16Store(), 1, HEAD_BF16_BLOCK_ROWS_PER_GROUP);
 }
@@ -192,9 +195,9 @@ static void square_at(const Outputs &outputs_val, const Operands &operands_val, 
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS, STAGES, 2>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS, STAGES, 2, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 0>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS, STAGES, 1>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS, STAGES, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 0>(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square that fits a block's shared memory, and its run.
@@ -255,7 +258,8 @@ static void every_order_block_count_and_cluster_gives_the_default_bits(void)
 {
     // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH, at this file's square: every block order
     // (1, 4, 16, 64 rows of squares a group), block count (as many as run at once, 1, 3, one a square) and cluster
-    // (1, 2) gives the bits of this file's setting: who works out a square changes, never a sum.
+    // (1, 2) gives the bits of this file's setting: who works out a square changes, never a sum. The cooperative
+    // walk at COOPERATIVE_STAGES sets (ping-pong's orders and counts: pingpong_gives_the_default_bits).
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 4);
     print_test_name(__func__);
     {
@@ -266,9 +270,61 @@ static void every_order_block_count_and_cluster_gives_the_default_bits(void)
                 for (int blocks_val : {0, 1, 3, HEAD_BF16_ONE_A_SQUARE})
                 {
                     Outputs outputs_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
-                    square_at<HEAD_BF16_ROW_GROUPS, HEAD_BF16_COLUMNS, HEAD_BF16_STAGES>(outputs_val, operands_val, cluster_val, block_rows_per_group_val,
+                    square_at<HEAD_BF16_ROW_GROUPS, HEAD_BF16_COLUMNS, COOPERATIVE_STAGES>(outputs_val, operands_val, cluster_val, block_rows_per_group_val,
                                                                      blocks_val);
                     printf("    clusters of %d, %d rows a group, %d blocks:\n", cluster_val, block_rows_per_group_val, blocks_val);
+                    ASSERT_EQ(same_bits(outputs_val, default_val), true);
+                }
+    }
+}
+
+/// One ping-pong square (2 warpgroups x COLUMNS x STAGES, clusters of 1) at a block order and block count: what the
+/// ping-pong check below calls.
+template <int COLUMNS, int STAGES>
+static void pingpong_at(const Outputs &outputs_val, const Operands &operands_val, int block_rows_per_group_val, int blocks_val)
+{
+    mine_at<2, COLUMNS, STAGES, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 1>(outputs_val, operands_val,
+                                                                                            block_rows_per_group_val, blocks_val);
+}
+
+/// A ping-pong square and its run.
+struct PingpongSquare
+{
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Outputs &, const Operands &, int, int);
+};
+
+/// The ping-pong squares: 128 or 256 columns, 2 to 4 sets (256 x 4 fits: a set holds one left tile).
+static const PingpongSquare PINGPONG_SQUARES_LIST[] = {
+    {128, 2, pingpong_at<128, 2>}, {128, 3, pingpong_at<128, 3>}, {128, 4, pingpong_at<128, 4>},
+    {256, 2, pingpong_at<256, 2>}, {256, 3, pingpong_at<256, 3>}, {256, 4, pingpong_at<256, 4>},
+};
+
+static void pingpong_gives_the_default_bits(void)
+{
+    // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH, and GPT-2's size: every ping-pong square
+    // (the 2 warpgroups each on their own 64-row squares, their sums in turns), at block orders 1 and 4 and block
+    // counts as many as run at once, 1 (one block takes every square, its warpgroups taking turns over all of them),
+    // 3 (a warpgroup with one square fewer) and one a square, gives the bits of this file's setting: each value's sum
+    // is the same 64 x k walk in the same order, only who works it out and when changes.
+    print_test_name(__func__);
+    const size_t sizes_list[2][3] = {{ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH}, {GPT2_ROWS, GPT2_PADDED_VOCAB_SIZE, GPT2_EMBED_DIM}};
+    for (const auto &size_val : sizes_list)
+    {
+        Operands operands_val = random_operands(size_val[0], size_val[1], size_val[2], 6);
+        Outputs default_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
+        mine(default_val, operands_val);
+        for (const PingpongSquare &square_val : PINGPONG_SQUARES_LIST)
+            for (int block_rows_per_group_val : {1, 4})
+                for (int blocks_val : {0, 1, 3, HEAD_BF16_ONE_A_SQUARE})
+                {
+                    if (size_val[0] == GPT2_ROWS && blocks_val == 1)
+                        continue;                                // one block for the whole of GPT-2's size: slow, and 3 covers it
+                    Outputs outputs_val = fresh_outputs(operands_val, size_val[0], size_val[1]);
+                    square_val.run_ptr(outputs_val, operands_val, block_rows_per_group_val, blocks_val);
+                    printf("    rows %zu: ping-pong 2 x %d x %d sets, %d rows a group, %d blocks:\n", size_val[0], square_val.columns_val,
+                           square_val.stages_val, block_rows_per_group_val, blocks_val);
                     ASSERT_EQ(same_bits(outputs_val, default_val), true);
                 }
     }
@@ -347,8 +403,8 @@ static const size_t MOST_SPILL_OF_THE_LARGEST_SQUARE = 16;   // bytes the 2 warp
 template <int COLUMNS, int STAGES, int ROW_GROUPS>
 static void add_kernels_of_square(std::vector<const void *> &kernels_list, std::vector<std::string> &names_list, std::vector<int> &threads_list)
 {
-    kernels_list.push_back((const void *)head_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 1>);
-    kernels_list.push_back((const void *)head_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 2>);
+    kernels_list.push_back((const void *)head_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 0>);
+    kernels_list.push_back((const void *)head_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, 2, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 0>);
     for (const char *kind_ptr : {"clusters of 1", "clusters of 2"})
     {
         names_list.push_back(std::string("head_bf16_kernel<") + std::to_string(ROW_GROUPS) + " warpgroups, " + std::to_string(COLUMNS) +
@@ -390,6 +446,18 @@ static void every_kernel_fits_its_block(void)
     add_kernels_of_square<256, 1, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_square<256, 2, 2>(kernels_list, names_list, threads_list);
     add_kernels_of_square<256, 3, 2>(kernels_list, names_list, threads_list);
+    // the ping-pong squares (2 warpgroups, clusters of 1)
+    const void *pingpong_kernels_list[] = {(const void *)head_bf16_kernel<128, 4, 2, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 1>,
+                                           (const void *)head_bf16_kernel<256, 3, 2, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 1>,
+                                           (const void *)head_bf16_kernel<256, 4, 2, 1, HEAD_BF16_PRODUCER_REGISTERS, HEAD_BF16_IN_FLIGHT, 1>};
+    const char *pingpong_names_list[] = {"head_bf16_kernel<ping-pong, 128 columns, 4 sets>", "head_bf16_kernel<ping-pong, 256 columns, 3 sets>",
+                                         "head_bf16_kernel<ping-pong, 256 columns, 4 sets>"};
+    for (int pingpong_index_val = 0; pingpong_index_val < 3; pingpong_index_val++)
+    {
+        kernels_list.push_back(pingpong_kernels_list[pingpong_index_val]);
+        names_list.push_back(pingpong_names_list[pingpong_index_val]);
+        threads_list.push_back((HEAD_BF16_PRODUCER_WARPGROUPS + 2) * HARDWARE_WARPGROUP_THREADS);
+    }
     for (size_t kernel_index_val = 0; kernel_index_val < kernels_list.size(); kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -417,6 +485,7 @@ int main(void)
     every_square_gives_the_default_bits();
     every_order_block_count_and_cluster_gives_the_default_bits();
     every_variant_gives_the_default_bits();
+    pingpong_gives_the_default_bits();
 
     every_kernel_fits_its_block();
 

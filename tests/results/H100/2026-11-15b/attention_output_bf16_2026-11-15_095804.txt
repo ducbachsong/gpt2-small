@@ -1,0 +1,112 @@
+log: tests/results/H100/attention_output_bf16_2026-11-15_095804.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    attention output: output {16384, 2304}, a sum of 2304: 173.9 GFLOP
+    average of steps 3..20:            ms     TFLOPS   of bf16 peak
+        mine (this file's setting)     0.371      468.5     57.2%
+        PyTorch (cuBLAS)               0.350      496.6     60.6%
+    cuBLAS takes 0.94x as long as mine
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      0.798 ms    218.0 TFLOPS
+        1 x  64 x 2      0.833 ms    208.7 TFLOPS
+        1 x  64 x 3      0.706 ms    246.5 TFLOPS
+        1 x  64 x 4      0.723 ms    240.5 TFLOPS
+        1 x 128 x 1      1.209 ms    143.9 TFLOPS
+        1 x 128 x 2      1.044 ms    166.5 TFLOPS
+        1 x 128 x 3      0.678 ms    256.4 TFLOPS
+        1 x 128 x 4      0.602 ms    289.1 TFLOPS
+        1 x 256 x 1      0.905 ms    192.2 TFLOPS
+        1 x 256 x 2      0.725 ms    239.9 TFLOPS
+        1 x 256 x 3      0.496 ms    351.0 TFLOPS
+        1 x 256 x 4      0.404 ms    430.8 TFLOPS
+        2 x  64 x 1      0.710 ms    244.9 TFLOPS
+        2 x  64 x 2      0.721 ms    241.4 TFLOPS
+        2 x  64 x 3      0.579 ms    300.5 TFLOPS
+        2 x  64 x 4      0.682 ms    254.9 TFLOPS
+        2 x 128 x 1      0.821 ms    212.0 TFLOPS
+        2 x 128 x 2      0.689 ms    252.5 TFLOPS
+        2 x 128 x 3      0.468 ms    371.5 TFLOPS
+        2 x 128 x 4      0.415 ms    418.7 TFLOPS
+        2 x 256 x 1      0.677 ms    256.9 TFLOPS
+        2 x 256 x 2      0.489 ms    355.7 TFLOPS
+        2 x 256 x 3      0.391 ms    445.2 TFLOPS   (this file's)
+    fastest: 2 x 256 x 3
+
+time_stream_k_against_this_files_setting
+    ms, average of rounds 3..20
+        this file's setting  2 x 256 x 3,  1 rows a group      0.404 ms    430.9 TFLOPS
+        stream-K             2 x 256 x 2,  1 rows a group      0.524 ms    332.0 TFLOPS
+        stream-K             2 x 256 x 2,  4 rows a group      0.537 ms    323.8 TFLOPS
+        stream-K             2 x 256 x 2, 16 rows a group      0.594 ms    292.8 TFLOPS
+        stream-K             2 x 256 x 2, 64 rows a group      0.729 ms    238.7 TFLOPS
+        stream-K             2 x 256 x 3,  1 rows a group      0.419 ms    415.4 TFLOPS
+        stream-K             2 x 256 x 3,  4 rows a group      0.422 ms    412.4 TFLOPS
+        stream-K             2 x 256 x 3, 16 rows a group      0.435 ms    400.2 TFLOPS
+        stream-K             2 x 256 x 3, 64 rows a group      0.557 ms    312.5 TFLOPS
+        stream-K             2 x 128 x 3,  1 rows a group      0.530 ms    328.5 TFLOPS
+        stream-K             2 x 128 x 3,  4 rows a group      0.529 ms    328.8 TFLOPS
+        stream-K             2 x 128 x 3, 16 rows a group      0.582 ms    298.8 TFLOPS
+        stream-K             2 x 128 x 3, 64 rows a group      0.808 ms    215.3 TFLOPS
+        stream-K             2 x 128 x 4,  1 rows a group      0.445 ms    390.5 TFLOPS
+        stream-K             2 x 128 x 4,  4 rows a group      0.448 ms    388.1 TFLOPS
+        stream-K             2 x 128 x 4, 16 rows a group      0.452 ms    384.7 TFLOPS
+        stream-K             2 x 128 x 4, 64 rows a group      0.571 ms    304.5 TFLOPS
+        stream-K             1 x 256 x 4,  1 rows a group      0.432 ms    402.7 TFLOPS
+        stream-K             1 x 256 x 4,  4 rows a group      0.429 ms    405.9 TFLOPS
+        stream-K             1 x 256 x 4, 16 rows a group      0.417 ms    416.8 TFLOPS
+        stream-K             1 x 256 x 4, 64 rows a group      0.433 ms    402.0 TFLOPS
+    fastest: this file's setting 2 x 256 x 3, 1 rows a group: 0.404 ms, this file's setting 1.00x as long
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 256 x 3
+        clusters of 1,  1 rows a group, persistent          0.412 ms    421.7 TFLOPS
+        clusters of 1,  1 rows a group, one a square        0.451 ms    385.7 TFLOPS
+        clusters of 1,  4 rows a group, persistent          0.416 ms    418.2 TFLOPS
+        clusters of 1,  4 rows a group, one a square        0.453 ms    384.4 TFLOPS
+        clusters of 1, 16 rows a group, persistent          0.425 ms    409.0 TFLOPS
+        clusters of 1, 16 rows a group, one a square        0.466 ms    373.5 TFLOPS
+        clusters of 1, 64 rows a group, persistent          0.539 ms    322.5 TFLOPS
+        clusters of 1, 64 rows a group, one a square        0.564 ms    308.6 TFLOPS
+        clusters of 2,  1 rows a group, persistent          0.418 ms    416.2 TFLOPS
+        clusters of 2,  1 rows a group, one a square        0.473 ms    367.7 TFLOPS
+        clusters of 2,  4 rows a group, persistent          0.427 ms    407.4 TFLOPS
+        clusters of 2,  4 rows a group, one a square        0.479 ms    363.3 TFLOPS
+        clusters of 2, 16 rows a group, persistent          0.472 ms    368.5 TFLOPS
+        clusters of 2, 16 rows a group, one a square        0.518 ms    335.8 TFLOPS
+        clusters of 2, 64 rows a group, persistent          0.612 ms    284.0 TFLOPS
+        clusters of 2, 64 rows a group, one a square        0.658 ms    264.5 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 256 x 3
+        producer 24 registers, 0 steps in flight      0.400 ms    434.6 TFLOPS
+        producer 24 registers, 1 steps in flight      0.411 ms    423.7 TFLOPS
+        producer 24 registers, 2 steps in flight      0.564 ms    308.2 TFLOPS
+        producer 32 registers, 0 steps in flight      0.402 ms    432.5 TFLOPS
+        producer 32 registers, 1 steps in flight      0.413 ms    421.5 TFLOPS
+        producer 32 registers, 2 steps in flight      0.576 ms    302.0 TFLOPS
+        producer 40 registers, 0 steps in flight      0.406 ms    428.2 TFLOPS
+        producer 40 registers, 1 steps in flight      0.412 ms    421.8 TFLOPS
+        producer 40 registers, 2 steps in flight      0.566 ms    307.3 TFLOPS
+        producer 48 registers, 0 steps in flight      0.402 ms    433.1 TFLOPS
+        producer 48 registers, 1 steps in flight      0.413 ms    421.4 TFLOPS
+        producer 48 registers, 2 steps in flight      0.561 ms    309.9 TFLOPS
+        producer 56 registers, 0 steps in flight      0.402 ms    432.9 TFLOPS
+        producer 56 registers, 1 steps in flight      0.414 ms    420.6 TFLOPS
+        producer 56 registers, 2 steps in flight      0.562 ms    309.5 TFLOPS
+
+    for llmc/kernels/bf16/prod/attention_output_bf16.cuh:
+#define ATTENTION_OUTPUT_BF16_ROW_GROUPS 2
+#define ATTENTION_OUTPUT_BF16_COLUMNS 256
+#define ATTENTION_OUTPUT_BF16_STAGES 3
+#define ATTENTION_OUTPUT_BF16_BLOCK_ROWS_PER_GROUP 1
+#define ATTENTION_OUTPUT_BF16_CLUSTER 1
+#define ATTENTION_OUTPUT_BF16_BLOCKS 0
+#define ATTENTION_OUTPUT_BF16_PRODUCER_REGISTERS 24
+#define ATTENTION_OUTPUT_BF16_IN_FLIGHT 0
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again)
+
+all tunes done

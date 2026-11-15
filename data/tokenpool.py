@@ -388,7 +388,35 @@ class TokenPool:
         """Load the tokenizer named in the settings.
 
         In : nothing.
-        Out: a transformers tokenizer, e.g. GPT2TokenizerFast
+        Out: a transformers tokenizer, e.g. GPT2TokenizerFast; or, for a path
+             ending in .pkl, a pickled tiktoken encoding (nanochat's tokenizer,
+             data/climbmix.py) wrapped to be called the same way
         """
+        if self.tokenizer_name.endswith(".pkl"):
+            return TiktokenTokenizer(self.tokenizer_name)
         from transformers import AutoTokenizer
         return AutoTokenizer.from_pretrained(self.tokenizer_name)
+
+
+class TiktokenTokenizer:
+    """A pickled tiktoken encoding called as _tokenize_worker calls a
+    transformers tokenizer: tokenizer(documents, add_special_tokens=False)
+    gives {"input_ids": [ids of each document]}, and eos_token_id is the id put
+    after each document: <|bos|> for nanochat's tokenizer (it begins the next
+    document), else <|endoftext|>.
+
+    In : pickle_path  str   e.g. "data/climbmix/tokenizer.pkl"
+    """
+
+    def __init__(self, pickle_path):
+        import pickle
+        with open(pickle_path, "rb") as pickle_file:
+            self.encoding = pickle.load(pickle_file)
+        special_tokens = self.encoding.special_tokens_set
+        separator = "<|bos|>" if "<|bos|>" in special_tokens else "<|endoftext|>"
+        self.eos_token_id = self.encoding.encode_single_token(separator)
+
+    def __call__(self, documents, add_special_tokens=False):
+        # tiktoken's Rust code lets go of Python's lock while it works, so the
+        # pool's threads tokenize at the same time
+        return {"input_ids": self.encoding.encode_ordinary_batch(documents, num_threads=1)}

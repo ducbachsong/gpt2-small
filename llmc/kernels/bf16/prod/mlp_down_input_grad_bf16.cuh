@@ -37,6 +37,13 @@
 //     BLOCKS                blocks a launch: 0, as many as the GPU runs at once; MLP_DOWN_INPUT_GRAD_BF16_ONE_A_SQUARE, one a square
 //     PRODUCER_REGISTERS    with 2 consumer warpgroups, the producer's registers a thread; the consumers take the rest
 //     IN_FLIGHT             steps of WGMMAs left running while a consumer goes on (at most STAGES - 1)
+//     PINGPONG              0: cooperative, the 2 consumer warpgroups on one square of 128 rows, sharing each right
+//                           tile; 1: ping-pong (CUTLASS's KernelTmaWarpSpecializedPingpong, FlashAttention-3's
+//                           warpgroup ping-pong): each warpgroup its own squares of 64 rows, the block's squares
+//                           taken in turns (0, 2, ... the first's, 1, 3, ... the second's); their sums in turns too
+//                           (a turn barrier each: the tensor cores to one at a time, the sets used in order), so one
+//                           warpgroup's store (its epilogue and TMA stores) runs under the other's sums. A set holds
+//                           one left tile, so 256 columns x 4 sets fit. The same sums in the same order: the same bits
 // WGMMA and TMA exist only on Hopper: run it on an H100 (compute capability 9.0), built with -arch=sm_90a.
 #ifndef MLP_DOWN_INPUT_GRAD_BF16_CUH
 #define MLP_DOWN_INPUT_GRAD_BF16_CUH
@@ -54,6 +61,7 @@
 #define MLP_DOWN_INPUT_GRAD_BF16_BLOCK_ROWS_PER_GROUP 4            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define MLP_DOWN_INPUT_GRAD_BF16_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define MLP_DOWN_INPUT_GRAD_BF16_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); MLP_DOWN_INPUT_GRAD_BF16_ONE_A_SQUARE: one a square
+#define MLP_DOWN_INPUT_GRAD_BF16_PINGPONG 0                         // the consumer warpgroups' turns: 0, cooperative (both on a square of 2 x 64 rows, sharing its right tile); 1, ping-pong (each its own squares of 64 rows, their sums in turns, one's store under the other's sums; ROW_GROUPS 2, CLUSTER 1)
 // the walk's own numbers
 #define MLP_DOWN_INPUT_GRAD_BF16_ONE_A_SQUARE (1 << 30)              // BLOCKS: more than any product's squares, so one block a square
 #define MLP_DOWN_INPUT_GRAD_BF16_MAX_ROW_GROUPS 2                     // the most: 2 x 128 threads, each warpgroup's sums up to 128 floats (COLUMNS 256), inside a block's registers
@@ -442,17 +450,17 @@ inline void mlp_down_input_grad_bf16_check_tensor(const char* caller_ptr, const 
 void mlp_down_input_grad_bf16(const Tensor& gelu_input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor,
          const Tensor& gelu_input_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_DOWN_INPUT_GRAD_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_BF16_IN_FLIGHT>
+          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_BF16_IN_FLIGHT, int PINGPONG = MLP_DOWN_INPUT_GRAD_BF16_PINGPONG>
 void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor,
             const Tensor& gelu_input_tensor, int block_rows_per_group_val, int blocks_val);
 
 // ── for it ────────────────────────────────────────────────────────────────────
-template <int COLUMNS, int STAGES, int ROW_GROUPS>
+template <int COLUMNS, int STAGES, int ROW_GROUPS, int PINGPONG = 0>
 constexpr size_t mlp_down_input_grad_bf16_shared_bytes();
 template <int STAGES, int ROW_GROUPS>
 constexpr size_t mlp_down_input_grad_bf16_barrier_bytes();
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS = MLP_DOWN_INPUT_GRAD_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_BF16_IN_FLIGHT>
+          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_BF16_IN_FLIGHT, int PINGPONG = MLP_DOWN_INPUT_GRAD_BF16_PINGPONG>
 __global__ void mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                            const __grid_constant__ CUtensorMap output_map_val,
                            const __grid_constant__ CUtensorMap side_map_val,
@@ -485,8 +493,8 @@ inline void mlp_down_input_grad_bf16(const Tensor& gelu_input_grad_tensor, const
 ///   blocks_val                          blocks launched: 0, as many as the GPU runs at once; more than the squares:
 ///                                       one a square
 /// ROW_GROUPS, COLUMNS, STAGES, CLUSTER: the square's warpgroups and columns, the sets of tiles, the blocks of a cluster.
-/// PRODUCER_REGISTERS, IN_FLIGHT: as at the top of the file; not given: their defines.
-template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT>
+/// PRODUCER_REGISTERS, IN_FLIGHT, PINGPONG: as at the top of the file; not given: their defines.
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int PINGPONG>
 inline void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor,
                    const Tensor& gelu_input_tensor, int block_rows_per_group_val, int blocks_val) {
     const Tensor& input_grad_tensor = gelu_input_grad_tensor;
@@ -494,7 +502,8 @@ inline void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, co
     static_assert(STAGES >= 1 && STAGES <= MLP_DOWN_INPUT_GRAD_BF16_MAX_STAGES, "STAGES is 1 to MLP_DOWN_INPUT_GRAD_BF16_MAX_STAGES");
     static_assert(ROW_GROUPS >= 1 && ROW_GROUPS <= MLP_DOWN_INPUT_GRAD_BF16_MAX_ROW_GROUPS, "ROW_GROUPS is 1 to MLP_DOWN_INPUT_GRAD_BF16_MAX_ROW_GROUPS");
     static_assert(CLUSTER >= 1 && CLUSTER <= MLP_DOWN_INPUT_GRAD_BF16_MAX_CLUSTER, "CLUSTER is 1 to MLP_DOWN_INPUT_GRAD_BF16_MAX_CLUSTER");
-    constexpr size_t SHARED_BYTES = mlp_down_input_grad_bf16_shared_bytes<COLUMNS, STAGES, ROW_GROUPS>();
+    static_assert(PINGPONG == 0 || (PINGPONG == 1 && ROW_GROUPS == 2 && CLUSTER == 1), "PINGPONG 1 takes 2 consumer warpgroups and no clusters");
+    constexpr size_t SHARED_BYTES = mlp_down_input_grad_bf16_shared_bytes<COLUMNS, STAGES, ROW_GROUPS, PINGPONG>();
     constexpr int THREADS = (MLP_DOWN_INPUT_GRAD_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
     static_assert(SHARED_BYTES + mlp_down_input_grad_bf16_barrier_bytes<STAGES, ROW_GROUPS>() <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK,
                   "the sets of tiles, the rooms and the barriers fit a block's shared memory");
@@ -530,7 +539,7 @@ inline void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, co
     CUtensorMap side_map_val = mlp_down_input_grad_bf16_tensor_map(gelu_input_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
 
     // 3. the first time: the shared memory allowed, and the blocks the GPU runs at once
-    auto kernel_ptr = mlp_down_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>;
+    auto kernel_ptr = mlp_down_input_grad_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PINGPONG>;
     static int blocks_at_once_val = 0;                       // one for each kernel this template makes
     if (blocks_at_once_val == 0) {
         int device_index_val = 0, total_sms_val = 0, blocks_per_sm_val = 0;
@@ -541,9 +550,10 @@ inline void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, co
         blocks_at_once_val = total_sms_val * (blocks_per_sm_val > 0 ? blocks_per_sm_val : 1);
     }
 
-    // 4. the clusters: a cluster's unit of work is CLUSTER squares one under the other; the blocks asked for in
-    //    whole clusters, at least one, at most one a unit
-    size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M));
+    // 4. the clusters: a cluster's unit of work is CLUSTER squares one under the other (ping-pong: one warpgroup's
+    //    square of 64 rows); the blocks asked for in whole clusters, at least one, at most one a unit
+    size_t unit_rows_val = PINGPONG ? (size_t)HARDWARE_WGMMA_M : (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M);
+    size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, unit_rows_val);
     size_t total_clusters_val = (blocks_val > 0 ? (size_t)blocks_val : (size_t)blocks_at_once_val) / CLUSTER;
     if (total_clusters_val < 1) total_clusters_val = 1;
     if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
@@ -576,19 +586,20 @@ inline void mlp_down_input_grad_bf16_at(const Tensor& gelu_input_grad_tensor, co
 // ── for it ────────────────────────────────────────────────────────────────────
 
 /// Gives the dynamic shared memory a block takes: STAGES sets of tiles (a left tile a consumer warpgroup and the
-/// right tile), each consumer warpgroup's room for its 64 rows as bfloat16 (TMA's store boxes), and one atom of
-/// room to start the tiles on one.
-template <int COLUMNS, int STAGES, int ROW_GROUPS>
+/// right tile; ping-pong: one left tile, the square's warpgroup's), each consumer warpgroup's room for its 64 rows as
+/// bfloat16 (TMA's store boxes), and one atom of room to start the tiles on one.
+template <int COLUMNS, int STAGES, int ROW_GROUPS, int PINGPONG>
 constexpr size_t mlp_down_input_grad_bf16_shared_bytes() {
-    return (size_t)STAGES * (ROW_GROUPS * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES + COLUMNS * MLP_DOWN_INPUT_GRAD_BF16_BLOCK_K) * sizeof(nv_bfloat16) +
+    return (size_t)STAGES * ((PINGPONG ? 1 : ROW_GROUPS) * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES + COLUMNS * MLP_DOWN_INPUT_GRAD_BF16_BLOCK_K) * sizeof(nv_bfloat16) +
            (size_t)ROW_GROUPS * HARDWARE_WGMMA_M * COLUMNS * sizeof(nv_bfloat16) + HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
 }
 
-/// Gives the static shared memory a block takes besides: its barriers, 8 bytes each (two a set of tiles, one a
-/// consumer warpgroup for its store, and one for gelu_input's rows). The dynamic and this together must fit HARDWARE_MAX_SHARED_BYTES_PER_BLOCK.
+/// Gives the static shared memory a block takes besides: its barriers, 8 bytes each (two a set of tiles, three a
+/// consumer warpgroup: its store's, gelu_input's rows' and its turn's). The dynamic and this together must fit
+/// HARDWARE_MAX_SHARED_BYTES_PER_BLOCK.
 template <int STAGES, int ROW_GROUPS>
 constexpr size_t mlp_down_input_grad_bf16_barrier_bytes() {
-    return (size_t)(2 * STAGES + 2 * ROW_GROUPS) * sizeof(uint64_t);
+    return (size_t)(2 * STAGES + 3 * ROW_GROUPS) * sizeof(uint64_t);
 }
 
 /// Gives gelu'(x), the slope the backward multiplies by, as fp32/gelu.cuh's gelu_slope. 1 - tanh² reuses the tanh.
@@ -613,13 +624,13 @@ __device__ __forceinline__ float2 mlp_down_input_grad_bf16_times_gelu_slope(floa
 }
 
 /// Walks this block's squares of output, square after square (persistent), with a producer warpgroup and ROW_GROUPS
-/// consumer warpgroups (see the top of the file), and stores each square by TMA.
+/// consumer warpgroups (see the top of the file), cooperative or ping-pong (PINGPONG), and stores each square by TMA.
 ///
 ///   left_map_val, right_map_val, output_map_val   TMA's descriptions of left's, right's and output's tiles
 ///   side_map_val                                  ... and gelu_input's
 ///   rows_val, columns_val, sum_length_val         the product's sizes
 ///   block_rows_per_group_val                      the squares' order: rows of units a group runs down
-template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT>
+template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int PINGPONG>
 __global__ void __launch_bounds__((MLP_DOWN_INPUT_GRAD_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
            const __grid_constant__ CUtensorMap output_map_val,
@@ -629,9 +640,11 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
     constexpr bool RIGHT_TURNED = true;                                                                     // weight {sum_length, columns}: turned
     constexpr int COLUMN_GROUPS = COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS;                                   // groups of 8 across the square
     constexpr int RIGHT_TILE_VALUES = COLUMNS * MLP_DOWN_INPUT_GRAD_BF16_BLOCK_K;                                   // a right tile: COLUMNS lines of a step's k
-    constexpr int BLOCK_ROWS = ROW_GROUPS * HARDWARE_WGMMA_M;                                              // a square's rows
-    constexpr int UNIT_ROWS = CLUSTER * BLOCK_ROWS;                                                        // a cluster's unit: its squares one under the other
-    constexpr int LEFT_VALUES = ROW_GROUPS * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES;                             // a set's left tiles, one a warpgroup
+    constexpr int BLOCK_ROWS = ROW_GROUPS * HARDWARE_WGMMA_M;                                              // a square's rows (cooperative)
+    constexpr int UNIT_ROWS = PINGPONG ? HARDWARE_WGMMA_M : CLUSTER * BLOCK_ROWS;                            // a unit: the cluster's squares one under the other; ping-pong, one warpgroup's square
+    constexpr int SET_LEFT_TILES = PINGPONG ? 1 : ROW_GROUPS;                                                // a set's left tiles: one a warpgroup; ping-pong, the unit's one
+    constexpr int LEFT_VALUES = SET_LEFT_TILES * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES;                             // a set's left tiles
+    constexpr int SET_USERS = PINGPONG ? 1 : ROW_GROUPS * CLUSTER;                                           // consumer warpgroups that free a set
     constexpr int SET_VALUES = LEFT_VALUES + RIGHT_TILE_VALUES;                                             // one set: left tiles, then right tile
     constexpr int LEFT_RUNNING = STAGES > IN_FLIGHT ? IN_FLIGHT : STAGES - 1;                                // steps of WGMMAs left running: IN_FLIGHT, at most STAGES - 1 (the set must be free)
     static_assert(IN_FLIGHT >= 0, "IN_FLIGHT is 0 or more steps");
@@ -659,6 +672,7 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
     __shared__ uint64_t full_barriers_list[STAGES];          // set s's bytes are in
     __shared__ uint64_t empty_barriers_list[STAGES];         // every consumer of the cluster is done with set s
     __shared__ uint64_t store_barriers_list[ROW_GROUPS];     // consumer warpgroup g's threads are all at the same point of its store
+    __shared__ uint64_t turn_barriers_list[ROW_GROUPS];      // ping-pong: warpgroup g's turn at the tensor cores (the other's sums done)
     __shared__ uint64_t side_barriers_list[ROW_GROUPS];      // consumer warpgroup g's 64 rows of gelu_input are in its room
     uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(mlp_down_input_grad_bf16_shared_list);
     nv_bfloat16* tiles_ptr = reinterpret_cast<nv_bfloat16*>(
@@ -678,11 +692,12 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
 #pragma unroll
         for (int set_index_val = 0; set_index_val < STAGES; set_index_val++) {
             mlp_down_input_grad_bf16_barrier_init(&full_barriers_list[set_index_val], 1);                       // the producer's one arrival, and the bytes
-            mlp_down_input_grad_bf16_barrier_init(&empty_barriers_list[set_index_val], ROW_GROUPS * CLUSTER);   // one arrival a consumer warpgroup of the cluster
+            mlp_down_input_grad_bf16_barrier_init(&empty_barriers_list[set_index_val], SET_USERS);   // one arrival a consumer warpgroup that used it
         }
 #pragma unroll
         for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++) {
             mlp_down_input_grad_bf16_barrier_init(&store_barriers_list[row_group_index_val], HARDWARE_WARPGROUP_THREADS);   // every thread of the warpgroup
+            mlp_down_input_grad_bf16_barrier_init(&turn_barriers_list[row_group_index_val], 1);                             // the other warpgroup's first thread
             mlp_down_input_grad_bf16_barrier_init(&side_barriers_list[row_group_index_val], 1);   // the warpgroup's first thread, and the bytes
         }
         mlp_down_input_grad_bf16_fence_for_tma();                     // the barriers visible to TMA
@@ -708,7 +723,7 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
         int unit_in_group_val = unit_index_val % units_per_group_val;
         int unit_row_index_val = group_first_unit_row_index_val + unit_in_group_val % group_unit_rows_val;
         int unit_column_index_val = unit_in_group_val / group_unit_rows_val;
-        block_first_row_index_val = unit_row_index_val * UNIT_ROWS + cluster_block_index_val * BLOCK_ROWS;
+        block_first_row_index_val = unit_row_index_val * UNIT_ROWS + (PINGPONG ? 0 : cluster_block_index_val * BLOCK_ROWS);
         block_first_column_index_val = unit_column_index_val * COLUMNS;
     };
 
@@ -735,7 +750,7 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
                     int step_first_k_index_val = step_index_val * MLP_DOWN_INPUT_GRAD_BF16_BLOCK_K;
                     mlp_down_input_grad_bf16_barrier_expect(&full_barriers_list[set_index_val], SET_BYTES);
 #pragma unroll
-                    for (int row_group_index_val = 0; row_group_index_val < ROW_GROUPS; row_group_index_val++)
+                    for (int row_group_index_val = 0; row_group_index_val < SET_LEFT_TILES; row_group_index_val++)
                         mlp_down_input_grad_bf16_copy_tile(left_tile_ptr + row_group_index_val * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES, &left_map_val,
                                                    step_first_k_index_val, block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M,
                                                    &full_barriers_list[set_index_val]);
@@ -787,11 +802,24 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
             mlp_down_input_grad_bf16_barrier_wait(&store_barriers_list[row_group_index_val], store_phase_val);
             store_phase_val ^= 1;
         };
-        int walk_step_index_val = 0;                                               // steps since the launch, as the producer counts them
-        for (int unit_index_val = cluster_index_val; unit_index_val < total_units_val; unit_index_val += total_clusters_val) {
+        // ping-pong: this warpgroup's turn at the tensor cores, its k-th wait (phase k % 2); the other's first thread
+        // arrives when its sums are done. Warpgroup 0's first unit needs no turn
+        uint32_t turn_phase_val = 0;
+        bool first_turn_val = true;
+        // Units of the block in order (ordinal o: unit cluster + o x clusters); cooperative, every one; ping-pong, this
+        // warpgroup's: o = g, g + 2, ... Every unit is total_steps steps, so unit o's sets start at walk step o x total_steps
+        for (int unit_ordinal_val = PINGPONG ? row_group_index_val : 0;; unit_ordinal_val += PINGPONG ? 2 : 1) {
+            int unit_index_val = cluster_index_val + unit_ordinal_val * total_clusters_val;
+            if (unit_index_val >= total_units_val) break;
+            int walk_step_index_val = unit_ordinal_val * total_steps_val;      // the unit's first step since the launch, as the producer counts them
             int block_first_row_index_val, block_first_column_index_val;
             place_unit_val(unit_index_val, block_first_row_index_val, block_first_column_index_val);
-            int group_first_row_index_val = block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M;
+            int group_first_row_index_val = block_first_row_index_val + (PINGPONG ? 0 : row_group_index_val * HARDWARE_WGMMA_M);
+            if (PINGPONG && !(row_group_index_val == 0 && first_turn_val)) {   // wait for the other warpgroup's sums of the unit before
+                mlp_down_input_grad_bf16_barrier_wait(&turn_barriers_list[row_group_index_val], turn_phase_val);
+                turn_phase_val ^= 1;
+            }
+            first_turn_val = false;
             // a. before the walk, the warpgroup's first thread asks TMA for its 64 rows of gelu_input, into its room
             //    (once TMA has read the room for the unit before), so they come while the tensor cores work
             if (warpgroup_first_thread_val) {
@@ -810,7 +838,7 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
                 mlp_down_input_grad_bf16_barrier_wait(&full_barriers_list[set_index_val], (uint32_t)(((walk_step_index_val + step_index_val) / STAGES) % 2));
 
                 // c. the tensor cores: MLP_DOWN_INPUT_GRAD_BF16_BLOCK_K / HARDWARE_WGMMA_K_BF16 WGMMAs, each 16 more values of k
-                const nv_bfloat16* left_tile_ptr = tiles_ptr + set_index_val * SET_VALUES + row_group_index_val * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES;
+                const nv_bfloat16* left_tile_ptr = tiles_ptr + set_index_val * SET_VALUES + (PINGPONG ? 0 : row_group_index_val * MLP_DOWN_INPUT_GRAD_BF16_LEFT_TILE_VALUES);
                 const nv_bfloat16* right_tile_ptr = tiles_ptr + set_index_val * SET_VALUES + LEFT_VALUES;
                 mlp_down_input_grad_bf16_wgmma_fence();                                    // the sums ready for the tensor cores
 #pragma unroll
@@ -830,7 +858,8 @@ mlp_down_input_grad_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val
             mlp_down_input_grad_bf16_wgmma_wait<0>();
             for (int step_index_val = max(total_steps_val - LEFT_RUNNING, 0); step_index_val < total_steps_val; step_index_val++)
                 free_set_val((walk_step_index_val + step_index_val) % STAGES);
-            walk_step_index_val += total_steps_val;
+            //    ping-pong: this warpgroup's sums are done; the other's turn at the tensor cores, while this one stores
+            if (PINGPONG && warpgroup_first_thread_val) mlp_down_input_grad_bf16_barrier_arrive(&turn_barriers_list[1 - row_group_index_val]);
 
             // the room's pair of each of this thread's pairs, and the pair
             // handed to what_val, whose result is written there as bfloat16 (box b: columns 64 b on, rows of 128 bytes,

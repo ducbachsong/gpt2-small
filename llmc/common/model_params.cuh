@@ -29,7 +29,20 @@ struct GPT2Config {
     size_t embed_dim = 768;
     bool linear_bias = true;             // the 4 linears' biases (qkv, attention_out, mlp_up, mlp_down): GPT-2 has
                                          // them; false: none (the LayerNorms keep theirs), as nanochat and Llama
+    size_t attention_window = 0;         // the short layers' sliding window: a token sees itself and this many tokens
+                                         // before it (a multiple of 64; model_bf16 and model_8bit, flash attention
+                                         // only); 0: every layer sees the whole row, as GPT-2
 };
+
+/// Gives a layer's sliding window, in nanochat's pattern SSSL: of every 4 layers the first 3 are short
+/// (config.attention_window), the 4th long, and the last layer always long. 0: long, the whole row.
+///
+///   config   the sizes: attention_window, num_layers
+///   layer    which block: 0 .. num_layers - 1
+inline size_t gpt2_attention_window(const GPT2Config& config, size_t layer) {
+    bool long_val = layer % 4 == 3 || layer + 1 == config.num_layers;
+    return long_val ? 0 : config.attention_window;
+}
 
 /// A block's 12 parameter tensors, or their gradients: views of the optimizer's buffer, the 4 matrices first.
 /// D is embed_dim. Without linear biases (GPT2Config::linear_bias false) it has 8: the 4 linear biases are

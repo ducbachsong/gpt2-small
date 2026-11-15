@@ -35,6 +35,16 @@
 //     BLOCKS                blocks a launch: 0, as many as the GPU runs at once; ATTENTION_OUTPUT_BF16_ONE_A_SQUARE, one a square
 //     PRODUCER_REGISTERS    with 2 consumer warpgroups, the producer's registers a thread; the consumers take the rest
 //     IN_FLIGHT             steps of WGMMAs left running while a consumer goes on (at most STAGES - 1)
+//     STREAM_K              0: each block's squares whole, the last round only part full (1,152 squares of 128 x 256 on
+//                           114 SMs: 10 rounds and 12 squares, the 11th round 12 blocks long); 1: stream-K (Osama et
+//                           al. 2023, as CUTLASS's data-parallel + stream-K hybrid): the full rounds' squares whole,
+//                           then the leftover squares' steps shared evenly by every block (block b the b-th stretch,
+//                           cut where the squares end). A piece that does not start its square's sum writes its sums
+//                           to a scratch in GPU memory and raises its flag (a block's first shared piece only, so one a
+//                           block at most); the block with the square's first piece, which comes last in its stretch,
+//                           waits for the later pieces' flags, adds their sums in order and stores. The order fixed:
+//                           the same bits every run, though not the unsplit sum's bits (as split-K's). CLUSTER 1;
+//                           every block at once (BLOCKS 0), so the waits always end
 // WGMMA and TMA exist only on Hopper: run it on an H100 (compute capability 9.0), built with -arch=sm_90a.
 #ifndef ATTENTION_OUTPUT_BF16_CUH
 #define ATTENTION_OUTPUT_BF16_CUH
@@ -52,6 +62,7 @@
 #define ATTENTION_OUTPUT_BF16_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define ATTENTION_OUTPUT_BF16_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define ATTENTION_OUTPUT_BF16_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); ATTENTION_OUTPUT_BF16_ONE_A_SQUARE: one a square
+#define ATTENTION_OUTPUT_BF16_STREAM_K 0                         // 0: each square whole; 1: stream-K, the squares of the full rounds whole and the last round's sums shared by every block (CLUSTER 1, BLOCKS 0)
 // the walk's own numbers
 #define ATTENTION_OUTPUT_BF16_ONE_A_SQUARE (1 << 30)              // BLOCKS: more than any product's squares, so one block a square
 #define ATTENTION_OUTPUT_BF16_MAX_ROW_GROUPS 2                     // the most: 2 x 128 threads, each warpgroup's sums up to 128 floats (COLUMNS 256), inside a block's registers
@@ -437,7 +448,7 @@ inline void attention_output_bf16_check_tensor(const char* caller_ptr, const cha
 // ── the product ───────────────────────────────────────────────────────────────
 void attention_output_bf16(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = ATTENTION_OUTPUT_BF16_IN_FLIGHT>
+          int IN_FLIGHT = ATTENTION_OUTPUT_BF16_IN_FLIGHT, int STREAM_K = ATTENTION_OUTPUT_BF16_STREAM_K>
 void attention_output_bf16_at(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor,
             int block_rows_per_group_val, int blocks_val);
 
@@ -447,11 +458,12 @@ constexpr size_t attention_output_bf16_shared_bytes();
 template <int STAGES, int ROW_GROUPS>
 constexpr size_t attention_output_bf16_barrier_bytes();
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS = ATTENTION_OUTPUT_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = ATTENTION_OUTPUT_BF16_IN_FLIGHT>
+          int IN_FLIGHT = ATTENTION_OUTPUT_BF16_IN_FLIGHT, int STREAM_K = ATTENTION_OUTPUT_BF16_STREAM_K>
 __global__ void attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                            const __grid_constant__ CUtensorMap output_map_val,
                            const nv_bfloat16* bias_ptr,
-                           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val);
+                           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
+                           float* partials_ptr, int* flags_ptr);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
@@ -477,14 +489,16 @@ inline void attention_output_bf16(const Tensor& output_tensor, const Tensor& inp
 ///   blocks_val                          blocks launched: 0, as many as the GPU runs at once; more than the squares:
 ///                                       one a square
 /// ROW_GROUPS, COLUMNS, STAGES, CLUSTER: the square's warpgroups and columns, the sets of tiles, the blocks of a cluster.
-/// PRODUCER_REGISTERS, IN_FLIGHT: as at the top of the file; not given: their defines.
-template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT>
+/// PRODUCER_REGISTERS, IN_FLIGHT, STREAM_K: as at the top of the file; not given: their defines. With STREAM_K, the
+/// pieces' sums and flags are scratch in GPU memory, made the first time and grown with the most blocks.
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int STREAM_K>
 inline void attention_output_bf16_at(const Tensor& output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor,
                    int block_rows_per_group_val, int blocks_val) {
     static_assert(COLUMNS == 64 || COLUMNS == 128 || COLUMNS == 256, "COLUMNS is one WGMMA's N this file has: 64, 128 or 256");
     static_assert(STAGES >= 1 && STAGES <= ATTENTION_OUTPUT_BF16_MAX_STAGES, "STAGES is 1 to ATTENTION_OUTPUT_BF16_MAX_STAGES");
     static_assert(ROW_GROUPS >= 1 && ROW_GROUPS <= ATTENTION_OUTPUT_BF16_MAX_ROW_GROUPS, "ROW_GROUPS is 1 to ATTENTION_OUTPUT_BF16_MAX_ROW_GROUPS");
     static_assert(CLUSTER >= 1 && CLUSTER <= ATTENTION_OUTPUT_BF16_MAX_CLUSTER, "CLUSTER is 1 to ATTENTION_OUTPUT_BF16_MAX_CLUSTER");
+    static_assert(STREAM_K == 0 || (STREAM_K == 1 && CLUSTER == 1), "STREAM_K 1 takes no clusters");
     constexpr size_t SHARED_BYTES = attention_output_bf16_shared_bytes<COLUMNS, STAGES, ROW_GROUPS>();
     constexpr int THREADS = (ATTENTION_OUTPUT_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
     static_assert(SHARED_BYTES + attention_output_bf16_barrier_bytes<STAGES, ROW_GROUPS>() <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK,
@@ -517,7 +531,7 @@ inline void attention_output_bf16_at(const Tensor& output_tensor, const Tensor& 
     CUtensorMap output_map_val = attention_output_bf16_tensor_map(output_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
 
     // 3. the first time: the shared memory allowed, and the blocks the GPU runs at once
-    auto kernel_ptr = attention_output_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>;
+    auto kernel_ptr = attention_output_bf16_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, STREAM_K>;
     static int blocks_at_once_val = 0;                       // one for each kernel this template makes
     if (blocks_at_once_val == 0) {
         int device_index_val = 0, total_sms_val = 0, blocks_per_sm_val = 0;
@@ -533,15 +547,37 @@ inline void attention_output_bf16_at(const Tensor& output_tensor, const Tensor& 
     size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M));
     size_t total_clusters_val = (blocks_val > 0 ? (size_t)blocks_val : (size_t)blocks_at_once_val) / CLUSTER;
     if (total_clusters_val < 1) total_clusters_val = 1;
-    if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
+    if (!STREAM_K && total_clusters_val > total_units_val) total_clusters_val = total_units_val;   // stream-K: every block, the units' steps shared
     unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
+    // stream-K: every block at once (a block waits for others' pieces), and the pieces' scratch: a warpgroup's
+    // 64 x COLUMNS float sums and a flag, for each block's first shared piece; the flags 0 before every launch
+    float* partials_ptr = nullptr;
+    int* flags_ptr = nullptr;
+    if (STREAM_K) {
+        if (total_blocks_val > (unsigned)blocks_at_once_val) {
+            fprintf(stderr, "error: attention_output_bf16 with stream-K runs every block at once: at most %d blocks, got %u\n", blocks_at_once_val,
+                    total_blocks_val);
+            exit(EXIT_FAILURE);
+        }
+        static Tensor partials_tensor;
+        static Tensor flags_tensor;
+        size_t warpgroups_val = (size_t)total_blocks_val * ROW_GROUPS;
+        if ((size_t)flags_tensor.numel() < warpgroups_val) {
+            partials_tensor = Tensor::zeros({warpgroups_val * HARDWARE_WGMMA_M * COLUMNS});
+            flags_tensor = Tensor::zeros({warpgroups_val}, DType::Int32);
+        }
+        partials_ptr = partials_tensor.data();
+        flags_ptr = reinterpret_cast<int*>(flags_tensor.data_ptr());
+        cudaCheck(cudaMemsetAsync(flags_ptr, 0, warpgroups_val * sizeof(int)));
+    }
 
     // 5. launch; with clusters, by cudaLaunchKernelEx, which takes the cluster's size
     const nv_bfloat16* bias_ptr = bias_tensor.numel() > 0 ? bias_tensor.data_ptr<nv_bfloat16>() : nullptr;   // nullptr: no bias
     if (CLUSTER == 1) {
         kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val,
                                                                 bias_ptr,
-                                                                (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val);
+                                                                (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
+                                                                partials_ptr, flags_ptr);
         cudaCheck(cudaGetLastError());
     } else {
         cudaLaunchConfig_t config_val = {};
@@ -557,7 +593,8 @@ inline void attention_output_bf16_at(const Tensor& output_tensor, const Tensor& 
         config_val.numAttrs = 1;
         cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val,
                                      bias_ptr,
-                                     (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val));
+                                     (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
+                                     partials_ptr, flags_ptr));
     }
 }
 
@@ -586,12 +623,13 @@ constexpr size_t attention_output_bf16_barrier_bytes() {
 ///   bias_ptr                                      {columns}, or nullptr for none
 ///   rows_val, columns_val, sum_length_val         the product's sizes
 ///   block_rows_per_group_val                      the squares' order: rows of units a group runs down
-template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT>
+template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int STREAM_K>
 __global__ void __launch_bounds__((ATTENTION_OUTPUT_BF16_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
            const __grid_constant__ CUtensorMap output_map_val,
            const nv_bfloat16* bias_ptr,
-           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val) {
+           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
+           float* partials_ptr, int* flags_ptr) {
     constexpr bool LEFT_TURNED = false;                                                                     // input {rows, sum_length}
     constexpr bool RIGHT_TURNED = false;                                                                    // weight {columns, sum_length}
     constexpr int COLUMN_GROUPS = COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS;                                   // groups of 8 across the square
@@ -675,6 +713,29 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
         block_first_row_index_val = unit_row_index_val * UNIT_ROWS + cluster_block_index_val * BLOCK_ROWS;
         block_first_column_index_val = unit_column_index_val * COLUMNS;
     };
+    // the block's pieces of work in order, each (unit, first step, end step) handed to piece_val: without stream-K its
+    // units whole (cluster + clusters x o); with stream-K the units of the full rounds whole, then its stretch of the
+    // leftover units' steps (block b's: steps b x block_shared_steps on, of all of them in unit order), cut at the
+    // units' edges
+    int whole_units_val = STREAM_K ? total_units_val / total_clusters_val * total_clusters_val : total_units_val;
+    long long shared_steps_val = (long long)(total_units_val - whole_units_val) * total_steps_val;
+    long long block_shared_steps_val = (shared_steps_val + total_clusters_val - 1) / total_clusters_val;
+    long long first_shared_step_val = (long long)cluster_index_val * block_shared_steps_val;
+    if (first_shared_step_val > shared_steps_val) first_shared_step_val = shared_steps_val;
+    long long end_shared_step_val = first_shared_step_val + block_shared_steps_val;
+    if (end_shared_step_val > shared_steps_val) end_shared_step_val = shared_steps_val;
+    auto for_each_piece_val = [&](auto piece_val) {
+        for (int unit_index_val = cluster_index_val; unit_index_val < whole_units_val; unit_index_val += total_clusters_val)
+            piece_val(unit_index_val, 0, total_steps_val);
+        for (long long shared_step_val = first_shared_step_val; shared_step_val < end_shared_step_val;) {
+            int unit_index_val = whole_units_val + (int)(shared_step_val / total_steps_val);
+            int first_step_val = (int)(shared_step_val % total_steps_val);
+            long long left_val = end_shared_step_val - shared_step_val;
+            int end_step_val = left_val < (long long)(total_steps_val - first_step_val) ? first_step_val + (int)left_val : total_steps_val;
+            piece_val(unit_index_val, first_step_val, end_step_val);
+            shared_step_val += end_step_val - first_step_val;
+        }
+    };
 
     if (threadIdx.x < PRODUCER_THREADS) {
         if (MOVE_REGISTERS) attention_output_bf16_give_registers<PRODUCER_REGISTERS>();   // the whole warpgroup
@@ -686,10 +747,10 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
         //    edges TMA gives 0s
         if (threadIdx.x == 0) {
             int walk_step_index_val = 0;
-            for (int unit_index_val = cluster_index_val; unit_index_val < total_units_val; unit_index_val += total_clusters_val) {
+            for_each_piece_val([&](int unit_index_val, int first_step_val, int end_step_val) {
                 int block_first_row_index_val, block_first_column_index_val;
                 place_unit_val(unit_index_val, block_first_row_index_val, block_first_column_index_val);
-                for (int step_index_val = 0; step_index_val < total_steps_val; step_index_val++, walk_step_index_val++) {
+                for (int step_index_val = first_step_val; step_index_val < end_step_val; step_index_val++, walk_step_index_val++) {
                     int set_index_val = walk_step_index_val % STAGES;
                     int lap_index_val = walk_step_index_val / STAGES;
                     if (lap_index_val > 0)
@@ -717,7 +778,7 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
                                                                   (uint16_t)((1u << CLUSTER) - 1));
                     }
                 }
-            }
+            });
         }
     } else {
         if (MOVE_REGISTERS) attention_output_bf16_take_registers<CONSUMER_REGISTERS>();   // the whole warpgroup
@@ -751,12 +812,14 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
             store_phase_val ^= 1;
         };
         int walk_step_index_val = 0;                                               // steps since the launch, as the producer counts them
-        for (int unit_index_val = cluster_index_val; unit_index_val < total_units_val; unit_index_val += total_clusters_val) {
+        constexpr int THREAD_SUMS = COLUMN_GROUPS * HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP;   // a thread's sums: its part of the warpgroup's 64 x COLUMNS
+        for_each_piece_val([&](int unit_index_val, int first_step_val, int end_step_val) {
+            int piece_steps_val = end_step_val - first_step_val;
             int block_first_row_index_val, block_first_column_index_val;
             place_unit_val(unit_index_val, block_first_row_index_val, block_first_column_index_val);
             int group_first_row_index_val = block_first_row_index_val + row_group_index_val * HARDWARE_WGMMA_M;
             float sums_list[COLUMN_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};   // this thread's part of its warpgroup's 64 rows
-            for (int step_index_val = 0; step_index_val < total_steps_val; step_index_val++) {
+            for (int step_index_val = 0; step_index_val < piece_steps_val; step_index_val++) {
                 // b. wait until this step's set is full: its barrier's phase is the set's lap
                 int set_index_val = (walk_step_index_val + step_index_val) % STAGES;
                 attention_output_bf16_barrier_wait(&full_barriers_list[set_index_val], (uint32_t)(((walk_step_index_val + step_index_val) / STAGES) % 2));
@@ -780,9 +843,49 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
             }
             // e. the last steps' WGMMAs done, and their sets free: the producer may be filling them for the next unit
             attention_output_bf16_wgmma_wait<0>();
-            for (int step_index_val = max(total_steps_val - LEFT_RUNNING, 0); step_index_val < total_steps_val; step_index_val++)
+            for (int step_index_val = max(piece_steps_val - LEFT_RUNNING, 0); step_index_val < piece_steps_val; step_index_val++)
                 free_set_val((walk_step_index_val + step_index_val) % STAGES);
-            walk_step_index_val += total_steps_val;
+            walk_step_index_val += piece_steps_val;
+
+            // stream-K. A piece past its unit's first step: its sums into this block's scratch (value v of thread t at
+            // v x 128 + t, a warp's 32 floats side by side), visible to every block, then its flag; the unit is stored
+            // by the block with its first piece
+            if (STREAM_K && first_step_val > 0) {
+                float* own_partials_ptr = partials_ptr + ((size_t)cluster_index_val * ROW_GROUPS + row_group_index_val) * THREAD_SUMS * HARDWARE_WARPGROUP_THREADS;
+#pragma unroll
+                for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++)
+#pragma unroll
+                    for (int value_index_val = 0; value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; value_index_val++)
+                        own_partials_ptr[(group_index_val * HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP + value_index_val) * HARDWARE_WARPGROUP_THREADS +
+                                         warpgroup_thread_index_val] = sums_list[group_index_val][value_index_val];
+                __threadfence();                                                     // this thread's sums before the flag
+                meet_warpgroup_val();                                                // every thread's
+                if (warpgroup_first_thread_val) atomicExch(flags_ptr + cluster_index_val * ROW_GROUPS + row_group_index_val, 1);
+                return;
+            }
+            //    The unit's first piece, ending before its last step: the later pieces' sums added in order, each once
+            //    its block's flag is up (those blocks start their stretch with it; this block ends its stretch with this)
+            if (STREAM_K && end_step_val < total_steps_val) {
+                long long unit_end_shared_step_val = (long long)(unit_index_val - whole_units_val + 1) * total_steps_val;
+                for (int other_block_val = cluster_index_val + 1; other_block_val < total_clusters_val; other_block_val++) {
+                    if ((long long)other_block_val * block_shared_steps_val >= unit_end_shared_step_val) break;   // its stretch starts past this unit
+                    int flag_index_val = other_block_val * ROW_GROUPS + row_group_index_val;
+                    if (warpgroup_first_thread_val) {
+                        while (atomicAdd(flags_ptr + flag_index_val, 0) == 0) {
+                        }
+                        __threadfence();                                             // its sums seen after its flag
+                    }
+                    meet_warpgroup_val();
+                    const float* other_partials_ptr = partials_ptr + (size_t)flag_index_val * THREAD_SUMS * HARDWARE_WARPGROUP_THREADS;
+#pragma unroll
+                    for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++)
+#pragma unroll
+                        for (int value_index_val = 0; value_index_val < HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP; value_index_val++)
+                            sums_list[group_index_val][value_index_val] += __ldcg(
+                                other_partials_ptr + (group_index_val * HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP + value_index_val) *
+                                                         HARDWARE_WARPGROUP_THREADS + warpgroup_thread_index_val);
+                }
+            }
 
             // the room's pair of each of this thread's pairs, and the pair
             // (+ bias)
@@ -835,7 +938,7 @@ attention_output_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, c
             meet_warpgroup_val();
             write_room_val([](float2 pair_val, const nv_bfloat162*) { return pair_val; });
             store_room_val(&output_map_val);
-        }
+        });
     }
 
     // 5. the consumers' TMA stores all written before the block leaves

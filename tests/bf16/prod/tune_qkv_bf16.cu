@@ -58,13 +58,13 @@ struct Product
 
 /// Runs qkv_bf16 at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = QKV_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = QKV_BF16_IN_FLIGHT
+          int IN_FLIGHT = QKV_BF16_IN_FLIGHT, int PINGPONG = QKV_BF16_PINGPONG
           >
 static void mine_at(const Product &product_val,
                     int block_rows_per_group_val, int blocks_val
                     )
 {
-    qkv_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>(product_val.output_tensor, product_val.input_tensor, product_val.weight_tensor,
+    qkv_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PINGPONG>(product_val.output_tensor, product_val.input_tensor, product_val.weight_tensor,
                                                      product_val.bias_tensor, block_rows_per_group_val, blocks_val);
 }
 
@@ -74,9 +74,9 @@ static void square_at(const Product &product_val, int cluster_val,
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2, QKV_BF16_PRODUCER_REGISTERS, QKV_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1, QKV_BF16_PRODUCER_REGISTERS, QKV_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square that fits a block's shared memory, and its run.
@@ -244,6 +244,82 @@ static int time_each_square(const Product &product_val)
     return fastest_index_val;
 }
 
+// ══ part 2b: ping-pong against this file's setting ════════════════════════════
+
+/// One ping-pong square (2 warpgroups x COLUMNS x STAGES, clusters of 1) at a block order: what the sweep below times.
+template <int COLUMNS_ARG, int STAGES>
+static void pingpong_at(const Product &product_val, int block_rows_per_group_val)
+{
+    mine_at<2, COLUMNS_ARG, STAGES, 1, QKV_BF16_PRODUCER_REGISTERS, QKV_BF16_IN_FLIGHT, 1>(product_val, block_rows_per_group_val, 0);
+}
+
+/// A ping-pong square and its run.
+struct PingpongSquare
+{
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Product &, int);
+};
+
+static const PingpongSquare PINGPONG_SQUARES_LIST[] = {
+    {128, 2, pingpong_at<128, 2>}, {128, 3, pingpong_at<128, 3>}, {128, 4, pingpong_at<128, 4>},
+    {256, 2, pingpong_at<256, 2>}, {256, 3, pingpong_at<256, 3>}, {256, 4, pingpong_at<256, 4>},
+};
+
+static void time_pingpong_against_this_files_setting(const Product &product_val)
+{
+    // Prints this file's setting (cooperative, or ping-pong if QKV_BF16_PINGPONG is 1) against each ping-pong square
+    // (the 2 warpgroups each on their own 64-row squares, their sums in turns, one's store under the
+    // other's sums; 256 x 4 sets fits) at block orders 1, 4 and 16, persistent, all taking turns over SWEEP_ROUNDS
+    // rounds; then the fastest, and as how many times this file's setting's time.
+    struct Run
+    {
+        const char *name_ptr;
+        int columns_val;
+        int stages_val;
+        int block_rows_per_group_val;
+    };
+    std::vector<Run> runs_list = {{"this file's setting", QKV_BF16_COLUMNS, QKV_BF16_STAGES, QKV_BF16_BLOCK_ROWS_PER_GROUP}};
+    std::vector<const PingpongSquare *> squares_list = {nullptr};
+    for (const PingpongSquare &square_val : PINGPONG_SQUARES_LIST)
+        for (int block_rows_per_group_val : {1, 4, 16})
+        {
+            runs_list.push_back({"ping-pong", square_val.columns_val, square_val.stages_val, block_rows_per_group_val});
+            squares_list.push_back(&square_val);
+        }
+    std::vector<double> totals_list(runs_list.size(), 0.0);
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+        for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+        {
+            float milliseconds_val = gpu_milliseconds([&] {
+                if (squares_list[run_index_val] == nullptr)
+                    mine_at<QKV_BF16_ROW_GROUPS, QKV_BF16_COLUMNS, QKV_BF16_STAGES, QKV_BF16_CLUSTER>(product_val,
+                                                                                   QKV_BF16_BLOCK_ROWS_PER_GROUP, QKV_BF16_BLOCKS);
+                else
+                    squares_list[run_index_val]->run_ptr(product_val, runs_list[run_index_val].block_rows_per_group_val);
+            });
+            if (round_index_val > WARM_UP_STEPS)
+                totals_list[run_index_val] += milliseconds_val;
+        }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    size_t fastest_index_val = 0;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+    {
+        const Run &run_val = runs_list[run_index_val];
+        double milliseconds_val = totals_list[run_index_val] / averaged_val;
+        printf("        %-20s 2 x %3d x %d, %2d rows a group   %8.3f ms   %6.1f TFLOPS\n", run_val.name_ptr, run_val.columns_val,
+               run_val.stages_val, run_val.block_rows_per_group_val, milliseconds_val, tflops_of(milliseconds_val));
+        if (totals_list[run_index_val] < totals_list[fastest_index_val])
+            fastest_index_val = run_index_val;
+    }
+    const Run &fastest_val = runs_list[fastest_index_val];
+    printf("    fastest: %s 2 x %d x %d, %d rows a group: %.3f ms, this file's setting %.2fx as long\n", fastest_val.name_ptr,
+           fastest_val.columns_val, fastest_val.stages_val, fastest_val.block_rows_per_group_val, totals_list[fastest_index_val] / averaged_val,
+           totals_list[0] / totals_list[fastest_index_val]);
+}
+
 // ══ part 3: order, blocks and cluster ═════════════════════════════════════════
 
 /// A launch choice at a square: its cluster, block order and block count
@@ -367,6 +443,7 @@ int main(void)
     Product product_val;
     time_against_cublas(product_val);
     int square_index_val = time_each_square(product_val);
+    time_pingpong_against_this_files_setting(product_val);
     Choice choice_val = time_each_choice(product_val, square_index_val);
     VariantChoice variant_choice_val = time_each_variant(product_val);
     // the fastest, as the defines of the product's file

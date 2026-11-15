@@ -1,0 +1,22 @@
+==== 2026-11-15 10:22:55 building 1 programs
+  built   tune_model (79 s)
+==== running
+  passed  tune_model (140 s)
+==== done 10:26:34
+    bfloat16: 760040448 parameters, 5.47G flops a token at T = 2048; this GPU's peak 819 TFLOPS in bfloat16
+    best: --batch-size 24, 63167 tokens/s, 345.3 TFLOPS, MFU 42.1% (--tokens-per-step must be a multiple of GPUs x rows x 2048)
+    8-bit: 760040448 parameters, 5.47G flops a token at T = 2048; this GPU's peak 819 TFLOPS in bfloat16
+    best: --batch-size 24, 66440 tokens/s, 363.2 TFLOPS, MFU 44.3% (--tokens-per-step must be a multiple of GPUs x rows x 2048)
+    196 gradients; the least alike: tensor 104 (a vector), cosine 0.9874
+time_against_pytorch
+    tokens/s, a micro-batch as the training loop runs it; PyTorch: cuBLAS for every product, its flash attention
+    rows   ours bf16   ours 8-bit   PyTorch (cuBLAS)   bf16 / PyTorch   8-bit / PyTorch
+       1       47277        51202              57789            0.82x             0.89x
+       2       55487        57374              60439            0.92x             0.95x
+       4       60426        61972              62600            0.97x             0.99x
+       8       62617        64332              64512            0.97x             1.00x
+      16       63094        66250              64134            0.98x             1.03x
+      24       63167        66440      out of memory
+    input: (double)gpt2_mean_loss(activations_val) expected: 11.1355 +/- 0.05   actual: 11.1353   ok  (line 447)
+
+[exited with code 0]

@@ -1,11 +1,12 @@
-// tune_model.cu — the whole model's speed at the size train_bf16.cu and train_8bit.cu train (32 layers x 2,304, 18 heads
-// of 128, rows of 2,048 tokens, no linear bias), apart from tests/test_model.cu so the tests only check numbers:
+// tune_model.cu — the whole model's speed at the size train_bf16.cu and train_8bit.cu train (nanochat's d24: 24 layers x
+// 1,536, 12 heads of 128, rows of 2,048 tokens, 32,768 ids, no linear bias, 3 of 4 layers a sliding window of 512), apart from tests/test_model.cu so the tests only check numbers:
 //     find_the_micro_batch_with_the_best_mfu   our bfloat16 model, then our 8-bit one: tokens/s and MFU at each
 //                                              --batch-size that fits, the best to train with
 //     eight_bit_gradients_follow_bfloat16s     the 8-bit model's gradients against the bfloat16 model's (cosine)
 //     time_against_pytorch                     PyTorch's model in bfloat16 on the same weights (cuBLAS for every
-//                                              product, its own flash attention), at the same rows: tokens/s against
-//                                              ours; and our loss against PyTorch's in float, once
+//                                              product, its own flash attention, which has no window: every layer
+//                                              the whole row), at the same rows: tokens/s against ours; and our loss
+//                                              against PyTorch's in float with the same windows (masks), once
 //
 // Built as tests/test_model.cu is (see tests/README.md); what it prints also goes to
 // tests/results/<GPU>/model_<date>_<time>.txt.
@@ -26,9 +27,11 @@
 static const double BFLOAT16_TOLERANCE = 5e-2;
 
 // The model the trainers train (train_bf16.cu's and train_8bit.cu's defines)
-#define MODEL_NUM_LAYERS 32
-#define MODEL_EMBED_DIM 2304
-#define MODEL_NUM_HEADS 18
+#define MODEL_NUM_LAYERS 24
+#define MODEL_EMBED_DIM 1536
+#define MODEL_NUM_HEADS 12
+#define MODEL_VOCAB_SIZE 32768        // nanochat's tokenizer: 2^15 ids, no padding
+#define MODEL_ATTENTION_WINDOW 512    // the short layers' sliding window (SSSL); 0: none
 #define MODEL_LINEAR_BIAS false       // the trainers' default: no linear bias, the LayerNorms with theirs
 #define SEQ_LEN 2048                  // tokens per row, as the trainers train
 #define LARGEST_MICRO_BATCH 64        // rows: the micro-batch sweep tries 1, 2, 4, ... this many, while they fit
@@ -38,7 +41,7 @@ static const double BFLOAT16_TOLERANCE = 5e-2;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Gives the model the trainers train: GPT2Config with the sizes above (the vocabulary GPT-2's).
+/// Gives the model the trainers train: GPT2Config with the sizes above.
 static GPT2Config model_config_of(void)
 {
     GPT2Config config_val;
@@ -47,6 +50,9 @@ static GPT2Config model_config_of(void)
     config_val.num_heads = MODEL_NUM_HEADS;
     config_val.max_seq_len = SEQ_LEN;
     config_val.linear_bias = MODEL_LINEAR_BIAS;
+    config_val.vocab_size = MODEL_VOCAB_SIZE;
+    config_val.padded_vocab_size = MODEL_VOCAB_SIZE;
+    config_val.attention_window = MODEL_ATTENTION_WINDOW;
     return config_val;
 }
 
@@ -122,8 +128,10 @@ static void fill_ids(const Tensor &token_ids_tensor, const Tensor &targets_tenso
 
 /// Runs the block the plain PyTorch way, as GPT-2's model.py writes it, on PyTorch tensors: from input and the 12
 /// parameters in BlockParams::shapes()' order (a linear bias undefined, torch::Tensor(), is none), gives the output.
+/// window_val 0: causal attention over the whole row (PyTorch's flash attention); else a token sees itself and the
+/// window_val tokens before it, by a mask {T, T} (PyTorch's flash attention has no window: its slower masked path).
 static torch::Tensor pytorch_block_forward(const torch::Tensor &input_tensor, const std::vector<torch::Tensor> &p_list,
-                                           int64_t num_heads_val)
+                                           int64_t num_heads_val, int64_t window_val = 0)
 {
     // 1. the sizes
     int64_t batch_size_val = input_tensor.size(0);
@@ -140,8 +148,18 @@ static torch::Tensor pytorch_block_forward(const torch::Tensor &input_tensor, co
     auto heads_val = [&](const torch::Tensor &part_tensor) {
         return part_tensor.view({batch_size_val, seq_len_val, num_heads_val, head_size_val}).transpose(1, 2);
     };
-    torch::Tensor y_tensor = torch::scaled_dot_product_attention(heads_val(parts_list[0]), heads_val(parts_list[1]),
-                                                                 heads_val(parts_list[2]), {}, 0.0, true);
+    torch::Tensor y_tensor;
+    if (window_val == 0)
+        y_tensor = torch::scaled_dot_product_attention(heads_val(parts_list[0]), heads_val(parts_list[1]), heads_val(parts_list[2]),
+                                                       {}, 0.0, true);
+    else
+    {
+        // true where the query (row) sees the key (column): the key at or before it, at most window_val before
+        torch::Tensor seen_tensor = torch::ones({seq_len_val, seq_len_val}, torch::TensorOptions().dtype(torch::kBool).device(input_tensor.device()));
+        seen_tensor = seen_tensor.tril(0).triu(-window_val);
+        y_tensor = torch::scaled_dot_product_attention(heads_val(parts_list[0]), heads_val(parts_list[1]), heads_val(parts_list[2]),
+                                                       seen_tensor, 0.0, false);
+    }
     y_tensor = y_tensor.transpose(1, 2).contiguous().view({batch_size_val, seq_len_val, embed_dim_val});
     torch::Tensor residual2_tensor = input_tensor + torch::linear(y_tensor, p_list[1], p_list[7]);
     // 3. ln2, the MLP, the residual add
@@ -152,9 +170,10 @@ static torch::Tensor pytorch_block_forward(const torch::Tensor &input_tensor, co
 
 /// Runs the same model the plain PyTorch way, on PyTorch tensors: from int64 token_ids {B, T} and the parameters in
 /// GPT2Params::shapes()' order (with no linear bias, each block's 4 vectors the LayerNorms'), gives the logits
-/// {B, T, padded_vocab_size}.
+/// {B, T, padded_vocab_size}. windows_val: the short layers' sliding windows as ours (gpt2_attention_window), by
+/// masks; false: every layer the whole row.
 static torch::Tensor pytorch_gpt2_logits(const torch::Tensor &token_ids_tensor, const std::vector<torch::Tensor> &p_list,
-                                         const GPT2Config &config_val)
+                                         const GPT2Config &config_val, bool windows_val = false)
 {
     // 1. the encoder
     int64_t num_layers_val = (int64_t)config_val.num_layers;
@@ -173,7 +192,8 @@ static torch::Tensor pytorch_gpt2_logits(const torch::Tensor &token_ids_tensor, 
         else      // ln1_weight, ln1_bias, qkv_bias, attention_out_bias, ln2_weight, ln2_bias, mlp_up_bias, mlp_down_bias
             block_list.insert(block_list.end(), {vectors_ptr[0], vectors_ptr[1], torch::Tensor(), torch::Tensor(),
                                                  vectors_ptr[2], vectors_ptr[3], torch::Tensor(), torch::Tensor()});
-        x_tensor = pytorch_block_forward(x_tensor, block_list, (int64_t)config_val.num_heads);
+        x_tensor = pytorch_block_forward(x_tensor, block_list, (int64_t)config_val.num_heads,
+                                         windows_val ? (int64_t)gpt2_attention_window(config_val, (size_t)layer_index_val) : 0);
     }
     // 3. lnf (the last two tensors), then the head: wte, no bias
     x_tensor = torch::layer_norm(x_tensor, {(int64_t)config_val.embed_dim}, p_list[p_list.size() - 2],
@@ -193,11 +213,17 @@ static torch::Tensor pytorch_loss(const torch::Tensor &logits_tensor, const torc
 /// Gives the flops one token of training takes, forward and backward, counted as nanoGPT and llm.c count them
 /// (from the PaLM paper's appendix B). Each parameter is one multiply and one add in the forward, 2 flops, and
 /// twice that in the backward, one gradient for the input and one for the weight, 4 flops: 6 a parameter. The
-/// attention's scores and weighted sums have no parameters, so they come on top: 12 x layers x embed_dim x
-/// seq_len. This model at T = 2048, no linear bias: 6 x 2,159,350,272 + 12 x 32 x 2,304 x 2,048 = 12.96G + 1.81G.
+/// attention's scores and weighted sums have no parameters, so they come on top: 12 x embed_dim x the keys a token
+/// can see, each layer: seq_len, or a short layer's window (as nanochat's estimate_flops counts it).
 static double training_flops_per_token(size_t num_params_val, const GPT2Config &config_val, size_t seq_len_val)
 {
-    return 6.0 * num_params_val + 12.0 * config_val.num_layers * config_val.embed_dim * seq_len_val;
+    double attention_val = 0.0;
+    for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
+    {
+        size_t window_val = gpt2_attention_window(config_val, layer_index_val);
+        attention_val += 12.0 * config_val.embed_dim * (window_val == 0 ? seq_len_val : std::min(window_val, seq_len_val));
+    }
+    return 6.0 * num_params_val + attention_val;
 }
 
 // ══ part 1: the micro-batch size with the best MFU, each of our models ══════════
@@ -324,6 +350,9 @@ static void eight_bit_gradients_follow_bfloat16s(const ModelBuffers &buffers_val
         GPT2Activations8bit activations_val(1, SEQ_LEN, config_val);
         buffers_val.grad_buffer_val.flat().zero_();
         gpt2_8bit_train_step(buffers_val.grads_val, token_ids_tensor, targets_tensor, buffers_val.params_val, activations_val, config_val, 1);
+        // again: with one scale per tensor, this micro-batch's scales come from the one before (the first's are exact)
+        buffers_val.grad_buffer_val.flat().zero_();
+        gpt2_8bit_train_step(buffers_val.grads_val, token_ids_tensor, targets_tensor, buffers_val.params_val, activations_val, config_val, 1);
     }
     // 3. each tensor's cosine, the smallest kept
     std::vector<Tensor> eight_list = buffers_val.grads_val.tensors();
@@ -405,6 +434,12 @@ static void time_against_pytorch(const ModelBuffers &buffers_val, const GPT2Conf
     // 2. each row count, while PyTorch fits
     print_test_name(__func__);
     printf("    tokens/s, a micro-batch as the training loop runs it; PyTorch: cuBLAS for every product, its flash attention\n");
+    int short_layers_val = 0;
+    for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
+        short_layers_val += gpt2_attention_window(config_val, layer_index_val) != 0;
+    printf("    (which has no window: PyTorch's every layer sees the whole row, ours %d of %d layers a window of %d tokens)
+",
+           short_layers_val, (int)config_val.num_layers, (int)config_val.attention_window);
     printf("    rows   ours bf16   ours 8-bit   PyTorch (cuBLAS)   bf16 / PyTorch   8-bit / PyTorch\n");
     for (const auto &row_val : bf16_val)
     {
@@ -439,7 +474,7 @@ static void time_against_pytorch(const ModelBuffers &buffers_val, const GPT2Conf
         std::vector<torch::Tensor> float_params_list;
         for (const Tensor &param_tensor : buffers_val.params_val.tensors())
             float_params_list.push_back(pytorch_copy_of(param_tensor));
-        loss_in_float_val = pytorch_loss(pytorch_gpt2_logits(pytorch_ids_of(token_ids_tensor), float_params_list, config_val),
+        loss_in_float_val = pytorch_loss(pytorch_gpt2_logits(pytorch_ids_of(token_ids_tensor), float_params_list, config_val, true),
                                          pytorch_ids_of(targets_tensor), config_val.vocab_size)
                                 .item<double>();
     }

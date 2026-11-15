@@ -117,7 +117,8 @@ struct PytorchAttention
     torch::Tensor logsumexp_tensor;                                // logsumexp of each row of masked scores
 
     /// Works out output, qkv.grad(), attention_probs and logsumexp from my qkv and output_grad, as floats.
-    PytorchAttention(const AttentionTensors &mine_val)
+    /// window_val: the sliding window (a query sees its own key and the window_val before it), by a mask; 0: none.
+    PytorchAttention(const AttentionTensors &mine_val, int64_t window_val = 0)
     {
         // 1. the sizes
         int64_t batch_size_val = mine_val.attention_probs_tensor.size(0);
@@ -134,13 +135,18 @@ struct PytorchAttention
         torch::Tensor q_tensor = heads_val(parts_list[0]);
         torch::Tensor k_tensor = heads_val(parts_list[1]);
         torch::Tensor v_tensor = heads_val(parts_list[2]);
-        torch::Tensor y_tensor = torch::scaled_dot_product_attention(q_tensor, k_tensor, v_tensor, {}, 0.0, true);
+        // seen: true where the query (row) sees the key (column): at or before it, and with a window at most
+        // window_val before it
+        torch::Tensor seen_tensor = torch::ones({seq_len_val, seq_len_val}, q_tensor.options().dtype(torch::kBool)).tril(0);
+        if (window_val > 0) seen_tensor = seen_tensor.triu(-window_val);
+        torch::Tensor y_tensor = window_val > 0 ? torch::scaled_dot_product_attention(q_tensor, k_tensor, v_tensor, seen_tensor, 0.0, false)
+                                                : torch::scaled_dot_product_attention(q_tensor, k_tensor, v_tensor, {}, 0.0, true);
         output_tensor = y_tensor.transpose(1, 2).contiguous().view({batch_size_val, seq_len_val, embed_dim_val});
         output_tensor.backward(pytorch_copy_of(mine_val.output_grad_tensor));
         // 3. the attention_probs and logsumexp, on the side
         torch::NoGradGuard no_grad_val;
         torch::Tensor scores_tensor = q_tensor.matmul(k_tensor.transpose(-2, -1)) / std::sqrt((double)head_size_val);
-        torch::Tensor after_tensor = torch::ones({seq_len_val, seq_len_val}, scores_tensor.options().dtype(torch::kBool)).triu(1);
+        torch::Tensor after_tensor = seen_tensor.logical_not();
         attention_probs_tensor = scores_tensor.masked_fill(after_tensor, -INFINITY).softmax(-1);
         logsumexp_tensor = scores_tensor.masked_fill(after_tensor, -INFINITY).logsumexp(-1);
     }
@@ -158,6 +164,7 @@ struct FlashTensors
     Tensor output_grad_tensor;
     Tensor qkv_grad_tensor;
     Tensor row_dot_tensor;
+    size_t window_val = 0;            // the sliding window forward and backward run with; 0: none
 
     /// Makes them for batch_size x num_heads heads of seq_len tokens of FLASH_HEAD_SIZE columns.
     FlashTensors(size_t batch_size_val, size_t num_heads_val, size_t seq_len_val)
@@ -174,14 +181,14 @@ struct FlashTensors
     /// Runs attention_bf16_flash_forward on these tensors.
     void forward()
     {
-        attention_bf16_flash_forward(output_tensor, logsumexp_tensor, qkv_tensor);
+        attention_bf16_flash_forward(output_tensor, logsumexp_tensor, qkv_tensor, window_val);
     }
 
     /// Runs attention_bf16_flash_backward on these tensors, row_dot at this block size (the default if not given).
     void backward(int threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK)
     {
         attention_bf16_flash_backward(qkv_grad_tensor, output_grad_tensor, output_tensor, qkv_tensor, logsumexp_tensor,
-                                      row_dot_tensor, threads_per_block_val);
+                                      row_dot_tensor, threads_per_block_val, window_val);
     }
 };
 
@@ -382,6 +389,67 @@ static void flash_matches_on_the_model_size(void)
         flash_matches_pytorch_and_the_steps(2, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
 }
 
+/// Runs flash attention's forward and backward with a sliding window on random bfloat16 qkv and output_grad, and
+/// PyTorch in float on the same values with the window as a mask; checks output and logsumexp within
+/// BFLOAT16_TOLERANCE, qkv_grad within BFLOAT16_GRAD_TOLERANCE.
+static void flash_window_matches_pytorch(size_t batch_size_val, size_t num_heads_val, size_t seq_len_val, size_t window_val)
+{
+    // 1. random bfloat16 values (in the steps' tensors, for PyTorch's copy); flash attention with the window
+    torch::manual_seed(0);
+    AttentionTensors values_val(batch_size_val, num_heads_val, seq_len_val, FLASH_HEAD_SIZE);
+    values_val.qkv_tensor = random_tensor_on_gpu(values_val.qkv_tensor.shape()).to(DType::BFloat16);
+    values_val.output_grad_tensor = random_tensor_on_gpu(values_val.output_tensor.shape()).to(DType::BFloat16);
+    FlashTensors flash_val(batch_size_val, num_heads_val, seq_len_val);
+    flash_val.window_val = window_val;
+    flash_val.qkv_tensor.copy_(values_val.qkv_tensor);
+    flash_val.output_grad_tensor.copy_(values_val.output_grad_tensor);
+    flash_val.forward();
+    flash_val.backward();
+    // 2. PyTorch's, in float, the window a mask; check
+    PytorchAttention pytorch_val(values_val, (int64_t)window_val);
+    printf("    {%zu, %zu, %zu}, window %zu:\n", batch_size_val, num_heads_val, seq_len_val, window_val);
+    ASSERT_NEAR(relative_difference_on_gpu(flash_val.output_tensor, pytorch_val.output_tensor), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash_val.logsumexp_tensor, pytorch_val.logsumexp_tensor), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()), 0.0,
+                BFLOAT16_GRAD_TOLERANCE);
+}
+
+static void flash_window_sees_only_its_keys(void)
+{
+    // Expect: a sliding window (a query sees its own key and the `window` keys before it, as FlashAttention-3's
+    // window_size = (window, 0)): {2, 4, 512} at windows of 64 (2 tiles walked, the oldest masked along its
+    // diagonal), 128 and 448 (the last queries' walk only starts past tile 0), and the model's {1, 18, 2048} at
+    // 512 (nanochat's short layers): forward and backward within the bfloat16 tolerances of PyTorch's masked attention.
+    if (!flash_runs_here(__func__))
+        return;
+    print_test_name(__func__);
+    for (size_t window_val : {(size_t)FLASH_TILE, (size_t)(2 * FLASH_TILE), (size_t)(7 * FLASH_TILE)})
+        flash_window_matches_pytorch(2, 4, 8 * FLASH_TILE, window_val);
+    flash_window_matches_pytorch(1, GPT2_NUM_HEADS, GPT2_SEQ_LEN, 8 * FLASH_TILE);
+}
+
+static void flash_window_as_long_as_the_row_changes_nothing(void)
+{
+    // Expect: {2, 4, 256} with a window of 256: no query is more than 255 after a key, so nothing is masked and no
+    // tile skipped: output, logsumexp and qkv_grad the very bits of no window.
+    if (!flash_runs_here(__func__))
+        return;
+    torch::manual_seed(1);
+    FlashTensors plain_val(2, 4, 4 * FLASH_TILE);
+    plain_val.qkv_tensor = random_tensor_on_gpu(plain_val.qkv_tensor.shape()).to(DType::BFloat16);
+    plain_val.output_grad_tensor = random_tensor_on_gpu(plain_val.output_tensor.shape()).to(DType::BFloat16);
+    FlashTensors window_val(2, 4, 4 * FLASH_TILE);
+    window_val.window_val = 4 * FLASH_TILE;
+    window_val.qkv_tensor.copy_(plain_val.qkv_tensor);
+    window_val.output_grad_tensor.copy_(plain_val.output_grad_tensor);
+    plain_val.forward(), plain_val.backward();
+    window_val.forward(), window_val.backward();
+    print_test_name(__func__);
+    ASSERT_EQ(torch::equal(pytorch_copy_of(window_val.output_tensor), pytorch_copy_of(plain_val.output_tensor)), true);
+    ASSERT_EQ(torch::equal(pytorch_copy_of(window_val.logsumexp_tensor), pytorch_copy_of(plain_val.logsumexp_tensor)), true);
+    ASSERT_EQ(torch::equal(pytorch_copy_of(window_val.qkv_grad_tensor), pytorch_copy_of(plain_val.qkv_grad_tensor)), true);
+}
+
 static void flash_backward_writes_over_qkv_grad_the_same_every_time(void)
 {
     // Expect: qkv_grad filled with 7s first: after a backward, no 7 is left (every value of its three parts
@@ -575,6 +643,8 @@ int main(void)
     flash_matches_on_one_tile();
     flash_matches_on_gpt2_heads_of_256_tokens();
     flash_matches_on_the_model_size();
+    flash_window_sees_only_its_keys();
+    flash_window_as_long_as_the_row_changes_nothing();
     flash_backward_writes_over_qkv_grad_the_same_every_time();
     every_stage_count_gives_the_same_bits();
 

@@ -4,10 +4,12 @@
 //
 // Part 1 checks the scales and the E4M3s against PyTorch's float8_e4m3fn; part 2 checks that a turned matrix
 // gives the same bits as rounding the matrix turned round first, and that round_8bit_rows_and_columns gives both
-// roundings' bits from its two reads; part 3 checks that each kernel's registers fit its block, and other block
+// roundings' bits from its two reads, and round_8bit_per_tensor's one scale for the whole tensor (exact, and from the
+// tensor before with a history); part 3 checks that each kernel's registers fit its block, and other block
 // sizes. Any GPU. The timings are in tests/8bit/tune_round_8bit.cu.
 #include <torch/types.h>              // torch::randn, float8_e4m3fn; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
+#include <cmath>                      // std::exp2, std::ceil, std::log2
 #include "../test_helpers.h"             // ASSERT_EQ
 #include "../../llmc/kernels/8bit/round_8bit.cuh"
 
@@ -240,6 +242,126 @@ static void rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_
 
 // ══ part 3: the kernels fit their launch, and any block size works ═══════════
 
+/// The copies round_8bit_per_tensor writes of one {rows, columns} matrix, and PyTorch's reading of them.
+struct PerTensorCopies
+{
+    Tensor rows_8bit_tensor;           // {rows, columns / 4} Int32
+    Tensor row_scales_tensor;          // {rows}
+    Tensor columns_8bit_tensor;        // {columns, rows / 4} Int32
+    Tensor column_scales_tensor;       // {columns}
+    size_t rows_val;
+    size_t columns_val;
+
+    PerTensorCopies(size_t rows_val, size_t columns_val)
+        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          row_scales_tensor(Tensor::zeros({rows_val})),
+          columns_8bit_tensor(Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          column_scales_tensor(Tensor::zeros({columns_val})), rows_val(rows_val), columns_val(columns_val) {}
+
+    /// Rounds values into both copies by round_8bit_per_tensor.
+    void round(const Tensor &values_tensor, const Round8bitHistory *history_ptr = nullptr, bool same_input_val = false)
+    {
+        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, values_tensor, history_ptr,
+                              same_input_val);
+    }
+
+    /// Gives the row copy turned back by PyTorch (each E4M3 as float8_e4m3fn, times its row's scale): {rows, columns}.
+    torch::Tensor rows_turned_back() const
+    {
+        torch::Tensor e4m3_tensor = torch::from_blob(rows_8bit_tensor.data_ptr(), {(int64_t)rows_val, (int64_t)columns_val},
+                                                     torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+        return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(row_scales_tensor).unsqueeze(1);
+    }
+
+    /// Gives the turned copy turned back by PyTorch, and turned round again: {rows, columns}.
+    torch::Tensor columns_turned_back() const
+    {
+        torch::Tensor e4m3_tensor = torch::from_blob(columns_8bit_tensor.data_ptr(), {(int64_t)columns_val, (int64_t)rows_val},
+                                                     torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+        return (e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(column_scales_tensor).unsqueeze(1)).t();
+    }
+};
+
+/// Gives the scale of a largest |value|, as round_8bit_scale: the smallest power of 2 with largest / scale <= 448.
+static double scale_of(double largest_val)
+{
+    return std::exp2(std::ceil(std::log2(largest_val / HARDWARE_E4M3_LARGEST)));
+}
+
+/// Checks both of copies_val's copies: every row's and column's scale is scale_val, and the E4M3s turned back are
+/// PyTorch's rounding of values at that scale, clamped to the largest E4M3 first (what saturating gives).
+static void check_per_tensor(const PerTensorCopies &copies_val, const Tensor &values_tensor, double scale_val)
+{
+    torch::Tensor clamped_tensor = (pytorch_copy_of(values_tensor) / scale_val).clamp(-HARDWARE_E4M3_LARGEST, HARDWARE_E4M3_LARGEST);
+    torch::Tensor expected_tensor = clamped_tensor.to(torch::kFloat8_e4m3fn).to(torch::kFloat) * scale_val;
+    ASSERT_EQ((pytorch_copy_of(copies_val.row_scales_tensor) != scale_val).sum().item<int64_t>(), (int64_t)0);
+    ASSERT_EQ((pytorch_copy_of(copies_val.column_scales_tensor) != scale_val).sum().item<int64_t>(), (int64_t)0);
+    ASSERT_EQ(torch::equal(copies_val.rows_turned_back(), expected_tensor), true);
+    ASSERT_EQ(torch::equal(copies_val.columns_turned_back(), expected_tensor), true);
+}
+
+static void per_tensor_gives_one_scale_and_pytorch_s_float8(void)
+{
+    // Expect: random {208, 272} (no tile divides it), row 5 a hundred times larger, row 0 all 0, no history. Every
+    // row's and column's scale is the one scale of the whole tensor's largest |value| (a power of 2, largest / scale
+    // in (224, 448]), and both copies turned back are exactly PyTorch's float8_e4m3fn at that scale. The same at the
+    // qkv output_grad's size.
+    torch::manual_seed(4);
+    print_test_name(__func__);
+    const size_t sizes_list[2][2] = {{208, 272}, {GPT2_ROWS, GPT2_QKV_DIM}};
+    for (const auto &size_val : sizes_list)
+    {
+        torch::Tensor floats_tensor = torch::randn({(int64_t)size_val[0], (int64_t)size_val[1]}, torch::TensorOptions().device(torch::kCUDA));
+        floats_tensor[5].mul_(100.0);
+        floats_tensor[0].zero_();
+        Tensor values_floats_tensor = Tensor::empty({size_val[0], size_val[1]});
+        cudaCheck(cudaMemcpy(values_floats_tensor.data(), floats_tensor.data_ptr<float>(), values_floats_tensor.numel() * sizeof(float),
+                             cudaMemcpyDeviceToDevice));
+        Tensor values_tensor = values_floats_tensor.to(DType::BFloat16);
+        PerTensorCopies copies_val(size_val[0], size_val[1]);
+        copies_val.round(values_tensor);
+        double largest_val = pytorch_copy_of(values_tensor).abs().max().item<double>();
+        printf("    input {%zu, %zu}, largest %.3f, scale %g:\n", size_val[0], size_val[1], largest_val, scale_of(largest_val));
+        check_per_tensor(copies_val, values_tensor, scale_of(largest_val));
+    }
+}
+
+static void per_tensor_with_a_history_takes_the_scale_of_the_tensor_before(void)
+{
+    // Expect: three random {208, 272} tensors rounded in turn with one history, the second 5 times the first's size:
+    //     the first    its own largest's scale (exact: a read of its own)
+    //     the second   the scale of the first's largest x ROUND_8BIT_DELAYED_MARGIN: too small for it, so its values
+    //                  past 448 x scale are clamped to the largest E4M3
+    //     the third    the scale of the second's largest x the margin (found while the second was rounded)
+    //     the third again, as the same input: its own largest's scale, exact (found while it was rounded)
+    torch::manual_seed(5);
+    Tensor first_tensor = random_bf16_tensor({208, 272});
+    torch::Tensor larger_tensor = pytorch_copy_of(random_bf16_tensor({208, 272})) * 5.0;
+    Tensor second_floats_tensor = Tensor::empty({208, 272});
+    cudaCheck(cudaMemcpy(second_floats_tensor.data(), larger_tensor.data_ptr<float>(), second_floats_tensor.numel() * sizeof(float),
+                         cudaMemcpyDeviceToDevice));
+    Tensor second_tensor = second_floats_tensor.to(DType::BFloat16);
+    Tensor third_tensor = random_bf16_tensor({208, 272});
+    double first_largest_val = pytorch_copy_of(first_tensor).abs().max().item<double>();
+    double second_largest_val = pytorch_copy_of(second_tensor).abs().max().item<double>();
+    double third_largest_val = pytorch_copy_of(third_tensor).abs().max().item<double>();
+    Round8bitHistory history_val;
+    PerTensorCopies copies_val(208, 272);
+    print_test_name(__func__);
+    printf("    the first, exact:\n");
+    copies_val.round(first_tensor, &history_val);
+    check_per_tensor(copies_val, first_tensor, scale_of(first_largest_val));
+    printf("    the second, 5 times larger, at the first's scale with its margin:\n");
+    copies_val.round(second_tensor, &history_val);
+    check_per_tensor(copies_val, second_tensor, scale_of(first_largest_val * ROUND_8BIT_DELAYED_MARGIN));
+    printf("    the third, at the second's:\n");
+    copies_val.round(third_tensor, &history_val);
+    check_per_tensor(copies_val, third_tensor, scale_of(second_largest_val * ROUND_8BIT_DELAYED_MARGIN));
+    printf("    the third again as the same input, exact:\n");
+    copies_val.round(third_tensor, &history_val, true);
+    check_per_tensor(copies_val, third_tensor, scale_of(third_largest_val));
+}
+
 static void every_kernel_fits_its_block(void)
 {
     // Expect: each kernel can be launched with its threads per block, and nothing is spilled: cudaFuncGetAttributes'
@@ -248,17 +370,17 @@ static void every_kernel_fits_its_block(void)
     // The row kernel is made for 1, 2, 4, 8 and 16 loads a thread (8 to 128 floats of a row kept in registers): those
     // up to 8 at the most threads round_8bit_threads_for picks (512), the 16-load one at the least (256; a larger
     // block asked of it goes to the tile kernels).
-    const int kernel_count_val = 7;
+    const int kernel_count_val = 8;
     const void *kernels_list[kernel_count_val] = {(const void *)round_8bit_rows_kernel<1>, (const void *)round_8bit_rows_kernel<2>,
                                                   (const void *)round_8bit_rows_kernel<4>, (const void *)round_8bit_rows_kernel<8>,
                                                   (const void *)round_8bit_rows_kernel<16>, (const void *)round_8bit_largest_kernel,
-                                                  (const void *)round_8bit_tile_kernel};
+                                                  (const void *)round_8bit_tile_kernel, (const void *)round_8bit_tensor_largest_kernel};
     const char *names_list[kernel_count_val] = {"round_8bit_rows_kernel<1>", "round_8bit_rows_kernel<2>", "round_8bit_rows_kernel<4>",
                                                 "round_8bit_rows_kernel<8>", "round_8bit_rows_kernel<16>", "round_8bit_largest_kernel",
-                                                "round_8bit_tile_kernel"};
+                                                "round_8bit_tile_kernel", "round_8bit_tensor_largest_kernel"};
     int threads_list[kernel_count_val] = {ROUND_8BIT_MOST_THREADS, ROUND_8BIT_MOST_THREADS, ROUND_8BIT_MOST_THREADS,
                                           ROUND_8BIT_MOST_THREADS, ROUND_8BIT_LEAST_THREADS, ROUND_8BIT_TILE_THREADS,
-                                          ROUND_8BIT_TILE_THREADS};
+                                          ROUND_8BIT_TILE_THREADS, ROUND_8BIT_LARGEST_THREADS};
     for (int kernel_index_val = 0; kernel_index_val < kernel_count_val; kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -309,6 +431,8 @@ int main(void)
     turned_gives_the_bits_of_the_turned_round_matrix_with_sizes_no_tile_divides();
     rows_and_columns_give_the_bits_of_both_roundings_on_qkv_output_grad();
     rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_divides();
+    per_tensor_gives_one_scale_and_pytorch_s_float8();
+    per_tensor_with_a_history_takes_the_scale_of_the_tensor_before();
 
     every_kernel_fits_its_block();
     any_block_size_gives_the_same_bits();

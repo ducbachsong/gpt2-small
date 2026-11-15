@@ -3,6 +3,7 @@
 // over SWEEP_ROUNDS rounds (the GPU's clock and heat move the same for all), rounds WARM_UP_STEPS + 1 on averaged:
 //     part 1   this file's setting against PyTorch's bfloat16 matmul (cuBLAS)
 //     part 2   every square that fits (1 or 2 warpgroups x 64, 128 or 256 columns x 1 to 4 sets of tiles)
+//     part 2b  stream-K's squares and block orders against this file's setting
 //     part 3   at part 2's fastest square: every block order, block count and cluster
 //     part 4   at this file's square: the producer's registers x the steps in flight
 // then the fastest as the #define lines of head_input_grad_bf16.cuh. Run it on an H100 (compute capability 9.0), built with
@@ -57,13 +58,13 @@ struct Product
 
 /// Runs head_input_grad_bf16 at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = HEAD_INPUT_GRAD_BF16_IN_FLIGHT
+          int IN_FLIGHT = HEAD_INPUT_GRAD_BF16_IN_FLIGHT, int STREAM_K = HEAD_INPUT_GRAD_BF16_STREAM_K
           >
 static void mine_at(const Product &product_val,
                     int block_rows_per_group_val, int blocks_val
                     )
 {
-    head_input_grad_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>(product_val.output_tensor, product_val.output_grad_tensor, product_val.weight_tensor,
+    head_input_grad_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, STREAM_K>(product_val.output_tensor, product_val.output_grad_tensor, product_val.weight_tensor,
                                                      block_rows_per_group_val, blocks_val);
 }
 
@@ -73,9 +74,9 @@ static void square_at(const Product &product_val, int cluster_val,
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square that fits a block's shared memory, and its run.
@@ -242,6 +243,88 @@ static int time_each_square(const Product &product_val)
     return fastest_index_val;
 }
 
+// ══ part 2b: stream-K against this file's setting ════════════════════════════
+
+/// One stream-K square (warpgroups x COLUMNS x STAGES, clusters of 1, persistent) at a block order: what the sweep
+/// below times.
+template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES>
+static void stream_k_at(const Product &product_val, int block_rows_per_group_val)
+{
+    mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1, HEAD_INPUT_GRAD_BF16_PRODUCER_REGISTERS, HEAD_INPUT_GRAD_BF16_IN_FLIGHT, 1>(product_val,
+                                                                                                                       block_rows_per_group_val, 0);
+}
+
+/// A stream-K square and its run.
+struct StreamKSquare
+{
+    int row_groups_val;
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Product &, int);
+};
+
+static const StreamKSquare STREAM_K_SQUARES_LIST[] = {
+    {2, 256, 2, stream_k_at<2, 256, 2>}, {2, 256, 3, stream_k_at<2, 256, 3>},
+    {2, 128, 3, stream_k_at<2, 128, 3>}, {2, 128, 4, stream_k_at<2, 128, 4>},
+    {1, 256, 4, stream_k_at<1, 256, 4>},
+};
+
+static void time_stream_k_against_this_files_setting(const Product &product_val)
+{
+    // Prints this file's setting (stream-K if HEAD_INPUT_GRAD_BF16_STREAM_K is 1) against each stream-K square (the
+    // full rounds' squares whole, the leftover squares' steps shared by every block: at 128 x 256, 1,152 squares on
+    // 114 SMs are 10 rounds and 12 squares, 12 x 786 steps over 114 blocks, 83 each) at block orders 1, 4, 16 and 64,
+    // all taking turns over SWEEP_ROUNDS rounds; then the fastest, and as how many times this file's setting's time.
+    struct Run
+    {
+        const char *name_ptr;
+        int row_groups_val;
+        int columns_val;
+        int stages_val;
+        int block_rows_per_group_val;
+    };
+    std::vector<Run> runs_list = {{"this file's setting", HEAD_INPUT_GRAD_BF16_ROW_GROUPS, HEAD_INPUT_GRAD_BF16_COLUMNS, HEAD_INPUT_GRAD_BF16_STAGES,
+                                   HEAD_INPUT_GRAD_BF16_BLOCK_ROWS_PER_GROUP}};
+    std::vector<const StreamKSquare *> squares_list = {nullptr};
+    for (const StreamKSquare &square_val : STREAM_K_SQUARES_LIST)
+        for (int block_rows_per_group_val : {1, 4, 16, 64})
+        {
+            runs_list.push_back({"stream-K", square_val.row_groups_val, square_val.columns_val, square_val.stages_val, block_rows_per_group_val});
+            squares_list.push_back(&square_val);
+        }
+    std::vector<double> totals_list(runs_list.size(), 0.0);
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+        for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+        {
+            float milliseconds_val = gpu_milliseconds([&] {
+                if (squares_list[run_index_val] == nullptr)
+                    mine_at<HEAD_INPUT_GRAD_BF16_ROW_GROUPS, HEAD_INPUT_GRAD_BF16_COLUMNS, HEAD_INPUT_GRAD_BF16_STAGES, HEAD_INPUT_GRAD_BF16_CLUSTER>(
+                        product_val, HEAD_INPUT_GRAD_BF16_BLOCK_ROWS_PER_GROUP, HEAD_INPUT_GRAD_BF16_BLOCKS);
+                else
+                    squares_list[run_index_val]->run_ptr(product_val, runs_list[run_index_val].block_rows_per_group_val);
+            });
+            if (round_index_val > WARM_UP_STEPS)
+                totals_list[run_index_val] += milliseconds_val;
+        }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    size_t fastest_index_val = 0;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+    {
+        const Run &run_val = runs_list[run_index_val];
+        double milliseconds_val = totals_list[run_index_val] / averaged_val;
+        printf("        %-20s %d x %3d x %d, %2d rows a group   %8.3f ms   %6.1f TFLOPS\n", run_val.name_ptr, run_val.row_groups_val,
+               run_val.columns_val, run_val.stages_val, run_val.block_rows_per_group_val, milliseconds_val, tflops_of(milliseconds_val));
+        if (totals_list[run_index_val] < totals_list[fastest_index_val])
+            fastest_index_val = run_index_val;
+    }
+    const Run &fastest_val = runs_list[fastest_index_val];
+    printf("    fastest: %s %d x %d x %d, %d rows a group: %.3f ms, this file's setting %.2fx as long\n", fastest_val.name_ptr,
+           fastest_val.row_groups_val, fastest_val.columns_val, fastest_val.stages_val, fastest_val.block_rows_per_group_val,
+           totals_list[fastest_index_val] / averaged_val, totals_list[0] / totals_list[fastest_index_val]);
+}
+
 // ══ part 3: order, blocks and cluster ═════════════════════════════════════════
 
 /// A launch choice at a square: its cluster, block order and block count
@@ -365,6 +448,7 @@ int main(void)
     Product product_val;
     time_against_cublas(product_val);
     int square_index_val = time_each_square(product_val);
+    time_stream_k_against_this_files_setting(product_val);
     Choice choice_val = time_each_choice(product_val, square_index_val);
     VariantChoice variant_choice_val = time_each_variant(product_val);
     // the fastest, as the defines of the product's file

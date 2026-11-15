@@ -58,6 +58,7 @@
 /// _scratch suffix: used only inside one forward or backward, one of each, shared by all the layers.
 struct GPT2ActivationsBf16 {
     bool flash_attention;                                   // flash attention (attention_bf16_flash_fits), or the steps
+    std::vector<size_t> attention_windows;                  // each layer's sliding window (gpt2_attention_window); 0: none
     // ── kept for the backward: the model's ──
     Tensor encoded;                                         // {B, T, D}: the encoder's output, block 0's input
     std::vector<Tensor> block_outputs;                      // {B, T, D} each: block l's output, block l + 1's input
@@ -170,6 +171,12 @@ inline GPT2ActivationsBf16::GPT2ActivationsBf16(size_t batch_size, size_t seq_le
     size_t NH = config.num_heads;
     DType bf16 = DType::BFloat16;
     flash_attention = attention_bf16_flash_fits(T, D / NH);
+    for (size_t l = 0; l < config.num_layers; l++) attention_windows.push_back(gpt2_attention_window(config, l));
+    if (config.attention_window != 0 && !flash_attention) {
+        fprintf(stderr, "error: a sliding window (GPT2Config::attention_window) needs flash attention: head_size %d, "
+                        "seq_len a multiple of %d, an H100\n", FLASH_HEAD_SIZE, FLASH_TILE);
+        exit(EXIT_FAILURE);
+    }
     // 1. kept: the model's
     encoded = Tensor::zeros({B, T, D}, bf16);
     lnf_output = Tensor::zeros({B, T, D}, bf16);
@@ -220,7 +227,7 @@ inline void block_bf16_forward(const Tensor& output, const Tensor& input, const 
     // the attention branch
     layer_norm_bf16_forward(a.ln1_output[l], a.ln1_mean[l], a.ln1_rstd[l], input, params.ln1_weight, params.ln1_bias);
     qkv_bf16(a.qkv[l], a.ln1_output[l], params.qkv_weight, params.qkv_bias);
-    if (a.flash_attention) attention_bf16_flash_forward(a.attention_output[l], a.attention_logsumexp[l], a.qkv[l]);
+    if (a.flash_attention) attention_bf16_flash_forward(a.attention_output[l], a.attention_logsumexp[l], a.qkv[l], a.attention_windows[l]);
     else attention_bf16_forward(a.attention_output[l], a.attention_probs[l], a.qkv[l]);
     attention_output_bf16(a.branch_output_scratch, a.attention_output[l], params.attention_out_weight, params.attention_out_bias);
     residual_bf16_forward(a.residual2[l], input, a.branch_output_scratch);
@@ -263,7 +270,8 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
     if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.attention_out_bias, a.branch_output_grad_scratch);
     if (a.flash_attention)
         attention_bf16_flash_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.attention_output[l],
-                                      a.qkv[l], a.attention_logsumexp[l], a.attention_row_dot_scratch);
+                                      a.qkv[l], a.attention_logsumexp[l], a.attention_row_dot_scratch,
+                                      ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, a.attention_windows[l]);
     else
         attention_bf16_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.qkv[l], a.attention_probs[l],
                                 a.attention_probs_grad_scratch);

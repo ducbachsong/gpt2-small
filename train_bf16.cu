@@ -36,17 +36,21 @@
 #include "llmc/helper/checkpoint.cuh"
 #include "llmc/kernels/bf16/grad_norm_bf16.cuh"     // GradNormBf16: the bfloat16 grads' norm
 
-// The model it trains (in place of GPT-2 small's 12 layers x 768, 12 heads, 1,024 tokens): about 2.15B parameters
-// (32 x 12 x 2,304² in the blocks, 50,304 x 2,304 in wte), head size 2,304 / 18 = 128
-#define TRAIN_BF16_NUM_LAYERS 32
-#define TRAIN_BF16_EMBED_DIM 2304
-#define TRAIN_BF16_NUM_HEADS 18
+// The model it trains (in place of GPT-2 small's 12 layers x 768, 12 heads, 1,024 tokens): nanochat's d24 size, about
+// 0.73B parameters (24 x 12 x 1,536² in the blocks, 32,768 x 1,536 in wte), head size 1,536 / 12 = 128
+#define TRAIN_BF16_NUM_LAYERS 24
+#define TRAIN_BF16_EMBED_DIM 1536
+#define TRAIN_BF16_NUM_HEADS 12
+#define TRAIN_BF16_VOCAB_SIZE 32768                        // nanochat's tokenizer (data/climbmix.py trains it): 2^15 ids, wte's rows with no padding
+#define TRAIN_BF16_ATTENTION_WINDOW 512                    // the short layers' sliding window, a quarter of the row (nanochat's SSSL: 3 short layers, 1 long, the last long); 0: none
+#define TRAIN_BF16_TRAIN_FILES "data/climbmix/climbmix_train_%06d.bin"   // NVIDIA ClimbMix (nanochat's data), tokenized by data/climbmix.py
+#define TRAIN_BF16_VAL_FILES "data/climbmix/climbmix_val_%06d.bin"
 #define TRAIN_BF16_MAX_SEQ_LEN 2048                     // wpe's rows, and the default tokens a row
 #define TRAIN_BF16_BATCH_SIZE 8                         // the default rows a micro-batch: about 4.5 GB of activations a row at 2,048 tokens (tune_model finds the best)
 #define TRAIN_BF16_LINEAR_BIAS 0                      // the 4 linears' biases: 0, none (as nanochat; no bias grads, 32 x 9 x 2,304 fewer
                                                        // values); 1, GPT-2's. --linear-bias changes it. The LayerNorms keep theirs
 
-/// Gives the model this program trains: GPT2Config with the sizes above (the vocabulary GPT-2's), and the linears'
+/// Gives the model this program trains: GPT2Config with the sizes above, and the linears'
 /// biases or not as the run says.
 ///
 ///   c   the run's settings: linear_bias
@@ -57,6 +61,9 @@ static GPT2Config model_config_of(const TrainConfig& c) {
     config.embed_dim = TRAIN_BF16_EMBED_DIM;
     config.num_heads = TRAIN_BF16_NUM_HEADS;
     config.max_seq_len = TRAIN_BF16_MAX_SEQ_LEN;
+    config.vocab_size = TRAIN_BF16_VOCAB_SIZE;
+    config.padded_vocab_size = TRAIN_BF16_VOCAB_SIZE;
+    config.attention_window = TRAIN_BF16_ATTENTION_WINDOW;
     return config;
 }
 
@@ -67,6 +74,8 @@ static TrainConfig train_defaults_of(void) {
     defaults.linear_bias = TRAIN_BF16_LINEAR_BIAS != 0;
     defaults.seq_len = TRAIN_BF16_MAX_SEQ_LEN;
     defaults.batch_size = TRAIN_BF16_BATCH_SIZE;
+    defaults.train_files = TRAIN_BF16_TRAIN_FILES;
+    defaults.val_files = TRAIN_BF16_VAL_FILES;
     return defaults;
 }
 

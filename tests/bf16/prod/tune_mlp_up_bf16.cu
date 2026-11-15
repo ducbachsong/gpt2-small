@@ -60,13 +60,13 @@ struct Product
 
 /// Runs mlp_up_bf16 at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_UP_BF16_PRODUCER_REGISTERS,
-          int IN_FLIGHT = MLP_UP_BF16_IN_FLIGHT
+          int IN_FLIGHT = MLP_UP_BF16_IN_FLIGHT, int PINGPONG = MLP_UP_BF16_PINGPONG
           >
 static void mine_at(const Product &product_val,
                     int block_rows_per_group_val, int blocks_val
                     )
 {
-    mlp_up_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT>(product_val.output_tensor, product_val.gelu_output_tensor, product_val.input_tensor,
+    mlp_up_bf16_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PINGPONG>(product_val.output_tensor, product_val.gelu_output_tensor, product_val.input_tensor,
                                                      product_val.weight_tensor, product_val.bias_tensor, block_rows_per_group_val, blocks_val);
 }
 
@@ -76,9 +76,9 @@ static void square_at(const Product &product_val, int cluster_val,
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2, MLP_UP_BF16_PRODUCER_REGISTERS, MLP_UP_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1, MLP_UP_BF16_PRODUCER_REGISTERS, MLP_UP_BF16_IN_FLIGHT, 0>(product_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square that fits a block's shared memory, and its run.
@@ -181,7 +181,8 @@ static void time_against_cublas(const Product &product_val)
     torch::Tensor bias_tensor = pytorch_bf16_copy_of(product_val.bias_tensor);
     torch::Tensor pytorch_output_tensor = torch::zeros({ROWS, COLUMNS}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
     // 2. take turns
-    double mine_total_val = 0.0, cublas_total_val = 0.0;
+    torch::Tensor pytorch_gelu_tensor = torch::zeros({ROWS, COLUMNS}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    double mine_total_val = 0.0, cublas_total_val = 0.0, cublas_gelu_total_val = 0.0;
     for (int step_index_val = 1; step_index_val <= TIMED_STEPS; step_index_val++)
     {
         float mine_val = gpu_milliseconds([&] {
@@ -191,14 +192,20 @@ static void time_against_cublas(const Product &product_val)
         float cublas_val = gpu_milliseconds([&] {
             torch::addmm_out(pytorch_output_tensor, bias_tensor, input_tensor, weight_turned_tensor);
         });
+        float cublas_gelu_val = gpu_milliseconds([&] {           // the same work as mine: the product, then its GELU beside it
+            torch::addmm_out(pytorch_output_tensor, bias_tensor, input_tensor, weight_turned_tensor);
+            pytorch_gelu_tensor.copy_(torch::gelu(pytorch_output_tensor, "tanh"));
+        });
         if (step_index_val <= WARM_UP_STEPS)
             continue;
         mine_total_val += mine_val;
         cublas_total_val += cublas_val;
+        cublas_gelu_total_val += cublas_gelu_val;
     }
     // 3. print
     const int averaged_val = TIMED_STEPS - WARM_UP_STEPS;
     double mine_ms_val = mine_total_val / averaged_val, cublas_ms_val = cublas_total_val / averaged_val;
+    double cublas_gelu_ms_val = cublas_gelu_total_val / averaged_val;
     print_test_name(__func__);
     printf("    mlp up: output {%d, %d}, a sum of %d: %.1f GFLOP\n", ROWS, COLUMNS, SUM_LENGTH,
            (double)FLOPS_PER_MULTIPLY_ADD * ROWS * COLUMNS * SUM_LENGTH / GIGA);
@@ -207,7 +214,8 @@ static void time_against_cublas(const Product &product_val)
            100.0 * tflops_of(mine_ms_val) * TERA / peak_bf16_flops());
     printf("        PyTorch (cuBLAS)           %9.3f   %8.1f   %6.1f%%\n", cublas_ms_val, tflops_of(cublas_ms_val),
            100.0 * tflops_of(cublas_ms_val) * TERA / peak_bf16_flops());
-    printf("    cuBLAS takes %.2fx as long as mine\n", cublas_ms_val / mine_ms_val);
+    printf("        PyTorch (cuBLAS + GELU)    %9.3f   (the same work as mine: the product, then gelu_output)\n", cublas_gelu_ms_val);
+    printf("    cuBLAS takes %.2fx as long as mine; with PyTorch's GELU %.2fx\n", cublas_ms_val / mine_ms_val, cublas_gelu_ms_val / mine_ms_val);
 }
 
 // ══ part 2: every square ══════════════════════════════════════════════════════
@@ -244,6 +252,82 @@ static int time_each_square(const Product &product_val)
     printf("    fastest: %d x %d x %d\n", SQUARES_LIST[fastest_index_val].row_groups_val, SQUARES_LIST[fastest_index_val].columns_val,
            SQUARES_LIST[fastest_index_val].stages_val);
     return fastest_index_val;
+}
+
+// ══ part 2b: ping-pong against this file's setting ════════════════════════════
+
+/// One ping-pong square (2 warpgroups x COLUMNS x STAGES, clusters of 1) at a block order: what the sweep below times.
+template <int COLUMNS_ARG, int STAGES>
+static void pingpong_at(const Product &product_val, int block_rows_per_group_val)
+{
+    mine_at<2, COLUMNS_ARG, STAGES, 1, MLP_UP_BF16_PRODUCER_REGISTERS, MLP_UP_BF16_IN_FLIGHT, 1>(product_val, block_rows_per_group_val, 0);
+}
+
+/// A ping-pong square and its run.
+struct PingpongSquare
+{
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Product &, int);
+};
+
+static const PingpongSquare PINGPONG_SQUARES_LIST[] = {
+    {128, 2, pingpong_at<128, 2>}, {128, 3, pingpong_at<128, 3>}, {128, 4, pingpong_at<128, 4>},
+    {256, 2, pingpong_at<256, 2>}, {256, 3, pingpong_at<256, 3>}, {256, 4, pingpong_at<256, 4>},
+};
+
+static void time_pingpong_against_this_files_setting(const Product &product_val)
+{
+    // Prints this file's setting (cooperative, or ping-pong if MLP_UP_BF16_PINGPONG is 1) against each ping-pong square
+    // (the 2 warpgroups each on their own 64-row squares, their sums in turns, one's store, GELU's included, under the
+    // other's sums; 256 x 4 sets fits) at block orders 1, 4 and 16, persistent, all taking turns over SWEEP_ROUNDS
+    // rounds; then the fastest, and as how many times this file's setting's time.
+    struct Run
+    {
+        const char *name_ptr;
+        int columns_val;
+        int stages_val;
+        int block_rows_per_group_val;
+    };
+    std::vector<Run> runs_list = {{"this file's setting", MLP_UP_BF16_COLUMNS, MLP_UP_BF16_STAGES, MLP_UP_BF16_BLOCK_ROWS_PER_GROUP}};
+    std::vector<const PingpongSquare *> squares_list = {nullptr};
+    for (const PingpongSquare &square_val : PINGPONG_SQUARES_LIST)
+        for (int block_rows_per_group_val : {1, 4, 16})
+        {
+            runs_list.push_back({"ping-pong", square_val.columns_val, square_val.stages_val, block_rows_per_group_val});
+            squares_list.push_back(&square_val);
+        }
+    std::vector<double> totals_list(runs_list.size(), 0.0);
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+        for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+        {
+            float milliseconds_val = gpu_milliseconds([&] {
+                if (squares_list[run_index_val] == nullptr)
+                    mine_at<MLP_UP_BF16_ROW_GROUPS, MLP_UP_BF16_COLUMNS, MLP_UP_BF16_STAGES, MLP_UP_BF16_CLUSTER>(product_val,
+                                                                                   MLP_UP_BF16_BLOCK_ROWS_PER_GROUP, MLP_UP_BF16_BLOCKS);
+                else
+                    squares_list[run_index_val]->run_ptr(product_val, runs_list[run_index_val].block_rows_per_group_val);
+            });
+            if (round_index_val > WARM_UP_STEPS)
+                totals_list[run_index_val] += milliseconds_val;
+        }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    size_t fastest_index_val = 0;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+    {
+        const Run &run_val = runs_list[run_index_val];
+        double milliseconds_val = totals_list[run_index_val] / averaged_val;
+        printf("        %-20s 2 x %3d x %d, %2d rows a group   %8.3f ms   %6.1f TFLOPS\n", run_val.name_ptr, run_val.columns_val,
+               run_val.stages_val, run_val.block_rows_per_group_val, milliseconds_val, tflops_of(milliseconds_val));
+        if (totals_list[run_index_val] < totals_list[fastest_index_val])
+            fastest_index_val = run_index_val;
+    }
+    const Run &fastest_val = runs_list[fastest_index_val];
+    printf("    fastest: %s 2 x %d x %d, %d rows a group: %.3f ms, this file's setting %.2fx as long\n", fastest_val.name_ptr,
+           fastest_val.columns_val, fastest_val.stages_val, fastest_val.block_rows_per_group_val, totals_list[fastest_index_val] / averaged_val,
+           totals_list[0] / totals_list[fastest_index_val]);
 }
 
 // ══ part 3: order, blocks and cluster ═════════════════════════════════════════
@@ -369,6 +453,7 @@ int main(void)
     Product product_val;
     time_against_cublas(product_val);
     int square_index_val = time_each_square(product_val);
+    time_pingpong_against_this_files_setting(product_val);
     Choice choice_val = time_each_choice(product_val, square_index_val);
     VariantChoice variant_choice_val = time_each_variant(product_val);
     // the fastest, as the defines of the product's file

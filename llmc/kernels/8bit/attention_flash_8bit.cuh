@@ -62,14 +62,14 @@ void attention_8bit_forward(const Tensor& output_tensor, const Tensor& query_8bi
                             const Tensor& value_8bit_tensor, const Tensor& query_scales_tensor,
                             const Tensor& key_scales_tensor, const Tensor& value_scales_tensor,
                             const Tensor& logsumexp_tensor, const Tensor& qkv_tensor,
-                            int threads_per_block_val = ATTENTION_8BIT_THREADS_PER_BLOCK);
+                            int threads_per_block_val = ATTENTION_8BIT_THREADS_PER_BLOCK, size_t window_val = 0);
 void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor, const Tensor& output_tensor,
                              const Tensor& query_8bit_tensor, const Tensor& key_8bit_tensor,
                              const Tensor& value_8bit_tensor, const Tensor& query_scales_tensor,
                              const Tensor& key_scales_tensor, const Tensor& value_scales_tensor,
                              const Tensor& logsumexp_tensor, const Tensor& qkv_rounded_tensor,
                              const Tensor& row_dot_tensor, int threads_per_block_val = ATTENTION_8BIT_THREADS_PER_BLOCK,
-                             int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK);
+                             int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, size_t window_val = 0);
 
 // ── for both ────────────────────────────────────────────────────────────
 CUtensorMap attention_8bit_tensor_map(const void* matrix_ptr, size_t matrix_rows_val);
@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(FLASH_THREADS)
 attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val, const __grid_constant__ CUtensorMap key_map_val,
                               nv_bfloat16* output_ptr, float* logsumexp_ptr, const __nv_fp8_e4m3* value_8bit_ptr,
                               const float* query_scales_ptr, const float* key_scales_ptr, const float* value_scales_ptr,
-                              int num_heads_val, int seq_len_val, float scale_val);
+                              int num_heads_val, int seq_len_val, float scale_val, int window_tiles_val);
 
 /// Tells if 8-bit flash attention can run here: head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE,
 /// and a GPU with WGMMA and TMA (compute capability HARDWARE_WGMMA_CAPABILITY / 10 exactly: an H100).
@@ -121,11 +121,14 @@ inline bool attention_8bit_fits(size_t seq_len_val, size_t head_size_val) {
 ///   threads_per_block_val                        F1's block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not
 ///                                                given: ATTENTION_8BIT_THREADS_PER_BLOCK. The tile kernel's is always
 ///                                                FLASH_THREADS. Any size gives the same bits; only the time changes.
+///   window_val                                   the sliding window, as attention_bf16_flash_forward's: a query sees its
+///                                                own key and the window_val keys before it; a multiple of FLASH_TILE;
+///                                                0 (not given): every key before it
 inline void attention_8bit_forward(const Tensor& output_tensor, const Tensor& query_8bit_tensor,
                                    const Tensor& key_8bit_tensor, const Tensor& value_8bit_tensor,
                                    const Tensor& query_scales_tensor, const Tensor& key_scales_tensor,
                                    const Tensor& value_scales_tensor, const Tensor& logsumexp_tensor,
-                                   const Tensor& qkv_tensor, int threads_per_block_val) {
+                                   const Tensor& qkv_tensor, int threads_per_block_val, size_t window_val) {
     // 1. check the tensors; any of them wrong: stop with an error (the launch is checked by the rounding)
     attention_8bit_check_shapes(output_tensor, query_8bit_tensor, key_8bit_tensor, value_8bit_tensor,
                                 query_scales_tensor, key_scales_tensor, value_scales_tensor, logsumexp_tensor, qkv_tensor);
@@ -151,7 +154,7 @@ inline void attention_8bit_forward(const Tensor& output_tensor, const Tensor& qu
         query_map_val, key_map_val, output_tensor.data_ptr<nv_bfloat16>(), logsumexp_tensor.data(),
         reinterpret_cast<const __nv_fp8_e4m3*>(value_8bit_tensor.data_ptr()), query_scales_tensor.data(),
         key_scales_tensor.data(), value_scales_tensor.data(), (int)num_heads_val, (int)seq_len_val,
-        1.0f / sqrtf((float)head_size_val));
+        1.0f / sqrtf((float)head_size_val), attention_bf16_flash_window_tiles(window_val));
     cudaCheck(cudaGetLastError());
 }
 
@@ -297,11 +300,12 @@ __device__ __forceinline__ void attention_8bit_load_value_tile(nv_bfloat16* tile
 ///   query_scales_ptr, key_scales_ptr, value_scales_ptr  one float per head row
 ///   num_heads_val, seq_len_val                          the shape
 ///   scale_val                                           1 / sqrt(FLASH_HEAD_SIZE)
+///   window_tiles_val                                    the sliding window in tiles (attention_bf16_flash_window_tiles); 0: none
 __global__ void __launch_bounds__(FLASH_THREADS)
 attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val, const __grid_constant__ CUtensorMap key_map_val,
                               nv_bfloat16* output_ptr, float* logsumexp_ptr, const __nv_fp8_e4m3* value_8bit_ptr,
                               const float* query_scales_ptr, const float* key_scales_ptr, const float* value_scales_ptr,
-                              int num_heads_val, int seq_len_val, float scale_val) {
+                              int num_heads_val, int seq_len_val, float scale_val, int window_tiles_val) {
     namespace cde = cuda::device::experimental;
     // the E4M3 tiles as TMA writes them (ATTENTION_8BIT_TMA_SWIZZLE), the value tile in bfloat16 (boxes in the
     // 128-byte swizzle, written by the threads), each on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom, and the
@@ -342,8 +346,11 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
     // rows group, group + HARDWARE_WGMMA_ROWS_PER_WARP
     float row_max_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {-INFINITY, -INFINITY};
     float row_sum_list[HARDWARE_WGMMA_ROWS_PER_THREAD] = {0.0f, 0.0f};
-    // 2. walk the key tiles up to this block's own
-    for (int key_block_index_val = 0; key_block_index_val <= query_block_index_val; key_block_index_val++) {
+    // 2. walk the key tiles up to this block's own: from the first, or with a window from the window's oldest tile
+    //    (whole tiles: the oldest key a query sees is window_tokens before it, in that tile)
+    int window_tokens_val = window_tiles_val > 0 ? window_tiles_val * FLASH_TILE : seq_len_val;   // none: no key is that far back
+    int first_key_block_val = window_tiles_val > 0 ? max(query_block_index_val - window_tiles_val, 0) : 0;
+    for (int key_block_index_val = first_key_block_val; key_block_index_val <= query_block_index_val; key_block_index_val++) {
         __syncthreads();                                            // every thread is done with the last tiles
         size_t tile_start_index_val = head_start_index_val + (size_t)key_block_index_val * FLASH_TILE * FLASH_HEAD_SIZE;
         size_t tile_first_row_index_val = head_first_row_index_val + (size_t)key_block_index_val * FLASH_TILE;
@@ -375,7 +382,7 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
                                        c_value_index_val % HARDWARE_WGMMA_COLUMNS_PER_THREAD;
                 int key_token_index_val = key_block_index_val * FLASH_TILE + column_index_val;
                 score_list[group_column_index_val][c_value_index_val] =
-                    key_token_index_val <= token_index_val
+                    key_token_index_val <= token_index_val && key_token_index_val >= token_index_val - window_tokens_val
                         ? score_list[group_column_index_val][c_value_index_val] * row_query_scale_list[thread_row_index_val] * key_scale_tile_list[column_index_val]
                         : -INFINITY;
                 tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], score_list[group_column_index_val][c_value_index_val]);
@@ -386,7 +393,7 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
         for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
             tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], __shfl_xor_sync(HARDWARE_WARP_ALL_LANES, tile_max_list[thread_row_index_val], 1));
             tile_max_list[thread_row_index_val] = fmaxf(tile_max_list[thread_row_index_val], __shfl_xor_sync(HARDWARE_WARP_ALL_LANES, tile_max_list[thread_row_index_val], 2));
-            float new_max_val = fmaxf(row_max_list[thread_row_index_val], tile_max_list[thread_row_index_val]);   // finite: every row sees key 0
+            float new_max_val = fmaxf(row_max_list[thread_row_index_val], tile_max_list[thread_row_index_val]);   // finite: every row sees a key of the first tile walked
             float correction_val = __expf(row_max_list[thread_row_index_val] - new_max_val);     // 0 on the first tile
             row_max_list[thread_row_index_val] = new_max_val;
             row_sum_list[thread_row_index_val] *= correction_val;
@@ -456,13 +463,14 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
 ///                                                not given: ATTENTION_8BIT_THREADS_PER_BLOCK
 ///   row_dot_threads_per_block_val                row_dot's, the same; not given: ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK.
 ///                                                Any sizes give the same bits; only the time changes.
+///   window_val                                   the forward's sliding window (0, not given: none)
 inline void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
                                     const Tensor& output_tensor, const Tensor& query_8bit_tensor,
                                     const Tensor& key_8bit_tensor, const Tensor& value_8bit_tensor,
                                     const Tensor& query_scales_tensor, const Tensor& key_scales_tensor,
                                     const Tensor& value_scales_tensor, const Tensor& logsumexp_tensor,
                                     const Tensor& qkv_rounded_tensor, const Tensor& row_dot_tensor,
-                                    int threads_per_block_val, int row_dot_threads_per_block_val) {
+                                    int threads_per_block_val, int row_dot_threads_per_block_val, size_t window_val) {
     // 1. check the 8-bit tensors as the forward does; the rest is checked by the two calls below
     attention_8bit_check_shapes(output_grad_tensor, query_8bit_tensor, key_8bit_tensor, value_8bit_tensor,
                                 query_scales_tensor, key_scales_tensor, value_scales_tensor, logsumexp_tensor,
@@ -472,7 +480,7 @@ inline void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor&
                              query_scales_tensor, key_scales_tensor, value_scales_tensor, threads_per_block_val);
     // 3. the flash backward on them
     attention_bf16_flash_backward(qkv_grad_tensor, output_grad_tensor, output_tensor, qkv_rounded_tensor,
-                                  logsumexp_tensor, row_dot_tensor, row_dot_threads_per_block_val);
+                                  logsumexp_tensor, row_dot_tensor, row_dot_threads_per_block_val, window_val);
 }
 
 // ── for both ────────────────────────────────────────────────────────────
