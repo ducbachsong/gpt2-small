@@ -24,9 +24,10 @@
 #include "../../common/tensor.cuh"
 
 #define ATTENTION_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // the rounding's and the turn-back's default: one warp per row, one int per thread
-#define ATTENTION_8BIT_HEAD_SIZE 64                                                 // the only head_size the kernels take: GPT-2's
+#define ATTENTION_8BIT_HEAD_SIZE 128                                                // the head_size the kernels take: 64 (GPT-2 small's) or 128 (the 32 x 2,304 model's, 18 heads)
 #define ATTENTION_8BIT_VALUES_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))         // E4M3s in one int: an Int32 tensor's
-static_assert(ATTENTION_8BIT_HEAD_SIZE == 2 * HARDWARE_THREADS_PER_WARP, "the rounding: each lane takes 2 values of a head row");
+#define ATTENTION_8BIT_PAIRS_PER_LANE (ATTENTION_8BIT_HEAD_SIZE / (2 * HARDWARE_THREADS_PER_WARP))   // the rounding: pairs of a head row each lane takes, 1 or 2
+static_assert(ATTENTION_8BIT_HEAD_SIZE % (2 * HARDWARE_THREADS_PER_WARP) == 0, "the rounding: each lane takes whole pairs of a head row");
 static_assert(ATTENTION_8BIT_VALUES_PER_INT == VALUES_PER_FLOAT4, "the turn-back takes an int of E4M3s as one float4");
 
 // ── the rounding and the turning back ────────────────────────────────────────────────────────────
@@ -103,8 +104,8 @@ __device__ __forceinline__ float attention_8bit_scale(float row_largest_val) {
 }
 
 /// F1: splits qkv into heads and rounds each head row of query, key and value to E4M3, one warp per head row:
-/// the row's largest |value| (warp_reduce_max), its scale, then value / scale rounded. Each lane takes 2
-/// neighbouring columns (ATTENTION_8BIT_HEAD_SIZE = 2 HARDWARE_THREADS_PER_WARP).
+/// the row's largest |value| (warp_reduce_max), its scale, then value / scale rounded. Each lane takes
+/// ATTENTION_8BIT_PAIRS_PER_LANE pairs of neighbouring columns, the pairs a warp's width apart.
 ///
 ///   query_8bit_ptr, key_8bit_ptr, value_8bit_ptr        {batch_size, num_heads, seq_len, ATTENTION_8BIT_HEAD_SIZE} E4M3: written
 ///   query_scales_ptr, key_scales_ptr, value_scales_ptr  one float per head row: written
@@ -130,17 +131,29 @@ __global__ void attention_8bit_round_qkv_kernel(__nv_fp8_e4m3* query_8bit_ptr, _
         size_t batch_index_val = batch_head_index_val / num_heads_val;
         size_t head_index_val = batch_head_index_val % num_heads_val;
         const nv_bfloat16* query_part_ptr =
-            qkv_ptr + (batch_index_val * seq_len_val + token_index_val) * 3 * embed_dim_val + head_index_val * ATTENTION_8BIT_HEAD_SIZE + 2 * lane_index_val;
-        size_t lane_value_index_val = row_index_val * ATTENTION_8BIT_HEAD_SIZE + 2 * lane_index_val;   // this lane's 2 values, per head
+            qkv_ptr + (batch_index_val * seq_len_val + token_index_val) * 3 * embed_dim_val + head_index_val * ATTENTION_8BIT_HEAD_SIZE;
+        size_t row_first_index_val = row_index_val * ATTENTION_8BIT_HEAD_SIZE;           // the row's first value, per head
         // 2. query, key, value in turn, embed_dim apart in qkv: the row's largest |value|, its scale, the values rounded
 #pragma unroll
         for (int part_index_val = 0; part_index_val < 3; part_index_val++) {
-            float2 values_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(query_part_ptr + part_index_val * embed_dim_val));
-            float row_largest_val = warp_reduce_max(fmaxf(fabsf(values_val.x), fabsf(values_val.y)));
+            float2 values_list[ATTENTION_8BIT_PAIRS_PER_LANE];
+            float lane_largest_val = 0.0f;
+#pragma unroll
+            for (int pair_index_val = 0; pair_index_val < ATTENTION_8BIT_PAIRS_PER_LANE; pair_index_val++) {
+                int column_index_val = 2 * (pair_index_val * HARDWARE_THREADS_PER_WARP + lane_index_val);
+                values_list[pair_index_val] = __bfloat1622float2(
+                    *reinterpret_cast<const nv_bfloat162*>(query_part_ptr + part_index_val * embed_dim_val + column_index_val));
+                lane_largest_val = fmaxf(lane_largest_val, fmaxf(fabsf(values_list[pair_index_val].x), fabsf(values_list[pair_index_val].y)));
+            }
+            float row_largest_val = warp_reduce_max(lane_largest_val);
             float scale_val = attention_8bit_scale(row_largest_val);
             float to_stored_val = 1.0f / scale_val;                             // exact: a power of 2
-            *reinterpret_cast<__nv_fp8x2_e4m3*>(rounded_list[part_index_val] + lane_value_index_val) =
-                __nv_fp8x2_e4m3(make_float2(values_val.x * to_stored_val, values_val.y * to_stored_val));
+#pragma unroll
+            for (int pair_index_val = 0; pair_index_val < ATTENTION_8BIT_PAIRS_PER_LANE; pair_index_val++) {
+                int column_index_val = 2 * (pair_index_val * HARDWARE_THREADS_PER_WARP + lane_index_val);
+                *reinterpret_cast<__nv_fp8x2_e4m3*>(rounded_list[part_index_val] + row_first_index_val + column_index_val) =
+                    __nv_fp8x2_e4m3(make_float2(values_list[pair_index_val].x * to_stored_val, values_list[pair_index_val].y * to_stored_val));
+            }
             if (lane_index_val == 0) scales_list[part_index_val][row_index_val] = scale_val;
         }
     }

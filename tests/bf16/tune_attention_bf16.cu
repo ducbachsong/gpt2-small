@@ -1,6 +1,7 @@
 // tune_attention_bf16.cu — the timings of llmc/kernels/bf16/attention_bf16.cuh and attention_flash_bf16.cuh, apart from tests/bf16/test_attention_bf16.cu
-// so the tests only check numbers: time_20_steps_on_gpt2_small_size, time_flash_against_the_steps_and_pytorch,
-// time_each_softmax_kernel_with_other_block_and_thread_counts.
+// so the tests only check numbers: time_20_steps_on_the_model_size, time_flash_against_the_steps_and_pytorch,
+// time_each_backward_stage_count, time_each_softmax_kernel_with_other_block_and_thread_counts. The size is the
+// model's attention (32 layers x 2,304, train_bf16.cu's): 18 heads of 128, 2,048 tokens a row.
 //
 // Built as tests/bf16/test_attention_bf16.cu is (see tests/README.md); what it prints also goes to
 // tests/results/<GPU>/attention_bf16_<date>_<time>.txt.
@@ -17,15 +18,15 @@
 static const double BFLOAT16_TOLERANCE = 2e-2;
 static const double BFLOAT16_GRAD_TOLERANCE = 5e-2;
 
-#define GPT2_NUM_HEADS 12             // GPT-2 small's heads
-#define GPT2_HEAD_SIZE 64             // and their columns
-#define GPT2_SEQ_LEN 1024             // its tokens per row
-#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * GPT2_HEAD_SIZE)   // 768
+#define GPT2_NUM_HEADS 18             // the model's heads
+#define GPT2_HEAD_SIZE FLASH_HEAD_SIZE   // and their columns: 128
+#define GPT2_SEQ_LEN 2048             // its tokens per row
+#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * GPT2_HEAD_SIZE)   // 2,304
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a float tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
-/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for GPT-2's 9.4M qkv values.
+/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for the model's 57M qkv values (4 rows).
 static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
     Tensor tensor = Tensor::empty(shape_list);
@@ -131,17 +132,18 @@ struct FlashTensors
     }
 };
 
-/// Tells if this GPU runs flash attention (sm_80 or later); if not, prints why the tune that asked is skipped.
+/// Tells if this GPU runs flash attention (an H100); if not, prints why the tune that asked is skipped.
 static bool flash_runs_here(const char *test_ptr)
 {
     if (attention_bf16_flash_fits(GPT2_SEQ_LEN, FLASH_HEAD_SIZE))
         return true;
     print_test_name(test_ptr);
-    printf("    skipped: flash attention needs a GPU of compute capability 8.0 or more (A100, H100)\n");
+    printf("    skipped: flash attention needs a GPU of compute capability %d.%d (an H100: WGMMA and TMA)\n",
+           HARDWARE_WGMMA_CAPABILITY / 10, HARDWARE_WGMMA_CAPABILITY % 10);
     return false;
 }
 
-/// Runs PyTorch's causal attention on GPT-2 small's size into `pytorch_output_tensor`, from `pytorch_qkv_tensor`,
+/// Runs PyTorch's causal attention on the model's size (4 rows) into `pytorch_output_tensor`, from `pytorch_qkv_tensor`,
 /// in the dtype of pytorch_qkv_tensor.
 static void pytorch_gpt2_forward(const torch::Tensor &pytorch_qkv_tensor, torch::Tensor &pytorch_output_tensor)
 {
@@ -156,12 +158,12 @@ static void pytorch_gpt2_forward(const torch::Tensor &pytorch_qkv_tensor, torch:
 
 // ══ part 1: timed against PyTorch's ══════════════════════════════════════════
 
-static void time_20_steps_on_gpt2_small_size(void)
+static void time_20_steps_on_the_model_size(void)
 {
-    // Prints the times of 20 forwards and 20 backwards of the attention steps on GPT-2 small's size, in
-    // bfloat16: {4, 1024} tokens, 12 heads of 64. Mine against PyTorch's scaled_dot_product_attention (causal)
+    // Prints the times of 20 forwards and 20 backwards of the attention steps on the model's size, in
+    // bfloat16: {4, 2048} tokens, 18 heads of 128. Mine against PyTorch's scaled_dot_product_attention (causal)
     // with autograd, in bfloat16 too, which on an sm_80 GPU or later is its flash attention: it never writes the
-    // 100 MB of attention_probs. Each side writes its gradient over each step; at the end they must agree within the
+    // 604 MB of attention_probs. Each side writes its gradient over each step; at the end they must agree within the
     // bfloat16 tolerances.
 
     // 1. random bfloat16 qkv and output_grad, mine and PyTorch's
@@ -209,9 +211,9 @@ static void time_20_steps_on_gpt2_small_size(void)
 
 static void time_flash_against_the_steps_and_pytorch(void)
 {
-    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's size, {4, 1024} tokens, 12 heads of
-    // 64, all in bfloat16: flash attention, the attention steps (attention_product_kernel's products, the
-    // softmax kernels, the 100 MB of attention_probs) and PyTorch's scaled_dot_product_attention (causal), which in bfloat16 on an sm_80 GPU is
+    // Prints the times of 20 forwards and 20 backwards on the model's size, {4, 2048} tokens, 18 heads of
+    // 128, all in bfloat16: flash attention, the attention steps (attention_product_kernel's products, the
+    // softmax kernels, the 604 MB of attention_probs) and PyTorch's scaled_dot_product_attention (causal), which in bfloat16 on an sm_80 GPU is
     // its own flash attention. Averages of steps 3..20. Expect flash attention faster than the steps, and at
     // the end its output and qkv_grad within the bfloat16 tolerances of PyTorch's.
     if (!flash_runs_here(__func__))
@@ -294,11 +296,11 @@ static const StageSetting STAGE_SETTINGS_LIST[] = {
     {4, 1, flash_backward_at<4, 1>}, {4, 2, flash_backward_at<4, 2>}, {4, 3, flash_backward_at<4, 3>}, {4, 4, flash_backward_at<4, 4>},
 };
 
-#define TRAINING_BATCH_SIZE 16        // a training micro-batch: 16 rows of 1024 tokens
+#define TRAINING_BATCH_SIZE 8         // a training micro-batch: 8 rows of 2048 tokens (train_bf16.cu's default)
 
 static void time_each_backward_stage_count(void)
 {
-    // Prints flash attention's backward on a training micro-batch of GPT-2 small, {16, 1024} tokens, 12 heads of 64,
+    // Prints flash attention's backward on a training micro-batch of the model, {8, 2048} tokens, 18 heads of 128,
     // with key_grad's and query_grad's sets of tiles each 1 to ATTENTION_FLASH_BF16_MAX_STAGES, taking turns over
     // SWEEP_ROUNDS rounds, rounds WARM_UP_STEPS + 1 on averaged; then the fastest against the default. 1 and 1:
     // ask, wait, work, as before the sets. row_dot is the same in every one.
@@ -352,20 +354,20 @@ static void time_each_backward_stage_count(void)
 
 static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
 {
-    // Prints the time of the two bfloat16 softmax kernels on GPT-2 small's attention_probs, {4, 12, 1024, 1024} (49,152
+    // Prints the time of the two bfloat16 softmax kernels on the model's attention_probs, {4, 18, 2048, 2048} (147,456
     // rows), for 9 block counts x 4 thread counts, each the average of SWEEP_ROUNDS runs: the 7 picked on a T4,
     // then this GPU's SM count x 1 and x 2 (114 and 228 on an H100 PCIe, 132 and 264 on an SXM; on a T4 they
     // repeat 40 and 80). The 36 launches take turns: SWEEP_ROUNDS rounds, each timing every launch once, so a
     // GPU's clock drifting as it heats up falls on all launches alike. Run 1 is counted too: warm_up_gpu has
     // already done the first-time work. They are launched here directly, <<<blocks, threads>>>. Their launches
-    // are the fastest on an H100 PCIe: both one warp per row, 6144 x 256. A T4's sweep had picked 80 x 128 for
+    // were the fastest on an H100 PCIe at GPT-2 small's size: both one warp per row, 6144 x 256 (18,432 x 256 here). A T4's sweep had picked 80 x 128 for
     // the backward (320 warps, 154 rows each), 5.3x slower on the H100.
     //
     // Both kernels work in place, so the timed runs change the values; before each check of the result, the
     // scores (or da) are copied back from a kept copy. Expect: every launch gives the same attention_probs and ds as the
     // usual ones, to the last bit: each row is worked out by one warp, the same way whichever.
 
-    // 1. GPT-2 small's size: a forward and a backward fill attention_probs and attention_probs_grad
+    // 1. the model's size: a forward and a backward fill attention_probs and attention_probs_grad
     torch::manual_seed(0);
     AttentionTensors tensors_val(4, GPT2_NUM_HEADS, GPT2_SEQ_LEN, GPT2_HEAD_SIZE);
     tensors_val.qkv_tensor = random_tensor_on_gpu(tensors_val.qkv_tensor.shape()).to(DType::BFloat16);
@@ -395,7 +397,7 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
                       query_ptr + 2 * GPT2_EMBED_DIM, qkv_turned_strides_val, GPT2_SEQ_LEN, GPT2_SEQ_LEN,
                       GPT2_HEAD_SIZE, 4, GPT2_NUM_HEADS, 1.0f, ATTENTION_PRODUCT_COLUMNS_UP_TO_ROW);
     int one_warp_per_row_blocks_val = attention_bf16_blocks(rows_val, ATTENTION_BF16_SOFTMAX_FORWARD_THREADS_PER_BLOCK,
-                                                            HARDWARE_THREADS_PER_WARP);   // 6144
+                                                            HARDWARE_THREADS_PER_WARP);   // 18,432
     tensors_val.attention_probs_tensor.copy_(scores_tensor);
     tensors_val.attention_probs_grad_tensor.copy_(attention_probs_grad_before_tensor);
     attention_bf16_softmax_forward_kernel<<<one_warp_per_row_blocks_val, ATTENTION_BF16_SOFTMAX_FORWARD_THREADS_PER_BLOCK>>>(
@@ -508,7 +510,7 @@ static void time_each_softmax_kernel_with_other_block_and_thread_counts(void)
 int main(void)
 {
     start_tune_log(__FILE__);                   // the console, and tests/results/<GPU>/<kernel>_<date>_<time>.txt
-    time_20_steps_on_gpt2_small_size();
+    time_20_steps_on_the_model_size();
     time_flash_against_the_steps_and_pytorch();
     time_each_backward_stage_count();
     time_each_softmax_kernel_with_other_block_and_thread_counts();

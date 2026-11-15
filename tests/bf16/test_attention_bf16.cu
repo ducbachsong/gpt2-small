@@ -24,14 +24,14 @@
 static const double BFLOAT16_TOLERANCE = 2e-2;
 static const double BFLOAT16_GRAD_TOLERANCE = 5e-2;
 
-#define GPT2_NUM_HEADS 12             // GPT-2 small's heads
-#define GPT2_HEAD_SIZE 64             // and their columns
-#define GPT2_SEQ_LEN 1024             // its tokens per row
+#define GPT2_NUM_HEADS 18             // the model's heads (32 layers x 2,304, train_bf16.cu's)
+#define GPT2_HEAD_SIZE FLASH_HEAD_SIZE   // and their columns: 2,304 / 18 = 128
+#define GPT2_SEQ_LEN 2048             // its tokens per row
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a float tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
-/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for GPT-2's 9.4M qkv values.
+/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for the model's 50M qkv values.
 static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
     Tensor tensor = Tensor::empty(shape_list);
@@ -59,7 +59,7 @@ static std::vector<float> list_of(const torch::Tensor &tensor)
 }
 
 /// Gives the largest difference between my tensor and PyTorch's, as a fraction of PyTorch's largest value,
-/// worked out on the GPU: GPT-2's attention_probs are 50M values, too many to copy to the CPU and print.
+/// worked out on the GPU: the model's attention_probs are 150M values, too many to copy to the CPU and print.
 static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch::Tensor &pytorch_tensor)
 {
     torch::Tensor difference_tensor = (pytorch_copy_of(mine_tensor).reshape(pytorch_tensor.sizes()) - pytorch_tensor).abs().max();
@@ -232,8 +232,8 @@ static void steps_match_pytorch(size_t batch_size_val, size_t num_heads_val, siz
 
 static void forward_and_backward_in_bfloat16(void)
 {
-    // Expect: batch_size = 2, 12 heads of 64 as GPT-2 small, seq_len = 64: qkv {2, 64, 2304}, attention_probs
-    // {2, 12, 64, 64}, every tensor bfloat16: the six products by attention_product_kernel on the tensor cores
+    // Expect: batch_size = 2, 18 heads of 128 as the model's, seq_len = 64: qkv {2, 64, 6912}, attention_probs
+    // {2, 18, 64, 64}, every tensor bfloat16: the six products by attention_product_kernel on the tensor cores
     // (WGMMA, float sums), each a single tile of left and of right brought by TMA; the softmax kernels reading
     // and writing bfloat16. PyTorch is given the same bfloat16 values as floats and works in float: output and
     // attention_probs within BFLOAT16_TOLERANCE, qkv_grad within BFLOAT16_GRAD_TOLERANCE.
@@ -244,7 +244,7 @@ static void forward_and_backward_in_bfloat16(void)
 static void steps_need_whole_wgmmas_and_an_h100(void)
 {
     // Expect: attention_bf16_fits says no to a seq_len that is not a multiple of 16 (1000) and to a head_size
-    // that is not (40); and yes to 1024 and 64, and to 80 and 32 (which flash attention does not take), exactly
+    // that is not (40); and yes to 2048 and 128, and to 80 and 32 (which flash attention does not take), exactly
     // when the GPU's compute capability is 9.0 (an H100: the only one with WGMMA and TMA).
     // 1. this GPU's compute capability
     int device_index_val = 0;
@@ -339,11 +339,11 @@ static void flash_matches_pytorch_and_the_steps(size_t batch_size_val, size_t nu
                 BFLOAT16_GRAD_TOLERANCE);
 }
 
-static void flash_needs_head_size_64_and_whole_tiles(void)
+static void flash_needs_its_head_size_and_whole_tiles(void)
 {
     // Expect: attention_bf16_flash_fits says no to a seq_len that is not a multiple of 64 (1000) and to a
-    // head_size other than 64 (32); and yes to 1024 and 64 exactly when the GPU's compute capability is 9.0
-    // (an H100: the only one with WGMMA and TMA).
+    // head_size other than FLASH_HEAD_SIZE (128; half of it, 64); and yes to 2048 and 128 exactly when the GPU's
+    // compute capability is 9.0 (an H100: the only one with WGMMA and TMA).
     // 1. this GPU's compute capability
     int device_index_val = 0;
     int major_val = 0;
@@ -360,24 +360,26 @@ static void flash_needs_head_size_64_and_whole_tiles(void)
 static void flash_matches_on_one_tile(void)
 {
     // Expect: {1, 2, 64}: one tile of 64 queries and 64 keys, all on the diagonal, so every score goes through
-    // the mask. Within the bfloat16 tolerances of PyTorch and of the steps.
+    // the mask; each tile two TMA boxes of 64 values side by side, the scores' 8 WGMMAs crossing from the first
+    // into the second, attention_probs · value one m64n128k16 per 16 keys. Within the bfloat16 tolerances of
+    // PyTorch and of the steps.
     if (flash_runs_here(__func__))
         flash_matches_pytorch_and_the_steps(1, 2, FLASH_TILE);
 }
 
 static void flash_matches_on_gpt2_heads_of_256_tokens(void)
 {
-    // Expect: {2, 12, 256}: 4 tiles per head, so tiles below the diagonal (no mask), the online softmax's
+    // Expect: {2, 18, 256}: 4 tiles per head, so tiles below the diagonal (no mask), the online softmax's
     // max moving from tile to tile, the backward's key blocks walking 4, 3, 2, 1 query tiles. The same.
     if (flash_runs_here(__func__))
         flash_matches_pytorch_and_the_steps(2, GPT2_NUM_HEADS, 4 * FLASH_TILE);
 }
 
-static void flash_matches_on_gpt2_small_size(void)
+static void flash_matches_on_the_model_size(void)
 {
-    // Expect: {4, 12, 1024}, as training runs it: 16 tiles per head, 768 blocks. The same.
+    // Expect: {2, 18, 2048}, the model's rows of 2,048 tokens: 32 tiles per head, 1,152 blocks. The same.
     if (flash_runs_here(__func__))
-        flash_matches_pytorch_and_the_steps(4, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
+        flash_matches_pytorch_and_the_steps(2, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
 }
 
 static void flash_backward_writes_over_qkv_grad_the_same_every_time(void)
@@ -431,7 +433,7 @@ static const StageSetting STAGE_SETTINGS_LIST[] = {
 
 static void every_stage_count_gives_the_same_bits(void)
 {
-    // Expect: random bfloat16 qkv and output_grad, {2, 12, 1024}: 16 tiles a head, so walks of 1 to 16 steps, longer
+    // Expect: random bfloat16 qkv and output_grad, {2, 18, 2048}: 32 tiles a head, so walks of 1 to 32 steps, longer
     // and shorter than the sets. The backward with key_grad's and query_grad's sets of tiles each 1, 2, 3 and 4
     // gives the default's qkv_grad to the last bit, the 7s it started with all written over: the same tiles, the
     // same sums in the same order; only when TMA brings the tiles changes.
@@ -469,9 +471,10 @@ static void every_kernel_fits_its_block(void)
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
     //
-    // Flash attention's key_grad kernel holds the most: key_grad and value_grad (32 sums each), the attention_probs
-    // and scores_grad (32 each) and both again packed as A (16 registers each), 160 registers of them, under the
-    // 255 a thread may have. Its keys, values, queries and output_grad stay in shared memory.
+    // Flash attention's key_grad kernel holds the most: key_grad and value_grad (64 sums each at head size 128),
+    // the attention_probs and scores_grad (32 each) and both again packed as A (16 registers each), 224 registers
+    // of them, under the 255 a thread may have (the attention_probs die as scores_grad is made, so fewer are live at
+    // once). Its keys, values, queries and output_grad stay in shared memory.
     const int kernel_count_val = 9;
     const void *kernels_list[kernel_count_val] = {(const void *)attention_product_kernel<false, false>,
                                                   (const void *)attention_product_kernel<false, true>,
@@ -509,11 +512,11 @@ static void every_kernel_fits_its_block(void)
 
 static void any_block_size_gives_the_same_bits(void)
 {
-    // Expect: random bfloat16 qkv and output_grad, {2, 12, 64, 64}. attention_bf16_forward and
+    // Expect: random bfloat16 qkv and output_grad, {2, 18, 64, 128}. attention_bf16_forward and
     // attention_bf16_backward with the softmax's block size set to 32, 128, 512 and 1024 (one warp up to
     // HARDWARE_MAX_THREADS_PER_BLOCK) give the defaults' output, attention_probs and qkv_grad to the last bit: each softmax row
     // is one warp's whatever the block, and the products' block is always ATTENTION_PRODUCT_THREADS_PER_BLOCK. On an H100, flash attention's backward with row_dot at those block
-    // sizes gives the default's qkv_grad to the last bit too: each row_dot is one warp's.
+    // sizes gives the default's qkv_grad to the last bit too: each row_dot is one warp's (4 values a lane at head size 128).
     const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     if (!steps_run_here(__func__))
         return;
@@ -568,10 +571,10 @@ int main(void)
     steps_match_on_heads_wider_than_a_tile();
     steps_backward_writes_over_qkv_grad_the_same_every_time();
 
-    flash_needs_head_size_64_and_whole_tiles();
+    flash_needs_its_head_size_and_whole_tiles();
     flash_matches_on_one_tile();
     flash_matches_on_gpt2_heads_of_256_tokens();
-    flash_matches_on_gpt2_small_size();
+    flash_matches_on_the_model_size();
     flash_backward_writes_over_qkv_grad_the_same_every_time();
     every_stage_count_gives_the_same_bits();
 

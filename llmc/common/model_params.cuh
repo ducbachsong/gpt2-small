@@ -8,6 +8,7 @@
 //     wte              {padded_vocab_size, D}      a row per word, also the head's weight ("tied")
 //     wpe              {max_seq_len, D}            a row per position
 //     each block       4 matrices, 8 vectors       12 D² + 13 D = 7,087,872 values for D = 768
+//                      (linear_bias false: 4 matrices, 4 vectors, the LayerNorms' only: 12 D² + 4 D)
 //     lnf_weight, lnf_bias   {D}                   the last LayerNorm
 // Every matrix comes first (wte, wpe, each block's 4 matrices), then every vector: AdamW decays the matrices only.
 #ifndef MODEL_PARAMS_CUH
@@ -26,10 +27,13 @@ struct GPT2Config {
     size_t num_layers = 12;
     size_t num_heads = 12;
     size_t embed_dim = 768;
+    bool linear_bias = true;             // the 4 linears' biases (qkv, attention_out, mlp_up, mlp_down): GPT-2 has
+                                         // them; false: none (the LayerNorms keep theirs), as nanochat and Llama
 };
 
 /// A block's 12 parameter tensors, or their gradients: views of the optimizer's buffer, the 4 matrices first.
-/// D is embed_dim.
+/// D is embed_dim. Without linear biases (GPT2Config::linear_bias false) it has 8: the 4 linear biases are
+/// Tensor(), which the products take as no bias.
 struct BlockParams {
     Tensor qkv_weight;                   // {3D, D}
     Tensor attention_out_weight;         // {D, D}
@@ -45,9 +49,11 @@ struct BlockParams {
     Tensor mlp_down_bias;                // {D}
 
     BlockParams() = default;
-    explicit BlockParams(const std::vector<Tensor>& tensors);           // 12 tensors, in shapes()' order
-    static std::vector<Shape> shapes(size_t embed_dim);                 // the 12 shapes, matrices first
-    std::vector<Tensor> tensors() const;                                // the 12, in the same order
+    explicit BlockParams(const std::vector<Tensor>& tensors);           // 12 tensors (8 with no linear bias), in shapes()' order
+    static std::vector<Shape> shapes(size_t embed_dim, bool linear_bias = true);   // the 12 (or 8) shapes, matrices first
+    static size_t vector_count(bool linear_bias);                       // the 1-D tensors after the 4 matrices: 8 or 4
+    std::vector<Tensor> tensors() const;                                // the 12 (or 8), in the same order
+    bool has_linear_bias() const;                                       // the 4 linear biases are there
 };
 
 /// The model's parameter tensors, or their gradients: views of the optimizer's buffer. Every matrix first:
@@ -61,7 +67,7 @@ struct GPT2Params {
 
     GPT2Params() = default;
     GPT2Params(const std::vector<Tensor>& tensors, const GPT2Config& config);  // in shapes()' order
-    static std::vector<Shape> shapes(const GPT2Config& config);                // 4 + 12 num_layers shapes
+    static std::vector<Shape> shapes(const GPT2Config& config);                // 4 + 12 num_layers shapes (4 + 8 num_layers with no linear bias)
     std::vector<Tensor> tensors() const;                                       // in the same order
 };
 
@@ -152,62 +158,87 @@ private:
 
 /// Makes the block's views.
 ///
-///   tensors   12, in shapes()' order: the 4 matrices, then the 8 vectors
+///   tensors   in shapes()' order: the 4 matrices, then the 8 vectors; or, with no linear bias, the 4 matrices
+///             and the LayerNorms' 4 (ln1_weight, ln1_bias, ln2_weight, ln2_bias), the linear biases left Tensor()
 inline BlockParams::BlockParams(const std::vector<Tensor>& tensors) {
-    if (tensors.size() != 12) {
-        fprintf(stderr, "error: a block has 12 parameter tensors, got %zu\n", tensors.size());
+    if (tensors.size() != 4 + vector_count(true) && tensors.size() != 4 + vector_count(false)) {
+        fprintf(stderr, "error: a block has %zu parameter tensors (%zu with no linear bias), got %zu\n",
+                4 + vector_count(true), 4 + vector_count(false), tensors.size());
         exit(EXIT_FAILURE);
     }
     qkv_weight = tensors[0], attention_out_weight = tensors[1];
     mlp_up_weight = tensors[2], mlp_down_weight = tensors[3];
-    ln1_weight = tensors[4], ln1_bias = tensors[5], qkv_bias = tensors[6], attention_out_bias = tensors[7];
-    ln2_weight = tensors[8], ln2_bias = tensors[9], mlp_up_bias = tensors[10], mlp_down_bias = tensors[11];
+    if (tensors.size() == 4 + vector_count(true)) {
+        ln1_weight = tensors[4], ln1_bias = tensors[5], qkv_bias = tensors[6], attention_out_bias = tensors[7];
+        ln2_weight = tensors[8], ln2_bias = tensors[9], mlp_up_bias = tensors[10], mlp_down_bias = tensors[11];
+    } else {
+        ln1_weight = tensors[4], ln1_bias = tensors[5], ln2_weight = tensors[6], ln2_bias = tensors[7];
+    }
 }
 
-/// Gives the 12 shapes, matrices first: 12 D² + 13 D = 7,087,872 values for D = 768.
+/// Gives the block's shapes, matrices first: 12, 12 D² + 13 D = 7,087,872 values for D = 768; with no linear
+/// bias 8, 12 D² + 4 D.
 ///
-///   embed_dim   D
-inline std::vector<Shape> BlockParams::shapes(size_t embed_dim) {
+///   embed_dim     D
+///   linear_bias   GPT2Config::linear_bias: the 4 linear biases or not
+inline std::vector<Shape> BlockParams::shapes(size_t embed_dim, bool linear_bias) {
     size_t D = embed_dim;
+    if (!linear_bias)
+        return {{3 * D, D}, {D, D}, {4 * D, D}, {D, 4 * D},   // qkv, attention_out, mlp_up, mlp_down weights
+                {D}, {D}, {D}, {D}};                          // ln1, ln2
     return {{3 * D, D}, {D, D}, {4 * D, D}, {D, 4 * D},       // qkv, attention_out, mlp_up, mlp_down weights
             {D}, {D}, {3 * D}, {D}, {D}, {D}, {4 * D}, {D}};  // ln1, qkv b, attention_out b, ln2, mlp_up b, mlp_down b
 }
 
-/// Gives the 12 tensors in shapes()' order.
+/// Gives how many 1-D tensors a block has after its 4 matrices: 8, or 4 with no linear bias (the LayerNorms').
+///
+///   linear_bias   GPT2Config::linear_bias
+inline size_t BlockParams::vector_count(bool linear_bias) { return linear_bias ? 8 : 4; }
+
+/// Gives the block's tensors in shapes()' order: 12, or 8 with no linear bias.
 inline std::vector<Tensor> BlockParams::tensors() const {
+    if (!has_linear_bias())
+        return {qkv_weight, attention_out_weight, mlp_up_weight, mlp_down_weight, ln1_weight, ln1_bias, ln2_weight, ln2_bias};
     return {qkv_weight, attention_out_weight, mlp_up_weight, mlp_down_weight, ln1_weight, ln1_bias,
             qkv_bias,   attention_out_bias,   ln2_weight,    ln2_bias,        mlp_up_bias, mlp_down_bias};
 }
 
+/// Tells if the block has the 4 linear biases (made with GPT2Config::linear_bias true).
+inline bool BlockParams::has_linear_bias() const { return qkv_bias.numel() > 0; }
+
 // ── GPT2Params ────────────────────────────────────────────────────────────────
 
-/// Makes the model's views; block l's 4 matrices are tensors 2 + 4l .., its 8 vectors 2 + 4L + 8l ...
+/// Makes the model's views; block l's 4 matrices are tensors 2 + 4l .., its V vectors 2 + 4L + Vl .. (V 8, or 4
+/// with no linear bias).
 ///
-///   tensors   4 + 12 num_layers, in shapes()' order
-///   config    the sizes
+///   tensors   4 + (4 + V) num_layers, in shapes()' order
+///   config    the sizes, and linear_bias
 inline GPT2Params::GPT2Params(const std::vector<Tensor>& tensors, const GPT2Config& config) {
     size_t num_layers = config.num_layers;
-    if (tensors.size() != 4 + 12 * num_layers) {
-        fprintf(stderr, "error: a GPT-2 of %zu layers has %zu parameter tensors, got %zu\n", num_layers,
-                4 + 12 * num_layers, tensors.size());
+    size_t vectors = BlockParams::vector_count(config.linear_bias);      // a block's 1-D tensors
+    size_t expected = 4 + (4 + vectors) * num_layers;
+    if (tensors.size() != expected) {
+        fprintf(stderr, "error: a GPT-2 of %zu layers%s has %zu parameter tensors, got %zu\n", num_layers,
+                config.linear_bias ? "" : " with no linear bias", expected, tensors.size());
         exit(EXIT_FAILURE);
     }
     wte = tensors[0], wpe = tensors[1];
     size_t first_vector = 2 + 4 * num_layers;               // block 0's first vector
     for (size_t l = 0; l < num_layers; l++) {
         std::vector<Tensor> block(tensors.begin() + 2 + 4 * l, tensors.begin() + 2 + 4 * l + 4);
-        block.insert(block.end(), tensors.begin() + first_vector + 8 * l, tensors.begin() + first_vector + 8 * l + 8);
+        block.insert(block.end(), tensors.begin() + first_vector + vectors * l, tensors.begin() + first_vector + vectors * (l + 1));
         blocks.push_back(BlockParams(block));
     }
-    lnf_weight = tensors[2 + 12 * num_layers], lnf_bias = tensors[3 + 12 * num_layers];
+    lnf_weight = tensors[expected - 2], lnf_bias = tensors[expected - 1];
 }
 
-/// Gives the model's shapes, every matrix first: 148 shapes, 124,475,904 values for GPT-2 small.
+/// Gives the model's shapes, every matrix first: 148 shapes, 124,475,904 values for GPT-2 small (100 shapes,
+/// 124,392,960 values with no linear bias: 12 x 9 x 768 fewer).
 ///
-///   config   the sizes
+///   config   the sizes, and linear_bias
 inline std::vector<Shape> GPT2Params::shapes(const GPT2Config& config) {
     size_t D = config.embed_dim;
-    std::vector<Shape> block = BlockParams::shapes(D);
+    std::vector<Shape> block = BlockParams::shapes(D, config.linear_bias);
     std::vector<Shape> shapes = {{config.padded_vocab_size, D}, {config.max_seq_len, D}};
     for (size_t l = 0; l < config.num_layers; l++) shapes.insert(shapes.end(), block.begin(), block.begin() + 4);
     for (size_t l = 0; l < config.num_layers; l++) shapes.insert(shapes.end(), block.begin() + 4, block.end());
@@ -235,7 +266,7 @@ inline std::vector<Tensor> GPT2Params::tensors() const {
 // ── starting values and the loss ──────────────────────────────────────────────
 
 /// Sets a block's GPT-2 starting values: matrices normal std 0.02, the two projections std 0.02 / sqrt(2
-/// num_layers), biases 0, LayerNorm weights 1.
+/// num_layers), biases 0 (the linear ones if it has them), LayerNorm weights 1.
 ///
 ///   params       the block's
 ///   num_layers   12 for GPT-2 small
@@ -246,8 +277,11 @@ inline void block_init_params(const BlockParams& params, int num_layers) {
     params.mlp_up_weight.normal_(0.0f, 0.02f);
     params.mlp_down_weight.normal_(0.0f, projection_std);
     params.ln1_weight.fill_(1.0), params.ln2_weight.fill_(1.0);
-    params.ln1_bias.zero_(), params.qkv_bias.zero_(), params.attention_out_bias.zero_();
-    params.ln2_bias.zero_(), params.mlp_up_bias.zero_(), params.mlp_down_bias.zero_();
+    params.ln1_bias.zero_(), params.ln2_bias.zero_();
+    if (params.has_linear_bias()) {
+        params.qkv_bias.zero_(), params.attention_out_bias.zero_();
+        params.mlp_up_bias.zero_(), params.mlp_down_bias.zero_();
+    }
 }
 
 /// Sets the whole model's GPT-2 starting values: wte and wpe normal std 0.02 (wte's padding rows 0, and they

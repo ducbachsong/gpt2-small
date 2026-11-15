@@ -12,9 +12,10 @@
 // (WGMMA m64n64k16, one instruction for the whole block's {FLASH_TILE, FLASH_TILE} product), with classifier.cuh's
 // online softmax; it keeps logsumexp = row_max + log(row_sum) per row, from which the backward makes the
 // attention_probs again. No copies: its tiles are brought from qkv by TMA, a head's FLASH_HEAD_SIZE columns of
-// FLASH_TILE tokens at a time, into shared memory in the swizzled layout the tensor cores read
-// (wgmma_matmul_bf16.cuh's), and output and qkv_grad are written straight into each head's columns. Needs
-// head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE, and an H100 (WGMMA and TMA exist only on Hopper),
+// FLASH_TILE tokens at a time (64 columns a box, FLASH_HEAD_BOXES boxes side by side), into shared memory in the
+// swizzled layout the tensor cores read (wgmma_matmul_bf16.cuh's), and output and qkv_grad are written straight into
+// each head's columns. The products over the tokens (attention_probs · value and the like) are m64nFLASH_HEAD_SIZEk16.
+// Needs head_size FLASH_HEAD_SIZE (64 or 128), seq_len a multiple of FLASH_TILE, and an H100 (WGMMA and TMA exist only on Hopper),
 // built with -arch=sm_90a. Its block size is fixed by the tiles (one warpgroup per HARDWARE_WGMMA_M rows), so its
 // tile kernels take no block size. Other sizes and GPUs: attention_bf16.cuh (the steps, which keep the
 // attention_probs). The same with query, key and value kept in 8 bits: attention_flash_8bit.cuh.
@@ -30,27 +31,35 @@
 #define ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // row_dot's default: one warp per row
 #define ATTENTION_FLASH_BF16_KEY_GRAD_STAGES 2                                              // key_grad's default sets of query tiles: 1 to ATTENTION_FLASH_BF16_MAX_STAGES (tune_attention_bf16 sweeps it)
 #define ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES 2                                            // query_grad's default sets of key tiles: the same
-#define ATTENTION_FLASH_BF16_MAX_STAGES 4                                                   // the most: key_grad's 4 sets are 10 tiles, 82 KB
+#define ATTENTION_FLASH_BF16_MAX_STAGES 4                                                   // the most: key_grad's 4 sets are 10 tiles, 160 KB at head size 128 (82 KB at 64)
 
-// WGMMA m64n64k16 fed by TMA, the tensor-core product the kernels are built on: its HARDWARE_WGMMA_* and
+// WGMMA m64nNk16 fed by TMA, the tensor-core product the kernels are built on: its HARDWARE_WGMMA_* and
 // HARDWARE_TMA_* numbers are in cuda_common.h. The index math is written for these numbers: change them together
 // with it.
 #define FLASH_TILE HARDWARE_WGMMA_M                               // queries per block, and keys per step: one WGMMA's rows
-#define FLASH_HEAD_SIZE 64                                        // the only head_size the kernels take: GPT-2's
+#define FLASH_HEAD_SIZE 128                                       // the head_size the kernels take: 64 (GPT-2 small's) or 128 (the 32 x 2,304 model's, 18 heads)
 #define FLASH_THREADS HARDWARE_WARPGROUP_THREADS                  // the block size: one warpgroup
 #define FLASH_K_STEPS (FLASH_HEAD_SIZE / HARDWARE_WGMMA_K_BF16)   // WGMMAs across a head row: a sum over a head's values
 #define FLASH_TILE_K_STEPS (FLASH_TILE / HARDWARE_WGMMA_K_BF16)   // WGMMAs down a tile's tokens: a sum over keys or queries
 #define FLASH_HEAD_GROUPS (FLASH_HEAD_SIZE / HARDWARE_WGMMA_GROUP_COLUMNS)   // groups of C across a head row
 #define FLASH_TILE_GROUPS (FLASH_TILE / HARDWARE_WGMMA_GROUP_COLUMNS)        // groups of C across a tile of keys or queries
-#define FLASH_TILE_BYTES (FLASH_TILE * FLASH_HEAD_SIZE * sizeof(nv_bfloat16))   // a tile in shared memory: what one TMA copy brings
+#define FLASH_TILE_BYTES (FLASH_TILE * FLASH_HEAD_SIZE * sizeof(nv_bfloat16))   // a tile in shared memory: what TMA brings for one tile (all its boxes)
+#define FLASH_BOX_VALUES_PER_ROW WGMMA_MATMUL_BF16_ROW_VALUES              // a TMA box's row: one swizzled row of 128 bytes, 64 values
+#define FLASH_HEAD_BOXES (FLASH_HEAD_SIZE / FLASH_BOX_VALUES_PER_ROW)      // boxes side by side in a tile: a head row's 64-value pieces, 1 or 2
+#define FLASH_BOX_VALUES (FLASH_TILE * FLASH_BOX_VALUES_PER_ROW)           // a box: FLASH_TILE tokens of 64 values, 8 KB
+#define FLASH_BOX_K_STEPS (FLASH_BOX_VALUES_PER_ROW / HARDWARE_WGMMA_K_BF16)   // WGMMAs across one box's row: 4
+#define FLASH_TURNED_K_STEP_VALUES (HARDWARE_WGMMA_K_BF16 * FLASH_BOX_VALUES_PER_ROW)   // a tile turned round, 16 tokens of k on: 16 box rows, in every box
+#define FLASH_ROW_DOT_PAIRS_PER_LANE (FLASH_HEAD_SIZE / (2 * HARDWARE_THREADS_PER_WARP))   // row_dot: pairs of a head row each lane takes, 1 or 2
 #define FLASH_LN_2 0.6931471805599453f                         // ln(2): 2^x = e^(x ln 2), to give logsumexp in natural units
 #define FLASH_LOG2_E 1.4426950408889634f                       // log2(e): exp(x) = 2^(x log2 e), and the tensor cores' neighbours have only 2^x
 static_assert(HARDWARE_WGMMA_K_BF16 == 2 * HARDWARE_WGMMA_GROUP_COLUMNS, "two groups of C side by side make one A {16, 16}");
-static_assert(FLASH_HEAD_SIZE == 2 * HARDWARE_THREADS_PER_WARP, "row_dot: each lane takes 2 values of a head row");
-static_assert(FLASH_HEAD_SIZE == WGMMA_MATMUL_BF16_ROW_VALUES, "a tile's row, a head row, is one swizzled row: wgmma_matmul_bf16_tensor_map's box");
+static_assert(FLASH_HEAD_SIZE == 64 || FLASH_HEAD_SIZE == 128,
+              "head_size 64 or 128: a head row is 1 or 2 swizzled rows (TMA boxes side by side), and the product over the "
+              "tokens is m64n64k16 or m64n128k16, the two flash_multiply_add_registers has written out");
+static_assert(FLASH_HEAD_SIZE % (2 * HARDWARE_THREADS_PER_WARP) == 0, "row_dot: each lane takes whole pairs of a head row");
 static_assert(FLASH_TILE == WGMMA_MATMUL_BF16_ROW_VALUES, "a tile turned round has rows of FLASH_TILE tokens: one swizzled row too");
-static_assert(FLASH_HEAD_GROUPS == WGMMA_MATMUL_BF16_COLUMN_GROUPS && FLASH_TILE_GROUPS == WGMMA_MATMUL_BF16_COLUMN_GROUPS,
-              "both kinds of product are one WGMMA m64n64k16: the sums wgmma_matmul_bf16_multiply_add takes");
+static_assert(FLASH_TILE_GROUPS == WGMMA_MATMUL_BF16_COLUMN_GROUPS,
+              "a product over a head row is one WGMMA m64n64k16 a step: the sums wgmma_matmul_bf16_multiply_add takes");
 
 // ── forward and backward ──────────────────────────────────────────────────────
 bool attention_bf16_flash_fits(size_t seq_len_val, size_t head_size_val);
@@ -89,6 +98,7 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
                                        const __grid_constant__ CUtensorMap output_grad_map_val, nv_bfloat16* qkv_grad_ptr,
                                        const float* logsumexp_ptr, const float* row_dot_ptr, int num_heads_val,
                                        int seq_len_val, float scale_val);
+size_t attention_bf16_flash_forward_shared_bytes();
 template <int STAGES>
 size_t attention_bf16_flash_key_grad_shared_bytes();
 template <int STAGES>
@@ -130,9 +140,17 @@ inline void attention_bf16_flash_forward(const Tensor& output_tensor, const Tens
     //    boxes of {FLASH_TILE tokens, FLASH_HEAD_SIZE values}: one head's part of query, key or value
     CUtensorMap qkv_map_val = wgmma_matmul_bf16_tensor_map(qkv_tensor.data_ptr<nv_bfloat16>(), batch_size_val * seq_len_val,
                                                            qkv_tensor.size(2), FLASH_TILE);
-    // 3. F2..F6: one block per FLASH_TILE queries of each head
+    // 3. F2..F6: one block per FLASH_TILE queries of each head, its three tiles in dynamic shared memory (the first
+    //    time, CUDA asked to allow it past the 48 KB a block gets without asking: 3 x 16 KB at head size 128)
+    size_t shared_bytes_val = attention_bf16_flash_forward_shared_bytes();
+    static bool allowed_val = false;
+    if (!allowed_val) {
+        cudaCheck(cudaFuncSetAttribute(attention_bf16_flash_forward_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       (int)shared_bytes_val));
+        allowed_val = true;
+    }
     dim3 grid_val((unsigned)(seq_len_val / FLASH_TILE), (unsigned)(batch_size_val * num_heads_val));
-    attention_bf16_flash_forward_kernel<<<grid_val, FLASH_THREADS>>>(
+    attention_bf16_flash_forward_kernel<<<grid_val, FLASH_THREADS, shared_bytes_val>>>(
         qkv_map_val, output_tensor.data_ptr<nv_bfloat16>(), logsumexp_tensor.data(), (int)num_heads_val,
         (int)seq_len_val, 1.0f / sqrtf((float)FLASH_HEAD_SIZE));
     cudaCheck(cudaGetLastError());
@@ -213,11 +231,15 @@ inline void attention_bf16_flash_backward(const Tensor& qkv_grad_tensor, const T
 // HARDWARE_WGMMA_THREADS_PER_ROW), holds in each group of HARDWARE_WGMMA_GROUP_COLUMNS columns:
 //     C (float)      4 values: (group, pair), (group, pair+1), (group+8, pair), (group+8, pair+1)
 // B is always a tile in shared memory, as TMA wrote it (the 128-byte swizzle), {FLASH_TILE tokens, FLASH_HEAD_SIZE
-// values}, read one of two ways:
+// values}. A swizzled row holds 64 values, so a tile is FLASH_HEAD_BOXES boxes of {FLASH_TILE tokens, 64 values}
+// side by side, FLASH_BOX_VALUES apart: box b holds values 64 b .. 64 b + 63 of every token. It is read one of two ways:
 //     as it sits        B's 64 columns are the tile's tokens, k runs along a token's values ("K-major"):
-//                       query · keyᵀ and the like, the sum over a head row. 16 more k: 16 values on
-//     turned round      B's 64 columns are the tile's values, k runs down its tokens ("MN-major", the WGMMA's
-//                       transpose bit): attention_probs · value and the like, the sum over tokens. 16 more k: 16 rows on
+//                       query · keyᵀ and the like, the sum over a head row, m64n64k16. 16 more k: 16 values on,
+//                       into the next box after 64 (flash_k_step_ptr)
+//     turned round      B's FLASH_HEAD_SIZE columns are the tile's values, k runs down its tokens ("MN-major", the
+//                       WGMMA's transpose bit): attention_probs · value and the like, the sum over tokens,
+//                       m64nFLASH_HEAD_SIZEk16. 16 more k: 16 box rows on; the descriptor's leading offset is from one
+//                       box to the next (its 64 columns to the next 64)
 // A is a tile in shared memory too (flash_multiply_add_tiles), or what was just worked out, in registers
 // (flash_multiply_add_registers): two groups of C side by side hold exactly a warp's A {16, 16}
 //     A (bfloat16)   4 registers of 2 values: (group, pair .. pair+1), (group+8, ..), (group, pair+8 ..), (group+8, pair+8 ..)
@@ -261,6 +283,43 @@ __device__ __forceinline__ void flash_wgmma_wait_until() {
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(LEFT_RUNNING) : "memory");
 }
 
+/// Gives the first HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM-byte atom of a block's dynamic shared memory, where its
+/// tiles start: dynamic shared memory starts wherever the static ends.
+///
+///   shared_list   the block's dynamic shared memory
+__device__ __forceinline__ nv_bfloat16* flash_first_atom(uint8_t* shared_list) {
+    uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(shared_list);
+    return reinterpret_cast<nv_bfloat16*>(shared_list + (HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM - shared_address_val % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) %
+                                                            HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM);
+}
+
+/// Asks TMA for one tile {FLASH_TILE tokens, FLASH_HEAD_SIZE values}: FLASH_HEAD_BOXES boxes of 64 values, side by
+/// side in shared memory FLASH_BOX_VALUES apart, FLASH_TILE_BYTES in all on the barrier. Called by one thread.
+///
+///   tile_ptr                 the tile in shared memory, on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom
+///   map_ptr                  TMA's description of the matrix (boxes of 64 values, FLASH_TILE rows)
+///   first_column_index_val   the tile's first column in the matrix: a head's first value of query, key, value or output_grad
+///   first_row_index_val      its first row: the tile's first token
+///   barrier_val              the barrier the bytes complete
+__device__ __forceinline__ void flash_copy_tile(nv_bfloat16* tile_ptr, const CUtensorMap* map_ptr, int first_column_index_val,
+                                                int first_row_index_val, FlashBarrier& barrier_val) {
+    namespace cde = cuda::device::experimental;
+#pragma unroll
+    for (int box_index_val = 0; box_index_val < FLASH_HEAD_BOXES; box_index_val++)
+        cde::cp_async_bulk_tensor_2d_global_to_shared(tile_ptr + box_index_val * FLASH_BOX_VALUES, map_ptr,
+                                                      first_column_index_val + box_index_val * FLASH_BOX_VALUES_PER_ROW,
+                                                      first_row_index_val, barrier_val);
+}
+
+/// Gives where a WGMMA's HARDWARE_WGMMA_K_BF16 values of k start in a tile read as it sits (k along a head row):
+/// the step's box, then 16 values per step along its rows.
+///
+///   tile_ptr           the tile in shared memory
+///   k_step_index_val   which 16 values of the head row: 0 to FLASH_K_STEPS - 1
+__device__ __forceinline__ const nv_bfloat16* flash_k_step_ptr(const nv_bfloat16* tile_ptr, int k_step_index_val) {
+    return tile_ptr + (k_step_index_val / FLASH_BOX_K_STEPS) * FLASH_BOX_VALUES + (k_step_index_val % FLASH_BOX_K_STEPS) * HARDWARE_WGMMA_K_BF16;
+}
+
 /// sums {64, 64} += left tile {64, 16} · right tile {64, 16}ᵀ on the tensor cores, for the whole warpgroup, both
 /// tiles read from shared memory as they sit: wgmma_matmul_bf16.cuh's, neither side turned. Asynchronous: done
 /// only after flash_wgmma_wait.
@@ -272,32 +331,64 @@ __device__ __forceinline__ void flash_multiply_add_tiles(float (&sums_list)[FLAS
     wgmma_matmul_bf16_multiply_add<false, false>(sums_list, left_tile_ptr, right_tile_ptr);
 }
 
-/// sums {64, 64} += A {64, 16} · right tile {16, 64} on the tensor cores, for the whole warpgroup: A from
-/// registers, the right tile from shared memory turned round (transpose bit 1). wgmma.mma_async m64n64k16,
-/// bfloat16 in, float sums. Asynchronous: done only after flash_wgmma_wait; A's registers and the sums must not
-/// change until then.
+/// sums {64, FLASH_HEAD_SIZE} += A {64, 16} · right tile {16, FLASH_HEAD_SIZE} on the tensor cores, for the whole
+/// warpgroup: A from registers, the right tile from shared memory turned round (transpose bit 1), its
+/// FLASH_HEAD_BOXES boxes one leading offset apart. wgmma.mma_async m64n64k16 or m64n128k16 (N = FLASH_HEAD_SIZE,
+/// both written out), bfloat16 in, float sums. Asynchronous: done only after flash_wgmma_wait; A's registers and the
+/// sums must not change until then.
 ///
 ///   sums_list        this thread's sums, in WGMMA's layout
 ///   a_ptr            this thread's HARDWARE_WGMMA_A_REGISTERS_PER_THREAD_BF16 registers of A
-///   right_tile_ptr   the HARDWARE_WGMMA_K_BF16 rows of k to use, in the shared memory tile
+///   right_tile_ptr   the HARDWARE_WGMMA_K_BF16 rows of k to use, in the shared memory tile's first box
 __device__ __forceinline__ void flash_multiply_add_registers(float (&sums_list)[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP],
                                                              const uint32_t* a_ptr, const nv_bfloat16* right_tile_ptr) {
-    uint64_t right_descriptor_val = wgmma_matmul_bf16_descriptor(right_tile_ptr);
-    // scale-d 1: add onto the sums; scale-a, scale-b 1; transpose-b 1: the right tile is turned round
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "setp.ne.b32 p, %37, 0;\n"
-        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
-        "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, "
-        "{%32, %33, %34, %35}, %36, p, 1, 1, 1;\n"
-        "}\n"
-        : "+f"(sums_list[0][0]), "+f"(sums_list[0][1]), "+f"(sums_list[0][2]), "+f"(sums_list[0][3]), "+f"(sums_list[1][0]), "+f"(sums_list[1][1]), "+f"(sums_list[1][2]), "+f"(sums_list[1][3]),
-          "+f"(sums_list[2][0]), "+f"(sums_list[2][1]), "+f"(sums_list[2][2]), "+f"(sums_list[2][3]), "+f"(sums_list[3][0]), "+f"(sums_list[3][1]), "+f"(sums_list[3][2]), "+f"(sums_list[3][3]),
-          "+f"(sums_list[4][0]), "+f"(sums_list[4][1]), "+f"(sums_list[4][2]), "+f"(sums_list[4][3]), "+f"(sums_list[5][0]), "+f"(sums_list[5][1]), "+f"(sums_list[5][2]), "+f"(sums_list[5][3]),
-          "+f"(sums_list[6][0]), "+f"(sums_list[6][1]), "+f"(sums_list[6][2]), "+f"(sums_list[6][3]), "+f"(sums_list[7][0]), "+f"(sums_list[7][1]), "+f"(sums_list[7][2]), "+f"(sums_list[7][3])
-        : "r"(a_ptr[0]), "r"(a_ptr[1]), "r"(a_ptr[2]), "r"(a_ptr[3]), "l"(right_descriptor_val), "r"(1));
+    // the leading offset: from one box (64 columns) to the next, in cells; with one box not used, the usual 1
+    constexpr uint32_t LEADING_CELLS = FLASH_HEAD_BOXES > 1 ? (uint32_t)(FLASH_BOX_VALUES * sizeof(nv_bfloat16) / HARDWARE_WGMMA_DESCRIPTOR_UNIT)
+                                                            : (uint32_t)(HARDWARE_TMA_BYTES_PER_CELL / HARDWARE_WGMMA_DESCRIPTOR_UNIT);
+    uint64_t right_descriptor_val = wgmma_matmul_bf16_descriptor(right_tile_ptr, LEADING_CELLS);
+    // scale-d 1: add onto the sums; scale-a, scale-b 1; transpose-b 1: the right tile is turned round (chosen by the
+    // preprocessor: only the instruction of FLASH_HEAD_SIZE's N is compiled)
+#if FLASH_HEAD_SIZE == 64
+    {
+        asm volatile(
+            "{\n"
+            ".reg .pred p;\n"
+            "setp.ne.b32 p, %37, 0;\n"
+            "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+            "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, "
+            "{%32, %33, %34, %35}, %36, p, 1, 1, 1;\n"
+            "}\n"
+            : "+f"(sums_list[0][0]), "+f"(sums_list[0][1]), "+f"(sums_list[0][2]), "+f"(sums_list[0][3]), "+f"(sums_list[1][0]), "+f"(sums_list[1][1]), "+f"(sums_list[1][2]), "+f"(sums_list[1][3]),
+              "+f"(sums_list[2][0]), "+f"(sums_list[2][1]), "+f"(sums_list[2][2]), "+f"(sums_list[2][3]), "+f"(sums_list[3][0]), "+f"(sums_list[3][1]), "+f"(sums_list[3][2]), "+f"(sums_list[3][3]),
+              "+f"(sums_list[4][0]), "+f"(sums_list[4][1]), "+f"(sums_list[4][2]), "+f"(sums_list[4][3]), "+f"(sums_list[5][0]), "+f"(sums_list[5][1]), "+f"(sums_list[5][2]), "+f"(sums_list[5][3]),
+              "+f"(sums_list[6][0]), "+f"(sums_list[6][1]), "+f"(sums_list[6][2]), "+f"(sums_list[6][3]), "+f"(sums_list[7][0]), "+f"(sums_list[7][1]), "+f"(sums_list[7][2]), "+f"(sums_list[7][3])
+            : "r"(a_ptr[0]), "r"(a_ptr[1]), "r"(a_ptr[2]), "r"(a_ptr[3]), "l"(right_descriptor_val), "r"(1));
+    }
+#else
+    {
+        asm volatile(
+            "{\n"
+            ".reg .pred p;\n"
+            "setp.ne.b32 p, %69, 0;\n"
+            "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+            "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+            "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+            "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, "
+            "{%64, %65, %66, %67}, %68, p, 1, 1, 1;\n"
+            "}\n"
+            : "+f"(sums_list[0][0]), "+f"(sums_list[0][1]), "+f"(sums_list[0][2]), "+f"(sums_list[0][3]), "+f"(sums_list[1][0]), "+f"(sums_list[1][1]), "+f"(sums_list[1][2]), "+f"(sums_list[1][3]),
+              "+f"(sums_list[2][0]), "+f"(sums_list[2][1]), "+f"(sums_list[2][2]), "+f"(sums_list[2][3]), "+f"(sums_list[3][0]), "+f"(sums_list[3][1]), "+f"(sums_list[3][2]), "+f"(sums_list[3][3]),
+              "+f"(sums_list[4][0]), "+f"(sums_list[4][1]), "+f"(sums_list[4][2]), "+f"(sums_list[4][3]), "+f"(sums_list[5][0]), "+f"(sums_list[5][1]), "+f"(sums_list[5][2]), "+f"(sums_list[5][3]),
+              "+f"(sums_list[6][0]), "+f"(sums_list[6][1]), "+f"(sums_list[6][2]), "+f"(sums_list[6][3]), "+f"(sums_list[7][0]), "+f"(sums_list[7][1]), "+f"(sums_list[7][2]), "+f"(sums_list[7][3]),
+              "+f"(sums_list[8][0]), "+f"(sums_list[8][1]), "+f"(sums_list[8][2]), "+f"(sums_list[8][3]), "+f"(sums_list[9][0]), "+f"(sums_list[9][1]), "+f"(sums_list[9][2]), "+f"(sums_list[9][3]),
+              "+f"(sums_list[10][0]), "+f"(sums_list[10][1]), "+f"(sums_list[10][2]), "+f"(sums_list[10][3]), "+f"(sums_list[11][0]), "+f"(sums_list[11][1]), "+f"(sums_list[11][2]), "+f"(sums_list[11][3]),
+              "+f"(sums_list[12][0]), "+f"(sums_list[12][1]), "+f"(sums_list[12][2]), "+f"(sums_list[12][3]), "+f"(sums_list[13][0]), "+f"(sums_list[13][1]), "+f"(sums_list[13][2]), "+f"(sums_list[13][3]),
+              "+f"(sums_list[14][0]), "+f"(sums_list[14][1]), "+f"(sums_list[14][2]), "+f"(sums_list[14][3]), "+f"(sums_list[15][0]), "+f"(sums_list[15][1]), "+f"(sums_list[15][2]), "+f"(sums_list[15][3])
+            : "r"(a_ptr[0]), "r"(a_ptr[1]), "r"(a_ptr[2]), "r"(a_ptr[3]), "l"(right_descriptor_val), "r"(1));
+    }
+#endif
 }
 
 /// Gives 2^x by the special function unit's one instruction (ex2.approx.ftz: about 2 ulp, values under 2^-126 to
@@ -345,13 +436,15 @@ __global__ void __launch_bounds__(FLASH_THREADS)
 attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_val, nv_bfloat16* output_ptr,
                                     float* logsumexp_ptr, int num_heads_val, int seq_len_val, float scale_val) {
     namespace cde = cuda::device::experimental;
-    // the tiles, in TMA's swizzled layout (each on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom), and the barrier
-    // that says they arrived
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 query_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 key_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
-    __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
+    // the tiles, in TMA's swizzled layout, in dynamic shared memory from its first atom on (query, key, value: 3 x
+    // 16 KB at head size 128, past the 48 KB of static shared memory), and the barrier that says they arrived
+    constexpr int TILE_VALUES = FLASH_TILE * FLASH_HEAD_SIZE;
+    extern __shared__ __align__(16) uint8_t flash_shared_list[];
 #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ FlashBarrier tiles_barrier_val;
+    nv_bfloat16* query_tile_list = flash_first_atom(flash_shared_list);
+    nv_bfloat16* key_tile_list = query_tile_list + TILE_VALUES;
+    nv_bfloat16* value_tile_list = query_tile_list + 2 * TILE_VALUES;
     int warp_index_val = threadIdx.x / HARDWARE_THREADS_PER_WARP;
     int lane_index_val = threadIdx.x % HARDWARE_THREADS_PER_WARP;
     int group_index_val = lane_index_val / HARDWARE_WGMMA_THREADS_PER_ROW;
@@ -375,8 +468,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
     }
     __syncthreads();
     if (threadIdx.x == 0)
-        cde::cp_async_bulk_tensor_2d_global_to_shared(query_tile_list, &qkv_map_val, query_first_column_index_val,
-                                                      head_first_row_index_val + query_block_index_val * FLASH_TILE, tiles_barrier_val);
+        flash_copy_tile(query_tile_list, &qkv_map_val, query_first_column_index_val,
+                        head_first_row_index_val + query_block_index_val * FLASH_TILE, tiles_barrier_val);
     flash_wait_for_tiles(tiles_barrier_val, FLASH_TILE_BYTES);
 
     float output_list[FLASH_HEAD_GROUPS][HARDWARE_WGMMA_C_VALUES_PER_THREAD_PER_GROUP] = {};    // {HARDWARE_WGMMA_M, FLASH_HEAD_SIZE}
@@ -389,10 +482,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
         __syncthreads();                                            // every thread is done with the last tiles
         if (threadIdx.x == 0) {
             int tile_first_row_index_val = head_first_row_index_val + key_block_index_val * FLASH_TILE;
-            cde::cp_async_bulk_tensor_2d_global_to_shared(key_tile_list, &qkv_map_val, key_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
-            cde::cp_async_bulk_tensor_2d_global_to_shared(value_tile_list, &qkv_map_val, value_first_column_index_val,
-                                                          tile_first_row_index_val, tiles_barrier_val);
+            flash_copy_tile(key_tile_list, &qkv_map_val, key_first_column_index_val, tile_first_row_index_val, tiles_barrier_val);
+            flash_copy_tile(value_tile_list, &qkv_map_val, value_first_column_index_val, tile_first_row_index_val, tiles_barrier_val);
         }
         flash_wait_for_tiles(tiles_barrier_val, 2 * FLASH_TILE_BYTES);
 
@@ -401,8 +492,8 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
         flash_wgmma_begin();
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
-            flash_multiply_add_tiles(score_list, query_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     key_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+            flash_multiply_add_tiles(score_list, flash_k_step_ptr(query_tile_list, k_step_index_val),
+                                     flash_k_step_ptr(key_tile_list, k_step_index_val));
         flash_wgmma_wait();
         // F3: on the diagonal tile (the block's own keys), -inf where the key comes after the query; then each row's
         // largest score, unscaled (the scale is positive, so the largest is the same)
@@ -463,7 +554,7 @@ attention_bf16_flash_forward_kernel(const __grid_constant__ CUtensorMap qkv_map_
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(output_list, prob_a_list[k_step_index_val],
-                                         value_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         value_tile_list + k_step_index_val * FLASH_TURNED_K_STEP_VALUES);
         flash_wgmma_wait();
     }
 
@@ -500,20 +591,31 @@ __global__ void attention_bf16_flash_row_dot_kernel(float* row_dot_ptr, const nv
     size_t warps_launched_val = (size_t)gridDim.x * blockDim.x / HARDWARE_THREADS_PER_WARP;
     // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
     for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
-        // 1. where the row is: which (batch, head), which token; each lane takes 2 neighbouring columns
+        // 1. where the row is: which (batch, head), which token; each lane takes FLASH_ROW_DOT_PAIRS_PER_LANE pairs of
+        //    neighbouring columns, the pairs a warp's width apart (each load: the warp reads one stretch of the row)
         size_t batch_head_index_val = row_index_val / seq_len_val;                    // batch x num_heads + head
         size_t token_index_val = row_index_val % seq_len_val;
         size_t batch_index_val = batch_head_index_val / num_heads_val;
         size_t head_index_val = batch_head_index_val % num_heads_val;
-        size_t lane_value_index_val = (batch_index_val * seq_len_val + token_index_val) * num_heads_val * FLASH_HEAD_SIZE + head_index_val * FLASH_HEAD_SIZE +
-                        2 * lane_index_val;
+        size_t row_first_index_val = (batch_index_val * seq_len_val + token_index_val) * num_heads_val * FLASH_HEAD_SIZE + head_index_val * FLASH_HEAD_SIZE;
         // 2. this lane's part of the dot, then the warp's
-        float2 grad_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_grad_ptr + lane_value_index_val));
-        float2 out_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_ptr + lane_value_index_val));
-        float dot_val = grad_val.x * out_val.x + grad_val.y * out_val.y;
+        float dot_val = 0.0f;
+#pragma unroll
+        for (int pair_index_val = 0; pair_index_val < FLASH_ROW_DOT_PAIRS_PER_LANE; pair_index_val++) {
+            size_t lane_value_index_val = row_first_index_val + 2 * (pair_index_val * HARDWARE_THREADS_PER_WARP + lane_index_val);
+            float2 grad_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_grad_ptr + lane_value_index_val));
+            float2 out_val = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(output_ptr + lane_value_index_val));
+            dot_val += grad_val.x * out_val.x + grad_val.y * out_val.y;
+        }
         dot_val = warp_reduce_sum(dot_val);
         if (lane_index_val == 0) row_dot_ptr[row_index_val] = dot_val;
     }
+}
+
+/// Gives the forward's dynamic shared memory: the query, key and value tiles, and one atom of room to start them on
+/// one (TMA's 128-byte swizzle repeats every HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM bytes).
+inline size_t attention_bf16_flash_forward_shared_bytes() {
+    return 3 * FLASH_TILE_BYTES + HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
 }
 
 /// Gives key_grad's dynamic shared memory at STAGES sets: the key and value tiles, STAGES sets of a query and an
@@ -529,16 +631,6 @@ inline size_t attention_bf16_flash_key_grad_shared_bytes() {
 template <int STAGES>
 inline size_t attention_bf16_flash_query_grad_shared_bytes() {
     return (2 + 2 * STAGES) * FLASH_TILE_BYTES + HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM;
-}
-
-/// Gives the first HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM-byte atom of a block's dynamic shared memory, where its
-/// tiles start: dynamic shared memory starts wherever the static ends.
-///
-///   shared_list   the block's dynamic shared memory
-__device__ __forceinline__ nv_bfloat16* flash_first_atom(uint8_t* shared_list) {
-    uint32_t shared_address_val = (uint32_t)__cvta_generic_to_shared(shared_list);
-    return reinterpret_cast<nv_bfloat16*>(shared_list + (HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM - shared_address_val % HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) %
-                                                            HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM);
 }
 
 /// Waits, the whole block, until TMA has brought the tiles thread 0 asked for with this barrier (it said how many
@@ -626,11 +718,10 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
         nv_bfloat16* set_query_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
         float* set_rows_ptr = rows_ptr + 2 * set_index_val * FLASH_TILE;
         cuda::device::barrier_expect_tx(sets_barriers_list[set_index_val], SET_BYTES);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(set_query_tile_ptr, &qkv_map_val, query_first_column_index_val,
-                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(set_query_tile_ptr + TILE_VALUES, &output_grad_map_val,
-                                                      query_first_column_index_val, tile_first_row_index_val,
-                                                      sets_barriers_list[set_index_val]);
+        flash_copy_tile(set_query_tile_ptr, &qkv_map_val, query_first_column_index_val, tile_first_row_index_val,
+                        sets_barriers_list[set_index_val]);
+        flash_copy_tile(set_query_tile_ptr + TILE_VALUES, &output_grad_map_val, query_first_column_index_val,
+                        tile_first_row_index_val, sets_barriers_list[set_index_val]);
         cde::cp_async_bulk_global_to_shared(set_rows_ptr, logsumexp_ptr + first_row_index_val, FLASH_TILE * sizeof(float),
                                             sets_barriers_list[set_index_val]);
         cde::cp_async_bulk_global_to_shared(set_rows_ptr + FLASH_TILE, row_dot_ptr + first_row_index_val,
@@ -641,10 +732,8 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
     if (threadIdx.x == 0) {
         int tile_first_row_index_val = head_first_row_index_val + key_block_index_val * FLASH_TILE;
         cuda::device::barrier_expect_tx(key_value_barrier_val, 2 * FLASH_TILE_BYTES);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(key_tile_ptr, &qkv_map_val, key_first_column_index_val,
-                                                      tile_first_row_index_val, key_value_barrier_val);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(value_tile_ptr, &qkv_map_val, value_first_column_index_val,
-                                                      tile_first_row_index_val, key_value_barrier_val);
+        flash_copy_tile(key_tile_ptr, &qkv_map_val, key_first_column_index_val, tile_first_row_index_val, key_value_barrier_val);
+        flash_copy_tile(value_tile_ptr, &qkv_map_val, value_first_column_index_val, tile_first_row_index_val, key_value_barrier_val);
         for (int step_index_val = 0; step_index_val < STAGES && step_index_val < query_steps_val; step_index_val++)
             ask_for_step_val(step_index_val);
     }
@@ -669,13 +758,13 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
         flash_wgmma_begin();
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
-            flash_multiply_add_tiles(attention_prob_list, key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+            flash_multiply_add_tiles(attention_prob_list, flash_k_step_ptr(key_tile_ptr, k_step_index_val),
+                                     flash_k_step_ptr(query_tile_ptr, k_step_index_val));
         flash_wgmma_commit();
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
-            flash_multiply_add_tiles(score_grad_list, value_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+            flash_multiply_add_tiles(score_grad_list, flash_k_step_ptr(value_tile_ptr, k_step_index_val),
+                                     flash_k_step_ptr(grad_tile_ptr, k_step_index_val));
         flash_wgmma_commit();
 
         // b. the scores in (B2 still running): the attention_probs turned round, exp2(score · scale · log2 e -
@@ -715,7 +804,7 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(value_grad_list, prob_a_list[k_step_index_val],
-                                         grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         grad_tile_ptr + k_step_index_val * FLASH_TURNED_K_STEP_VALUES);
         flash_wgmma_commit();
 
         // d. B2 in (B3 still running): B4-B6, scores_gradᵀ in attention_probs_gradᵀ's place, packed as A
@@ -740,7 +829,7 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(key_grad_list, score_grad_a_list[k_step_index_val],
-                                         query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         query_tile_ptr + k_step_index_val * FLASH_TURNED_K_STEP_VALUES);
         flash_wgmma_wait();
 
         // every thread done with this set: thread 0 asks for the step STAGES on into it
@@ -831,10 +920,10 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
         int tile_first_row_index_val = head_first_row_index_val + step_index_val * FLASH_TILE;
         nv_bfloat16* set_key_tile_ptr = sets_ptr + 2 * set_index_val * TILE_VALUES;
         cuda::device::barrier_expect_tx(sets_barriers_list[set_index_val], 2 * FLASH_TILE_BYTES);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(set_key_tile_ptr, &qkv_map_val, key_first_column_index_val,
-                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(set_key_tile_ptr + TILE_VALUES, &qkv_map_val, value_first_column_index_val,
-                                                      tile_first_row_index_val, sets_barriers_list[set_index_val]);
+        flash_copy_tile(set_key_tile_ptr, &qkv_map_val, key_first_column_index_val, tile_first_row_index_val,
+                        sets_barriers_list[set_index_val]);
+        flash_copy_tile(set_key_tile_ptr + TILE_VALUES, &qkv_map_val, value_first_column_index_val, tile_first_row_index_val,
+                        sets_barriers_list[set_index_val]);
     };
 
     // 2. this block's query and output_grad tiles, kept for the whole walk, the first STAGES steps' sets, and this
@@ -842,10 +931,9 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
     if (threadIdx.x == 0) {
         int tile_first_row_index_val = head_first_row_index_val + query_block_index_val * FLASH_TILE;
         cuda::device::barrier_expect_tx(query_grad_barrier_val, 2 * FLASH_TILE_BYTES);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(query_tile_ptr, &qkv_map_val, query_first_column_index_val,
-                                                      tile_first_row_index_val, query_grad_barrier_val);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(grad_tile_ptr, &output_grad_map_val, query_first_column_index_val,
-                                                      tile_first_row_index_val, query_grad_barrier_val);
+        flash_copy_tile(query_tile_ptr, &qkv_map_val, query_first_column_index_val, tile_first_row_index_val, query_grad_barrier_val);
+        flash_copy_tile(grad_tile_ptr, &output_grad_map_val, query_first_column_index_val, tile_first_row_index_val,
+                        query_grad_barrier_val);
         for (int step_index_val = 0; step_index_val < STAGES && step_index_val < key_steps_val; step_index_val++)
             ask_for_step_val(step_index_val);
     }
@@ -876,13 +964,13 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
         flash_wgmma_begin();
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
-            flash_multiply_add_tiles(attention_prob_list, query_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+            flash_multiply_add_tiles(attention_prob_list, flash_k_step_ptr(query_tile_ptr, k_step_index_val),
+                                     flash_k_step_ptr(key_tile_ptr, k_step_index_val));
         flash_wgmma_commit();
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_K_STEPS; k_step_index_val++)
-            flash_multiply_add_tiles(score_grad_list, grad_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16,
-                                     value_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16);
+            flash_multiply_add_tiles(score_grad_list, flash_k_step_ptr(grad_tile_ptr, k_step_index_val),
+                                     flash_k_step_ptr(value_tile_ptr, k_step_index_val));
         flash_wgmma_commit();
 
         // b. the scores in (B2 still running): the attention_probs, exp2(score · scale · log2 e - logsumexp · log2 e);
@@ -929,7 +1017,7 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(query_grad_list, score_grad_a_list[k_step_index_val],
-                                         key_tile_ptr + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         key_tile_ptr + k_step_index_val * FLASH_TURNED_K_STEP_VALUES);
         flash_wgmma_wait();
 
         // every thread done with this set: thread 0 asks for the step STAGES on into it

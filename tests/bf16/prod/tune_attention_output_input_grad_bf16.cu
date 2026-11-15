@@ -14,8 +14,8 @@
 #include "../../tune_helpers.h"          // gpu_milliseconds, peak_bf16_flops, start_tune_log
 #include "../../../llmc/kernels/bf16/prod/attention_output_input_grad_bf16.cuh"
 
-#define GPT2_ROWS 16384               // a training micro-batch: 16 rows of 1024 tokens
-#define GPT2_EMBED_DIM 768            // GPT-2 small's widths
+#define GPT2_ROWS 16384               // a training micro-batch: 8 rows of 2048 tokens (train_bf16.cu's and train_8bit.cu's default)
+#define GPT2_EMBED_DIM 2304           // the model's width (32 layers x 2,304, 18 heads)
 #define GPT2_QKV_DIM (3 * GPT2_EMBED_DIM)
 #define GPT2_MLP_DIM (4 * GPT2_EMBED_DIM)
 #define GPT2_PADDED_VOCAB_SIZE 50304

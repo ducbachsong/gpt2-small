@@ -1,0 +1,95 @@
+log: tests/results/H100/head_input_grad_8bit_2026-11-15_033116.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    head input grad: output {16384, 2304}, a sum of 50304: 3797.8 GFLOP
+    average of steps 3..20:              ms     TFLOPS   of bf16 peak
+        mine, rounding included         11.168      340.1     41.5%
+        mine, the product alone          5.071      749.0     91.4%
+        PyTorch (cuBLAS, bfloat16)       8.152      465.9     56.9%
+    cuBLAS takes 0.73x as long as mine with the rounding, 1.61x as long as the product alone
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1     16.441 ms    231.0 TFLOPS
+        1 x  64 x 2      9.880 ms    384.4 TFLOPS
+        1 x  64 x 3      8.655 ms    438.8 TFLOPS
+        1 x  64 x 4      8.815 ms    430.9 TFLOPS
+        1 x 128 x 1     19.746 ms    192.3 TFLOPS
+        1 x 128 x 2     10.638 ms    357.0 TFLOPS
+        1 x 128 x 3      7.208 ms    526.9 TFLOPS
+        1 x 128 x 4      6.281 ms    604.6 TFLOPS
+        2 x  64 x 1     18.933 ms    200.6 TFLOPS
+        2 x  64 x 2     11.328 ms    335.3 TFLOPS
+        2 x  64 x 3      7.651 ms    496.4 TFLOPS
+        2 x  64 x 4      7.587 ms    500.6 TFLOPS
+        2 x 128 x 1     12.432 ms    305.5 TFLOPS
+        2 x 128 x 2      6.960 ms    545.6 TFLOPS
+        2 x 128 x 3      5.146 ms    738.0 TFLOPS
+        2 x 128 x 4      5.028 ms    755.4 TFLOPS   (this file's)
+    fastest: 2 x 128 x 4
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        clusters of 1,  1 rows a group, persistent          7.388 ms    514.1 TFLOPS
+        clusters of 1,  1 rows a group, one a square        7.031 ms    540.2 TFLOPS
+        clusters of 1,  4 rows a group, persistent          6.182 ms    614.4 TFLOPS
+        clusters of 1,  4 rows a group, one a square        6.085 ms    624.1 TFLOPS
+        clusters of 1, 16 rows a group, persistent          6.582 ms    577.0 TFLOPS
+        clusters of 1, 16 rows a group, one a square        6.230 ms    609.6 TFLOPS
+        clusters of 1, 64 rows a group, persistent          7.667 ms    495.4 TFLOPS
+        clusters of 1, 64 rows a group, one a square        8.246 ms    460.6 TFLOPS
+        clusters of 2,  1 rows a group, persistent          6.341 ms    598.9 TFLOPS
+        clusters of 2,  1 rows a group, one a square        6.159 ms    616.7 TFLOPS
+        clusters of 2,  4 rows a group, persistent          6.425 ms    591.1 TFLOPS
+        clusters of 2,  4 rows a group, one a square        6.194 ms    613.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent          6.459 ms    588.0 TFLOPS
+        clusters of 2, 16 rows a group, one a square        6.467 ms    587.3 TFLOPS
+        clusters of 2, 64 rows a group, persistent          8.628 ms    440.2 TFLOPS
+        clusters of 2, 64 rows a group, one a square        8.419 ms    451.1 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        producer 24 registers, 0 in flight, promotion 4      5.109 ms    743.4 TFLOPS
+        producer 24 registers, 1 in flight, promotion 4      5.521 ms    687.9 TFLOPS
+        producer 24 registers, 2 in flight, promotion 4      8.068 ms    470.7 TFLOPS
+        producer 24 registers, 3 in flight, promotion 4     14.568 ms    260.7 TFLOPS
+        producer 32 registers, 0 in flight, promotion 4      5.355 ms    709.3 TFLOPS
+        producer 32 registers, 1 in flight, promotion 4      5.528 ms    687.0 TFLOPS
+        producer 32 registers, 2 in flight, promotion 4      7.621 ms    498.4 TFLOPS
+        producer 32 registers, 3 in flight, promotion 4     13.284 ms    285.9 TFLOPS
+        producer 40 registers, 0 in flight, promotion 4      4.974 ms    763.5 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4      5.379 ms    706.1 TFLOPS
+        producer 40 registers, 2 in flight, promotion 4      7.335 ms    517.8 TFLOPS
+        producer 40 registers, 3 in flight, promotion 4     12.585 ms    301.8 TFLOPS
+        producer 48 registers, 0 in flight, promotion 4      4.905 ms    774.3 TFLOPS
+        producer 48 registers, 1 in flight, promotion 4      5.101 ms    744.5 TFLOPS
+        producer 48 registers, 2 in flight, promotion 4      6.913 ms    549.3 TFLOPS
+        producer 48 registers, 3 in flight, promotion 4     12.521 ms    303.3 TFLOPS
+        producer 56 registers, 0 in flight, promotion 4      4.810 ms    789.6 TFLOPS
+        producer 56 registers, 1 in flight, promotion 4      5.219 ms    727.7 TFLOPS
+        producer 56 registers, 2 in flight, promotion 4      7.041 ms    539.4 TFLOPS
+        producer 56 registers, 3 in flight, promotion 4     12.309 ms    308.5 TFLOPS
+        producer 56 registers, 0 in flight, promotion 0      4.840 ms    784.6 TFLOPS
+        producer 56 registers, 0 in flight, promotion 1      5.294 ms    717.4 TFLOPS
+        producer 56 registers, 0 in flight, promotion 2      5.098 ms    744.9 TFLOPS
+        producer 56 registers, 0 in flight, promotion 4      5.095 ms    745.4 TFLOPS
+        producer 56 registers, 0 in flight, promotion 8      5.101 ms    744.5 TFLOPS
+    (the promotion changes the bits a little: every 4 steps was as accurate as every step on an H100 NVL; 0, never,
+     keeps the whole sum in the tensor cores, less accurate over a long sum)
+
+    for llmc/kernels/8bit/prod/head_input_grad_8bit.cuh:
+#define HEAD_INPUT_GRAD_8BIT_ROW_GROUPS 2
+#define HEAD_INPUT_GRAD_8BIT_COLUMNS 128
+#define HEAD_INPUT_GRAD_8BIT_STAGES 4
+#define HEAD_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4
+#define HEAD_INPUT_GRAD_8BIT_CLUSTER 1
+#define HEAD_INPUT_GRAD_8BIT_BLOCKS HEAD_INPUT_GRAD_8BIT_ONE_A_SQUARE
+#define HEAD_INPUT_GRAD_8BIT_PRODUCER_REGISTERS 56
+#define HEAD_INPUT_GRAD_8BIT_IN_FLIGHT 0
+#define HEAD_INPUT_GRAD_8BIT_PROMOTION_STEPS 4
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion
+     changes the bits: take a faster one only if the tests stay within their tolerances)
+
+all tunes done

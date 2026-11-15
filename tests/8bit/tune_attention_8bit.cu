@@ -3,7 +3,8 @@
 // time_rounding_and_turn_back_with_other_block_and_thread_counts.
 //
 // Built as tests/8bit/test_attention_8bit.cu is (see tests/README.md); what it prints also goes to
-// tests/results/<GPU>/attention_8bit_<date>_<time>.txt. Needs a GPU of compute capability 8.9 or more.
+// tests/results/<GPU>/attention_8bit_<date>_<time>.txt. Needs an H100 (compute capability 9.0). The size is the
+// model's attention (32 layers x 2,304, train_8bit.cu's): 18 heads of 128, 2,048 tokens a row.
 #include <torch/types.h>              // torch::scaled_dot_product_attention, torch::randn, backward(); before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
 #include "../test_helpers.h"    // ASSERT_EQ, ASSERT_NEAR
@@ -16,16 +17,16 @@
 static const double EIGHT_BIT_TOLERANCE = 1e-1;
 static const double EIGHT_BIT_GRAD_TOLERANCE = 1.5e-1;
 
-#define GPT2_NUM_HEADS 12             // GPT-2 small's heads
-#define GPT2_SEQ_LEN 1024             // its tokens per row
-#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * FLASH_HEAD_SIZE)   // 768
+#define GPT2_NUM_HEADS 18             // the model's heads, FLASH_HEAD_SIZE (128) each
+#define GPT2_SEQ_LEN 2048             // its tokens per row
+#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * FLASH_HEAD_SIZE)   // 2,304
 #define GPT2_BATCH_SIZE 4             // rows of the micro-batch timed
 #define MEGA 1e6
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a float tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
-/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for GPT-2's 9.4M qkv values.
+/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for the model's 57M qkv values (4 rows).
 static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
     Tensor tensor = Tensor::empty(shape_list);
@@ -164,7 +165,7 @@ static bool eight_bit_runs_here(const char *test_ptr)
     return false;
 }
 
-/// Runs PyTorch's causal attention on GPT-2 small's size into `pytorch_output_tensor`, from `pytorch_qkv_tensor`,
+/// Runs PyTorch's causal attention on the model's size into `pytorch_output_tensor`, from `pytorch_qkv_tensor`,
 /// in the dtype of pytorch_qkv_tensor.
 static void pytorch_gpt2_forward(const torch::Tensor &pytorch_qkv_tensor, torch::Tensor &pytorch_output_tensor)
 {
@@ -181,7 +182,7 @@ static void pytorch_gpt2_forward(const torch::Tensor &pytorch_qkv_tensor, torch:
 
 static void time_8bit_against_flash_and_pytorch(void)
 {
-    // Prints the times of 20 forwards and 20 backwards on GPT-2 small's size, {4, 1024} tokens, 12 heads of 64:
+    // Prints the times of 20 forwards and 20 backwards on the model's size, {4, 2048} tokens, 18 heads of 128:
     // 8-bit attention, attention_bf16.cuh's flash attention, and PyTorch's scaled_dot_product_attention (causal)
     // in bfloat16, its own flash attention. The three take turns in each step. Averages of steps 3..20. Then the
     // bytes each keeps from the forward for the backward: query, key, value (bfloat16, or E4M3 and a float scale
@@ -221,8 +222,8 @@ static void time_8bit_against_flash_and_pytorch(void)
 
     // 3. print the averages, and the bytes kept for the backward
     const int averaged_val = TIMED_STEPS - WARM_UP_STEPS;
-    double head_values_val = (double)GPT2_BATCH_SIZE * GPT2_NUM_HEADS * GPT2_SEQ_LEN * FLASH_HEAD_SIZE;   // 3.1M per tensor
-    double head_rows_val = (double)GPT2_BATCH_SIZE * GPT2_NUM_HEADS * GPT2_SEQ_LEN;                      // 49,152
+    double head_values_val = (double)GPT2_BATCH_SIZE * GPT2_NUM_HEADS * GPT2_SEQ_LEN * FLASH_HEAD_SIZE;   // 18.9M per tensor
+    double head_rows_val = (double)GPT2_BATCH_SIZE * GPT2_NUM_HEADS * GPT2_SEQ_LEN;                      // 147,456
     double kept_8bit_val = 3 * head_values_val * sizeof(__nv_fp8_e4m3) + 3 * head_rows_val * sizeof(float) +
                            head_rows_val * sizeof(float);
     double kept_bf16_val = 3 * head_values_val * sizeof(nv_bfloat16) + head_rows_val * sizeof(float);
@@ -250,7 +251,7 @@ static void time_8bit_against_flash_and_pytorch(void)
 
 static void time_rounding_and_turn_back_with_other_block_and_thread_counts(void)
 {
-    // Prints the time, GB/s and MBU of the two kernels that move values, on GPT-2 small's size (49,152 head rows
+    // Prints the time, GB/s and MBU of the two kernels that move values, on the model's size (147,456 head rows
     // of query, key and value), for 5 block counts x 5 thread counts, each the average of SWEEP_ROUNDS runs taking
     // turns: the rounding (F1: reads qkv in bfloat16, writes E4M3 and a scale per head row, one warp per row)
     // and the turn-back (reads E4M3 and the scales, writes bfloat16, one int of 4 E4M3s per thread). The block
@@ -263,7 +264,7 @@ static void time_rounding_and_turn_back_with_other_block_and_thread_counts(void)
     // Expect: every launch gives the default's bytes, to the last bit.
     if (!eight_bit_runs_here(__func__))
         return;
-    // 1. GPT-2 small's size; the defaults' results
+    // 1. the model's size; the defaults' results
     torch::manual_seed(0);
     EightBitTensors tensors_val(GPT2_BATCH_SIZE, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
     tensors_val.qkv_tensor = random_tensor_on_gpu(tensors_val.qkv_tensor.shape()).to(DType::BFloat16);

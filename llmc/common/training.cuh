@@ -23,6 +23,7 @@ struct TrainConfig {
     size_t batch_size = 64;                  // rows per micro-batch, on each GPU: tune_model's best MFU on an H100 NVL
     size_t seq_len = 1024;                   // tokens per row
     size_t tokens_per_step = 524288;         // all GPUs together: 2^19, GPT-2 small's ~0.5M (GPT-3 paper, llm.c)
+    bool linear_bias = true;                 // the model's 4 linears have biases (GPT2Config::linear_bias); train_bf16 and train_8bit only
     int steps = -1;                          // -1: one pass over the train files, 19,073 for 10B tokens
     float max_learning_rate = 6e-4f;
     float min_learning_rate = 0.0f;          // where the cosine ends
@@ -41,8 +42,8 @@ struct TrainConfig {
 };
 
 // ── settings ──────────────────────────────────────────────────────────────────
-void print_usage_and_stop(const char* program, int exit_code);
-TrainConfig parse_args(int argc, char** argv);
+void print_usage_and_stop(const char* program, int exit_code, const TrainConfig& defaults = TrainConfig());
+TrainConfig parse_args(int argc, char** argv, const TrainConfig& defaults = TrainConfig());
 float learning_rate_at(int step, const TrainConfig& c);
 AdamWConfig adamw_config_of(const TrainConfig& c);
 
@@ -72,14 +73,17 @@ double seconds_since(std::chrono::steady_clock::time_point started);
 ///
 ///   program     argv[0], for the usage line
 ///   exit_code   EXIT_SUCCESS for --help, EXIT_FAILURE for a mistake
-inline void print_usage_and_stop(const char* program, int exit_code) {
-    TrainConfig d;
+///   defaults    the trainer's defaults; not given: TrainConfig's
+inline void print_usage_and_stop(const char* program, int exit_code, const TrainConfig& defaults) {
+    const TrainConfig& d = defaults;
     printf("usage: %s [--flag value] ...\n", program);
     printf("  --train-files PATTERN         %s\n", d.train_files.c_str());
     printf("  --val-files PATTERN           %s\n", d.val_files.c_str());
     printf("  --batch-size N                %zu   rows per micro-batch\n", d.batch_size);
     printf("  --seq-len N                   %zu\n", d.seq_len);
     printf("  --tokens-per-step N           %zu   all GPUs together\n", d.tokens_per_step);
+    printf("  --linear-bias 0|1             %d   the linears' biases (the LayerNorms keep theirs); train_bf16, train_8bit\n",
+           d.linear_bias ? 1 : 0);
     printf("  --steps N                     one pass over the train files\n");
     printf("  --max-learning-rate X         %g\n", d.max_learning_rate);
     printf("  --min-learning-rate X         %g\n", d.min_learning_rate);
@@ -102,14 +106,15 @@ inline void print_usage_and_stop(const char* program, int exit_code) {
 /// know or a flag with no value.
 ///
 ///   argc, argv   main's
-inline TrainConfig parse_args(int argc, char** argv) {
-    TrainConfig c;
+///   defaults     the trainer's defaults (a model of another size: its seq_len and rows); not given: TrainConfig's
+inline TrainConfig parse_args(int argc, char** argv, const TrainConfig& defaults) {
+    TrainConfig c = defaults;
     for (int i = 1; i < argc; i++) {
         std::string flag = argv[i];
-        if (flag == "--help" || flag == "-h") print_usage_and_stop(argv[0], EXIT_SUCCESS);
+        if (flag == "--help" || flag == "-h") print_usage_and_stop(argv[0], EXIT_SUCCESS, defaults);
         if (i + 1 >= argc) {
             fprintf(stderr, "error: %s needs a value\n", flag.c_str());
-            print_usage_and_stop(argv[0], EXIT_FAILURE);
+            print_usage_and_stop(argv[0], EXIT_FAILURE, defaults);
         }
         const char* value = argv[++i];
         if (flag == "--train-files") c.train_files = value;
@@ -117,6 +122,7 @@ inline TrainConfig parse_args(int argc, char** argv) {
         else if (flag == "--batch-size") c.batch_size = (size_t)atoll(value);
         else if (flag == "--seq-len") c.seq_len = (size_t)atoll(value);
         else if (flag == "--tokens-per-step") c.tokens_per_step = (size_t)atoll(value);
+        else if (flag == "--linear-bias") c.linear_bias = atoi(value) != 0;
         else if (flag == "--steps") c.steps = atoi(value);
         else if (flag == "--max-learning-rate") c.max_learning_rate = (float)atof(value);
         else if (flag == "--min-learning-rate") c.min_learning_rate = (float)atof(value);
@@ -134,7 +140,7 @@ inline TrainConfig parse_args(int argc, char** argv) {
         else if (flag == "--resume") c.resume = value;
         else {
             fprintf(stderr, "error: no flag %s\n", flag.c_str());
-            print_usage_and_stop(argv[0], EXIT_FAILURE);
+            print_usage_and_stop(argv[0], EXIT_FAILURE, defaults);
         }
     }
     if ((c.steps < 1 && c.steps != -1) || c.tokens_per_step < 1 || c.val_every < 1 || c.val_batches < 1 ||

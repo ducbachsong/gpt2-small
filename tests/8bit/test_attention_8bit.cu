@@ -21,18 +21,18 @@ static const double BFLOAT16_TOLERANCE = 2e-2;
 static const double BFLOAT16_GRAD_TOLERANCE = 5e-2;
 // Against PyTorch in float on the values before rounding. E4M3 keeps 4 significant bits, so each value moves by
 // up to 2^-4, about 6%: the largest output (token 0's, its own value) by up to 6% of itself, and a score, a sum of
-// 64 products each off by about 5%, by about 0.05, which moves its attention_prob by 5%. The gradients add the backward's
+// 128 products each off by about 5% (over sqrt(128)), by about 0.05, which moves its attention_prob by 5%. The gradients add the backward's
 // bfloat16 roundings on top.
 static const double EIGHT_BIT_TOLERANCE = 1e-1;
 static const double EIGHT_BIT_GRAD_TOLERANCE = 1.5e-1;
 
-#define GPT2_NUM_HEADS 12             // GPT-2 small's heads
-#define GPT2_SEQ_LEN 1024             // its tokens per row
+#define GPT2_NUM_HEADS 18             // the model's heads (32 layers x 2,304, train_8bit.cu's), FLASH_HEAD_SIZE (128) each
+#define GPT2_SEQ_LEN 2048             // its tokens per row
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Makes a float tensor of `shape_list` with random values, mean 0 and standard deviation 1, made by PyTorch on
-/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for GPT-2's 9.4M qkv values.
+/// the GPU: Tensor::randn makes them on the CPU, which takes seconds for the model's 57M qkv values (4 rows).
 static Tensor random_tensor_on_gpu(const Shape &shape_list)
 {
     Tensor tensor = Tensor::empty(shape_list);
@@ -209,11 +209,11 @@ static bool eight_bit_runs_here(const char *test_ptr)
 
 // ══ part 1: the rounding ══════════════════════════════════════════════════════
 
-static void needs_head_size_64_whole_tiles_and_an_h100(void)
+static void needs_its_head_size_whole_tiles_and_an_h100(void)
 {
     // Expect: attention_8bit_fits says no to a seq_len that is not a multiple of 64 (1000) and to a head_size
-    // other than 64 (32); and yes to 1024 and 64 exactly when the GPU's compute capability is 9.0 (an H100: the
-    // only one with WGMMA and TMA).
+    // other than FLASH_HEAD_SIZE (128; half of it, 64); and yes to 2048 and 128 exactly when the GPU's compute
+    // capability is 9.0 (an H100: the only one with WGMMA and TMA).
     // 1. this GPU's compute capability
     int device_index_val = 0;
     int major_val = 0;
@@ -229,9 +229,10 @@ static void needs_head_size_64_whole_tiles_and_an_h100(void)
 
 static void each_row_s_scale_is_a_power_of_2_that_fits_448(void)
 {
-    // Expect: random qkv {2, 12, 256}, with token 0 of batch 0 all 0. Every head row's scale is a power of 2,
-    // log2(scale) a whole number, and the smallest one with largest |value| / scale <= 448: so that ratio is in
-    // (224, 448]. Its 36 rows of 0s (12 heads x query, key, value) get scale 1.
+    // Expect: random qkv {2, 18, 256}, with token 0 of batch 0 all 0. Every head row's scale is a power of 2,
+    // log2(scale) a whole number, and the smallest one with largest |value| / scale <= 448 (each lane's 4 values
+    // in it, the warp's largest of them): so that ratio is in (224, 448]. Its 54 rows of 0s (18 heads x query,
+    // key, value) get scale 1.
     if (!eight_bit_runs_here(__func__))
         return;
     // 1. random qkv with one token of 0s; the forward
@@ -258,7 +259,7 @@ static void each_row_s_scale_is_a_power_of_2_that_fits_448(void)
 
 static void rounding_matches_pytorch_s_float8(void)
 {
-    // Expect: random qkv {2, 12, 256}. The forward's 8-bit query, key and value, turned back to bfloat16 by
+    // Expect: random qkv {2, 18, 256}. The forward's 8-bit query, key and value, turned back to bfloat16 by
     // attention_8bit_turn_back where qkv has them, are exactly PyTorch's: qkv / my scale, to float8_e4m3fn, back
     // to float, times the scale. Both round to the nearest E4M3 with ties to even, and turning back is exact.
     if (!eight_bit_runs_here(__func__))
@@ -300,37 +301,38 @@ static void matches_pytorch_on_the_rounded_values(size_t batch_size_val, size_t 
 
 static void matches_pytorch_on_one_tile(void)
 {
-    // Expect: {1, 2, 64}: one tile of 64 queries and 64 keys, all on the diagonal. Within the bfloat16
-    // tolerances of PyTorch on the rounded values.
+    // Expect: {1, 2, 64}: one tile of 64 queries and 64 keys, all on the diagonal; the E4M3 tiles' rows 128 bytes
+    // (the 128-byte swizzle, 4 WGMMAs of 32 across), the bfloat16 value tile two boxes of 64 values written by the
+    // threads. Within the bfloat16 tolerances of PyTorch on the rounded values.
     if (eight_bit_runs_here(__func__))
         matches_pytorch_on_the_rounded_values(1, 2, FLASH_TILE);
 }
 
 static void matches_pytorch_on_gpt2_heads_of_256_tokens(void)
 {
-    // Expect: {2, 12, 256}: 4 tiles per head, the online softmax's max moving from tile to tile, each key
+    // Expect: {2, 18, 256}: 4 tiles per head, the online softmax's max moving from tile to tile, each key
     // tile's scales loaded with it. The same.
     if (eight_bit_runs_here(__func__))
         matches_pytorch_on_the_rounded_values(2, GPT2_NUM_HEADS, 4 * FLASH_TILE);
 }
 
-static void matches_pytorch_on_gpt2_small_size(void)
+static void matches_pytorch_on_the_model_size(void)
 {
-    // Expect: {4, 12, 1024}, as training runs it: 16 tiles per head, 768 blocks. The same.
+    // Expect: {2, 18, 2048}, the model's rows of 2,048 tokens: 32 tiles per head, 1,152 blocks. The same.
     if (eight_bit_runs_here(__func__))
-        matches_pytorch_on_the_rounded_values(4, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
+        matches_pytorch_on_the_rounded_values(2, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
 }
 
 static void stays_near_pytorch_on_the_values_before_rounding(void)
 {
-    // Expect: {4, 12, 1024}, PyTorch in float on the bfloat16 qkv as it was, before rounding to E4M3: output
+    // Expect: {2, 18, 2048}, PyTorch in float on the bfloat16 qkv as it was, before rounding to E4M3: output
     // within EIGHT_BIT_TOLERANCE, qkv_grad within EIGHT_BIT_GRAD_TOLERANCE. What 8 bits cost, next to
     // bfloat16's 2e-2 and 5e-2.
     if (!eight_bit_runs_here(__func__))
         return;
     // 1. mine
     torch::manual_seed(0);
-    EightBitTensors mine_val(4, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
+    EightBitTensors mine_val(2, GPT2_NUM_HEADS, GPT2_SEQ_LEN);
     mine_val.fill_random();
     mine_val.forward();
     mine_val.backward();
@@ -369,9 +371,9 @@ static void every_kernel_fits_its_block(void)
 {
     // Expect: each kernel can be launched with its threads per block (256; the tile kernel's 128), and nothing
     // is spilled: cudaFuncGetAttributes' numRegs (registers per thread), maxThreadsPerBlock (the largest block)
-    // and localSizeBytes (local memory per thread, 0 if nothing spills). The forward kernel holds the scores and
-    // the output (32 sums each) and the attention_probs packed as A (16 registers); its query and key tiles stay
-    // in shared memory. The backward's kernels are attention_bf16.cuh's, tested there.
+    // and localSizeBytes (local memory per thread, 0 if nothing spills). The forward kernel holds the scores (32
+    // sums) and the output (64 at head size 128) and the attention_probs packed as A (16 registers); its query and
+    // key tiles stay in shared memory. The backward's kernels are attention_bf16.cuh's, tested there.
     const int kernel_count_val = 3;
     const void *kernels_list[kernel_count_val] = {(const void *)attention_8bit_round_qkv_kernel,
                                                   (const void *)attention_8bit_forward_kernel,
@@ -396,7 +398,7 @@ static void every_kernel_fits_its_block(void)
 
 static void any_block_size_gives_the_same_bits(void)
 {
-    // Expect: random qkv and output_grad, {2, 12, 256}. The forward with the rounding's block size, and the
+    // Expect: random qkv and output_grad, {2, 18, 256}. The forward with the rounding's block size, and the
     // backward with the turn-back's and row_dot's, set to 32, 128, 512 and 1024 (one warp up to
     // HARDWARE_MAX_THREADS_PER_BLOCK) give the defaults' 8-bit query, key, value, scales, output and qkv_grad to the
     // last bit: each head row is one warp's, each int of the turn-back one thread's, whatever the block.
@@ -432,13 +434,13 @@ static void any_block_size_gives_the_same_bits(void)
 int main(void)
 {
     start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
-    needs_head_size_64_whole_tiles_and_an_h100();
+    needs_its_head_size_whole_tiles_and_an_h100();
     each_row_s_scale_is_a_power_of_2_that_fits_448();
     rounding_matches_pytorch_s_float8();
 
     matches_pytorch_on_one_tile();
     matches_pytorch_on_gpt2_heads_of_256_tokens();
-    matches_pytorch_on_gpt2_small_size();
+    matches_pytorch_on_the_model_size();
     stays_near_pytorch_on_the_values_before_rounding();
 
     backward_writes_over_qkv_grad_the_same_every_time();

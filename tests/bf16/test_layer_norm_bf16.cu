@@ -403,19 +403,22 @@ static void many_rows_adding_onto_bias_grad_lose_nothing(void)
 
 static void every_kernel_fits_its_block(void)
 {
-    // Expect: the forward can be launched with LAYER_NORM_BF16_THREADS_PER_BLOCK (256) and the backward with
-    // LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK (512), and nothing is spilled: a lane's 8 values (and the 16-byte
-    // loads they are read into) stay in registers. cudaFuncGetAttributes reads what the compiler wrote down, without
-    // running anything:
+    // Expect: the forward can be launched with LAYER_NORM_BF16_THREADS_PER_BLOCK (256) and the backward made for
+    // GPT-2 small's 768 (3 loads a lane) with LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK (512), and nothing is spilled:
+    // a lane's 8 values (and the 16-byte loads they are read into) stay in registers. The backward made for the
+    // 2,304-wide model (9 loads a lane, 144 registers of sums) fits at least 256 threads (its launch lowers the block
+    // size to what fits), and spills nothing either. cudaFuncGetAttributes reads what the compiler wrote down,
+    // without running anything:
     //
     //     numRegs              registers per thread
     //     maxThreadsPerBlock   the largest block it can be launched with
     //     localSizeBytes       local memory per thread (spills and stack): 0 if nothing spills
-    const void *kernels_list[] = {(const void *)layer_norm_bf16_forward_kernel, (const void *)layer_norm_bf16_backward_kernel,
-                                  (const void *)layer_norm_bf16_backward_sums_kernel};
-    const char *names_list[] = {"layer_norm_bf16_forward_kernel", "layer_norm_bf16_backward_kernel",
-                                "layer_norm_bf16_backward_sums_kernel"};
-    int threads_list[] = {LAYER_NORM_BF16_THREADS_PER_BLOCK, LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK, LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK};
+    const void *kernels_list[] = {(const void *)layer_norm_bf16_forward_kernel, (const void *)layer_norm_bf16_backward_kernel<3>,
+                                  (const void *)layer_norm_bf16_backward_kernel<9>, (const void *)layer_norm_bf16_backward_sums_kernel};
+    const char *names_list[] = {"layer_norm_bf16_forward_kernel", "layer_norm_bf16_backward_kernel<3>",
+                                "layer_norm_bf16_backward_kernel<9>", "layer_norm_bf16_backward_sums_kernel"};
+    int threads_list[] = {LAYER_NORM_BF16_THREADS_PER_BLOCK, LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK, 8 * HARDWARE_THREADS_PER_WARP,
+                          LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK};
     for (int kernel_index_val = 0; kernel_index_val < (int)(sizeof(kernels_list) / sizeof(kernels_list[0])); kernel_index_val++)
     {
         // 1. what the compiler wrote down

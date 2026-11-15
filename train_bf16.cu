@@ -1,4 +1,4 @@
-// train_bf16.cu — trains GPT-2 small from scratch on the FineWeb-Edu token files in bfloat16 (model_bf16.cuh), on
+// train_bf16.cu — trains a GPT-2 of 32 layers x 2,304 (about 2.15B parameters) from scratch on the FineWeb-Edu token files in bfloat16 (model_bf16.cuh), on
 // one GPU or on several GPUs of one machine. The model's params, grads and activations are bfloat16; AdamWBf16
 // keeps float master params and bfloat16 m and v for this GPU's slice. The other two: train_fp32.cu (all float)
 // and train_8bit.cu (the products and m and v in 8 bits). The defaults are llm.c's GPT-2 (124M) run: 524,288
@@ -15,13 +15,12 @@
 //     ./train_bf16 --checkpoint-dir ckpt --resume ckpt                    # on from the newest (checkpoint.cuh)
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
-// {64, 1024}, 524,288 / (GPUs x 65,536) of them: 1 on 8 GPUs, 8 on one. 64 rows: the best MFU tune_model
-// found on an H100 NVL (16.3%, against 16.2% at 16 rows and 15.5% at 4: bigger products for the tensor cores and
-// fewer launches per step); its activations take about 34 GB of the GPU (T4: --batch-size 4).
+// {8, 2048}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 8 rows: about 36 GB of activations at
+// 2,048 tokens a row (tune_model finds the best for a GPU).
 //
 //     zero the grads
 //     micro_batches times:   next batch → gpt2_bf16_train_step: forward, backward (each row's loss
-//                            1 / (micro_batches x 65,536), the grads adding up)
+//                            1 / (micro_batches x 16,384), the grads adding up)
 //     average the grads over the GPUs, each GPU its own slice (on one GPU: nothing to do)
 //     the norm of all the grads → AdamW on this GPU's slice, at this step's learning rate, clipped to norm 1
 //     every GPU's slice of the new params to every GPU (on one GPU: nothing to do)
@@ -36,6 +35,40 @@
 #include "llmc/model_bf16.cuh"                      // GPT2ActivationsBf16, gpt2_bf16_train_step, AdamWBf16
 #include "llmc/helper/checkpoint.cuh"
 #include "llmc/kernels/bf16/grad_norm_bf16.cuh"     // GradNormBf16: the bfloat16 grads' norm
+
+// The model it trains (in place of GPT-2 small's 12 layers x 768, 12 heads, 1,024 tokens): about 2.15B parameters
+// (32 x 12 x 2,304² in the blocks, 50,304 x 2,304 in wte), head size 2,304 / 18 = 128
+#define TRAIN_BF16_NUM_LAYERS 32
+#define TRAIN_BF16_EMBED_DIM 2304
+#define TRAIN_BF16_NUM_HEADS 18
+#define TRAIN_BF16_MAX_SEQ_LEN 2048                     // wpe's rows, and the default tokens a row
+#define TRAIN_BF16_BATCH_SIZE 8                         // the default rows a micro-batch: about 4.5 GB of activations a row at 2,048 tokens (tune_model finds the best)
+#define TRAIN_BF16_LINEAR_BIAS 0                      // the 4 linears' biases: 0, none (as nanochat; no bias grads, 32 x 9 x 2,304 fewer
+                                                       // values); 1, GPT-2's. --linear-bias changes it. The LayerNorms keep theirs
+
+/// Gives the model this program trains: GPT2Config with the sizes above (the vocabulary GPT-2's), and the linears'
+/// biases or not as the run says.
+///
+///   c   the run's settings: linear_bias
+static GPT2Config model_config_of(const TrainConfig& c) {
+    GPT2Config config;
+    config.linear_bias = c.linear_bias;
+    config.num_layers = TRAIN_BF16_NUM_LAYERS;
+    config.embed_dim = TRAIN_BF16_EMBED_DIM;
+    config.num_heads = TRAIN_BF16_NUM_HEADS;
+    config.max_seq_len = TRAIN_BF16_MAX_SEQ_LEN;
+    return config;
+}
+
+/// Gives this program's run defaults: TrainConfig's, with the model's context as seq_len, TRAIN_BF16_BATCH_SIZE rows
+/// and TRAIN_BF16_LINEAR_BIAS.
+static TrainConfig train_defaults_of(void) {
+    TrainConfig defaults;
+    defaults.linear_bias = TRAIN_BF16_LINEAR_BIAS != 0;
+    defaults.seq_len = TRAIN_BF16_MAX_SEQ_LEN;
+    defaults.batch_size = TRAIN_BF16_BATCH_SIZE;
+    return defaults;
+}
 
 /// Gives the val loss: the mean loss of the first val_batches batches of each GPU's turn of the val files,
 /// averaged over the GPUs; from the start every time, so every val loss of a run is on the same tokens.
@@ -60,7 +93,7 @@ static float val_loss(DataLoader& val_loader, const Tensor& token_ids, const Ten
 
 int main(int argc, char** argv) {
     // 1. the settings, the GPUs and the data: every file's header checked before anything else
-    TrainConfig c = parse_args(argc, argv);
+    TrainConfig c = parse_args(argc, argv, train_defaults_of());
     Distributed distributed(c.nccl_id_file);                            // first: it picks this process's GPU
     int micro_batches = micro_batches_of(c, distributed);
     DataLoader train_loader(c.train_files, c.batch_size, c.seq_len, distributed.rank(), distributed.world_size());
@@ -69,7 +102,7 @@ int main(int argc, char** argv) {
 
     // 2. the model: its params and grads live in AdamWBf16, the model reads and writes views of them. Every rank
     // makes the same starting values from the same seed, and keeps the master of its own slice.
-    GPT2Config model_config;                                            // GPT-2 small
+    GPT2Config model_config = model_config_of(c);                        // 32 layers x 2,304, 18 heads, 2,048 tokens
     AdamWBf16 optimizer(GPT2Params::shapes(model_config), adamw_config_of(c), distributed.rank(),
                         distributed.world_size());
     GPT2Params params = params_of(optimizer, model_config);

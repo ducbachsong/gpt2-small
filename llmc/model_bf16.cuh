@@ -6,9 +6,11 @@
 //     the MLP's GELU is done inside its two linears (prod/mlp_up_bf16.cuh, prod/mlp_down_input_grad_bf16.cuh): GELU
 //         as each pair of mlp_up_output is stored, gelu' as each pair of mlp_up_output_grad is stored, so
 //         gelu_output_grad is never written
-//     the attention is flash attention (attention_flash_bf16.cuh) when attention_bf16_flash_fits (head_size 64,
-//         seq_len a multiple of 64, sm_80 or later); otherwise the steps (attention_bf16.cuh), which keep the
+//     the attention is flash attention (attention_flash_bf16.cuh) when attention_bf16_flash_fits (head_size
+//         FLASH_HEAD_SIZE, 128; seq_len a multiple of 64; an H100); otherwise the steps (attention_bf16.cuh), which keep the
 //         attention weights {B, NH, T, T}
+// With GPT2Config::linear_bias false the 4 linears have no bias: the params' biases are Tensor(), which the
+// products take as none, and the backward skips their 4 linear_bf16_bias_grad (the LayerNorms keep theirs).
 // The head's logits are bfloat16; bf16/softmax_loss_bf16.cuh works out the softmax and the loss from them in float,
 // and in a training micro-batch (gpt2_bf16_forward_backward) the logits' gradient in the same pass over them.
 // The params and grads live in AdamWBf16, with AdamW's float master, m and v for this GPU's slice; the model reads
@@ -248,17 +250,17 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
     // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored
     mlp_down_input_grad_bf16(a.mlp_up_output_grad_scratch, a.branch_output_grad_scratch, params.mlp_down_weight, a.mlp_up_output[l]);
     mlp_down_weight_grad_bf16(param_grads.mlp_down_weight, a.branch_output_grad_scratch, a.gelu_output[l]);
-    linear_bf16_bias_grad(param_grads.mlp_down_bias, a.branch_output_grad_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_down_bias, a.branch_output_grad_scratch);
     mlp_up_input_grad_bf16(a.ln_output_grad_scratch, a.mlp_up_output_grad_scratch, params.mlp_up_weight);
     mlp_up_weight_grad_bf16(param_grads.mlp_up_weight, a.mlp_up_output_grad_scratch, a.ln2_output[l]);
-    linear_bf16_bias_grad(param_grads.mlp_up_bias, a.mlp_up_output_grad_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_up_bias, a.mlp_up_output_grad_scratch);
     layer_norm_bf16_backward(a.residual2_grad_scratch, param_grads.ln2_weight, param_grads.ln2_bias,
                              a.ln_output_grad_scratch, a.residual2[l], params.ln2_weight, a.ln2_mean[l], a.ln2_rstd[l]);
     // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_bf16_backward(input_grad, a.branch_output_grad_scratch, a.residual2_grad_scratch);
     attention_output_input_grad_bf16(a.attention_output_grad_scratch, a.branch_output_grad_scratch, params.attention_out_weight);
     attention_output_weight_grad_bf16(param_grads.attention_out_weight, a.branch_output_grad_scratch, a.attention_output[l]);
-    linear_bf16_bias_grad(param_grads.attention_out_bias, a.branch_output_grad_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.attention_out_bias, a.branch_output_grad_scratch);
     if (a.flash_attention)
         attention_bf16_flash_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.attention_output[l],
                                       a.qkv[l], a.attention_logsumexp[l], a.attention_row_dot_scratch);
@@ -267,7 +269,7 @@ inline void block_bf16_backward(const Tensor& input_grad, const BlockParams& par
                                 a.attention_probs_grad_scratch);
     qkv_input_grad_bf16(a.ln_output_grad_scratch, a.qkv_grad_scratch, params.qkv_weight);
     qkv_weight_grad_bf16(param_grads.qkv_weight, a.qkv_grad_scratch, a.ln1_output[l]);
-    linear_bf16_bias_grad(param_grads.qkv_bias, a.qkv_grad_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.qkv_bias, a.qkv_grad_scratch);
     layer_norm_bf16_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, a.ln_output_grad_scratch, input,
                              params.ln1_weight, a.ln1_mean[l], a.ln1_rstd[l]);
 }

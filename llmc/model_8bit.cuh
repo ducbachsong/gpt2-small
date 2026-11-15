@@ -13,14 +13,18 @@
 //
 //     step                              kernel                          in 8 bits
 //     encoder, LayerNorms, residuals    bf16/                           nothing: no product
-//     the 4 linears of a block          8bit/linear_8bit.cuh            output, input_grad, weight_grad
-//     GELU                              8bit/gelu_8bit.cuh              inside mlp_up's forward, mlp_down's backward
+//     the 4 linears of a block          8bit/prod/<product>_8bit.cuh    output, input_grad, weight_grad: a kernel each
+//     GELU                              8bit/prod/mlp_up_8bit.cuh,      inside mlp_up's forward, mlp_down's backward
+//                                       mlp_down_input_grad_8bit.cuh
 //     attention                         8bit/attention_flash_8bit.cuh   query · keyᵀ; query, key, value kept in E4M3
-//     head + loss                       8bit/classifier_8bit.cuh        logits, lnf_output_grad, wte_grad
+//     head                              8bit/prod/head*_8bit.cuh        logits, lnf_output_grad, wte_grad
+//     loss                              bf16/softmax_loss_bf16.cuh      nothing: from the bfloat16 logits
+// With GPT2Config::linear_bias false the 4 linears have no bias, as in model_bf16.cuh: Tensor() biases the products
+// take as none, and no linear_bf16_bias_grad in the backward.
 // Each E4M3 is off by up to 2^-4 (6%) of its value, against bfloat16's 2^-8: the losses land a little off
 // model_bf16.cuh's. Every product rounds its own two sides (round_8bit), so the LayerNorms and the encoder run in
 // bfloat16: layer_norm_8bit.cuh's and encoder_8bit.cuh's copies would be made again by the product after them.
-// Needs an H100 (WGMMA and TMA), built with -arch=sm_90a; head_size 64, seq_len a multiple of 64, and batch_size x
+// Needs an H100 (WGMMA and TMA), built with -arch=sm_90a; head_size FLASH_HEAD_SIZE (128), seq_len a multiple of 64, and batch_size x
 // seq_len, embed_dim and padded_vocab_size multiples of ROUND_8BIT_ROW_LENGTH_MULTIPLE (16).
 #ifndef MODEL_8BIT_CUH
 #define MODEL_8BIT_CUH
@@ -32,18 +36,35 @@
 #include "kernels/bf16/encoder_bf16.cuh"
 #include "kernels/bf16/layer_norm_bf16.cuh"
 #include "kernels/bf16/residual_bf16.cuh"
-#include "kernels/8bit/linear_8bit.cuh"            // Linear8bitScratch, linear_8bit_forward, _backward
-#include "kernels/8bit/gelu_8bit.cuh"              // GELU inside the MLP's two linears
+#include "kernels/bf16/linear_bf16.cuh"            // linear_bf16_bias_grad: the linears' bias gradients, in float from bfloat16
+#include "kernels/bf16/softmax_loss_bf16.cuh"      // the softmax, the loss and its gradient from the bfloat16 logits
 #include "kernels/8bit/attention_flash_8bit.cuh"   // attention_8bit_forward, _backward
-#include "kernels/8bit/classifier_8bit.cuh"        // the head and the loss
 #include "kernels/8bit/adamw_8bit.cuh"            // AdamW8bit's update
+// GPT-2's 15 matrix products in 8 bits, each a kernel of its own with its own setting (its file's defines, from its
+// tests/8bit/prod/tune_<product>_8bit.cu) and its own 8-bit copies: a layer's forward, its backward's input_grad and
+// weight_grad, and the head's
+#include "kernels/8bit/prod/qkv_8bit.cuh"
+#include "kernels/8bit/prod/qkv_input_grad_8bit.cuh"
+#include "kernels/8bit/prod/qkv_weight_grad_8bit.cuh"
+#include "kernels/8bit/prod/attention_output_8bit.cuh"
+#include "kernels/8bit/prod/attention_output_input_grad_8bit.cuh"
+#include "kernels/8bit/prod/attention_output_weight_grad_8bit.cuh"
+#include "kernels/8bit/prod/mlp_up_8bit.cuh"                    // with GELU: gelu_output written beside mlp_up_output
+#include "kernels/8bit/prod/mlp_up_input_grad_8bit.cuh"
+#include "kernels/8bit/prod/mlp_up_weight_grad_8bit.cuh"
+#include "kernels/8bit/prod/mlp_down_8bit.cuh"
+#include "kernels/8bit/prod/mlp_down_input_grad_8bit.cuh"       // with GELU's backward: times gelu'(mlp_up_output)
+#include "kernels/8bit/prod/mlp_down_weight_grad_8bit.cuh"
+#include "kernels/8bit/prod/head_8bit.cuh"
+#include "kernels/8bit/prod/head_input_grad_8bit.cuh"
+#include "kernels/8bit/prod/head_weight_grad_8bit.cuh"
 
 /// Everything the model works in: mean, rstd, the scales, attention_logsumexp and the per-row tensors float;
 /// query, key and value in E4M3 (4 in each int of an Int32 tensor) with a float scale per head row; the rest
 /// bfloat16. Kept for the backward: the model's tensors, and a block's as lists, one tensor per layer
 /// (ln1_output[l] is layer l's); qkv itself is not kept: the backward turns query, key and value back from their
 /// 8-bit copies. With the _scratch suffix: used only inside one forward or backward, one of each, shared by all
-/// the layers, with the 8-bit copies of each product (one Linear8bitScratch per shape).
+/// the layers, with the 8-bit copies of each product (one set per product: its file's copies struct).
 struct GPT2Activations8bit {
     // ── kept for the backward: the model's ──
     Tensor encoded;                                         // {B, T, D}: the encoder's output, block 0's input
@@ -52,7 +73,7 @@ struct GPT2Activations8bit {
     Tensor lnf_mean;                                        // {B, T}
     Tensor lnf_rstd;                                        // {B, T}
     Tensor logits;                                          // {B, T, padded_vocab_size}; the backward writes logits_grad
-                                                            // over it (classifier_bf16_backward allows it): 6.6 GB less
+                                                            // over it (softmax_loss_bf16_backward allows it): 6.6 GB less
                                                             // at {64, 1024}
     Tensor losses;                                          // {B, T}
     Tensor max_of_each_row;                                 // {B, T}
@@ -86,16 +107,24 @@ struct GPT2Activations8bit {
     Tensor mlp_up_output_grad_scratch;                      // {B, T, 4D}
     Tensor qkv_grad_scratch;                                // {B, T, 3D}
     Tensor attention_row_dot_scratch;                       // {B, NH, T} float
-    Linear8bitScratch qkv_copies_scratch;                   // rows x D -> 3D
-    Linear8bitScratch attention_out_copies_scratch;         // rows x D -> D
-    Linear8bitScratch mlp_up_copies_scratch;                // rows x D -> 4D
-    Linear8bitScratch mlp_down_copies_scratch;              // rows x 4D -> D
-    Tensor losses_grad_scratch;                             // {B, T} float: 1 / (B x T) each
+    // each product's 8-bit copies {rows of output, its columns, its sum's length}
+    Qkv8bitCopies qkv_copies_scratch;                                        // {rows, 3D, D}
+    QkvInputGrad8bitCopies qkv_input_grad_copies_scratch;                    // {rows, D, 3D}
+    QkvWeightGrad8bitCopies qkv_weight_grad_copies_scratch;                  // {3D, D, rows}
+    AttentionOutput8bitCopies attention_output_copies_scratch;               // {rows, D, D}
+    AttentionOutputInputGrad8bitCopies attention_output_input_grad_copies_scratch;     // {rows, D, D}
+    AttentionOutputWeightGrad8bitCopies attention_output_weight_grad_copies_scratch;   // {D, D, rows}
+    MlpUp8bitCopies mlp_up_copies_scratch;                                   // {rows, 4D, D}
+    MlpUpInputGrad8bitCopies mlp_up_input_grad_copies_scratch;               // {rows, D, 4D}
+    MlpUpWeightGrad8bitCopies mlp_up_weight_grad_copies_scratch;             // {4D, D, rows}
+    MlpDown8bitCopies mlp_down_copies_scratch;                               // {rows, D, 4D}
+    MlpDownInputGrad8bitCopies mlp_down_input_grad_copies_scratch;           // {rows, 4D, D}
+    MlpDownWeightGrad8bitCopies mlp_down_weight_grad_copies_scratch;         // {D, 4D, rows}
+    Head8bitCopies head_copies_scratch;                                      // {rows, padded_vocab_size, D}
+    HeadInputGrad8bitCopies head_input_grad_copies_scratch;                  // {rows, D, padded_vocab_size}
+    HeadWeightGrad8bitCopies head_weight_grad_copies_scratch;                // {padded_vocab_size, D, rows}
     Tensor lnf_output_grad_scratch;                         // {B, T, D}
     Tensor residual_grads_scratch[2];                       // {B, T, D}: a block's output_grad and input_grad, in turns
-    Tensor tile_max_scratch;                                // {B, T, classifier_bf16_tile_columns(padded_vocab_size)} float
-    Tensor tile_sum_scratch;                                // the same
-    Linear8bitScratch head_copies_scratch;                  // rows x D -> padded_vocab_size
 
     GPT2Activations8bit(size_t batch_size, size_t seq_len, const GPT2Config& config);
 };
@@ -162,11 +191,21 @@ private:
 ///   batch_size, seq_len   B and T; T at most config.max_seq_len
 ///   config                the sizes; head_size HS = D / NH
 inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_len, const GPT2Config& config)
-    : qkv_copies_scratch(batch_size * seq_len, config.embed_dim, 3 * config.embed_dim),
-      attention_out_copies_scratch(batch_size * seq_len, config.embed_dim, config.embed_dim),
-      mlp_up_copies_scratch(batch_size * seq_len, config.embed_dim, 4 * config.embed_dim),
-      mlp_down_copies_scratch(batch_size * seq_len, 4 * config.embed_dim, config.embed_dim),
-      head_copies_scratch(batch_size * seq_len, config.embed_dim, config.padded_vocab_size) {
+    : qkv_copies_scratch(batch_size * seq_len, 3 * config.embed_dim, config.embed_dim),
+      qkv_input_grad_copies_scratch(batch_size * seq_len, config.embed_dim, 3 * config.embed_dim),
+      qkv_weight_grad_copies_scratch(3 * config.embed_dim, config.embed_dim, batch_size * seq_len),
+      attention_output_copies_scratch(batch_size * seq_len, config.embed_dim, config.embed_dim),
+      attention_output_input_grad_copies_scratch(batch_size * seq_len, config.embed_dim, config.embed_dim),
+      attention_output_weight_grad_copies_scratch(config.embed_dim, config.embed_dim, batch_size * seq_len),
+      mlp_up_copies_scratch(batch_size * seq_len, 4 * config.embed_dim, config.embed_dim),
+      mlp_up_input_grad_copies_scratch(batch_size * seq_len, config.embed_dim, 4 * config.embed_dim),
+      mlp_up_weight_grad_copies_scratch(4 * config.embed_dim, config.embed_dim, batch_size * seq_len),
+      mlp_down_copies_scratch(batch_size * seq_len, config.embed_dim, 4 * config.embed_dim),
+      mlp_down_input_grad_copies_scratch(batch_size * seq_len, 4 * config.embed_dim, config.embed_dim),
+      mlp_down_weight_grad_copies_scratch(config.embed_dim, 4 * config.embed_dim, batch_size * seq_len),
+      head_copies_scratch(batch_size * seq_len, config.padded_vocab_size, config.embed_dim),
+      head_input_grad_copies_scratch(batch_size * seq_len, config.embed_dim, config.padded_vocab_size),
+      head_weight_grad_copies_scratch(config.padded_vocab_size, config.embed_dim, batch_size * seq_len) {
     size_t B = batch_size;
     size_t T = seq_len;
     size_t D = config.embed_dim;
@@ -207,11 +246,8 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
     mlp_up_output_grad_scratch = Tensor::zeros({B, T, 4 * D}, bf16);
     qkv_grad_scratch = Tensor::zeros({B, T, 3 * D}, bf16);
     attention_row_dot_scratch = Tensor::zeros({B, NH, T});
-    losses_grad_scratch = Tensor::zeros({B, T});
     lnf_output_grad_scratch = Tensor::zeros({B, T, D}, bf16);
     residual_grads_scratch[0] = Tensor::zeros({B, T, D}, bf16), residual_grads_scratch[1] = Tensor::zeros({B, T, D}, bf16);
-    tile_max_scratch = Tensor::zeros({B, T, classifier_bf16_tile_columns(config.padded_vocab_size)});
-    tile_sum_scratch = Tensor::zeros({B, T, classifier_bf16_tile_columns(config.padded_vocab_size)});
 }
 
 // ── one block ─────────────────────────────────────────────────────────────────
@@ -229,19 +265,18 @@ inline void block_8bit_forward(const Tensor& output, const Tensor& input, const 
     size_t l = layer;
     // the attention branch; attention keeps query, key, value in 8 bits, so qkv is only scratch
     layer_norm_bf16_forward(a.ln1_output[l], a.ln1_mean[l], a.ln1_rstd[l], input, params.ln1_weight, params.ln1_bias);
-    linear_8bit_forward(a.qkv_scratch, a.ln1_output[l], params.qkv_weight, params.qkv_bias, a.qkv_copies_scratch);
+    qkv_8bit(a.qkv_scratch, a.ln1_output[l], params.qkv_weight, params.qkv_bias, a.qkv_copies_scratch);
     attention_8bit_forward(a.attention_output[l], a.query_8bit[l], a.key_8bit[l], a.value_8bit[l], a.query_scales[l],
                            a.key_scales[l], a.value_scales[l], a.attention_logsumexp[l], a.qkv_scratch);
-    linear_8bit_forward(a.branch_output_scratch, a.attention_output[l], params.attention_out_weight,
-                        params.attention_out_bias, a.attention_out_copies_scratch);
+    attention_output_8bit(a.branch_output_scratch, a.attention_output[l], params.attention_out_weight, params.attention_out_bias,
+                          a.attention_output_copies_scratch);
     residual_bf16_forward(a.residual2[l], input, a.branch_output_scratch);
     // the MLP branch; mlp_up and GELU in one product: GELU as each pair of mlp_up_output is stored
     layer_norm_bf16_forward(a.ln2_output[l], a.ln2_mean[l], a.ln2_rstd[l], a.residual2[l], params.ln2_weight,
                             params.ln2_bias);
-    gelu_8bit_forward(a.mlp_up_output[l], a.gelu_output[l], a.ln2_output[l], params.mlp_up_weight, params.mlp_up_bias,
-                      a.mlp_up_copies_scratch);
-    linear_8bit_forward(a.branch_output_scratch, a.gelu_output[l], params.mlp_down_weight, params.mlp_down_bias,
-                        a.mlp_down_copies_scratch);
+    mlp_up_8bit(a.mlp_up_output[l], a.gelu_output[l], a.ln2_output[l], params.mlp_up_weight, params.mlp_up_bias,
+                a.mlp_up_copies_scratch);
+    mlp_down_8bit(a.branch_output_scratch, a.gelu_output[l], params.mlp_down_weight, params.mlp_down_bias, a.mlp_down_copies_scratch);
     residual_bf16_forward(output, a.residual2[l], a.branch_output_scratch);
 }
 
@@ -261,23 +296,29 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_bf16_backward(a.residual2_grad_scratch, a.branch_output_grad_scratch, output_grad);
     // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored
-    gelu_8bit_backward(a.mlp_up_output_grad_scratch, param_grads.mlp_down_weight, param_grads.mlp_down_bias,
-                       a.branch_output_grad_scratch, a.gelu_output[l], params.mlp_down_weight, a.mlp_up_output[l],
-                       a.mlp_down_copies_scratch);
-    linear_8bit_backward(a.ln_output_grad_scratch, param_grads.mlp_up_weight, param_grads.mlp_up_bias,
-                         a.mlp_up_output_grad_scratch, a.ln2_output[l], params.mlp_up_weight, a.mlp_up_copies_scratch);
+    mlp_down_input_grad_8bit(a.mlp_up_output_grad_scratch, a.branch_output_grad_scratch, params.mlp_down_weight, a.mlp_up_output[l],
+                             a.mlp_down_input_grad_copies_scratch);
+    mlp_down_weight_grad_8bit(param_grads.mlp_down_weight, a.branch_output_grad_scratch, a.gelu_output[l],
+                              a.mlp_down_weight_grad_copies_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_down_bias, a.branch_output_grad_scratch);
+    mlp_up_input_grad_8bit(a.ln_output_grad_scratch, a.mlp_up_output_grad_scratch, params.mlp_up_weight, a.mlp_up_input_grad_copies_scratch);
+    mlp_up_weight_grad_8bit(param_grads.mlp_up_weight, a.mlp_up_output_grad_scratch, a.ln2_output[l], a.mlp_up_weight_grad_copies_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_up_bias, a.mlp_up_output_grad_scratch);
     layer_norm_bf16_backward(a.residual2_grad_scratch, param_grads.ln2_weight, param_grads.ln2_bias,
                              a.ln_output_grad_scratch, a.residual2[l], params.ln2_weight, a.ln2_mean[l], a.ln2_rstd[l]);
     // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_bf16_backward(input_grad, a.branch_output_grad_scratch, a.residual2_grad_scratch);
-    linear_8bit_backward(a.attention_output_grad_scratch, param_grads.attention_out_weight,
-                         param_grads.attention_out_bias, a.branch_output_grad_scratch, a.attention_output[l],
-                         params.attention_out_weight, a.attention_out_copies_scratch);
+    attention_output_input_grad_8bit(a.attention_output_grad_scratch, a.branch_output_grad_scratch, params.attention_out_weight,
+                                     a.attention_output_input_grad_copies_scratch);
+    attention_output_weight_grad_8bit(param_grads.attention_out_weight, a.branch_output_grad_scratch, a.attention_output[l],
+                                      a.attention_output_weight_grad_copies_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.attention_out_bias, a.branch_output_grad_scratch);
     attention_8bit_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.attention_output[l],
                             a.query_8bit[l], a.key_8bit[l], a.value_8bit[l], a.query_scales[l], a.key_scales[l],
                             a.value_scales[l], a.attention_logsumexp[l], a.qkv_scratch, a.attention_row_dot_scratch);
-    linear_8bit_backward(a.ln_output_grad_scratch, param_grads.qkv_weight, param_grads.qkv_bias, a.qkv_grad_scratch,
-                         a.ln1_output[l], params.qkv_weight, a.qkv_copies_scratch);
+    qkv_input_grad_8bit(a.ln_output_grad_scratch, a.qkv_grad_scratch, params.qkv_weight, a.qkv_input_grad_copies_scratch);
+    qkv_weight_grad_8bit(param_grads.qkv_weight, a.qkv_grad_scratch, a.ln1_output[l], a.qkv_weight_grad_copies_scratch);
+    if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.qkv_bias, a.qkv_grad_scratch);
     layer_norm_bf16_backward(input_grad, param_grads.ln1_weight, param_grads.ln1_bias, a.ln_output_grad_scratch, input,
                              params.ln1_weight, a.ln1_mean[l], a.ln1_rstd[l]);
 }
@@ -301,8 +342,8 @@ inline void gpt2_8bit_forward(const GPT2Activations8bit& activations, const Tens
     }
     layer_norm_bf16_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
                             params.lnf_bias);
-    classifier_8bit_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.tile_max_scratch, a.tile_sum_scratch,
-                            a.logits, a.lnf_output, params.wte, targets, config.vocab_size, a.head_copies_scratch);
+    head_8bit(a.logits, a.lnf_output, params.wte, a.head_copies_scratch);   // the head: no bias
+    softmax_loss_bf16_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
 
 /// Adds every parameter's gradient onto param_grads for the mean loss, the products in 8 bits: the forward's
@@ -318,12 +359,12 @@ inline void gpt2_8bit_backward(const GPT2Params& param_grads, const Tensor& toke
                                const GPT2Config& config, size_t micro_batches) {
     const GPT2Activations8bit& a = activations;
     size_t num_layers = params.blocks.size();
-    // loss = sum of the row losses / (micro_batches x B x T); the head's backward writes logits_grad over the
-    // logits, gives lnf_output_grad and adds its part onto wte_grad
-    a.losses_grad_scratch.fill_(1.0 / ((double)micro_batches * a.losses.numel()));
-    classifier_8bit_backward(a.lnf_output_grad_scratch, param_grads.wte, a.logits, a.losses_grad_scratch, a.logits,
-                             a.lnf_output, params.wte, targets, a.max_of_each_row, a.sum_of_each_row,
-                             config.vocab_size, a.head_copies_scratch);
+    // loss = sum of the row losses / (micro_batches x B x T); logits_grad written over the logits, then the head's
+    // backward: lnf_output_grad, and its part added onto wte_grad
+    float loss_grad_val = (float)(1.0 / ((double)micro_batches * a.losses.numel()));
+    softmax_loss_bf16_backward(a.logits, a.logits, targets, a.max_of_each_row, a.sum_of_each_row, config.vocab_size, loss_grad_val);
+    head_input_grad_8bit(a.lnf_output_grad_scratch, a.logits, params.wte, a.head_input_grad_copies_scratch);
+    head_weight_grad_8bit(param_grads.wte, a.logits, a.lnf_output, a.head_weight_grad_copies_scratch);
     Tensor output_grad = a.residual_grads_scratch[0];
     Tensor input_grad = a.residual_grads_scratch[1];
     output_grad.zero_();                                    // LayerNorm's backward adds onto it

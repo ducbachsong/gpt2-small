@@ -71,8 +71,8 @@
 #define HEAD_WEIGHT_GRAD_BF16_COLUMNS 256                        // a square's columns, its WGMMA's N: 64, 128 or 256
 #define HEAD_WEIGHT_GRAD_BF16_STAGES 3                           // sets of tiles in shared memory: 1 to HEAD_WEIGHT_GRAD_BF16_MAX_STAGES
 #define HEAD_WEIGHT_GRAD_BF16_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (head_weight_grad_bf16_auto_splits)
-#define HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP 16            // rows of squares a group of blocks runs down before the next column (1: row after row)
-#define HEAD_WEIGHT_GRAD_BF16_CLUSTER 2                          // blocks a cluster, sharing each right tile: 1 (none) or 2
+#define HEAD_WEIGHT_GRAD_BF16_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define HEAD_WEIGHT_GRAD_BF16_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define HEAD_WEIGHT_GRAD_BF16_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); HEAD_WEIGHT_GRAD_BF16_ONE_A_SQUARE: one a square
 #define HEAD_WEIGHT_GRAD_BF16_SPLITS_SUM_THREADS_PER_BLOCK 256     // the splits' sum's block size
 #define HEAD_WEIGHT_GRAD_BF16_SPLIT_COST_STEPS 15                  // SPLITS 0: what a split piece's float store and its share of the splits' sum cost, in steps of the walk (tune_head_weight_grad_bf16 prints each count's time beside the rule's)
@@ -83,8 +83,8 @@
 #define HEAD_WEIGHT_GRAD_BF16_MAX_STAGES 4                         // the most sets of tiles: with the room, a square must fit HARDWARE_MAX_SHARED_BYTES_PER_BLOCK
 #define HEAD_WEIGHT_GRAD_BF16_MAX_CLUSTER 2                        // the most blocks a cluster
 #define HEAD_WEIGHT_GRAD_BF16_PRODUCER_WARPGROUPS 1                // warpgroups of a block that only load tiles: the first one (its thread 0 asks TMA)
-#define HEAD_WEIGHT_GRAD_BF16_PRODUCER_REGISTERS 40                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_head_weight_grad_bf16 sweeps it
-#define HEAD_WEIGHT_GRAD_BF16_IN_FLIGHT 1                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_head_weight_grad_bf16 sweeps it
+#define HEAD_WEIGHT_GRAD_BF16_PRODUCER_REGISTERS 48                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_head_weight_grad_bf16 sweeps it
+#define HEAD_WEIGHT_GRAD_BF16_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_head_weight_grad_bf16 sweeps it
 #define HEAD_WEIGHT_GRAD_BF16_STAGED_ROWS 32                       // rows a consumer warpgroup stages and stores a round: 16, 32 or 64; tune_head_weight_grad_bf16 sweeps it
 #define HEAD_WEIGHT_GRAD_BF16_STAGED_ROW_PADDING 8                 // floats past COLUMNS in a staged row, a multiple of 4 (rows stay on 16 bytes): the rows a warp writes start in other banks; tune_head_weight_grad_bf16 sweeps it
 #define HEAD_WEIGHT_GRAD_BF16_STORE_VALUES 4                       // neighbouring values a thread stores at once: two pairs, 8 bytes

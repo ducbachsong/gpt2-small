@@ -35,7 +35,7 @@
 #define LAYER_NORM_BF16_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)             // the forward's default: fp32/layer_norm.cuh's, not swept for 8 values yet
 #define LAYER_NORM_BF16_BACKWARD_BLOCKS 80                                            // backward: blocks in every launch, as fp32/layer_norm.cuh's
 #define LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK (16 * HARDWARE_THREADS_PER_WARP)   // the backward's default, as fp32/layer_norm.cuh's
-#define LAYER_NORM_BF16_MAX_LOADS_PER_LANE 4                                       // backward: loads a lane takes per row, at most: embed_dim up to 4 x 32 x 8 = 1024; its sums stay in registers
+#define LAYER_NORM_BF16_MAX_LOADS_PER_LANE 9                                       // backward: loads a lane takes per row, at most: embed_dim up to 9 x 32 x 8 = 2304 (the 32 x 2,304 model's); its sums stay in registers, one kernel made for each count (768: 3)
 #define LAYER_NORM_BF16_EPS 1e-5f                                                     // added to the variance, as GPT-2 does
 #define LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)     // the backward's second kernel: one thread per value of bias_grad and weight_grad
 
@@ -137,10 +137,17 @@ __global__ void layer_norm_bf16_forward_kernel(nv_bfloat16* output_ptr, float* m
 
 // ── backward ──────────────────────────────────────────────────────────────────
 
+template <int LOADS_PER_LANE>
 __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_bfloat16* weight_grad_ptr, nv_bfloat16* bias_grad_ptr,
                                                 const nv_bfloat16* output_grad_ptr, const nv_bfloat16* input_ptr,
                                                 const nv_bfloat16* weight_ptr, const float* mean_ptr, const float* rstd_ptr,
                                                 float* block_sums_ptr, size_t rows_val, size_t embed_dim_val);
+template <int LOADS_PER_LANE>
+void layer_norm_bf16_backward_kernel_launch(int blocks_val, int threads_per_block_val, size_t shared_bytes_val,
+                                            nv_bfloat16* input_grad_ptr, nv_bfloat16* weight_grad_ptr, nv_bfloat16* bias_grad_ptr,
+                                            const nv_bfloat16* output_grad_ptr, const nv_bfloat16* input_ptr,
+                                            const nv_bfloat16* weight_ptr, const float* mean_ptr, const float* rstd_ptr,
+                                            float* block_sums_ptr, size_t rows_val, size_t embed_dim_val);
 __global__ void layer_norm_bf16_backward_sums_kernel(nv_bfloat16* weight_grad_ptr, nv_bfloat16* bias_grad_ptr,
                                                      const float* block_sums_ptr, int blocks_val, size_t embed_dim_val);
 
@@ -194,14 +201,22 @@ inline void layer_norm_bf16_backward_launch(const Tensor& input_grad_tensor, con
     static Tensor block_sums_tensor;
     if ((size_t)block_sums_tensor.numel() < (size_t)blocks_val * 2 * embed_dim_val)
         block_sums_tensor = Tensor::zeros({(size_t)blocks_val * 2 * embed_dim_val});
-    // 2. the gradients: input_grad written, each block's sums into its row
+    // 2. the gradients: input_grad written, each block's sums into its row, by the kernel made for the row's loads
+    //    a lane (768: 3, 2,304: 9)
+    using KernelLaunch = void (*)(int, int, size_t, nv_bfloat16*, nv_bfloat16*, nv_bfloat16*, const nv_bfloat16*, const nv_bfloat16*,
+                                  const nv_bfloat16*, const float*, const float*, float*, size_t, size_t);
+    static const KernelLaunch launches_list[LAYER_NORM_BF16_MAX_LOADS_PER_LANE] = {
+        layer_norm_bf16_backward_kernel_launch<1>, layer_norm_bf16_backward_kernel_launch<2>, layer_norm_bf16_backward_kernel_launch<3>,
+        layer_norm_bf16_backward_kernel_launch<4>, layer_norm_bf16_backward_kernel_launch<5>, layer_norm_bf16_backward_kernel_launch<6>,
+        layer_norm_bf16_backward_kernel_launch<7>, layer_norm_bf16_backward_kernel_launch<8>, layer_norm_bf16_backward_kernel_launch<9>};
+    static_assert(LAYER_NORM_BF16_MAX_LOADS_PER_LANE == 9, "one launch above for each count up to the most");
+    int loads_per_lane_val = (int)CEIL_DIV(embed_dim_val / LAYER_NORM_BF16_VALUES_PER_LOAD, (size_t)HARDWARE_THREADS_PER_WARP);
     size_t shared_bytes_val = 2 * embed_dim_val * sizeof(float);
-    layer_norm_bf16_backward_kernel<<<blocks_val, threads_per_block_val, shared_bytes_val>>>(
-        input_grad_tensor.data_ptr<nv_bfloat16>(), weight_grad_tensor.data_ptr<nv_bfloat16>(),
-        bias_grad_tensor.data_ptr<nv_bfloat16>(), output_grad_tensor.data_ptr<nv_bfloat16>(), input_tensor.data_ptr<nv_bfloat16>(),
-        weight_tensor.data_ptr<nv_bfloat16>(), mean_tensor.data(), rstd_tensor.data(), block_sums_tensor.data(), rows_val,
-        embed_dim_val);
-    cudaCheck(cudaGetLastError());
+    launches_list[loads_per_lane_val - 1](
+        blocks_val, threads_per_block_val, shared_bytes_val, input_grad_tensor.data_ptr<nv_bfloat16>(),
+        weight_grad_tensor.data_ptr<nv_bfloat16>(), bias_grad_tensor.data_ptr<nv_bfloat16>(), output_grad_tensor.data_ptr<nv_bfloat16>(),
+        input_tensor.data_ptr<nv_bfloat16>(), weight_tensor.data_ptr<nv_bfloat16>(), mean_tensor.data(), rstd_tensor.data(),
+        block_sums_tensor.data(), rows_val, embed_dim_val);
     // 3. the blocks' rows added up, onto bias_grad and weight_grad: one thread per value
     layer_norm_bf16_backward_sums_kernel<<<(unsigned)CEIL_DIV(2 * embed_dim_val, (size_t)LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK),
                                            LAYER_NORM_BF16_SUMS_THREADS_PER_BLOCK>>>(
@@ -223,6 +238,8 @@ inline void layer_norm_bf16_backward_launch(const Tensor& input_grad_tensor, con
 ///   block_sums_ptr                                                    {blocks, 2, embed_dim}: this block's row written
 ///   rows_val                                                          batch_size x seq_len
 ///   embed_dim_val                                                     the row length: 768
+/// LOADS_PER_LANE: the loads a lane takes in a row, at least embed_dim / (8 x 32): the registers its sums take.
+template <int LOADS_PER_LANE>
 __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_bfloat16* weight_grad_ptr, nv_bfloat16* bias_grad_ptr,
                                                 const nv_bfloat16* output_grad_ptr, const nv_bfloat16* input_ptr,
                                                 const nv_bfloat16* weight_ptr, const float* mean_ptr, const float* rstd_ptr,
@@ -241,8 +258,8 @@ __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_
     size_t row_loads_val = embed_dim_val / LAYER_NORM_BF16_VALUES_PER_LOAD;
     // this lane's columns' bias_grad and weight_grad over the rows its warp takes, in registers: its loads are
     // lane, lane + HARDWARE_THREADS_PER_WARP, ... in every row
-    float lane_bias_grad_list[LAYER_NORM_BF16_MAX_LOADS_PER_LANE][LAYER_NORM_BF16_VALUES_PER_LOAD] = {};
-    float lane_weight_grad_list[LAYER_NORM_BF16_MAX_LOADS_PER_LANE][LAYER_NORM_BF16_VALUES_PER_LOAD] = {};
+    float lane_bias_grad_list[LOADS_PER_LANE][LAYER_NORM_BF16_VALUES_PER_LOAD] = {};
+    float lane_weight_grad_list[LOADS_PER_LANE][LAYER_NORM_BF16_VALUES_PER_LOAD] = {};
     // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
     for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
         const nv_bfloat16* input_row_ptr = input_ptr + row_index_val * embed_dim_val;
@@ -274,7 +291,7 @@ __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_
 
         // 3. the three gradients: input_grad written; bias_grad and weight_grad into the lane's registers
 #pragma unroll
-        for (int lane_load_index_val = 0; lane_load_index_val < LAYER_NORM_BF16_MAX_LOADS_PER_LANE; lane_load_index_val++) {
+        for (int lane_load_index_val = 0; lane_load_index_val < LOADS_PER_LANE; lane_load_index_val++) {
             size_t load_index_val = lane_index_val + (size_t)lane_load_index_val * HARDWARE_THREADS_PER_WARP;
             if (load_index_val >= row_loads_val) continue;
             size_t first_index_val = LAYER_NORM_BF16_VALUES_PER_LOAD * load_index_val;
@@ -300,7 +317,7 @@ __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_
 
     // 4. each lane's sums into the block's copy: once a warp
 #pragma unroll
-    for (int lane_load_index_val = 0; lane_load_index_val < LAYER_NORM_BF16_MAX_LOADS_PER_LANE; lane_load_index_val++) {
+    for (int lane_load_index_val = 0; lane_load_index_val < LOADS_PER_LANE; lane_load_index_val++) {
         size_t load_index_val = lane_index_val + (size_t)lane_load_index_val * HARDWARE_THREADS_PER_WARP;
         if (load_index_val >= row_loads_val) continue;
         size_t first_index_val = LAYER_NORM_BF16_VALUES_PER_LOAD * load_index_val;
@@ -316,6 +333,33 @@ __global__ void layer_norm_bf16_backward_kernel(nv_bfloat16* input_grad_ptr, nv_
     float* block_row_ptr = block_sums_ptr + (size_t)blockIdx.x * 2 * embed_dim_val;
     for (size_t value_index_val = threadIdx.x; value_index_val < 2 * embed_dim_val; value_index_val += blockDim.x)
         block_row_ptr[value_index_val] = block_sums_list[value_index_val];
+}
+
+/// Launches layer_norm_bf16_backward_kernel<LOADS_PER_LANE>, its block no larger than its registers allow: a lane's
+/// sums take 2 x LOADS_PER_LANE x 8 registers (144 at 9 loads), so the 9-load kernel runs at most 256 or so threads a
+/// block where the 3-load one runs 512. The most is asked of CUDA once (cudaFuncGetAttributes), and the asked block
+/// size is lowered to it, whole warps; input_grad's bits do not change with the block size.
+///
+///   blocks_val, threads_per_block_val, shared_bytes_val   the launch asked for
+///   the pointers and sizes                               as layer_norm_bf16_backward_kernel takes them
+template <int LOADS_PER_LANE>
+inline void layer_norm_bf16_backward_kernel_launch(int blocks_val, int threads_per_block_val, size_t shared_bytes_val,
+                                                   nv_bfloat16* input_grad_ptr, nv_bfloat16* weight_grad_ptr, nv_bfloat16* bias_grad_ptr,
+                                                   const nv_bfloat16* output_grad_ptr, const nv_bfloat16* input_ptr,
+                                                   const nv_bfloat16* weight_ptr, const float* mean_ptr, const float* rstd_ptr,
+                                                   float* block_sums_ptr, size_t rows_val, size_t embed_dim_val) {
+    // 1. the most threads a block of this kernel can have, whole warps: asked once
+    static int most_threads_val = [] {
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, layer_norm_bf16_backward_kernel<LOADS_PER_LANE>));
+        return attributes_val.maxThreadsPerBlock / HARDWARE_THREADS_PER_WARP * HARDWARE_THREADS_PER_WARP;
+    }();
+    // 2. launch at the asked size, or the most
+    int threads_val = threads_per_block_val < most_threads_val ? threads_per_block_val : most_threads_val;
+    layer_norm_bf16_backward_kernel<LOADS_PER_LANE><<<blocks_val, threads_val, shared_bytes_val>>>(
+        input_grad_ptr, weight_grad_ptr, bias_grad_ptr, output_grad_ptr, input_ptr, weight_ptr, mean_ptr, rstd_ptr,
+        block_sums_ptr, rows_val, embed_dim_val);
+    cudaCheck(cudaGetLastError());
 }
 
 /// Adds the blocks' rows of block_sums up, in float, then onto bias_grad and weight_grad, each value rounded to

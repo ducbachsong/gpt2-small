@@ -1,4 +1,4 @@
-// train_8bit.cu — trains GPT-2 small from scratch on the FineWeb-Edu token files with its products in 8 bits
+// train_8bit.cu — trains a GPT-2 of 32 layers x 2,304 (about 2.15B parameters) from scratch on the FineWeb-Edu token files with its products in 8 bits
 // (model_8bit.cuh), on one H100 or on several of one machine: the params, grads and activations bfloat16,
 // each product's two sides rounded to FP8 E4M3 just before it; AdamW8bit keeps float master params and m and
 // sqrt(v) in 8 bits for this GPU's slice. No checkpoints yet. The other two: train_fp32.cu and train_bf16.cu.
@@ -11,11 +11,11 @@
 //     ./train_8bit --steps 20 --tokens-per-step 32768 --val-every 10      # a quick try
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
-// {64, 1024}, 524,288 / (GPUs x 65,536) of them: 1 on 8 GPUs, 8 on one. 64 rows, as train_bf16.cu runs.
+// {8, 2048}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 8 rows, as train_bf16.cu runs.
 //
 //     zero the grads
 //     micro_batches times:   next batch → gpt2_8bit_train_step: forward, backward (each row's loss
-//                            1 / (micro_batches x 65,536), the grads adding up)
+//                            1 / (micro_batches x 16,384), the grads adding up)
 //     average the grads over the GPUs, each GPU its own slice (on one GPU: nothing to do)
 //     the norm of all the grads → AdamW on this GPU's slice, at this step's learning rate, clipped to norm 1
 //     every GPU's slice of the new params to every GPU (on one GPU: nothing to do)
@@ -26,6 +26,40 @@
 #include "llmc/common/training.cuh"                 // TrainConfig, parse_args, learning_rate_at, print0, ...
 #include "llmc/model_8bit.cuh"                      // GPT2Activations8bit, gpt2_8bit_train_step, AdamW8bit
 #include "llmc/kernels/bf16/grad_norm_bf16.cuh"     // GradNormBf16: the grads stay bfloat16
+
+// The model it trains (in place of GPT-2 small's 12 layers x 768, 12 heads, 1,024 tokens): about 2.15B parameters
+// (32 x 12 x 2,304² in the blocks, 50,304 x 2,304 in wte), head size 2,304 / 18 = 128
+#define TRAIN_8BIT_NUM_LAYERS 32
+#define TRAIN_8BIT_EMBED_DIM 2304
+#define TRAIN_8BIT_NUM_HEADS 18
+#define TRAIN_8BIT_MAX_SEQ_LEN 2048                     // wpe's rows, and the default tokens a row
+#define TRAIN_8BIT_BATCH_SIZE 8                         // the default rows a micro-batch: about 4.5 GB of activations a row at 2,048 tokens (tune_model finds the best)
+#define TRAIN_8BIT_LINEAR_BIAS 0                      // the 4 linears' biases: 0, none (as nanochat; no bias grads, 32 x 9 x 2,304 fewer
+                                                       // values); 1, GPT-2's. --linear-bias changes it. The LayerNorms keep theirs
+
+/// Gives the model this program trains: GPT2Config with the sizes above (the vocabulary GPT-2's), and the linears'
+/// biases or not as the run says.
+///
+///   c   the run's settings: linear_bias
+static GPT2Config model_config_of(const TrainConfig& c) {
+    GPT2Config config;
+    config.linear_bias = c.linear_bias;
+    config.num_layers = TRAIN_8BIT_NUM_LAYERS;
+    config.embed_dim = TRAIN_8BIT_EMBED_DIM;
+    config.num_heads = TRAIN_8BIT_NUM_HEADS;
+    config.max_seq_len = TRAIN_8BIT_MAX_SEQ_LEN;
+    return config;
+}
+
+/// Gives this program's run defaults: TrainConfig's, with the model's context as seq_len, TRAIN_8BIT_BATCH_SIZE rows
+/// and TRAIN_8BIT_LINEAR_BIAS.
+static TrainConfig train_defaults_of(void) {
+    TrainConfig defaults;
+    defaults.linear_bias = TRAIN_8BIT_LINEAR_BIAS != 0;
+    defaults.seq_len = TRAIN_8BIT_MAX_SEQ_LEN;
+    defaults.batch_size = TRAIN_8BIT_BATCH_SIZE;
+    return defaults;
+}
 
 /// Gives the val loss: the mean loss of the first val_batches batches of each GPU's turn of the val files,
 /// averaged over the GPUs; from the start every time, so every val loss of a run is on the same tokens.
@@ -51,7 +85,7 @@ static float val_loss(DataLoader& val_loader, const Tensor& token_ids, const Ten
 int main(int argc, char** argv) {
     // 1. the settings (no checkpoints yet), the GPUs and the data: every file's header checked before anything
     // else
-    TrainConfig c = parse_args(argc, argv);
+    TrainConfig c = parse_args(argc, argv, train_defaults_of());
     if (!c.checkpoint_dir.empty() || !c.resume.empty()) {
         fprintf(stderr, "error: train_8bit has no checkpoints yet (no --checkpoint-dir or --resume): its m and v "
                         "are 8 bits\n");
@@ -65,7 +99,7 @@ int main(int argc, char** argv) {
 
     // 2. the model: its params and grads live in AdamW8bit, the model reads and writes views of them. Every rank
     // makes the same starting values from the same seed, and keeps the master of its own slice.
-    GPT2Config model_config;                                            // GPT-2 small
+    GPT2Config model_config = model_config_of(c);                        // 32 layers x 2,304, 18 heads, 2,048 tokens
     AdamW8bit optimizer(GPT2Params::shapes(model_config), adamw_config_of(c), distributed.rank(),
                         distributed.world_size());
     GPT2Params params = params_of(optimizer, model_config);

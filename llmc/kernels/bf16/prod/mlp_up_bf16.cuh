@@ -7,7 +7,7 @@
 //     tensor        type in memory   shape                                  read / written
 //     input         bfloat16         {rows, in_features}                    TMA, a 64 x 64 tile at a time (left)
 //     weight        bfloat16         {out_features, in_features}            TMA, a COLUMNS x 64 tile at a time (right)
-//     bias          bfloat16         {out_features}                         plain loads, as the sums are stored
+//     bias          bfloat16         {out_features}                         plain loads, as the sums are stored; or none (Tensor())
 //     gelu_input    bfloat16         {rows, out_features}                   written by TMA: the product + bias
 //     gelu_output   bfloat16         {rows, out_features}                   written by TMA: gelu of gelu_input
 //     sums          float            in registers                           the tensor cores' C
@@ -470,7 +470,7 @@ __global__ void mlp_up_bf16_kernel(const __grid_constant__ CUtensorMap left_map_
 ///   gelu_output_tensor   gelu_input's shape, bfloat16: written
 ///   input_tensor         {..., in_features} bfloat16
 ///   weight_tensor        {out_features, in_features} bfloat16
-///   bias_tensor          {out_features} bfloat16
+///   bias_tensor          {out_features} bfloat16, or Tensor() for none (nothing added)
 inline void mlp_up_bf16(const Tensor& gelu_input_tensor, const Tensor& gelu_output_tensor, const Tensor& input_tensor, const Tensor& weight_tensor,
                 const Tensor& bias_tensor) {
     mlp_up_bf16_at<MLP_UP_BF16_ROW_GROUPS, MLP_UP_BF16_COLUMNS, MLP_UP_BF16_STAGES, MLP_UP_BF16_CLUSTER>(gelu_input_tensor, gelu_output_tensor, input_tensor, weight_tensor,
@@ -510,9 +510,9 @@ inline void mlp_up_bf16_at(const Tensor& gelu_input_tensor, const Tensor& gelu_o
     bool fits_val = weight_tensor.dim() == 2 && weight_tensor.size(1) == in_features_val &&
                     output_tensor.size(output_tensor.dim() - 1) == out_features_val && output_tensor.numel() == rows_val * out_features_val;
     fits_val = fits_val && gelu_output_tensor.shape() == gelu_input_tensor.shape();
-    fits_val = fits_val && bias_tensor.dtype() == DType::BFloat16 && bias_tensor.shape() == Shape({out_features_val});
+    fits_val = fits_val && (bias_tensor.numel() == 0 || (bias_tensor.dtype() == DType::BFloat16 && bias_tensor.shape() == Shape({out_features_val})));
     if (!fits_val) {
-        fprintf(stderr, "error: mlp_up_bf16 needs input {..., in}, weight {out, in}, gelu_input and gelu_output {..., out} of input's rows, bias {out}\n");
+        fprintf(stderr, "error: mlp_up_bf16 needs input {..., in}, weight {out, in}, gelu_input and gelu_output {..., out} of input's rows, bias {out} or none\n");
         exit(EXIT_FAILURE);
     }
     if (block_rows_per_group_val < 1 || blocks_val < 0) {
@@ -550,7 +550,7 @@ inline void mlp_up_bf16_at(const Tensor& gelu_input_tensor, const Tensor& gelu_o
     unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
 
     // 5. launch; with clusters, by cudaLaunchKernelEx, which takes the cluster's size
-    const nv_bfloat16* bias_ptr = bias_tensor.data_ptr<nv_bfloat16>();
+    const nv_bfloat16* bias_ptr = bias_tensor.numel() > 0 ? bias_tensor.data_ptr<nv_bfloat16>() : nullptr;   // nullptr: no bias
     if (CLUSTER == 1) {
         kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val,
                                                                 side_map_val,
@@ -617,7 +617,7 @@ __device__ __forceinline__ float2 mlp_up_bf16_gelu_of(float2 pair_val) {
 ///
 ///   left_map_val, right_map_val, output_map_val   TMA's descriptions of left's, right's and output's tiles
 ///   side_map_val                                  ... and gelu_output's
-///   bias_ptr                                      {columns}
+///   bias_ptr                                      {columns}, or nullptr for none
 ///   rows_val, columns_val, sum_length_val         the product's sizes
 ///   block_rows_per_group_val                      the squares' order: rows of units a group runs down
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT>
@@ -828,7 +828,7 @@ mlp_up_bf16_kernel(const __grid_constant__ CUtensorMap left_map_val, const __gri
                 for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
                     int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
                     int column_index_val = block_first_column_index_val + column_in_square_val;
-                    float2 bias_val = column_index_val < columns_val
+                    float2 bias_val = bias_ptr != nullptr && column_index_val < columns_val
                                           ? __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(bias_ptr + column_index_val))
                                           : make_float2(0.0f, 0.0f);
                     int box_index_val = column_in_square_val / MLP_UP_BF16_ROW_VALUES;

@@ -25,8 +25,8 @@
 // The scales are powers of 2, so turning back is exact: the backward sees the very query, key and value the
 // forward used, and its gradient is the exact gradient of attention on the rounded values; the rounding itself
 // is passed through, as if it were not there.
-// Needs head_size FLASH_HEAD_SIZE, seq_len a multiple of FLASH_TILE, and an H100 (WGMMA and TMA exist only on
-// Hopper), built with -arch=sm_90a.
+// Needs head_size FLASH_HEAD_SIZE (64 or 128), seq_len a multiple of FLASH_TILE, and an H100 (WGMMA and TMA exist
+// only on Hopper), built with -arch=sm_90a.
 #ifndef ATTENTION_FLASH_8BIT_CUH
 #define ATTENTION_FLASH_8BIT_CUH
 
@@ -45,9 +45,15 @@
 #define ATTENTION_8BIT_TILE_BYTES_PER_ROW ((int)(FLASH_HEAD_SIZE * sizeof(__nv_fp8_e4m3)))   // an E4M3 tile's row in shared memory: a head row
 #define ATTENTION_8BIT_TILE_BYTES (FLASH_TILE * ATTENTION_8BIT_TILE_BYTES_PER_ROW)           // an E4M3 tile: what one TMA copy brings
 #define ATTENTION_8BIT_TILE_BYTES_PER_ATOM (HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN * ATTENTION_8BIT_TILE_BYTES_PER_ROW)   // from one atom's rows to the next's
+#define ATTENTION_8BIT_FULL_SWIZZLE_ROW (ATTENTION_8BIT_TILE_BYTES_PER_ROW == HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW)   // head size 128: an E4M3 head row is a whole swizzle row (the 128-byte swizzle); 64: half of one (the 64-byte swizzle)
+#define ATTENTION_8BIT_TMA_SWIZZLE (ATTENTION_8BIT_FULL_SWIZZLE_ROW ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B)   // the E4M3 tiles' swizzle, as TMA names it
+#define ATTENTION_8BIT_DESCRIPTOR_SWIZZLE (ATTENTION_8BIT_FULL_SWIZZLE_ROW ? HARDWARE_WGMMA_DESCRIPTOR_SWIZZLE_128 : HARDWARE_WGMMA_DESCRIPTOR_SWIZZLE_64)   // ... as the WGMMA descriptor names it
+#define ATTENTION_8BIT_VALUE_CELLS_PER_BOX_ROW ((int)(FLASH_BOX_VALUES_PER_ROW * sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL))   // the bfloat16 value tile: cells in a box's row, 8
 static_assert(ATTENTION_8BIT_HEAD_SIZE == FLASH_HEAD_SIZE, "the rounding's head rows are flash attention's");
-static_assert(2 * ATTENTION_8BIT_TILE_BYTES_PER_ROW == HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW, "an E4M3 head row is half a swizzle row: the 64-byte swizzle");
-static_assert(FLASH_HEAD_SIZE * sizeof(nv_bfloat16) == HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW, "the bfloat16 value tile's row is one swizzle row: a row's cells XOR the row");
+static_assert(2 * ATTENTION_8BIT_TILE_BYTES_PER_ROW == HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW || ATTENTION_8BIT_FULL_SWIZZLE_ROW,
+              "an E4M3 head row is half a swizzle row (the 64-byte swizzle) or a whole one (the 128-byte): head size 64 or 128");
+static_assert(ATTENTION_8BIT_VALUE_CELLS_PER_BOX_ROW == HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_ROW, "the bfloat16 value tile's box row is one swizzle row: a row's cells XOR the row");
+static_assert(ATTENTION_8BIT_VALUE_CELLS_PER_BOX_ROW % ATTENTION_8BIT_CELLS_PER_LOAD == 0, "one load's cells stay in one box");
 static_assert(sizeof(uint4) == HARDWARE_TMA_BYTES_PER_CELL, "the value tile is stored one cell, one uint4, at a time");
 
 // ── forward and backward ────────────────────────────────────────────────────────────
@@ -152,14 +158,15 @@ inline void attention_8bit_forward(const Tensor& output_tensor, const Tensor& qu
 // WGMMA m64n64k32 in E4M3: C {64, 64} += A {64, 32} · B {32, 64}, sums in float, one instruction for the block's
 // whole warpgroup; both tiles are read from shared memory as they sit, k along a token's values (FP8 WGMMA has
 // no transpose bit). An E4M3 tile {FLASH_TILE tokens, FLASH_HEAD_SIZE values} has rows of
-// ATTENTION_8BIT_TILE_BYTES_PER_ROW bytes, half of bfloat16's, so TMA writes it in the 64-byte swizzle (4 cells
-// a row, atoms of the same HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN rows), and the WGMMA descriptor says so.
+// ATTENTION_8BIT_TILE_BYTES_PER_ROW bytes, half of bfloat16's: at head size 64 TMA writes it in the 64-byte swizzle
+// (4 cells a row), at 128 in the 128-byte swizzle (8 cells, one whole swizzle row), atoms of the same
+// HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN rows, and the WGMMA descriptor says which.
 // C's layout is attention_flash_bf16.cuh's (WGMMA's, whatever the type of A and B), so the softmax below is the same.
 
 /// Gives TMA's description of an 8-bit tensor's tiles: its E4M3s as a matrix {matrix_rows head rows,
 /// FLASH_HEAD_SIZE bytes}, read in boxes of {FLASH_TILE rows, FLASH_HEAD_SIZE bytes} written into shared memory
-/// in the 64-byte swizzle. Made by the driver's cuTensorMapEncodeTiled, found at run time, so the program needs
-/// no -lcuda.
+/// in ATTENTION_8BIT_TMA_SWIZZLE (the 64-byte swizzle at head size 64, the 128-byte at 128). Made by the driver's
+/// cuTensorMapEncodeTiled, found at run time, so the program needs no -lcuda.
 ///
 ///   matrix_ptr        the tensor's first byte, on a HARDWARE_TMA_BYTES_PER_CELL-byte cell
 ///   matrix_rows_val   its head rows: batch_size x num_heads x seq_len
@@ -183,7 +190,7 @@ inline CUtensorMap attention_8bit_tensor_map(const void* matrix_ptr, size_t matr
     cuuint32_t element_steps_list[2] = {1, 1};                                         // every value, no gaps
     CUresult result_val = encode_ptr(&map_val, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(matrix_ptr), sizes_list,
                                      row_bytes_list, box_list, element_steps_list, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                     CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                     ATTENTION_8BIT_TMA_SWIZZLE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (result_val != CUDA_SUCCESS) {
         fprintf(stderr, "error: cuTensorMapEncodeTiled gave %d for a {%zu, %d}-byte matrix at %p\n", (int)result_val,
@@ -193,8 +200,9 @@ inline CUtensorMap attention_8bit_tensor_map(const void* matrix_ptr, size_t matr
     return map_val;
 }
 
-/// Gives the WGMMA descriptor of an E4M3 tile in shared memory, as wgmma_matmul_bf16.cuh's but for the 64-byte
-/// swizzle: rows of ATTENTION_8BIT_TILE_BYTES_PER_ROW bytes with k along them, the next
+/// Gives the WGMMA descriptor of an E4M3 tile in shared memory, as wgmma_matmul_bf16.cuh's but in
+/// ATTENTION_8BIT_DESCRIPTOR_SWIZZLE (64-byte or 128-byte): rows of ATTENTION_8BIT_TILE_BYTES_PER_ROW bytes with k
+/// along them, the next
 /// HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN rows ATTENTION_8BIT_TILE_BYTES_PER_ATOM on. Moving
 /// HARDWARE_WGMMA_K_E4M3 values of k is as many bytes more on the start address.
 ///
@@ -204,7 +212,7 @@ __device__ __forceinline__ uint64_t attention_8bit_descriptor(const uint8_t* til
     uint64_t descriptor_val = ((address_val & HARDWARE_WGMMA_DESCRIPTOR_ADDRESS_MASK_BITS) / HARDWARE_WGMMA_DESCRIPTOR_UNIT) << HARDWARE_WGMMA_DESCRIPTOR_ADDRESS_SHIFT;
     descriptor_val |= (uint64_t)(HARDWARE_TMA_BYTES_PER_CELL / HARDWARE_WGMMA_DESCRIPTOR_UNIT) << HARDWARE_WGMMA_DESCRIPTOR_LEADING_SHIFT;
     descriptor_val |= (uint64_t)(ATTENTION_8BIT_TILE_BYTES_PER_ATOM / HARDWARE_WGMMA_DESCRIPTOR_UNIT) << HARDWARE_WGMMA_DESCRIPTOR_STRIDE_SHIFT;
-    descriptor_val |= HARDWARE_WGMMA_DESCRIPTOR_SWIZZLE_64 << HARDWARE_WGMMA_DESCRIPTOR_SWIZZLE_SHIFT;
+    descriptor_val |= ATTENTION_8BIT_DESCRIPTOR_SWIZZLE << HARDWARE_WGMMA_DESCRIPTOR_SWIZZLE_SHIFT;
     return descriptor_val;
 }
 
@@ -236,12 +244,13 @@ __device__ __forceinline__ void attention_8bit_multiply_add(float (&sums_list)[F
 }
 
 /// Copies a {FLASH_TILE, FLASH_HEAD_SIZE} tile of E4M3 values into shared memory as bfloat16, each row times its
-/// scale: exact, the scale being a power of 2. Written in the layout TMA gives attention_flash_bf16.cuh's tiles (the
-/// 128-byte swizzle: cell c of row r at slot c XOR (r % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN)), so F5's
-/// WGMMA reads it as it reads theirs. ATTENTION_8BIT_LOAD_VALUES E4M3s per load, written as as many bfloat16s:
-/// ATTENTION_8BIT_CELLS_PER_LOAD cells.
+/// scale: exact, the scale being a power of 2. Written in the layout TMA gives attention_flash_bf16.cuh's tiles
+/// (FLASH_HEAD_BOXES boxes of 64 values side by side, FLASH_BOX_VALUES apart, each in the 128-byte swizzle: cell c
+/// of a box's row r at slot c XOR (r % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN)), so F5's WGMMA reads it as it
+/// reads theirs. ATTENTION_8BIT_LOAD_VALUES E4M3s per load, written as as many bfloat16s: ATTENTION_8BIT_CELLS_PER_LOAD
+/// cells, all in one box.
 ///
-///   tile_ptr     shared memory, on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom, rows FLASH_HEAD_SIZE apart
+///   tile_ptr     shared memory, on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom: FLASH_TILE_BYTES
 ///   source_ptr   the tile's first value in GPU memory, rows FLASH_HEAD_SIZE apart
 ///   scales_ptr   the tile's first row's scale; one per row
 __device__ __forceinline__ void attention_8bit_load_value_tile(nv_bfloat16* tile_ptr, const __nv_fp8_e4m3* source_ptr,
@@ -262,12 +271,14 @@ __device__ __forceinline__ void attention_8bit_load_value_tile(nv_bfloat16* tile
             pairs_list[2 * four_index_val] = __floats2bfloat162_rn(values_val.x * scale_val, values_val.y * scale_val);
             pairs_list[2 * four_index_val + 1] = __floats2bfloat162_rn(values_val.z * scale_val, values_val.w * scale_val);
         }
-        // 3. into the tile, a cell (one uint4) at a time, each at its swizzled slot of the row
-        uint4* row_cells_ptr = reinterpret_cast<uint4*>(tile_ptr + tile_row_index_val * FLASH_HEAD_SIZE);
+        // 3. into the tile, a cell (one uint4) at a time, each at its swizzled slot of its box's row
+        int first_cell_index_val = load_index_val * ATTENTION_8BIT_CELLS_PER_LOAD;            // in the whole head row
+        int box_index_val = first_cell_index_val / ATTENTION_8BIT_VALUE_CELLS_PER_BOX_ROW;
+        uint4* row_cells_ptr = reinterpret_cast<uint4*>(tile_ptr + box_index_val * FLASH_BOX_VALUES + tile_row_index_val * FLASH_BOX_VALUES_PER_ROW);
         int row_swizzle_val = tile_row_index_val % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN;
 #pragma unroll
         for (int load_cell_index_val = 0; load_cell_index_val < ATTENTION_8BIT_CELLS_PER_LOAD; load_cell_index_val++) {
-            int cell_index_val = load_index_val * ATTENTION_8BIT_CELLS_PER_LOAD + load_cell_index_val;
+            int cell_index_val = (first_cell_index_val + load_cell_index_val) % ATTENTION_8BIT_VALUE_CELLS_PER_BOX_ROW;   // in the box's row
             row_cells_ptr[cell_index_val ^ row_swizzle_val] = reinterpret_cast<const uint4*>(pairs_list)[load_cell_index_val];
         }
     }
@@ -292,9 +303,9 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
                               const float* query_scales_ptr, const float* key_scales_ptr, const float* value_scales_ptr,
                               int num_heads_val, int seq_len_val, float scale_val) {
     namespace cde = cuda::device::experimental;
-    // the E4M3 tiles as TMA writes them (the 64-byte swizzle), the value tile in bfloat16 (the 128-byte swizzle,
-    // written by the threads), each on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom, and the barrier that says
-    // TMA's have arrived
+    // the E4M3 tiles as TMA writes them (ATTENTION_8BIT_TMA_SWIZZLE), the value tile in bfloat16 (boxes in the
+    // 128-byte swizzle, written by the threads), each on a HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM atom, and the
+    // barrier that says TMA's have arrived: 8 + 8 + 16 KB at head size 128, inside the 48 KB of static shared memory
     __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) uint8_t query_tile_list[ATTENTION_8BIT_TILE_BYTES];
     __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) uint8_t key_tile_list[ATTENTION_8BIT_TILE_BYTES];
     __shared__ alignas(HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM) nv_bfloat16 value_tile_list[FLASH_TILE * FLASH_HEAD_SIZE];
@@ -404,7 +415,7 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
 #pragma unroll
         for (int k_step_index_val = 0; k_step_index_val < FLASH_TILE_K_STEPS; k_step_index_val++)
             flash_multiply_add_registers(output_list, prob_a_list[k_step_index_val],
-                                         value_tile_list + k_step_index_val * HARDWARE_WGMMA_K_BF16 * FLASH_HEAD_SIZE);
+                                         value_tile_list + k_step_index_val * FLASH_TURNED_K_STEP_VALUES);
         flash_wgmma_wait();
     }
 

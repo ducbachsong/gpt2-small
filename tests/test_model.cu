@@ -51,11 +51,22 @@ static const char *BLOCK_PARAM_NAMES[BLOCK_PARAMS] = {
     "qkv_weight", "attention_out_weight", "mlp_up_weight", "mlp_down_weight",
     "ln1_weight", "ln1_bias",             "qkv_bias",      "attention_out_bias",
     "ln2_weight", "ln2_bias",             "mlp_up_bias",   "mlp_down_bias"};
+// with no linear bias (GPT2Config::linear_bias false), a block's vectors are the LayerNorms' only
+static const char *NO_LINEAR_BIAS_VECTOR_NAMES[] = {"ln1_weight", "ln1_bias", "ln2_weight", "ln2_bias"};
+
+// two_layer_config's model with no linear bias: the 4 linears without, the LayerNorms with theirs.
+static GPT2Config two_layer_no_linear_bias_config()
+{
+    GPT2Config config_val;
+    config_val.num_layers = 2;
+    config_val.linear_bias = false;
+    return config_val;
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Gives every parameter's name in GPT2Params::shapes()' order, to print with its check: "wte", "wpe",
-/// "block 0 qkv_weight", ..., "lnf_bias".
+/// "block 0 qkv_weight", ..., "lnf_bias" (with no linear bias, a block's vectors the LayerNorms' 4).
 static std::vector<std::string> param_names(const GPT2Config &config_val)
 {
     std::vector<std::string> names_list = {"wte", "wpe"};
@@ -63,8 +74,10 @@ static std::vector<std::string> param_names(const GPT2Config &config_val)
         for (int param_index_val = 0; param_index_val < BLOCK_MATRICES; param_index_val++)
             names_list.push_back("block " + std::to_string(layer_index_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
     for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
-        for (int param_index_val = BLOCK_MATRICES; param_index_val < BLOCK_PARAMS; param_index_val++)
-            names_list.push_back("block " + std::to_string(layer_index_val) + " " + BLOCK_PARAM_NAMES[param_index_val]);
+        for (size_t vector_index_val = 0; vector_index_val < BlockParams::vector_count(config_val.linear_bias); vector_index_val++)
+            names_list.push_back("block " + std::to_string(layer_index_val) + " " +
+                                 (config_val.linear_bias ? BLOCK_PARAM_NAMES[BLOCK_MATRICES + vector_index_val]
+                                                         : NO_LINEAR_BIAS_VECTOR_NAMES[vector_index_val]));
     names_list.push_back("lnf_weight");
     names_list.push_back("lnf_bias");
     return names_list;
@@ -196,7 +209,8 @@ struct GPT2Tensors
             fill_random(block_val.mlp_down_weight, 1.0f / sqrtf(4.0f * config_val.embed_dim));
             for (const Tensor &bias_tensor : {block_val.ln1_bias, block_val.qkv_bias, block_val.attention_out_bias,
                                               block_val.ln2_bias, block_val.mlp_up_bias, block_val.mlp_down_bias})
-                fill_random(bias_tensor, 0.1f);
+                if (bias_tensor.numel() > 0)                       // Tensor(): no linear bias
+                    fill_random(bias_tensor, 0.1f);
             fill_random(block_val.ln1_weight, 0.1f, 1.0f);
             fill_random(block_val.ln2_weight, 0.1f, 1.0f);
         }
@@ -250,7 +264,8 @@ struct GPT2Tensors
 };
 
 /// Runs the block the plain PyTorch way, as GPT-2's model.py writes it, on PyTorch tensors: from input and the 12
-/// parameters in BlockParams::shapes()' order, gives the output. The same as test_block.cu's.
+/// parameters in BlockParams::shapes()' order, gives the output. The same as test_block.cu's. A linear bias
+/// left undefined (torch::Tensor()) is none: torch::linear adds nothing.
 static torch::Tensor pytorch_block_forward(const torch::Tensor &input_tensor, const std::vector<torch::Tensor> &p_list,
                                            int64_t num_heads_val)
 {
@@ -288,20 +303,25 @@ static torch::Tensor pytorch_gpt2_logits(const torch::Tensor &token_ids_tensor, 
     int64_t num_layers_val = (int64_t)config_val.num_layers;
     int64_t seq_len_val = token_ids_tensor.size(1);
     torch::Tensor x_tensor = torch::embedding(p_list[0], token_ids_tensor) + p_list[1].narrow(0, 0, seq_len_val);
-    // 2. the blocks, each's 12 gathered as GPT2Params does
+    // 2. the blocks, each's tensors gathered as GPT2Params does: 12, or with no linear bias 8, made 12 with the 4
+    //    linear biases undefined
+    int64_t vectors_val = (int64_t)BlockParams::vector_count(config_val.linear_bias);
     for (int64_t layer_index_val = 0; layer_index_val < num_layers_val; layer_index_val++)
     {
         std::vector<torch::Tensor> block_list;
         for (int64_t param_index_val = 0; param_index_val < BLOCK_MATRICES; param_index_val++)
             block_list.push_back(p_list[2 + BLOCK_MATRICES * layer_index_val + param_index_val]);
-        for (int64_t param_index_val = 0; param_index_val < BLOCK_PARAMS - BLOCK_MATRICES; param_index_val++)
-            block_list.push_back(p_list[2 + BLOCK_MATRICES * num_layers_val + (BLOCK_PARAMS - BLOCK_MATRICES) * layer_index_val +
-                                        param_index_val]);
+        const torch::Tensor *vectors_ptr = &p_list[2 + BLOCK_MATRICES * num_layers_val + vectors_val * layer_index_val];
+        if (config_val.linear_bias)
+            block_list.insert(block_list.end(), vectors_ptr, vectors_ptr + vectors_val);
+        else      // ln1_weight, ln1_bias, qkv_bias, attention_out_bias, ln2_weight, ln2_bias, mlp_up_bias, mlp_down_bias
+            block_list.insert(block_list.end(), {vectors_ptr[0], vectors_ptr[1], torch::Tensor(), torch::Tensor(),
+                                                 vectors_ptr[2], vectors_ptr[3], torch::Tensor(), torch::Tensor()});
         x_tensor = pytorch_block_forward(x_tensor, block_list, (int64_t)config_val.num_heads);
     }
-    // 3. lnf, then the head: wte, no bias
-    x_tensor = torch::layer_norm(x_tensor, {(int64_t)config_val.embed_dim}, p_list[2 + BLOCK_PARAMS * num_layers_val],
-                                 p_list[3 + BLOCK_PARAMS * num_layers_val], 1e-5);
+    // 3. lnf (the last two tensors), then the head: wte, no bias
+    x_tensor = torch::layer_norm(x_tensor, {(int64_t)config_val.embed_dim}, p_list[p_list.size() - 2],
+                                 p_list[p_list.size() - 1], 1e-5);
     return torch::linear(x_tensor, p_list[0]);
 }
 
@@ -386,6 +406,15 @@ static void forward_and_backward_in_bfloat16(void)
     forward_and_backward_match_pytorch(__func__, two_layer_config(), 2, 64, DType::BFloat16, BFLOAT16_TOLERANCE);
 }
 
+static void forward_and_backward_with_no_linear_bias_in_bfloat16(void)
+{
+    // Expect: forward_and_backward_in_bfloat16's model with no linear bias (GPT2Config::linear_bias false): the 4
+    // linears add nothing and have no gradient, the LayerNorms keep their biases. PyTorch's model the same way
+    // (torch::linear given no bias): the loss, the logits and all 20 parameter gradients (4 + 2 x 8) within
+    // BFLOAT16_TOLERANCE.
+    forward_and_backward_match_pytorch(__func__, two_layer_no_linear_bias_config(), 2, 64, DType::BFloat16, BFLOAT16_TOLERANCE);
+}
+
 static void forward_backward_gives_forward_then_backward_in_bfloat16(void)
 {
     // Expect: bfloat16, forward_and_backward_in_bfloat16's model. A training micro-batch's one pass
@@ -466,6 +495,43 @@ static void shapes_are_gpt2s_with_the_matrices_first(void)
     ASSERT_EQ(matrix_values_val, (size_t)124354560);
     ASSERT_EQ(vector_values_val, (size_t)121344);
     ASSERT_EQ(matrix_values_val + vector_values_val, (size_t)124475904);
+}
+
+static void no_linear_bias_drops_the_4_linear_biases(void)
+{
+    // Expect: GPT-2 small with linear_bias false has 4 + 12 x 8 = 100 parameter tensors: the same 50 matrices,
+    // then each block's 4 LayerNorm vectors (ln1_weight, ln1_bias, ln2_weight, ln2_bias, all {768}), then lnf's.
+    // 124,354,560 matrix values and 12 x 4 x 768 + 2 x 768 = 38,400 vector values: 124,392,960 in all, 82,944
+    // (12 x 9 x 768) fewer. Made from a buffer's views (2 layers), the 4 linear biases are Tensor(),
+    // has_linear_bias says no, and block 1's ln2_bias is tensor 2 + 8 + 4 + 3 = 17 of 20.
+    // 1. GPT-2 small's shapes
+    GPT2Config config_val;
+    config_val.linear_bias = false;
+    std::vector<Shape> shapes_list = GPT2Params::shapes(config_val);
+    ASSERT_EQ(shapes_list.size(), (size_t)100);
+    ASSERT_EQ(shapes_list[49], Shape({768, 3072}));              // block 11's mlp_down_weight, the last matrix
+    ASSERT_EQ(shapes_list[50], Shape({768}));                    // block 0's ln1_weight
+    ASSERT_EQ(shapes_list[54], Shape({768}));                    // block 1's ln1_weight
+    ASSERT_EQ(shapes_list[99], Shape({768}));                    // lnf_bias
+    size_t values_val = 0;
+    for (const Shape &shape_val : shapes_list)
+    {
+        size_t numel_val = 1;
+        for (size_t size_val : shape_val)
+            numel_val *= size_val;
+        values_val += numel_val;
+    }
+    ASSERT_EQ(values_val, (size_t)124392960);
+    // 2. the views of a small model of 2 layers
+    GPT2Config small_val = small_config();
+    small_val.linear_bias = false;
+    GPT2Tensors mine_val(small_val, 1, 4);
+    ASSERT_EQ(mine_val.params_val.tensors().size(), (size_t)20);
+    ASSERT_EQ(mine_val.params_val.blocks[1].has_linear_bias(), false);
+    ASSERT_EQ((size_t)mine_val.params_val.blocks[1].qkv_bias.numel(), (size_t)0);
+    ASSERT_EQ((size_t)mine_val.params_val.blocks[1].mlp_down_bias.numel(), (size_t)0);
+    ASSERT_EQ((const void *)mine_val.params_val.blocks[1].ln2_bias.data_ptr(),
+              (const void *)mine_val.param_buffer_val.tensor(0, 17).data_ptr());
 }
 
 static void params_are_views_in_shapes_order(void)
@@ -629,9 +695,11 @@ int main(void)
     matches_pytorch_with_small_odd_sizes();
     matches_pytorch_on_gpt2_widths();
     forward_and_backward_in_bfloat16();
+    forward_and_backward_with_no_linear_bias_in_bfloat16();
     forward_backward_gives_forward_then_backward_in_bfloat16();
 
     shapes_are_gpt2s_with_the_matrices_first();
+    no_linear_bias_drops_the_4_linear_biases();
     params_are_views_in_shapes_order();
     init_gives_gpt2s_starting_values();
     zero_wte_gives_every_word_the_same_chance();

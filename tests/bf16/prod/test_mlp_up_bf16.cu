@@ -129,7 +129,8 @@ static void reference(const Outputs &outputs_val, const Operands &operands_val
 static torch::Tensor pytorch_expected(const Operands &operands_val)
 {
     torch::Tensor expected_tensor = pytorch_copy_of(operands_val.input_tensor).matmul(pytorch_copy_of(operands_val.weight_tensor).t());
-    expected_tensor = expected_tensor + pytorch_copy_of(operands_val.bias_tensor);
+    if (operands_val.bias_tensor.numel() > 0)                                // Tensor(): no bias
+        expected_tensor = expected_tensor + pytorch_copy_of(operands_val.bias_tensor);
     return expected_tensor;
 }
 
@@ -173,6 +174,24 @@ static void matches_pytorch_with_sizes_no_tile_divides(void)
     // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH, no square nor step dividing them: TMA
     // gives 0s past the edges and stores nothing there; within 1e-2 of PyTorch's float product.
     matches_pytorch(__func__, ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH);
+}
+
+static void matches_pytorch_and_the_general_kernel_with_no_bias(void)
+{
+    // Expect: bias Tensor(), as a model with no linear bias passes it (GPT2Config::linear_bias false): nothing is
+    // added. Output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH: within 1e-2 of PyTorch's float product with
+    // no bias (and gelu_output, GELU of it), and the same bits as wgmma_matmul_bf16 given no bias.
+    Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 3);
+    operands_val.bias_tensor = Tensor();
+    Outputs mine_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
+    Outputs reference_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
+    mine(mine_val, operands_val);
+    reference(reference_val, operands_val);
+    torch::Tensor expected_tensor = pytorch_expected(operands_val);
+    print_test_name(__func__);
+    ASSERT_NEAR(relative_difference_on_gpu(mine_val.output_tensor, expected_tensor), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(mine_val.gelu_output_tensor, torch::gelu(expected_tensor, "tanh")), 0.0, BFLOAT16_TOLERANCE);
+    ASSERT_EQ(same_bits(mine_val, reference_val), true);
 }
 
 // ══ part 2: the bits ══════════════════════════════════════════════════════════
@@ -424,6 +443,7 @@ int main(void)
     start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     matches_pytorch_on_gpt2_size();
     matches_pytorch_with_sizes_no_tile_divides();
+    matches_pytorch_and_the_general_kernel_with_no_bias();
 
     gives_wgmma_matmul_bf16s_bits();
     every_square_gives_the_default_bits();
