@@ -32,7 +32,11 @@
 
 #define ROUND_8BIT_VALUES_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))      // E4M3s in one int of an Int32 tensor: 4
 #define ROUND_8BIT_ROW_LENGTH_MULTIPLE 16                                    // row_length's multiple: the products read rows of whole 16-byte pieces
-#define ROUND_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)         // the default: one warp per row
+#define ROUND_8BIT_THREADS_PER_BLOCK 0                                       // as it sits: the default block size, one block a row: 0, chosen by the row's width (round_8bit_threads_for)
+#define ROUND_8BIT_LOADS_PER_THREAD_AIM 2                                    // ... chosen: the fewest threads, a power of 2, holding the row in this many loads a thread ...
+#define ROUND_8BIT_LEAST_THREADS (8 * HARDWARE_THREADS_PER_WARP)             // ... at least 256 ...
+#define ROUND_8BIT_MOST_THREADS (16 * HARDWARE_THREADS_PER_WARP)             // ... at most 512: the fastest for rows of 2,304 (256) and 9,216 (512) on an H100 PCIe (tune_round_8bit)
+#define ROUND_8BIT_MAX_LOADS_PER_THREAD 16                                   // as it sits: 16-byte loads a thread holds in registers, at most (1, 2, 4, 8 or 16, a kernel each): a row of up to 16 x 8 x the block's threads values, 32,768 at 256
 #define ROUND_8BIT_TILE 128                                                  // the tile kernels' tile: 128 x 128 values, a turned row of it 128 E4M3s (128 bytes)
 #define ROUND_8BIT_TILE_THREADS (8 * HARDWARE_THREADS_PER_WARP)              // the tile kernels' block size: fixed by the tile
 #define ROUND_8BIT_LOAD_VALUES VALUES_PER_BF16_LOAD                          // bfloat16s a thread reads at once: one 16-byte load, 8
@@ -55,8 +59,8 @@ void round_8bit_rows_and_columns(const Tensor& rows_8bit_tensor, const Tensor& r
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
-__global__ void round_8bit_kernel(__nv_fp8_e4m3* rounded_ptr, float* scales_ptr, const nv_bfloat16* input_ptr, size_t rows_val,
-                                  int row_length_val);
+template <int LOADS_PER_THREAD>
+__global__ void round_8bit_rows_kernel(__nv_fp8_e4m3* rounded_ptr, float* scales_ptr, const nv_bfloat16* input_ptr, int row_length_val);
 __global__ void __launch_bounds__(ROUND_8BIT_TILE_THREADS)
 round_8bit_largest_kernel(unsigned* row_largest_ptr, unsigned* column_largest_ptr, const nv_bfloat16* input_ptr, size_t rows_val,
                           size_t columns_val);
@@ -66,48 +70,73 @@ round_8bit_tile_kernel(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv
                        size_t rows_val, size_t columns_val);
 void round_8bit_by_tiles(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv_fp8_e4m3* columns_8bit_ptr, float* column_scales_ptr,
                          const nv_bfloat16* input_ptr, size_t rows_val, size_t columns_val);
+int round_8bit_threads_for(size_t row_length_val);
 __device__ __forceinline__ float round_8bit_scale(float row_largest_val);
 
-/// Writes input rounded to E4M3, one power-of-2 scale per row: checks, then launches round_8bit_kernel (one warp
-/// per row), or for a turned input the tile kernels (round_8bit_by_tiles).
+/// Writes input rounded to E4M3, one power-of-2 scale per row: checks, then launches round_8bit_rows_kernel (one
+/// block a row, the row read once into registers), or for a turned input the tile kernels (round_8bit_by_tiles).
 ///
 ///   rounded_tensor          {rows, row_length / ROUND_8BIT_VALUES_PER_INT} Int32 (more dims allowed when not turned,
 ///                           as input's): written
 ///   scales_tensor           {rows} float (input's dims but the last, when not turned): written
 ///   input_tensor            bfloat16: {..., row_length}, or turned {..., rows} (row_length = all the other dims);
-///                           row_length a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE
+///                           row_length a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE; starting on 16 bytes
 ///   turned_val              true: input holds the matrix turned round
-///   threads_per_block_val   round_8bit_kernel's block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not
-///                           given: ROUND_8BIT_THREADS_PER_BLOCK. Any size gives the same bits; only the time changes.
-///                           The tile kernels' block size is fixed by the tile.
+///   threads_per_block_val   a row's block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; 0 (not given:
+///                           ROUND_8BIT_THREADS_PER_BLOCK): round_8bit_threads_for the row's width. Each thread holds the fewest loads of 1, 2, 4, 8, 16 its row
+///                           needs; a row longer than ROUND_8BIT_MAX_LOADS_PER_THREAD loads a thread (the head's logits'
+///                           gradient, 50,304 wide: 24.6 at 256) goes to the tile kernels instead. Any size gives the
+///                           same bits; only the time changes. The tile kernels' block size is fixed by the tile.
 inline void round_8bit(const Tensor& rounded_tensor, const Tensor& scales_tensor, const Tensor& input_tensor, bool turned_val,
                        int threads_per_block_val) {
     // 1. check the launch and the tensors; any of them wrong: stop with an error
-    check_threads_per_block(threads_per_block_val, "round_8bit");
     bool fits_val = input_tensor.dim() >= 1 && input_tensor.dtype() == DType::BFloat16 &&
                     rounded_tensor.dtype() == DType::Int32 && scales_tensor.dtype() == DType::Float32;
     size_t last_size_val = fits_val ? input_tensor.size(input_tensor.dim() - 1) : 1;
     size_t rows_val = turned_val ? last_size_val : input_tensor.numel() / last_size_val;
     size_t row_length_val = turned_val ? input_tensor.numel() / last_size_val : last_size_val;
+    if (threads_per_block_val == 0) threads_per_block_val = round_8bit_threads_for(row_length_val);
+    check_threads_per_block(threads_per_block_val, "round_8bit");
     fits_val = fits_val && row_length_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && (!turned_val || rows_val % ROUND_8BIT_LOAD_VALUES == 0) &&
                rounded_tensor.dim() >= 1 && rounded_tensor.size(rounded_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT == row_length_val &&
                rounded_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * row_length_val && scales_tensor.numel() == rows_val &&
-               (size_t)input_tensor.data_ptr() % (turned_val ? sizeof(uint4) : VALUES_PER_FLOAT4 * sizeof(nv_bfloat16)) == 0;
+               (size_t)input_tensor.data_ptr() % sizeof(uint4) == 0;
     if (!fits_val) {
-        fprintf(stderr, "error: round_8bit needs a bfloat16 input {..., row_length} (turned: {..., rows}, rows a multiple of %d, "
-                        "starting on 16 bytes) with row_length a multiple of %d, an Int32 rounded {rows, row_length / %d} and float "
-                        "scales {rows}\n",
+        fprintf(stderr, "error: round_8bit needs a bfloat16 input {..., row_length} (turned: {..., rows}, rows a multiple of %d) "
+                        "starting on 16 bytes, with row_length a multiple of %d, an Int32 rounded {rows, row_length / %d} and "
+                        "float scales {rows}\n",
                 ROUND_8BIT_LOAD_VALUES, ROUND_8BIT_ROW_LENGTH_MULTIPLE, (int)ROUND_8BIT_VALUES_PER_INT);
         exit(EXIT_FAILURE);
     }
+    size_t row_loads_val = row_length_val / ROUND_8BIT_LOAD_VALUES;
+    int loads_per_thread_val = 1;                            // the fewest of 1, 2, 4, 8, 16 that hold the row
+    while (loads_per_thread_val < ROUND_8BIT_MAX_LOADS_PER_THREAD && (size_t)loads_per_thread_val * threads_per_block_val < row_loads_val)
+        loads_per_thread_val *= 2;
+    // the kernel made for that many loads, and the largest block its registers allow (asked of CUDA once a kernel)
+    using RowsKernel = void (*)(__nv_fp8_e4m3*, float*, const nv_bfloat16*, int);
+    static const RowsKernel kernels_list[] = {round_8bit_rows_kernel<1>, round_8bit_rows_kernel<2>, round_8bit_rows_kernel<4>,
+                                              round_8bit_rows_kernel<8>, round_8bit_rows_kernel<16>};
+    static_assert(ROUND_8BIT_MAX_LOADS_PER_THREAD == 16, "a kernel above for each count of loads up to the most");
+    static int most_threads_list[sizeof(kernels_list) / sizeof(kernels_list[0])] = {};
+    int kernel_index_val = __builtin_ctz((unsigned)loads_per_thread_val);   // 1, 2, 4, 8, 16: 0 .. 4
+    if (most_threads_list[kernel_index_val] == 0) {
+        cudaFuncAttributes attributes_val;
+        cudaCheck(cudaFuncGetAttributes(&attributes_val, kernels_list[kernel_index_val]));
+        most_threads_list[kernel_index_val] = attributes_val.maxThreadsPerBlock;
+    }
+    bool row_fits_block_val = (size_t)loads_per_thread_val * threads_per_block_val >= row_loads_val &&
+                              threads_per_block_val <= most_threads_list[kernel_index_val];
 
-    // 2. launch: one warp per row; turned, the tile kernels writing only the turned copy (input's columns are the
-    //    copy's rows)
+    // 2. launch: one block a row, the kernel made for its loads a thread; a row longer than the block holds (or a
+    //    block larger than that kernel's registers allow), or turned, the tile kernels writing only the copy asked for
+    //    (turned: input's columns are the copy's rows)
     __nv_fp8_e4m3* rounded_ptr = reinterpret_cast<__nv_fp8_e4m3*>(rounded_tensor.data_ptr());
-    if (!turned_val) {
-        int blocks_val = (int)CEIL_DIV(rows_val * HARDWARE_THREADS_PER_WARP, (size_t)threads_per_block_val);
-        round_8bit_kernel<<<blocks_val, threads_per_block_val>>>(rounded_ptr, scales_tensor.data(), input_tensor.data_ptr<nv_bfloat16>(),
-                                                                 rows_val, (int)row_length_val);
+    if (!turned_val && !row_fits_block_val) {
+        round_8bit_by_tiles(rounded_ptr, scales_tensor.data(), nullptr, nullptr, input_tensor.data_ptr<nv_bfloat16>(), rows_val,
+                            row_length_val);
+    } else if (!turned_val) {
+        kernels_list[kernel_index_val]<<<(unsigned)rows_val, threads_per_block_val>>>(
+            rounded_ptr, scales_tensor.data(), input_tensor.data_ptr<nv_bfloat16>(), (int)row_length_val);
         cudaCheck(cudaGetLastError());
     } else {
         round_8bit_by_tiles(nullptr, nullptr, rounded_ptr, scales_tensor.data(), input_tensor.data_ptr<nv_bfloat16>(), row_length_val,
@@ -160,43 +189,61 @@ inline void round_8bit_rows_and_columns(const Tensor& rows_8bit_tensor, const Te
                         columns_val);
 }
 
-/// Rounds each row to E4M3, one warp per row: the row's largest |value| (warp_reduce_max), its scale, then
-/// value / scale rounded to the nearest E4M3 (saturating, as __nv_fp8x4_e4m3 does), VALUES_PER_FLOAT4 values per
-/// lane at a time.
+/// Rounds one row to E4M3 per block, reading it once: each thread's LOADS_PER_THREAD 16-byte loads (loads t,
+/// t + threads, ... of the row) kept in registers, the row's largest |value| (each warp's by warp_reduce_max, the
+/// warps' through shared memory), its scale, then those values / scale rounded to the nearest E4M3 (saturating, as
+/// __nv_fp8x4_e4m3 does), 8 a store. The largest is the same whatever the order, so any block size gives the same
+/// bits.
 ///
-///   rounded_ptr                 {rows, row_length} E4M3: written
-///   scales_ptr                  one float per row: written
-///   input_ptr                   {rows, row_length} bfloat16
-///   rows_val, row_length_val    the shape
-__global__ void round_8bit_kernel(__nv_fp8_e4m3* rounded_ptr, float* scales_ptr, const nv_bfloat16* input_ptr, size_t rows_val,
-                                  int row_length_val) {
+///   rounded_ptr      {rows, row_length} E4M3: written
+///   scales_ptr       one float per row: written
+///   input_ptr        {rows, row_length} bfloat16, on 16 bytes; rows: the launch's blocks
+///   row_length_val   a multiple of ROUND_8BIT_LOAD_VALUES, at most LOADS_PER_THREAD x 8 x the block's threads
+/// LOADS_PER_THREAD: the loads a thread holds, the registers its values take (8 floats each).
+template <int LOADS_PER_THREAD>
+__global__ void round_8bit_rows_kernel(__nv_fp8_e4m3* rounded_ptr, float* scales_ptr, const nv_bfloat16* input_ptr, int row_length_val) {
+    __shared__ float warp_largest_list[HARDWARE_MAX_WARPS_PER_BLOCK];
     int lane_index_val = threadIdx.x % HARDWARE_THREADS_PER_WARP;
-    size_t warp_index_val = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / HARDWARE_THREADS_PER_WARP;   // which warp of all launched
-    size_t warps_launched_val = (size_t)gridDim.x * blockDim.x / HARDWARE_THREADS_PER_WARP;
-    // Warp n takes rows n, n + every warp launched, ...: the same for all its lanes, so the warp stays whole
-    for (size_t row_index_val = warp_index_val; row_index_val < rows_val; row_index_val += warps_launched_val) {
-        const nv_bfloat16* row_ptr = input_ptr + row_index_val * row_length_val;
-        // 1. the row's largest |value|: this lane's float4s, then the warp's
-        float thread_largest_val = 0.0f;
-        for (int column_index_val = VALUES_PER_FLOAT4 * lane_index_val; column_index_val < row_length_val;
-             column_index_val += VALUES_PER_FLOAT4 * HARDWARE_THREADS_PER_WARP) {
-            float4 values_val = read4_as_float(row_ptr + column_index_val);
-            thread_largest_val = fmaxf(thread_largest_val, fmaxf(fmaxf(fabsf(values_val.x), fabsf(values_val.y)),
-                                                                 fmaxf(fabsf(values_val.z), fabsf(values_val.w))));
-        }
-        float row_largest_val = warp_reduce_max(thread_largest_val);
-        // 2. its scale, and the values over it, rounded
-        float scale_val = round_8bit_scale(row_largest_val);
-        float to_stored_val = 1.0f / scale_val;                             // exact: a power of 2
-        for (int column_index_val = VALUES_PER_FLOAT4 * lane_index_val; column_index_val < row_length_val;
-             column_index_val += VALUES_PER_FLOAT4 * HARDWARE_THREADS_PER_WARP) {
-            float4 values_val = read4_as_float(row_ptr + column_index_val);
-            *reinterpret_cast<__nv_fp8x4_e4m3*>(rounded_ptr + row_index_val * row_length_val + column_index_val) =
-                __nv_fp8x4_e4m3(make_float4(values_val.x * to_stored_val, values_val.y * to_stored_val,
-                                            values_val.z * to_stored_val, values_val.w * to_stored_val));
-        }
-        if (lane_index_val == 0) scales_ptr[row_index_val] = scale_val;
+    int warp_index_val = threadIdx.x / HARDWARE_THREADS_PER_WARP;
+    int row_loads_val = row_length_val / ROUND_8BIT_LOAD_VALUES;
+    const nv_bfloat16* row_ptr = input_ptr + (size_t)blockIdx.x * row_length_val;
+    // 1. this thread's loads of the row, kept, and their largest |value|
+    float values_list[LOADS_PER_THREAD][ROUND_8BIT_LOAD_VALUES];
+    float thread_largest_val = 0.0f;
+#pragma unroll
+    for (int thread_load_index_val = 0; thread_load_index_val < LOADS_PER_THREAD; thread_load_index_val++) {
+        int load_index_val = threadIdx.x + thread_load_index_val * blockDim.x;
+        if (load_index_val >= row_loads_val) continue;
+        read8_as_float(values_list[thread_load_index_val], row_ptr + load_index_val * ROUND_8BIT_LOAD_VALUES);
+#pragma unroll
+        for (int value_index_val = 0; value_index_val < ROUND_8BIT_LOAD_VALUES; value_index_val++)
+            thread_largest_val = fmaxf(thread_largest_val, fabsf(values_list[thread_load_index_val][value_index_val]));
     }
+    // 2. the row's largest: each warp's, then the warps' (every thread reads them all), and its scale
+    float warp_largest_val = warp_reduce_max(thread_largest_val);
+    if (lane_index_val == 0) warp_largest_list[warp_index_val] = warp_largest_val;
+    __syncthreads();
+    float row_largest_val = 0.0f;
+    for (int other_warp_index_val = 0; other_warp_index_val < (int)(blockDim.x / HARDWARE_THREADS_PER_WARP); other_warp_index_val++)
+        row_largest_val = fmaxf(row_largest_val, warp_largest_list[other_warp_index_val]);
+    float scale_val = round_8bit_scale(row_largest_val);
+    float to_stored_val = 1.0f / scale_val;                                 // exact: a power of 2
+    // 3. the kept values over it, rounded, 8 a store
+    __nv_fp8_e4m3* rounded_row_ptr = rounded_ptr + (size_t)blockIdx.x * row_length_val;
+#pragma unroll
+    for (int thread_load_index_val = 0; thread_load_index_val < LOADS_PER_THREAD; thread_load_index_val++) {
+        int load_index_val = threadIdx.x + thread_load_index_val * blockDim.x;
+        if (load_index_val >= row_loads_val) continue;
+        const float* values_ptr = values_list[thread_load_index_val];
+        __nv_fp8x4_e4m3 stored_list[ROUND_8BIT_LOAD_VALUES / VALUES_PER_FLOAT4];
+#pragma unroll
+        for (int four_index_val = 0; four_index_val < ROUND_8BIT_LOAD_VALUES / VALUES_PER_FLOAT4; four_index_val++)
+            stored_list[four_index_val] = __nv_fp8x4_e4m3(make_float4(
+                values_ptr[VALUES_PER_FLOAT4 * four_index_val] * to_stored_val, values_ptr[VALUES_PER_FLOAT4 * four_index_val + 1] * to_stored_val,
+                values_ptr[VALUES_PER_FLOAT4 * four_index_val + 2] * to_stored_val, values_ptr[VALUES_PER_FLOAT4 * four_index_val + 3] * to_stored_val));
+        *reinterpret_cast<uint2*>(rounded_row_ptr + load_index_val * ROUND_8BIT_LOAD_VALUES) = *reinterpret_cast<const uint2*>(stored_list);
+    }
+    if (threadIdx.x == 0) scales_ptr[blockIdx.x] = scale_val;
 }
 
 /// The tile kernels' first read: each row's and each column's largest |value| of input {rows, columns}, one
@@ -263,7 +310,7 @@ round_8bit_largest_kernel(unsigned* row_largest_ptr, unsigned* column_largest_pt
 ///                     tile column (neighbouring lanes, neighbouring columns: other banks), times 1 / the column's
 ///                     scale, rounded, and writes them as 16 E4M3s (16 bytes) of the turned row
 /// The blocks of the first tile row write the columns' scales, those of the first tile column the rows'. Rounding
-/// as round_8bit_kernel does (__nv_fp8x4_e4m3, saturating), so the same bits.
+/// as round_8bit_rows_kernel does (__nv_fp8x4_e4m3, saturating), so the same bits.
 ///
 ///   rows_8bit_ptr, row_scales_ptr           {rows, columns} E4M3 and {rows}: written; or nullptr
 ///   columns_8bit_ptr, column_scales_ptr     {columns, rows} E4M3 and {columns}: written; or nullptr
@@ -360,6 +407,18 @@ inline void round_8bit_by_tiles(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_
     round_8bit_tile_kernel<<<grid_val, ROUND_8BIT_TILE_THREADS>>>(rows_8bit_ptr, row_scales_ptr, columns_8bit_ptr, column_scales_ptr,
                                                                   row_largest_ptr, column_largest_ptr, input_ptr, rows_val, columns_val);
     cudaCheck(cudaGetLastError());
+}
+
+/// Gives round_8bit's block size for rows as they sit, from their width: the fewest threads, a power of 2, that
+/// hold the row in ROUND_8BIT_LOADS_PER_THREAD_AIM loads each, between ROUND_8BIT_LEAST_THREADS and
+/// ROUND_8BIT_MOST_THREADS: 256 for 2,304 values (1.1 loads a thread), 512 for 9,216 (2.2).
+///
+///   row_length_val   the row's values
+inline int round_8bit_threads_for(size_t row_length_val) {
+    size_t wanted_val = CEIL_DIV(row_length_val / ROUND_8BIT_LOAD_VALUES, (size_t)ROUND_8BIT_LOADS_PER_THREAD_AIM);
+    int threads_val = ROUND_8BIT_LEAST_THREADS;
+    while (threads_val < ROUND_8BIT_MOST_THREADS && (size_t)threads_val < wanted_val) threads_val *= 2;
+    return threads_val;
 }
 
 /// Gives a row's scale: the smallest power of 2 with row_largest / scale <= HARDWARE_E4M3_LARGEST; 1 for a row of

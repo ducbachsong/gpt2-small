@@ -1,5 +1,5 @@
 // tune_round_8bit.cu — the timings of llmc/kernels/8bit/round_8bit.cuh, apart from tests/8bit/test_round_8bit.cu so the tests
-// only check numbers: time_rounding_with_other_block_and_thread_counts (a matrix as it sits),
+// only check numbers: time_rounding_with_other_block_sizes (a matrix as it sits),
 // time_turned_rounding_of_each_shape (turned matrices, as a linear layer's backward rounds output_grad and input),
 // time_both_copies_of_each_output_grad (round_8bit_rows_and_columns against two calls). With the bytes each moves,
 // their GB/s and MBU. Sizes: the 32 x 2,304 model's micro-batch of 8 rows of 2,048 tokens.
@@ -59,95 +59,71 @@ static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &sca
 
 // ══ part 1: a matrix as it sits, other block and thread counts ════════════════
 
-static void time_rounding_with_other_block_and_thread_counts(void)
+/// Prints round_8bit as it sits on a random {GPT2_ROWS, row_length} matrix at the block size it picks for the width
+/// and at 128, 256, 512 and 1024 threads (a block a row; each thread holds the loads its row needs), taking turns over SWEEP_ROUNDS rounds, with the
+/// bytes it moves (each value read once, 2 bytes, and written once, 1 byte, and a scale a row), GB/s and MBU; then
+/// checks that each block size gives the default's bits.
+static void time_rows_at_each_block_size(const char *name_ptr, size_t row_length_val)
 {
-    // Prints the time of round_8bit_kernel on x {16384, 2304}, for 5 block counts x 5 thread counts, each the average
-    // of SWEEP_ROUNDS runs: as many as one warp per row needs, and this GPU's SM count x 1, 2, 4 and 8 (114 .. 912
-    // on an H100 PCIe). The launches take turns: SWEEP_ROUNDS rounds, each timing every launch once. With the bytes
-    // it moves (reads 2, writes 1 per value, and a scale per row), its GB/s and MBU.
-    //
-    // Expect: every launch gives the same E4M3s and scales as the usual one, to the last bit: each row is one warp's.
-
-    // 1. GPT-2's x; the usual rounding
+    // 1. random values; the default's rounding
     torch::manual_seed(0);
-    Tensor input_tensor = random_bf16_tensor({GPT2_ROWS, GPT2_EMBED_DIM});
-    Tensor rounded_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor input_tensor = random_bf16_tensor({GPT2_ROWS, row_length_val});
+    Tensor rounded_tensor = Tensor::zeros({GPT2_ROWS, row_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
     Tensor scales_tensor = Tensor::zeros({GPT2_ROWS});
     round_8bit(rounded_tensor, scales_tensor, input_tensor);
-    torch::Tensor usual_tensor = turned_back(rounded_tensor, scales_tensor, GPT2_ROWS, GPT2_EMBED_DIM);
-    size_t rows_val = GPT2_ROWS;
-    double moved_bytes_val = (double)GPT2_ROWS * GPT2_EMBED_DIM * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) +
+    torch::Tensor usual_tensor = turned_back(rounded_tensor, scales_tensor, GPT2_ROWS, (int64_t)row_length_val);
+    double moved_bytes_val = (double)GPT2_ROWS * row_length_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) +
                              (double)GPT2_ROWS * sizeof(float);
-
-    // 2. the launch, at the launch the loop sets
-    int blocks_val = 0;
-    int threads_val = 0;
-    auto round_val = [&] {
-        round_8bit_kernel<<<blocks_val, threads_val>>>(reinterpret_cast<__nv_fp8_e4m3 *>(rounded_tensor.data_ptr()),
-                                                       scales_tensor.data(), input_tensor.data_ptr<nv_bfloat16>(), rows_val,
-                                                       GPT2_EMBED_DIM);
-        cudaCheck(cudaGetLastError());
-    };
-    threads_val = ROUND_8BIT_THREADS_PER_BLOCK;
-    blocks_val = (int)CEIL_DIV(rows_val * HARDWARE_THREADS_PER_WARP, (size_t)threads_val);
-    warm_up_gpu(round_val);
-
-    // 3. time every launch, taking turns over SWEEP_ROUNDS rounds; block count choice 0 is "as many as the work needs"
-    int sms_val = 0;
-    cudaCheck(cudaDeviceGetAttribute(&sms_val, cudaDevAttrMultiProcessorCount, 0));
-    const int block_count_choices_val = 5;
-    const int thread_count_choices_val = 5;
-    int sm_multiples_list[block_count_choices_val] = {0, 1, 2, 4, 8};
-    int thread_counts_list[thread_count_choices_val] = {2 * HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP,
-                                                        16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
-    const int launches_val = block_count_choices_val * thread_count_choices_val;
-    auto blocks_of_val = [&](int launch_index_val) {
-        int multiple_val = sm_multiples_list[launch_index_val / thread_count_choices_val];
-        int threads_of_val = thread_counts_list[launch_index_val % thread_count_choices_val];
-        return multiple_val > 0 ? multiple_val * sms_val : (int)CEIL_DIV(rows_val * HARDWARE_THREADS_PER_WARP, (size_t)threads_of_val);
-    };
-    float total_ms_list[launches_val] = {};
+    // 2. time every block size, taking turns over SWEEP_ROUNDS rounds; the first the one round_8bit picks for the
+    //    width (0: ROUND_8BIT_THREADS_PER_BLOCK)
+    const int choices_val = 5;
+    const int threads_list[choices_val] = {0, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP,
+                                           HARDWARE_MAX_THREADS_PER_BLOCK};
+    float total_ms_list[choices_val] = {};
+    warm_up_gpu([&] { round_8bit(rounded_tensor, scales_tensor, input_tensor); });
     for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
-    {
-        for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
-        {
-            threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
-            blocks_val = blocks_of_val(launch_index_val);
-            total_ms_list[launch_index_val] += gpu_milliseconds(round_val);
-        }
-    }
-
-    // 4. print each launch's average with GB/s and MBU, and check its result against the usual one
+        for (int choice_index_val = 0; choice_index_val < choices_val; choice_index_val++)
+            total_ms_list[choice_index_val] += gpu_milliseconds(
+                [&] { round_8bit(rounded_tensor, scales_tensor, input_tensor, false, threads_list[choice_index_val]); });
+    // 3. print each with GB/s and MBU, and check its bits
     double peak_val = peak_gigabytes_per_second();
-    int launches_with_the_same_result_val = 0;
+    int same_count_val = 0;
     print_test_name(__func__);
-    printf("    %.1f MB moved; this GPU's peak %.0f GB/s\n", moved_bytes_val / MEGA, peak_val);
-    printf("    threads    blocks       ms     GB/s    MBU   same result\n");
-    for (int launch_index_val = 0; launch_index_val < launches_val; launch_index_val++)
+    printf("    %s {%d, %zu}: %.1f MB moved; this GPU's peak %.0f GB/s\n", name_ptr, GPT2_ROWS, row_length_val,
+           moved_bytes_val / MEGA, peak_val);
+    printf("    threads   loads a thread       ms     GB/s    MBU   same result\n");
+    for (int choice_index_val = 0; choice_index_val < choices_val; choice_index_val++)
     {
-        threads_val = thread_counts_list[launch_index_val % thread_count_choices_val];
-        blocks_val = blocks_of_val(launch_index_val);
         rounded_tensor.zero_();
         scales_tensor.zero_();
-        round_val();
-        bool same_val = torch::equal(turned_back(rounded_tensor, scales_tensor, GPT2_ROWS, GPT2_EMBED_DIM), usual_tensor);
+        round_8bit(rounded_tensor, scales_tensor, input_tensor, false, threads_list[choice_index_val]);
+        bool same_val = torch::equal(turned_back(rounded_tensor, scales_tensor, GPT2_ROWS, (int64_t)row_length_val), usual_tensor);
         if (same_val)
-            launches_with_the_same_result_val++;
-        float milliseconds_val = total_ms_list[launch_index_val] / SWEEP_ROUNDS;
+            same_count_val++;
+        float milliseconds_val = total_ms_list[choice_index_val] / SWEEP_ROUNDS;
         double speed_val = gigabytes_per_second(moved_bytes_val, milliseconds_val);
-        printf("    %7d   %7d   %6.3f   %6.0f   %3.0f%%   %s\n", threads_val, blocks_val, milliseconds_val, speed_val,
-               100.0 * speed_val / peak_val, same_val ? "yes" : "NO");
+        int threads_val = threads_list[choice_index_val] > 0 ? threads_list[choice_index_val] : round_8bit_threads_for(row_length_val);
+        printf("    %7d   %14.1f   %6.3f   %6.0f   %3.0f%%   %s%s\n", threads_val,
+               (double)row_length_val / ROUND_8BIT_LOAD_VALUES / threads_val, milliseconds_val, speed_val,
+               100.0 * speed_val / peak_val, same_val ? "yes" : "NO", threads_list[choice_index_val] == 0 ? "   <- picked for the width" : "");
     }
+    // 4. every block size gave the same result
+    ASSERT_EQ(same_count_val, choices_val);
+}
 
-    // 5. every launch gave the same result
-    ASSERT_EQ(launches_with_the_same_result_val, launches_val);
+static void time_rounding_with_other_block_sizes(void)
+{
+    // Prints, for the matrices a layer's forward rounds as they sit (x {16384, 2304}, mlp down's input {16384, 9216}),
+    // round_8bit at each block size: a block a row, the row read once into registers.
+    time_rows_at_each_block_size("x (2304 wide)", GPT2_EMBED_DIM);
+    time_rows_at_each_block_size("mlp down's input (9216 wide)", GPT2_MLP_DIM);
 }
 
 // ══ part 2: turned matrices ═══════════════════════════════════════════════════
 
 /// Prints the average of 20 turned roundings (steps 3..20) of a random {row_length, rows} matrix, both kernels
 /// together, with the bytes moved (the scales' kernel reads the matrix once, the turning reads it again and writes
-/// one byte a value), GB/s and MBU; then the same matrix as it sits ({rows, row_length}, round_8bit_kernel) for
+/// one byte a value), GB/s and MBU; then the same matrix as it sits ({rows, row_length}, round_8bit_rows_kernel) for
 /// comparison.
 static void time_turned_rounding_of_one_shape(const char *name_ptr, size_t row_length_val, size_t rows_val)
 {
@@ -273,7 +249,7 @@ static void time_both_copies_of_each_output_grad(void)
 int main(void)
 {
     start_tune_log(__FILE__);                   // the console, and tests/results/<GPU>/<kernel>_<date>_<time>.txt
-    time_rounding_with_other_block_and_thread_counts();
+    time_rounding_with_other_block_sizes();
     time_turned_rounding_of_each_shape();
     time_both_copies_of_each_output_grad();
 

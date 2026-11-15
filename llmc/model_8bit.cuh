@@ -77,6 +77,25 @@
 #include "kernels/bf16/prod/head_weight_grad_bf16.cuh"
 #endif
 
+/// One linear layer's weight {out, in} in 8 bits both ways, from one round_8bit_rows_and_columns: as it sits, the
+/// forward's right side (one scale an output feature, k along in), and turned, the input_grad's right side (one scale
+/// an input feature, k along out). Made once a step and kept (GPT2Activations8bit's weight copies): the weights change
+/// only at the optimizer's update, as NVIDIA Transformer Engine caches its FP8 weights over a step's micro-batches.
+struct LinearWeight8bitCopies {
+    Tensor rows_8bit_tensor;                                // {out, in / 4} Int32
+    Tensor row_scales_tensor;                               // {out} float
+    Tensor turned_8bit_tensor;                              // {in, out / 4} Int32
+    Tensor turned_scales_tensor;                            // {in} float
+
+    LinearWeight8bitCopies() = default;
+    /// Makes them, all 0, for a weight {out_features, in_features}.
+    LinearWeight8bitCopies(size_t out_features, size_t in_features)
+        : rows_8bit_tensor(Tensor::zeros({out_features, in_features / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          row_scales_tensor(Tensor::zeros({out_features})),
+          turned_8bit_tensor(Tensor::zeros({in_features, out_features / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          turned_scales_tensor(Tensor::zeros({in_features})) {}
+};
+
 /// Everything the model works in: mean, rstd, the scales, attention_logsumexp and the per-row tensors float;
 /// query, key and value in E4M3 (4 in each int of an Int32 tensor) with a float scale per head row; the rest
 /// bfloat16. Kept for the backward: the model's tensors, and a block's as lists, one tensor per layer
@@ -143,6 +162,15 @@ struct GPT2Activations8bit {
     HeadWeightGrad8bitCopies head_weight_grad_copies_scratch;                // {padded_vocab_size, D, rows}
     Tensor lnf_output_grad_scratch;                         // {B, T, D}
     Tensor residual_grads_scratch[2];                       // {B, T, D}: a block's output_grad and input_grad, in turns
+    // ── the weights in 8 bits both ways, one set per layer: made by the first forward after
+    //    gpt2_8bit_weights_changed (call it after each optimizer step), kept until the next. 2 bytes a weight: 4.3 GB
+    //    for the 32 x 2,304 model ──
+    std::vector<LinearWeight8bitCopies> qkv_weight_copies;             // {3D, D}
+    std::vector<LinearWeight8bitCopies> attention_out_weight_copies;   // {D, D}
+    std::vector<LinearWeight8bitCopies> mlp_up_weight_copies;          // {4D, D}
+    std::vector<LinearWeight8bitCopies> mlp_down_weight_copies;        // {D, 4D}
+    LinearWeight8bitCopies wte_copies;                                 // {padded_vocab_size, D}: the head's
+    mutable bool weight_copies_made = false;                           // they hold the params' current values
 
     GPT2Activations8bit(size_t batch_size, size_t seq_len, const GPT2Config& config);
 };
@@ -155,6 +183,8 @@ void block_8bit_backward(const Tensor& input_grad, const BlockParams& param_grad
                          size_t layer);
 
 // ── the whole model ───────────────────────────────────────────────────────────
+void gpt2_8bit_weights_changed(const GPT2Activations8bit& activations);
+void gpt2_8bit_round_weights(const GPT2Activations8bit& activations, const GPT2Params& params);
 void gpt2_8bit_forward(const GPT2Activations8bit& activations, const Tensor& token_ids, const Tensor& targets,
                        const GPT2Params& params, const GPT2Config& config);
 void gpt2_8bit_backward(const GPT2Params& param_grads, const Tensor& token_ids, const Tensor& targets,
@@ -223,7 +253,8 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
       mlp_down_weight_grad_copies_scratch(config.embed_dim, 4 * config.embed_dim, batch_size * seq_len),
       head_copies_scratch(batch_size * seq_len, config.padded_vocab_size, config.embed_dim),
       head_input_grad_copies_scratch(batch_size * seq_len, config.embed_dim, config.padded_vocab_size),
-      head_weight_grad_copies_scratch(config.padded_vocab_size, config.embed_dim, batch_size * seq_len) {
+      head_weight_grad_copies_scratch(config.padded_vocab_size, config.embed_dim, batch_size * seq_len),
+      wte_copies(config.padded_vocab_size, config.embed_dim) {
     size_t B = batch_size;
     size_t T = seq_len;
     size_t D = config.embed_dim;
@@ -254,6 +285,11 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
         ln2_mean.push_back(Tensor::zeros({B, T})), ln2_rstd.push_back(Tensor::zeros({B, T}));
         mlp_up_output.push_back(Tensor::zeros({B, T, 4 * D}, bf16));
         gelu_output.push_back(Tensor::zeros({B, T, 4 * D}, bf16));
+        // the layer's weights in 8 bits, made by the first forward
+        qkv_weight_copies.push_back(LinearWeight8bitCopies(3 * D, D));
+        attention_out_weight_copies.push_back(LinearWeight8bitCopies(D, D));
+        mlp_up_weight_copies.push_back(LinearWeight8bitCopies(4 * D, D));
+        mlp_down_weight_copies.push_back(LinearWeight8bitCopies(D, 4 * D));
     }
     // 3. scratch (the 8-bit copies made above)
     qkv_scratch = Tensor::zeros({B, T, 3 * D}, bf16);
@@ -270,8 +306,39 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
 
 // ── one block ─────────────────────────────────────────────────────────────────
 
+/// Gives a forward product's copies: its scratch's own tensors with the input rounded into the left side (one scale
+/// a token), and the weight's 8-bit copy as it sits (made once a step) as the right side.
+///
+///   scratch_val   the product's copies scratch: its left side written
+///   input         {B, T, in} bfloat16
+///   weight_val    the weight's copies (GPT2Activations8bit's)
+/// COPIES: the product's copies type, e.g. Qkv8bitCopies.
+template <typename COPIES>
+inline COPIES forward_copies_8bit(const COPIES& scratch_val, const Tensor& input, const LinearWeight8bitCopies& weight_val) {
+    round_8bit(scratch_val.left_8bit_tensor, scratch_val.left_scales_tensor, input);
+    COPIES copies_val = scratch_val;
+    copies_val.right_8bit_tensor = weight_val.rows_8bit_tensor;
+    copies_val.right_scales_tensor = weight_val.row_scales_tensor;
+    return copies_val;
+}
+
+/// Gives an input_grad product's copies: its scratch's left side (output_grad, rounded by linear_8bit_round_backward)
+/// and the weight's 8-bit copy turned round (made once a step) as the right side.
+///
+///   scratch_val   the product's copies scratch
+///   weight_val    the weight's copies (GPT2Activations8bit's)
+/// COPIES: the product's copies type, e.g. QkvInputGrad8bitCopies.
+template <typename COPIES>
+inline COPIES input_grad_copies_8bit(const COPIES& scratch_val, const LinearWeight8bitCopies& weight_val) {
+    COPIES copies_val = scratch_val;
+    copies_val.right_8bit_tensor = weight_val.turned_8bit_tensor;
+    copies_val.right_scales_tensor = weight_val.turned_scales_tensor;
+    return copies_val;
+}
+
 /// Writes output = block `layer` applied to input with its products in 8 bits, keeping what the backward needs in
-/// that layer's activations.
+/// that layer's activations. Each product's input is rounded here; its weight's 8-bit copy is the step's
+/// (gpt2_8bit_round_weights).
 ///
 ///   output, input   {batch_size, seq_len, embed_dim} bfloat16; not the same tensor (the backward reads input)
 ///   params          the block's, bfloat16
@@ -283,35 +350,36 @@ inline void block_8bit_forward(const Tensor& output, const Tensor& input, const 
     size_t l = layer;
     // the attention branch; attention keeps query, key, value in 8 bits, so qkv is only scratch
     layer_norm_bf16_forward(a.ln1_output[l], a.ln1_mean[l], a.ln1_rstd[l], input, params.ln1_weight, params.ln1_bias);
-    qkv_8bit(a.qkv_scratch, a.ln1_output[l], params.qkv_weight, params.qkv_bias, a.qkv_copies_scratch);
+    qkv_8bit_rounded(a.qkv_scratch, params.qkv_bias, forward_copies_8bit(a.qkv_copies_scratch, a.ln1_output[l], a.qkv_weight_copies[l]));
     attention_8bit_forward(a.attention_output[l], a.query_8bit[l], a.key_8bit[l], a.value_8bit[l], a.query_scales[l],
                            a.key_scales[l], a.value_scales[l], a.attention_logsumexp[l], a.qkv_scratch);
-    attention_output_8bit(a.branch_output_scratch, a.attention_output[l], params.attention_out_weight, params.attention_out_bias,
-                          a.attention_output_copies_scratch);
+    attention_output_8bit_rounded(a.branch_output_scratch, params.attention_out_bias,
+                                  forward_copies_8bit(a.attention_output_copies_scratch, a.attention_output[l], a.attention_out_weight_copies[l]));
     residual_bf16_forward(a.residual2[l], input, a.branch_output_scratch);
     // the MLP branch; mlp_up and GELU in one product: GELU as each pair of mlp_up_output is stored
     layer_norm_bf16_forward(a.ln2_output[l], a.ln2_mean[l], a.ln2_rstd[l], a.residual2[l], params.ln2_weight,
                             params.ln2_bias);
-    mlp_up_8bit(a.mlp_up_output[l], a.gelu_output[l], a.ln2_output[l], params.mlp_up_weight, params.mlp_up_bias,
-                a.mlp_up_copies_scratch);
-    mlp_down_8bit(a.branch_output_scratch, a.gelu_output[l], params.mlp_down_weight, params.mlp_down_bias, a.mlp_down_copies_scratch);
+    mlp_up_8bit_rounded(a.mlp_up_output[l], a.gelu_output[l], params.mlp_up_bias,
+                        forward_copies_8bit(a.mlp_up_copies_scratch, a.ln2_output[l], a.mlp_up_weight_copies[l]));
+    mlp_down_8bit_rounded(a.branch_output_scratch, params.mlp_down_bias,
+                          forward_copies_8bit(a.mlp_down_copies_scratch, a.gelu_output[l], a.mlp_down_weight_copies[l]));
     residual_bf16_forward(output, a.residual2[l], a.branch_output_scratch);
 }
 
 /// Rounds a linear layer's backward operands once each into its two products' copies: output_grad both ways in two
 /// reads (round_8bit_rows_and_columns: the input_grad's left as it sits, one scale a token; the weight_grad's left
-/// turned, one scale an output feature), the weight turned (the input_grad's right) and the input turned (the
-/// weight_grad's right). With MODEL_8BIT_WEIGHT_GRAD_BF16, only the input_grad's: its weight_grad is bfloat16.
+/// turned, one scale an output feature) and the input turned (the weight_grad's right). The weight's turned copy, the
+/// input_grad's right, is the step's (input_grad_copies_8bit). With MODEL_8BIT_WEIGHT_GRAD_BF16, only output_grad as
+/// it sits: the weight_grad is bfloat16.
 ///
 ///   input_grad_copies_val    the input_grad product's copies: written
 ///   weight_grad_copies_val   the weight_grad product's: written (not with MODEL_8BIT_WEIGHT_GRAD_BF16)
 ///   output_grad              {B, T, out} bfloat16
-///   weight                   {out, in} bfloat16
 ///   input                    {B, T, in} bfloat16: the forward's input of the linear
 /// INPUT_GRAD_COPIES, WEIGHT_GRAD_COPIES: the products' copies types, e.g. QkvInputGrad8bitCopies, QkvWeightGrad8bitCopies.
 template <typename INPUT_GRAD_COPIES, typename WEIGHT_GRAD_COPIES>
 inline void linear_8bit_round_backward(const INPUT_GRAD_COPIES& input_grad_copies_val, const WEIGHT_GRAD_COPIES& weight_grad_copies_val,
-                                       const Tensor& output_grad, const Tensor& weight, const Tensor& input) {
+                                       const Tensor& output_grad, const Tensor& input) {
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     (void)weight_grad_copies_val, (void)input;
     round_8bit(input_grad_copies_val.left_8bit_tensor, input_grad_copies_val.left_scales_tensor, output_grad);
@@ -320,7 +388,6 @@ inline void linear_8bit_round_backward(const INPUT_GRAD_COPIES& input_grad_copie
                                 weight_grad_copies_val.left_8bit_tensor, weight_grad_copies_val.left_scales_tensor, output_grad);
     round_8bit(weight_grad_copies_val.right_8bit_tensor, weight_grad_copies_val.right_scales_tensor, input, true);
 #endif
-    round_8bit(input_grad_copies_val.right_8bit_tensor, input_grad_copies_val.right_scales_tensor, weight, true);
 }
 
 /// Writes input_grad and adds block `layer`'s parameter gradients onto param_grads, the products in 8 bits: the
@@ -340,18 +407,16 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_bf16_backward(a.residual2_grad_scratch, a.branch_output_grad_scratch, output_grad);
     // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored
-    linear_8bit_round_backward(a.mlp_down_input_grad_copies_scratch, a.mlp_down_weight_grad_copies_scratch, a.branch_output_grad_scratch,
-                               params.mlp_down_weight, a.gelu_output[l]);
-    mlp_down_input_grad_8bit_rounded(a.mlp_up_output_grad_scratch, a.mlp_up_output[l], a.mlp_down_input_grad_copies_scratch);
+    linear_8bit_round_backward(a.mlp_down_input_grad_copies_scratch, a.mlp_down_weight_grad_copies_scratch, a.branch_output_grad_scratch, a.gelu_output[l]);
+    mlp_down_input_grad_8bit_rounded(a.mlp_up_output_grad_scratch, a.mlp_up_output[l], input_grad_copies_8bit(a.mlp_down_input_grad_copies_scratch, a.mlp_down_weight_copies[l]));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     mlp_down_weight_grad_bf16(param_grads.mlp_down_weight, a.branch_output_grad_scratch, a.gelu_output[l]);
 #else
     mlp_down_weight_grad_8bit_rounded(param_grads.mlp_down_weight, a.mlp_down_weight_grad_copies_scratch);
 #endif
     if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_down_bias, a.branch_output_grad_scratch);
-    linear_8bit_round_backward(a.mlp_up_input_grad_copies_scratch, a.mlp_up_weight_grad_copies_scratch, a.mlp_up_output_grad_scratch,
-                               params.mlp_up_weight, a.ln2_output[l]);
-    mlp_up_input_grad_8bit_rounded(a.ln_output_grad_scratch, a.mlp_up_input_grad_copies_scratch);
+    linear_8bit_round_backward(a.mlp_up_input_grad_copies_scratch, a.mlp_up_weight_grad_copies_scratch, a.mlp_up_output_grad_scratch, a.ln2_output[l]);
+    mlp_up_input_grad_8bit_rounded(a.ln_output_grad_scratch, input_grad_copies_8bit(a.mlp_up_input_grad_copies_scratch, a.mlp_up_weight_copies[l]));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     mlp_up_weight_grad_bf16(param_grads.mlp_up_weight, a.mlp_up_output_grad_scratch, a.ln2_output[l]);
 #else
@@ -363,8 +428,8 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     // the attention branch; LayerNorm 1 adds its part onto input_grad
     residual_bf16_backward(input_grad, a.branch_output_grad_scratch, a.residual2_grad_scratch);
     linear_8bit_round_backward(a.attention_output_input_grad_copies_scratch, a.attention_output_weight_grad_copies_scratch,
-                               a.branch_output_grad_scratch, params.attention_out_weight, a.attention_output[l]);
-    attention_output_input_grad_8bit_rounded(a.attention_output_grad_scratch, a.attention_output_input_grad_copies_scratch);
+                               a.branch_output_grad_scratch, a.attention_output[l]);
+    attention_output_input_grad_8bit_rounded(a.attention_output_grad_scratch, input_grad_copies_8bit(a.attention_output_input_grad_copies_scratch, a.attention_out_weight_copies[l]));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     attention_output_weight_grad_bf16(param_grads.attention_out_weight, a.branch_output_grad_scratch, a.attention_output[l]);
 #else
@@ -374,9 +439,9 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     attention_8bit_backward(a.qkv_grad_scratch, a.attention_output_grad_scratch, a.attention_output[l],
                             a.query_8bit[l], a.key_8bit[l], a.value_8bit[l], a.query_scales[l], a.key_scales[l],
                             a.value_scales[l], a.attention_logsumexp[l], a.qkv_scratch, a.attention_row_dot_scratch);
-    linear_8bit_round_backward(a.qkv_input_grad_copies_scratch, a.qkv_weight_grad_copies_scratch, a.qkv_grad_scratch, params.qkv_weight,
+    linear_8bit_round_backward(a.qkv_input_grad_copies_scratch, a.qkv_weight_grad_copies_scratch, a.qkv_grad_scratch,
                                a.ln1_output[l]);
-    qkv_input_grad_8bit_rounded(a.ln_output_grad_scratch, a.qkv_input_grad_copies_scratch);
+    qkv_input_grad_8bit_rounded(a.ln_output_grad_scratch, input_grad_copies_8bit(a.qkv_input_grad_copies_scratch, a.qkv_weight_copies[l]));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     qkv_weight_grad_bf16(param_grads.qkv_weight, a.qkv_grad_scratch, a.ln1_output[l]);
 #else
@@ -389,7 +454,36 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
 
 // ── the whole model ───────────────────────────────────────────────────────────
 
+/// Marks the weights' 8-bit copies out of date, so the next forward makes them again: call it after each optimizer
+/// step (the params changed). Cheap: nothing runs until that forward.
+///
+///   activations   the model's: its weight copies
+inline void gpt2_8bit_weights_changed(const GPT2Activations8bit& activations) {
+    activations.weight_copies_made = false;
+}
+
+/// Makes the weights' 8-bit copies from the params, both ways, one round_8bit_rows_and_columns a weight: each
+/// layer's 4 linears and wte (the head's). The forward calls it when they are out of date.
+///
+///   activations   the model's: its weight copies written
+///   params        the model's, bfloat16
+inline void gpt2_8bit_round_weights(const GPT2Activations8bit& activations, const GPT2Params& params) {
+    const GPT2Activations8bit& a = activations;
+    auto round_both_val = [](const LinearWeight8bitCopies& copies_val, const Tensor& weight) {
+        round_8bit_rows_and_columns(copies_val.rows_8bit_tensor, copies_val.row_scales_tensor, copies_val.turned_8bit_tensor,
+                                    copies_val.turned_scales_tensor, weight);
+    };
+    for (size_t l = 0; l < params.blocks.size(); l++) {
+        round_both_val(a.qkv_weight_copies[l], params.blocks[l].qkv_weight);
+        round_both_val(a.attention_out_weight_copies[l], params.blocks[l].attention_out_weight);
+        round_both_val(a.mlp_up_weight_copies[l], params.blocks[l].mlp_up_weight);
+        round_both_val(a.mlp_down_weight_copies[l], params.blocks[l].mlp_down_weight);
+    }
+    round_both_val(a.wte_copies, params.wte);
+}
+
 /// Works out each row's loss into activations.losses with the products in 8 bits, keeping what the backward needs.
+/// The weights' 8-bit copies are made first if they are out of date (gpt2_8bit_weights_changed).
 ///
 ///   activations          written
 ///   token_ids, targets   {batch_size, seq_len} ints, every id < vocab_size
@@ -399,6 +493,11 @@ inline void gpt2_8bit_forward(const GPT2Activations8bit& activations, const Tens
                               const GPT2Params& params, const GPT2Config& config) {
     const GPT2Activations8bit& a = activations;
     size_t num_layers = params.blocks.size();
+    // the weights' 8-bit copies, the first forward after they changed
+    if (!a.weight_copies_made) {
+        gpt2_8bit_round_weights(a, params);
+        a.weight_copies_made = true;
+    }
     encoder_bf16_forward(a.encoded, token_ids, params.wte, params.wpe);
     for (size_t l = 0; l < num_layers; l++) {
         const Tensor& input = l == 0 ? a.encoded : a.block_outputs[l - 1];
@@ -406,7 +505,7 @@ inline void gpt2_8bit_forward(const GPT2Activations8bit& activations, const Tens
     }
     layer_norm_bf16_forward(a.lnf_output, a.lnf_mean, a.lnf_rstd, a.block_outputs[num_layers - 1], params.lnf_weight,
                             params.lnf_bias);
-    head_8bit(a.logits, a.lnf_output, params.wte, a.head_copies_scratch);   // the head: no bias
+    head_8bit_rounded(a.logits, forward_copies_8bit(a.head_copies_scratch, a.lnf_output, a.wte_copies));   // the head: no bias
     softmax_loss_bf16_forward(a.losses, a.max_of_each_row, a.sum_of_each_row, a.logits, targets, config.vocab_size);
 }
 
@@ -427,8 +526,8 @@ inline void gpt2_8bit_backward(const GPT2Params& param_grads, const Tensor& toke
     // backward: lnf_output_grad, and its part added onto wte_grad
     float loss_grad_val = (float)(1.0 / ((double)micro_batches * a.losses.numel()));
     softmax_loss_bf16_backward(a.logits, a.logits, targets, a.max_of_each_row, a.sum_of_each_row, config.vocab_size, loss_grad_val);
-    linear_8bit_round_backward(a.head_input_grad_copies_scratch, a.head_weight_grad_copies_scratch, a.logits, params.wte, a.lnf_output);
-    head_input_grad_8bit_rounded(a.lnf_output_grad_scratch, a.head_input_grad_copies_scratch);
+    linear_8bit_round_backward(a.head_input_grad_copies_scratch, a.head_weight_grad_copies_scratch, a.logits, a.lnf_output);
+    head_input_grad_8bit_rounded(a.lnf_output_grad_scratch, input_grad_copies_8bit(a.head_input_grad_copies_scratch, a.wte_copies));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
     head_weight_grad_bf16(param_grads.wte, a.logits, a.lnf_output);
 #else

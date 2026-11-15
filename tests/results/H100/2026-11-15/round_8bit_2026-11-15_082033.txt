@@ -1,0 +1,57 @@
+log: tests/results/H100/round_8bit_2026-11-15_082033.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_rows_at_each_block_size
+    x (2304 wide) {16384, 2304}: 113.3 MB moved; this GPU's peak 2039 GB/s
+    threads   loads a thread       ms     GB/s    MBU   same result
+        256              1.1    0.073     1547    76%   yes   <- picked for the width
+        128              2.2    0.078     1453    71%   yes
+        256              1.1    0.073     1548    76%   yes
+        512              0.6    0.081     1394    68%   yes
+       1024              0.3    0.179      635    31%   yes
+    input: same_count_val                       expected: 5   actual: 5   ok  (line 111)
+    mlp down's input (9216 wide) {16384, 9216}: 453.1 MB moved; this GPU's peak 2039 GB/s
+    threads   loads a thread       ms     GB/s    MBU   same result
+        512              2.2    0.287     1577    77%   yes   <- picked for the width
+        128              9.0    0.386     1173    58%   yes
+        256              4.5    0.350     1293    63%   yes
+        512              2.2    0.287     1580    77%   yes
+       1024              1.1    0.441     1028    50%   yes
+    input: same_count_val                       expected: 5   actual: 5   ok  (line 111)
+
+time_turned_rounding_of_one_shape
+    qkv output_grad: rows 6912, row_length 16384
+                                   ms     MB     GB/s    MBU
+        turned (tile kernels)    0.354  566.3     1597    78%
+        as it sits              0.207  339.8     1642    81%
+    input x (2304 wide): rows 2304, row_length 16384
+                                   ms     MB     GB/s    MBU
+        turned (tile kernels)    0.135  188.8     1400    69%
+        as it sits              0.071  113.3     1588    78%
+    mlp up output_grad: rows 9216, row_length 16384
+                                   ms     MB     GB/s    MBU
+        turned (tile kernels)    0.465  755.0     1624    80%
+        as it sits              0.276  453.0     1644    81%
+
+time_both_copies_of_one_shape
+    qkv output_grad {16384, 6912}: both copies
+                                   ms     MB     GB/s    MBU
+        rows_and_columns        0.420  679.6     1618    79%
+        two round_8bit          0.561  906.1     1616    79%
+    input: torch::equal(turned_back(rows_8bit_tensor, row_scales_tensor, (int64_t)rows_val, (int64_t)columns_val), turned_back(plain_8bit_tensor, plain_scales_tensor, (int64_t)rows_val, (int64_t)columns_val)) expected: true   actual: true   ok  (line 231)
+    input: torch::equal(turned_back(columns_8bit_tensor, column_scales_tensor, (int64_t)columns_val, (int64_t)rows_val), turned_back(turned_8bit_tensor, turned_scales_tensor, (int64_t)columns_val, (int64_t)rows_val)) expected: true   actual: true   ok  (line 233)
+    mlp up output_grad {16384, 9216}: both copies
+                                   ms     MB     GB/s    MBU
+        rows_and_columns        0.554  906.1     1636    80%
+        two round_8bit          0.755 1208.1     1601    79%
+    input: torch::equal(turned_back(rows_8bit_tensor, row_scales_tensor, (int64_t)rows_val, (int64_t)columns_val), turned_back(plain_8bit_tensor, plain_scales_tensor, (int64_t)rows_val, (int64_t)columns_val)) expected: true   actual: true   ok  (line 231)
+    input: torch::equal(turned_back(columns_8bit_tensor, column_scales_tensor, (int64_t)columns_val, (int64_t)rows_val), turned_back(turned_8bit_tensor, turned_scales_tensor, (int64_t)columns_val, (int64_t)rows_val)) expected: true   actual: true   ok  (line 233)
+    2304-wide output_grad {16384, 2304}: both copies
+                                   ms     MB     GB/s    MBU
+        rows_and_columns        0.160  226.6     1420    70%
+        two round_8bit          0.214  302.1     1415    69%
+    input: torch::equal(turned_back(rows_8bit_tensor, row_scales_tensor, (int64_t)rows_val, (int64_t)columns_val), turned_back(plain_8bit_tensor, plain_scales_tensor, (int64_t)rows_val, (int64_t)columns_val)) expected: true   actual: true   ok  (line 231)
+    input: torch::equal(turned_back(columns_8bit_tensor, column_scales_tensor, (int64_t)columns_val, (int64_t)rows_val), turned_back(turned_8bit_tensor, turned_scales_tensor, (int64_t)columns_val, (int64_t)rows_val)) expected: true   actual: true   ok  (line 233)
+
+all tunes done

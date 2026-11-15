@@ -126,6 +126,32 @@ static void rounding_matches_pytorch_s_float8(void)
     ASSERT_EQ(torch::equal(matrix_val.turned_back(), expected_tensor), true);
 }
 
+static void long_rows_match_pytorch_s_float8(void)
+{
+    // Expect: random {64, 9216} at the block size its width picks (mlp down's input: 1,152 loads a row, 512 threads,
+    // 2.25 a thread: round_8bit_rows_kernel<4>), {16, 32768} at 256 threads (4,096 loads, 16 a thread: <16>, the longest
+    // row a block of 256 takes), and {16, 50304} at its pick (the head's logits' gradient: 6,288 loads, more than a
+    // block's registers hold: the tile kernels). The E4M3s turned back are exactly PyTorch's with my scales, and each
+    // scale the smallest power of 2 that fits 448, as for short rows.
+    const size_t shapes_list[3][3] = {{64, 9216, 0}, {16, 32768, ROUND_8BIT_LEAST_THREADS}, {16, 50304, 0}};   // rows, row length, threads (0: picked)
+    for (const auto &shape_val : shapes_list)
+    {
+        // 1. the rounding
+        torch::manual_seed(4);
+        RoundedMatrix matrix_val(random_bf16_tensor({shape_val[0], shape_val[1]}), false, (int)shape_val[2]);
+        // 2. PyTorch's rounding with my scales, and the scales' ratios
+        torch::Tensor scales_tensor = pytorch_copy_of(matrix_val.scales_tensor).unsqueeze(1);
+        torch::Tensor expected_tensor =
+            (pytorch_copy_of(matrix_val.values_tensor) / scales_tensor).to(torch::kFloat8_e4m3fn).to(torch::kFloat) * scales_tensor;
+        torch::Tensor ratio_tensor = pytorch_copy_of(matrix_val.values_tensor).abs().amax(-1) / scales_tensor.squeeze(1);
+        // 3. check
+        print_test_name(__func__);
+        printf("    {%zu, %zu}, %zu threads a block (0: picked)\n", shape_val[0], shape_val[1], shape_val[2]);
+        ASSERT_EQ(torch::equal(matrix_val.turned_back(), expected_tensor), true);
+        ASSERT_EQ(((ratio_tensor <= 224.0) | (ratio_tensor > HARDWARE_E4M3_LARGEST)).sum().item<int64_t>(), (int64_t)0);
+    }
+}
+
 // ══ part 2: turned round ══════════════════════════════════════════════════════
 
 /// Rounds random `values` {row_length, rows} as a turned matrix, and the same values turned round first as a plain
@@ -219,11 +245,20 @@ static void every_kernel_fits_its_block(void)
     // Expect: each kernel can be launched with its threads per block, and nothing is spilled: cudaFuncGetAttributes'
     // numRegs (registers per thread), maxThreadsPerBlock (the largest block) and localSizeBytes (0 if nothing
     // spills), read without running anything.
-    const int kernel_count_val = 3;
-    const void *kernels_list[kernel_count_val] = {(const void *)round_8bit_kernel, (const void *)round_8bit_largest_kernel,
+    // The row kernel is made for 1, 2, 4, 8 and 16 loads a thread (8 to 128 floats of a row kept in registers): those
+    // up to 8 at the most threads round_8bit_threads_for picks (512), the 16-load one at the least (256; a larger
+    // block asked of it goes to the tile kernels).
+    const int kernel_count_val = 7;
+    const void *kernels_list[kernel_count_val] = {(const void *)round_8bit_rows_kernel<1>, (const void *)round_8bit_rows_kernel<2>,
+                                                  (const void *)round_8bit_rows_kernel<4>, (const void *)round_8bit_rows_kernel<8>,
+                                                  (const void *)round_8bit_rows_kernel<16>, (const void *)round_8bit_largest_kernel,
                                                   (const void *)round_8bit_tile_kernel};
-    const char *names_list[kernel_count_val] = {"round_8bit_kernel", "round_8bit_largest_kernel", "round_8bit_tile_kernel"};
-    int threads_list[kernel_count_val] = {ROUND_8BIT_THREADS_PER_BLOCK, ROUND_8BIT_TILE_THREADS, ROUND_8BIT_TILE_THREADS};
+    const char *names_list[kernel_count_val] = {"round_8bit_rows_kernel<1>", "round_8bit_rows_kernel<2>", "round_8bit_rows_kernel<4>",
+                                                "round_8bit_rows_kernel<8>", "round_8bit_rows_kernel<16>", "round_8bit_largest_kernel",
+                                                "round_8bit_tile_kernel"};
+    int threads_list[kernel_count_val] = {ROUND_8BIT_MOST_THREADS, ROUND_8BIT_MOST_THREADS, ROUND_8BIT_MOST_THREADS,
+                                          ROUND_8BIT_MOST_THREADS, ROUND_8BIT_LEAST_THREADS, ROUND_8BIT_TILE_THREADS,
+                                          ROUND_8BIT_TILE_THREADS};
     for (int kernel_index_val = 0; kernel_index_val < kernel_count_val; kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -243,8 +278,9 @@ static void any_block_size_gives_the_same_bits(void)
 {
     // Expect: random {304, 768}, rounded as it sits and as a turned matrix, with block sizes 32, 128, 512 and 1024
     // (one warp up to HARDWARE_MAX_THREADS_PER_BLOCK): the same E4M3s and scales as the default's, to the last bit.
-    // As it sits each row is one warp's; turned, the block size does not apply (the tile kernels' is fixed), so the
-    // same launches. 304 rows: turned, they are the row length, which must be a multiple of
+    // As it sits each row is one block's, its largest the same in any order (32 threads hold 4 loads each of a row's
+    // 96, 1024 threads 1 load, most of them none); turned, the block size does not apply (the tile kernels' is fixed),
+    // so the same launches. 304 rows: turned, they are the row length, which must be a multiple of
     // ROUND_8BIT_ROW_LENGTH_MULTIPLE (16); 304 is not a whole number of the 128-row tiles, so the last is part-full.
     const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 16 * HARDWARE_THREADS_PER_WARP, HARDWARE_MAX_THREADS_PER_BLOCK};
     // 1. random values; the default's roundings
@@ -267,6 +303,7 @@ int main(void)
     start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     each_row_s_scale_is_a_power_of_2_that_fits_448();
     rounding_matches_pytorch_s_float8();
+    long_rows_match_pytorch_s_float8();
 
     turned_gives_the_bits_of_the_turned_round_matrix_on_gpt2_output_grad();
     turned_gives_the_bits_of_the_turned_round_matrix_with_sizes_no_tile_divides();

@@ -104,7 +104,7 @@ inline void layer_norm_8bit_forward(const Tensor& output_tensor, const Tensor& o
 }
 
 /// Normalizes the rows as layer_norm_bf16_forward_kernel does, one warp per row, 8 values a lane, then rounds each
-/// row as round_8bit_kernel does: the largest |value| of the bfloat16 output as stored, its scale, each value over
+/// row as round_8bit_rows_kernel does: the largest |value| of the bfloat16 output as stored, its scale, each value over
 /// the scale to the nearest E4M3 (saturating, as __nv_fp8x4_e4m3 does).
 ///
 ///   output_ptr, mean_ptr, rstd_ptr, input_ptr, weight_ptr, bias_ptr   as in layer_norm_8bit_forward

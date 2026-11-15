@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
         optimizer.set_learning_rate(learning_rate);
         optimizer.step();                                              // this rank's slice
         distributed.all_gather(optimizer.all_params());                // every slice to every rank
+        gpt2_8bit_weights_changed(activations);                        // the next forward makes the weights' 8-bit copies again
         float norm = optimizer.grad_norm().item<float>();              // waits for the GPU: the step is done
         float loss = distributed.mean_of_cpu_value((float)(loss_sum / micro_batches));
         double seconds = seconds_since(started);
