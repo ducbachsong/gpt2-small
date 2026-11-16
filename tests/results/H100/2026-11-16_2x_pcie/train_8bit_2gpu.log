@@ -1,0 +1,25 @@
+W1116 05:19:52.163000 10947 site-packages/torch/distributed/run.py:851] 
+W1116 05:19:52.163000 10947 site-packages/torch/distributed/run.py:851] *****************************************
+W1116 05:19:52.163000 10947 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1116 05:19:52.163000 10947 site-packages/torch/distributed/run.py:851] *****************************************
+GPT-2 small: 733105152 parameters, 8 bits, on 2 GPU(s)
+train: 4 file(s), 400000000 tokens; val: 10000000 tokens, 10 batches of it on each GPU each time
+10 steps of 2 GPU(s) x 8 x {16, 2048} = 524288 tokens: 5242880 tokens, 0.01 epochs
+learning rate: 0.0006, warmup 5 steps, cosine down to 0; weight decay 0.1, clip at 1
+GPU memory, rank 0: 51.1 GB used of 85.0 GB
+checkpoints: none
+
+step     0 | val loss 10.6761
+step     1/10 | loss 10.6793 | norm 33.6003 | lr 1.20e-04 |   3490 ms |  150232 tokens/s
+step     2/10 | loss 9.5508 | norm 17.3578 | lr 2.40e-04 |   3457 ms |  151671 tokens/s
+step     3/10 | loss 11.2334 | norm  7.3360 | lr 3.60e-04 |   3449 ms |  151991 tokens/s
+step     4/10 | loss 9.6097 | norm  4.9271 | lr 4.80e-04 |   3445 ms |  152173 tokens/s
+step     5/10 | loss 8.9493 | norm  2.5580 | lr 6.00e-04 |   3444 ms |  152245 tokens/s
+step     5 | val loss 8.4614
+step     6/10 | loss 8.3848 | norm  2.1350 | lr 6.00e-04 |   3439 ms |  152438 tokens/s
+step     7/10 | loss 8.1629 | norm  7.3532 | lr 5.12e-04 |   3443 ms |  152272 tokens/s
+step     8/10 | loss 7.8808 | norm  2.5069 | lr 3.00e-04 |   3442 ms |  152337 tokens/s
+step     9/10 | loss 7.8034 | norm  1.0877 | lr 8.79e-05 |   3443 ms |  152285 tokens/s
+step    10/10 | loss 7.8130 | norm  1.2035 | lr 0.00e+00 |   3443 ms |  152283 tokens/s
+step    10 | val loss 7.8751
+done: steps 1 .. 10 in 37 s

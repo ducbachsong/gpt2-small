@@ -13,7 +13,7 @@
 #include "../../llmc/kernels/8bit/round_8bit.cuh"
 
 #define GPT2_ROWS 16384                 // a micro-batch of 8 rows of 2048 tokens (the trainers' default)
-#define GPT2_EMBED_DIM 2304             // the model's width
+#define GPT2_EMBED_DIM 1536             // the model's width
 #define GPT2_QKV_DIM (3 * GPT2_EMBED_DIM)
 #define GPT2_MLP_DIM (4 * GPT2_EMBED_DIM)
 #define MEGA 1e6                        // bytes in an MB

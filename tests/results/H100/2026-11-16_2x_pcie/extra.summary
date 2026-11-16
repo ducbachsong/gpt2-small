@@ -1,0 +1,7 @@
+built train_8bit
+built test_distributed
+test_distributed exit 0
+climbmix.py exit 0
+train_8bit 2 GPUs exit 0
+train_8bit 1 GPU exit 0
+ALL_DONE

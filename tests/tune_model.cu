@@ -437,8 +437,7 @@ static void time_against_pytorch(const ModelBuffers &buffers_val, const GPT2Conf
     int short_layers_val = 0;
     for (size_t layer_index_val = 0; layer_index_val < config_val.num_layers; layer_index_val++)
         short_layers_val += gpt2_attention_window(config_val, layer_index_val) != 0;
-    printf("    (which has no window: PyTorch's every layer sees the whole row, ours %d of %d layers a window of %d tokens)
-",
+    printf("    (which has no window: PyTorch's every layer sees the whole row, ours %d of %d layers a window of %d tokens)\n",
            short_layers_val, (int)config_val.num_layers, (int)config_val.attention_window);
     printf("    rows   ours bf16   ours 8-bit   PyTorch (cuBLAS)   bf16 / PyTorch   8-bit / PyTorch\n");
     for (const auto &row_val : bf16_val)

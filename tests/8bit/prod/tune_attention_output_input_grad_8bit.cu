@@ -16,10 +16,10 @@
 #include "../../../llmc/kernels/8bit/prod/attention_output_input_grad_8bit.cuh"
 
 #define GPT2_ROWS 16384               // a training micro-batch: 8 rows of 2048 tokens (train_bf16.cu's and train_8bit.cu's default)
-#define GPT2_EMBED_DIM 2304           // the model's width (32 layers x 2,304, 18 heads)
+#define GPT2_EMBED_DIM 1536           // the model's width (nanochat's d24: 24 layers x 1,536, 12 heads)
 #define GPT2_QKV_DIM (3 * GPT2_EMBED_DIM)
 #define GPT2_MLP_DIM (4 * GPT2_EMBED_DIM)
-#define GPT2_PADDED_VOCAB_SIZE 50304
+#define GPT2_PADDED_VOCAB_SIZE 32768  // nanochat's tokenizer: 2^15 ids, no padding
 #define FLOPS_PER_MULTIPLY_ADD 2      // a product's flops: 2 x rows x columns x sum_length
 #define ROWS GPT2_ROWS               // the product's output {ROWS, COLUMNS} and its sum
 #define COLUMNS GPT2_EMBED_DIM

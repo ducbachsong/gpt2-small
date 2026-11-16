@@ -1,0 +1,95 @@
+log: tests/results/H100/qkv_8bit_2026-11-16_051708.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    qkv: output {16384, 4608}, a sum of 1536: 231.9 GFLOP
+    average of steps 3..20:              ms     TFLOPS   of bf16 peak
+        mine, rounding included          0.408      569.1     69.4%
+        mine, the product alone          0.345      671.3     81.9%
+        PyTorch (cuBLAS, bfloat16)       0.470      493.4     60.2%
+    cuBLAS takes 1.15x as long as mine with the rounding, 1.36x as long as the product alone
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      0.736 ms    315.2 TFLOPS
+        1 x  64 x 2      0.746 ms    310.9 TFLOPS
+        1 x  64 x 3      0.592 ms    391.5 TFLOPS
+        1 x  64 x 4      0.539 ms    430.2 TFLOPS
+        1 x 128 x 1      0.825 ms    281.1 TFLOPS
+        1 x 128 x 2      0.769 ms    301.7 TFLOPS
+        1 x 128 x 3      0.544 ms    426.5 TFLOPS
+        1 x 128 x 4      0.464 ms    499.6 TFLOPS
+        2 x  64 x 1      0.994 ms    233.3 TFLOPS
+        2 x  64 x 2      1.000 ms    231.9 TFLOPS
+        2 x  64 x 3      0.661 ms    350.8 TFLOPS
+        2 x  64 x 4      0.541 ms    428.4 TFLOPS
+        2 x 128 x 1      0.646 ms    359.2 TFLOPS
+        2 x 128 x 2      0.603 ms    384.6 TFLOPS
+        2 x 128 x 3      0.415 ms    559.1 TFLOPS
+        2 x 128 x 4      0.351 ms    660.5 TFLOPS   (this file's)
+    fastest: 2 x 128 x 4
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        clusters of 1,  1 rows a group, persistent          0.358 ms    647.9 TFLOPS
+        clusters of 1,  1 rows a group, one a square        0.419 ms    553.3 TFLOPS
+        clusters of 1,  4 rows a group, persistent          0.363 ms    639.1 TFLOPS
+        clusters of 1,  4 rows a group, one a square        0.425 ms    545.2 TFLOPS
+        clusters of 1, 16 rows a group, persistent          0.368 ms    630.9 TFLOPS
+        clusters of 1, 16 rows a group, one a square        0.440 ms    526.8 TFLOPS
+        clusters of 1, 64 rows a group, persistent          0.377 ms    615.7 TFLOPS
+        clusters of 1, 64 rows a group, one a square        0.439 ms    528.7 TFLOPS
+        clusters of 2,  1 rows a group, persistent          0.371 ms    625.8 TFLOPS
+        clusters of 2,  1 rows a group, one a square        0.500 ms    464.1 TFLOPS
+        clusters of 2,  4 rows a group, persistent          0.374 ms    619.4 TFLOPS
+        clusters of 2,  4 rows a group, one a square        0.512 ms    453.3 TFLOPS
+        clusters of 2, 16 rows a group, persistent          0.381 ms    608.7 TFLOPS
+        clusters of 2, 16 rows a group, one a square        0.522 ms    444.0 TFLOPS
+        clusters of 2, 64 rows a group, persistent          0.394 ms    588.0 TFLOPS
+        clusters of 2, 64 rows a group, one a square        0.535 ms    433.2 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        producer 24 registers, 0 in flight, promotion 4      0.363 ms    639.0 TFLOPS
+        producer 24 registers, 1 in flight, promotion 4      0.392 ms    591.8 TFLOPS
+        producer 24 registers, 2 in flight, promotion 4      0.445 ms    521.7 TFLOPS
+        producer 24 registers, 3 in flight, promotion 4      0.621 ms    373.4 TFLOPS
+        producer 32 registers, 0 in flight, promotion 4      0.366 ms    634.5 TFLOPS
+        producer 32 registers, 1 in flight, promotion 4      0.390 ms    594.4 TFLOPS
+        producer 32 registers, 2 in flight, promotion 4      0.446 ms    520.3 TFLOPS
+        producer 32 registers, 3 in flight, promotion 4      0.628 ms    369.4 TFLOPS
+        producer 40 registers, 0 in flight, promotion 4      0.369 ms    628.5 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4      0.390 ms    594.9 TFLOPS
+        producer 40 registers, 2 in flight, promotion 4      0.445 ms    520.6 TFLOPS
+        producer 40 registers, 3 in flight, promotion 4      0.629 ms    368.9 TFLOPS
+        producer 48 registers, 0 in flight, promotion 4      0.367 ms    632.7 TFLOPS
+        producer 48 registers, 1 in flight, promotion 4      0.393 ms    589.8 TFLOPS
+        producer 48 registers, 2 in flight, promotion 4      0.448 ms    517.8 TFLOPS
+        producer 48 registers, 3 in flight, promotion 4      0.627 ms    370.2 TFLOPS
+        producer 56 registers, 0 in flight, promotion 4      0.367 ms    632.7 TFLOPS
+        producer 56 registers, 1 in flight, promotion 4      0.394 ms    588.2 TFLOPS
+        producer 56 registers, 2 in flight, promotion 4      0.448 ms    518.0 TFLOPS
+        producer 56 registers, 3 in flight, promotion 4      0.628 ms    369.6 TFLOPS
+        producer 40 registers, 1 in flight, promotion 0      0.370 ms    627.6 TFLOPS
+        producer 40 registers, 1 in flight, promotion 1      0.413 ms    561.0 TFLOPS
+        producer 40 registers, 1 in flight, promotion 2      0.405 ms    572.1 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4      0.390 ms    594.4 TFLOPS
+        producer 40 registers, 1 in flight, promotion 8      0.387 ms    598.7 TFLOPS
+    (the promotion changes the bits a little: every 4 steps was as accurate as every step on an H100 NVL; 0, never,
+     keeps the whole sum in the tensor cores, less accurate over a long sum)
+
+    for llmc/kernels/8bit/prod/qkv_8bit.cuh:
+#define QKV_8BIT_ROW_GROUPS 2
+#define QKV_8BIT_COLUMNS 128
+#define QKV_8BIT_STAGES 4
+#define QKV_8BIT_BLOCK_ROWS_PER_GROUP 1
+#define QKV_8BIT_CLUSTER 1
+#define QKV_8BIT_BLOCKS 0
+#define QKV_8BIT_PRODUCER_REGISTERS 24
+#define QKV_8BIT_IN_FLIGHT 0
+#define QKV_8BIT_PROMOTION_STEPS 0
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion
+     changes the bits: take a faster one only if the tests stay within their tolerances)
+
+all tunes done

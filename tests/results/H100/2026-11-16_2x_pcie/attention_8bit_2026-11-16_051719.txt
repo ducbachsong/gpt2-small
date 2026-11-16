@@ -1,0 +1,44 @@
+log: tests/results/H100/attention_8bit_2026-11-16_051719.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_8bit_against_flash_and_pytorch
+    average of steps 3..20, ms:   forward   backward   both     kept for the backward, MB
+        8-bit attention             0.439      0.627  1.066         39.3
+        flash attention             0.194      0.574  0.768         75.9
+        PyTorch (flash)             0.184      0.670  0.854         75.9
+    flash attention takes 0.44x as long as 8-bit attention in the forward, 0.72x in both; PyTorch 0.80x in both
+    input: relative_difference_on_gpu(eight_bit_val.output_tensor, pytorch_output_tensor.to(torch::kFloat)) expected: 0 +/- 0.1   actual: 0.0530612   ok  (line 244)
+    input: relative_difference_on_gpu(eight_bit_val.qkv_grad_tensor, pytorch_qkv_tensor.grad().to(torch::kFloat)) expected: 0 +/- 0.15   actual: 0.0338983   ok  (line 246)
+
+time_rounding_and_turn_back_with_other_block_and_thread_counts
+    114.4 MB moved by each kernel; this GPU's peak 2039 GB/s
+    threads   rounding: blocks       ms     GB/s    MBU   turn-back: blocks       ms     GB/s    MBU   same result
+         64              49152    0.078     1465    72%               49152    0.068     1681    82%   yes
+        128              24576    0.078     1463    72%               24576    0.068     1675    82%   yes
+        256              12288    0.080     1427    70%               12288    0.070     1636    80%   yes
+        512               6144    0.083     1381    68%                6144    0.072     1579    77%   yes
+       1024               3072    0.086     1325    65%                3072    0.076     1499    73%   yes
+         64                114    1.033      111     5%                 114    0.702      163     8%   yes
+        128                114    0.533      215    11%                 114    0.373      307    15%   yes
+        256                114    0.285      401    20%                 114    0.208      551    27%   yes
+        512                114    0.156      732    36%                 114    0.121      949    47%   yes
+       1024                114    0.098     1170    57%                 114    0.084     1357    67%   yes
+         64                228    0.534      214    11%                 228    0.374      306    15%   yes
+        128                228    0.286      401    20%                 228    0.206      555    27%   yes
+        256                228    0.157      731    36%                 228    0.119      958    47%   yes
+        512                228    0.098     1162    57%                 228    0.082     1397    69%   yes
+       1024                228    0.078     1459    72%                 228    0.075     1532    75%   yes
+         64                456    0.286      400    20%                 456    0.206      555    27%   yes
+        128                456    0.157      731    36%                 456    0.118      968    47%   yes
+        256                456    0.099     1162    57%                 456    0.081     1413    69%   yes
+        512                456    0.078     1458    72%                 456    0.072     1590    78%   yes
+       1024                456    0.078     1458    71%                 456    0.075     1528    75%   yes
+         64                912    0.156      734    36%                 912    0.118      970    48%   yes
+        128                912    0.099     1160    57%                 912    0.080     1431    70%   yes
+        256                912    0.078     1458    72%                 912    0.071     1618    79%   yes
+        512                912    0.079     1455    71%                 912    0.072     1593    78%   yes
+       1024                912    0.082     1394    68%                 912    0.076     1515    74%   yes
+    input: launches_with_the_same_result_val    expected: 25   actual: 25   ok  (line 371)
+
+all tunes done

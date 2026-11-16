@@ -18,10 +18,10 @@
 static const double BFLOAT16_TOLERANCE = 2e-2;
 static const double BFLOAT16_GRAD_TOLERANCE = 5e-2;
 
-#define GPT2_NUM_HEADS 18             // the model's heads
+#define GPT2_NUM_HEADS 12             // the model's heads
 #define GPT2_HEAD_SIZE FLASH_HEAD_SIZE   // and their columns: 128
 #define GPT2_SEQ_LEN 2048             // its tokens per row
-#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * GPT2_HEAD_SIZE)   // 2,304
+#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * GPT2_HEAD_SIZE)   // 1,536
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

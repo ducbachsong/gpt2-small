@@ -1,0 +1,95 @@
+log: tests/results/H100/attention_output_input_grad_8bit_2026-11-16_054832.txt
+GPU: NVIDIA H100 80GB HBM3   compute 9.0   132 SMs   85.0 GB   peak memory bandwidth 3352 GB/s   peak bfloat16 1071 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    attention output input grad: output {16384, 1536}, a sum of 1536: 77.3 GFLOP
+    average of steps 3..20:              ms     TFLOPS   of bf16 peak
+        mine, rounding included          0.139      555.6     51.9%
+        mine, the product alone          0.089      869.4     81.2%
+        PyTorch (cuBLAS, bfloat16)       0.121      639.0     59.7%
+    cuBLAS takes 0.87x as long as mine with the rounding, 1.36x as long as the product alone
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      0.187 ms    414.2 TFLOPS
+        1 x  64 x 2      0.182 ms    423.9 TFLOPS
+        1 x  64 x 3      0.150 ms    514.5 TFLOPS
+        1 x  64 x 4      0.134 ms    578.6 TFLOPS
+        1 x 128 x 1      0.204 ms    378.5 TFLOPS
+        1 x 128 x 2      0.188 ms    411.0 TFLOPS
+        1 x 128 x 3      0.134 ms    576.9 TFLOPS
+        1 x 128 x 4      0.119 ms    648.7 TFLOPS
+        2 x  64 x 1      0.216 ms    357.6 TFLOPS
+        2 x  64 x 2      0.220 ms    351.2 TFLOPS
+        2 x  64 x 3      0.153 ms    505.8 TFLOPS
+        2 x  64 x 4      0.133 ms    582.9 TFLOPS
+        2 x 128 x 1      0.154 ms    502.1 TFLOPS
+        2 x 128 x 2      0.139 ms    555.1 TFLOPS
+        2 x 128 x 3      0.102 ms    759.1 TFLOPS
+        2 x 128 x 4      0.089 ms    866.0 TFLOPS   (this file's)
+    fastest: 2 x 128 x 4
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        clusters of 1,  1 rows a group, persistent          0.088 ms    875.2 TFLOPS
+        clusters of 1,  1 rows a group, one a square        0.105 ms    736.8 TFLOPS
+        clusters of 1,  4 rows a group, persistent          0.087 ms    884.8 TFLOPS
+        clusters of 1,  4 rows a group, one a square        0.102 ms    756.2 TFLOPS
+        clusters of 1, 16 rows a group, persistent          0.088 ms    877.3 TFLOPS
+        clusters of 1, 16 rows a group, one a square        0.100 ms    773.5 TFLOPS
+        clusters of 1, 64 rows a group, persistent          0.092 ms    844.3 TFLOPS
+        clusters of 1, 64 rows a group, one a square        0.107 ms    721.0 TFLOPS
+        clusters of 2,  1 rows a group, persistent          0.091 ms    851.0 TFLOPS
+        clusters of 2,  1 rows a group, one a square        0.122 ms    634.6 TFLOPS
+        clusters of 2,  4 rows a group, persistent          0.089 ms    868.7 TFLOPS
+        clusters of 2,  4 rows a group, one a square        0.121 ms    637.8 TFLOPS
+        clusters of 2, 16 rows a group, persistent          0.091 ms    852.3 TFLOPS
+        clusters of 2, 16 rows a group, one a square        0.127 ms    610.0 TFLOPS
+        clusters of 2, 64 rows a group, persistent          0.101 ms    764.1 TFLOPS
+        clusters of 2, 64 rows a group, one a square        0.127 ms    610.7 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        producer 24 registers, 0 in flight, promotion 4      0.082 ms    942.5 TFLOPS
+        producer 24 registers, 1 in flight, promotion 4      0.088 ms    877.7 TFLOPS
+        producer 24 registers, 2 in flight, promotion 4      0.096 ms    805.2 TFLOPS
+        producer 24 registers, 3 in flight, promotion 4      0.128 ms    602.6 TFLOPS
+        producer 32 registers, 0 in flight, promotion 4      0.083 ms    936.5 TFLOPS
+        producer 32 registers, 1 in flight, promotion 4      0.088 ms    879.1 TFLOPS
+        producer 32 registers, 2 in flight, promotion 4      0.096 ms    809.4 TFLOPS
+        producer 32 registers, 3 in flight, promotion 4      0.128 ms    602.0 TFLOPS
+        producer 40 registers, 0 in flight, promotion 4      0.082 ms    937.9 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4      0.088 ms    880.1 TFLOPS
+        producer 40 registers, 2 in flight, promotion 4      0.096 ms    803.3 TFLOPS
+        producer 40 registers, 3 in flight, promotion 4      0.128 ms    605.9 TFLOPS
+        producer 48 registers, 0 in flight, promotion 4      0.083 ms    936.7 TFLOPS
+        producer 48 registers, 1 in flight, promotion 4      0.088 ms    876.4 TFLOPS
+        producer 48 registers, 2 in flight, promotion 4      0.096 ms    805.3 TFLOPS
+        producer 48 registers, 3 in flight, promotion 4      0.129 ms    601.4 TFLOPS
+        producer 56 registers, 0 in flight, promotion 4      0.083 ms    936.6 TFLOPS
+        producer 56 registers, 1 in flight, promotion 4      0.088 ms    874.8 TFLOPS
+        producer 56 registers, 2 in flight, promotion 4      0.096 ms    803.6 TFLOPS
+        producer 56 registers, 3 in flight, promotion 4      0.128 ms    601.9 TFLOPS
+        producer 40 registers, 1 in flight, promotion 0      0.083 ms    927.0 TFLOPS
+        producer 40 registers, 1 in flight, promotion 1      0.092 ms    840.9 TFLOPS
+        producer 40 registers, 1 in flight, promotion 2      0.090 ms    855.2 TFLOPS
+        producer 40 registers, 1 in flight, promotion 4      0.088 ms    877.3 TFLOPS
+        producer 40 registers, 1 in flight, promotion 8      0.088 ms    882.9 TFLOPS
+    (the promotion changes the bits a little: every 4 steps was as accurate as every step on an H100 NVL; 0, never,
+     keeps the whole sum in the tensor cores, less accurate over a long sum)
+
+    for llmc/kernels/8bit/prod/attention_output_input_grad_8bit.cuh:
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_ROW_GROUPS 2
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_COLUMNS 128
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_STAGES 4
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_CLUSTER 1
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_BLOCKS 0
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_PRODUCER_REGISTERS 24
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_IN_FLIGHT 0
+#define ATTENTION_OUTPUT_INPUT_GRAD_8BIT_PROMOTION_STEPS 0
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion
+     changes the bits: take a faster one only if the tests stay within their tolerances)
+
+all tunes done

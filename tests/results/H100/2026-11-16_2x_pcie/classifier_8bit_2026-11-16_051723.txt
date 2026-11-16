@@ -1,0 +1,15 @@
+log: tests/results/H100/classifier_8bit_2026-11-16_051723.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_20_steps_on_gpt2_small_size
+    average of steps 3..20:   forward ms   backward ms   forward TFLOPS   backward TFLOPS
+        8-bit (with roundings)        1.740         3.632           181.84            174.27
+        bfloat16                      1.347         4.154           234.90            152.38
+        PyTorch bfloat16              1.909         3.520           165.82            179.83
+    bfloat16 takes, against 8-bit:                    0.77x          1.14x
+    input: mean_loss_tensor.item<double>()      expected: 11 +/- 1.1   actual: 10.9781   ok  (line 191)
+    input: relative_difference_on_gpu(eight_bit_val.lnf_output_grad_tensor, pytorch_lnf_output_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0412844   ok  (line 193)
+    input: relative_difference_on_gpu(eight_bit_val.wte_grad_tensor, pytorch_wte_tensor.grad()) expected: 0 +/- 0.1   actual: 0.0431655   ok  (line 195)
+
+all tunes done

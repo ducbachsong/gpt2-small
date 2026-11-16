@@ -17,9 +17,9 @@
 static const double EIGHT_BIT_TOLERANCE = 1e-1;
 static const double EIGHT_BIT_GRAD_TOLERANCE = 1.5e-1;
 
-#define GPT2_NUM_HEADS 18             // the model's heads, FLASH_HEAD_SIZE (128) each
+#define GPT2_NUM_HEADS 12             // the model's heads, FLASH_HEAD_SIZE (128) each
 #define GPT2_SEQ_LEN 2048             // its tokens per row
-#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * FLASH_HEAD_SIZE)   // 2,304
+#define GPT2_EMBED_DIM (GPT2_NUM_HEADS * FLASH_HEAD_SIZE)   // 1,536
 #define GPT2_BATCH_SIZE 4             // rows of the micro-batch timed
 #define MEGA 1e6
 

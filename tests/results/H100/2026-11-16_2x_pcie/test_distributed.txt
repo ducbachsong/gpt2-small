@@ -1,0 +1,56 @@
+W1116 05:19:47.307000 10856 site-packages/torch/distributed/run.py:851] 
+W1116 05:19:47.307000 10856 site-packages/torch/distributed/run.py:851] *****************************************
+W1116 05:19:47.307000 10856 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1116 05:19:47.307000 10856 site-packages/torch/distributed/run.py:851] *****************************************
+log: logs/tests/test_distributed_rank0_2026-11-16_051947.log
+log: logs/tests/test_distributed_rank1_2026-11-16_051947.log
+rank 1 of 2, on GPU 1
+rank 0 of 2, on GPU 0
+
+reduce_scatter_mean_averages_each_ranks_slice
+    input: flat_tensor.to(DType::Float32).tolist() expected: {1, 2, 3, 4, 4, 5, 6, 7}   actual: {1, 2, 3, 4, 4, 5, 6, 7}   ok  (line 60)
+
+reduce_scatter_mean_averages_each_ranks_slice
+    input: flat_tensor.to(DType::Float32).tolist() expected: {2, 3, 4, 5, 5, 6, 7, 8}   actual: {2, 3, 4, 5, 5, 6, 7, 8}   ok  (line 60)
+    input: flat_tensor.to(DType::Float32).tolist() expected: {1, 2, 3, 4, 4, 5, 6, 7}   actual: {1, 2, 3, 4, 4, 5, 6, 7}   ok  (line 60)
+    input: flat_tensor.to(DType::Float32).tolist() expected: {2, 3, 4, 5, 5, 6, 7, 8}   actual: {2, 3, 4, 5, 5, 6, 7, 8}   ok  (line 60)
+
+all_gather_gives_every_rank_every_slice
+    input: flat_tensor.to(DType::Float32).tolist() expected: {0, 1, 2, 3, 10, 11, 12, 13}   actual: {0, 1, 2, 3, 10, 11, 12, 13}   ok  (line 80)
+
+all_gather_gives_every_rank_every_slice
+    input: flat_tensor.to(DType::Float32).tolist() expected: {0, 1, 2, 3, 10, 11, 12, 13}   actual: {0, 1, 2, 3, 10, 11, 12, 13}   ok  (line 80)
+    input: flat_tensor.to(DType::Float32).tolist() expected: {0, 1, 2, 3, 10, 11, 12, 13}   actual: {0, 1, 2, 3, 10, 11, 12, 13}   ok  (line 80)
+    input: flat_tensor.to(DType::Float32).tolist() expected: {0, 1, 2, 3, 10, 11, 12, 13}   actual: {0, 1, 2, 3, 10, 11, 12, 13}   ok  (line 80)
+
+slice_norms_add_up_to_the_norm_of_all
+    input: norm_tensor.item<float>()            expected: 2.23607 +/- 1e-06   actual: 2.23607   ok  (line 99)
+
+slice_norms_add_up_to_the_norm_of_all
+    input: norm_tensor.item<float>()            expected: 2.23607 +/- 1e-06   actual: 2.23607   ok  (line 99)
+
+mean_of_cpu_value_averages_a_number_over_the_ranks
+    input: distributed_val.mean_of_cpu_value((float)rank_index_val) expected: 0.5 +/- 1e-06   actual: 0.5   ok  (line 107)
+
+mean_of_cpu_value_averages_a_number_over_the_ranks
+    input: distributed_val.mean_of_cpu_value((float)rank_index_val) expected: 0.5 +/- 1e-06   actual: 0.5   ok  (line 107)
+
+a_shared_step_equals_one_adamw_on_the_mean_grads
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.490234, -0.458984, -0.427734, -0.396484, -0.365234, -0.333984, -0.302734, -0.28125, -0.259766, -0.228516, -0.197266, -0.166016, -0.134766, -0.103516, -0.0722656, -0.0412598, ... (32 values)}   actual: {-0.490234, -0.458984, -0.427734, -0.396484, -0.365234, -0.333984, -0.302734, -0.28125, -0.259766, -0.228516, -0.197266, -0.166016, -0.134766, -0.103516, -0.0722656, -0.0412598, ... (32 values)}   ok  (line 164)
+
+a_shared_step_equals_one_adamw_on_the_mean_grads
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.490234, -0.458984, -0.427734, -0.396484, -0.365234, -0.333984, -0.302734, -0.28125, -0.259766, -0.228516, -0.197266, -0.166016, -0.134766, -0.103516, -0.0722656, -0.0412598, ... (32 values)}   actual: {-0.490234, -0.458984, -0.427734, -0.396484, -0.365234, -0.333984, -0.302734, -0.28125, -0.259766, -0.228516, -0.197266, -0.166016, -0.134766, -0.103516, -0.0722656, -0.0412598, ... (32 values)}   ok  (line 164)
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.478516, -0.447266, -0.416016, -0.384766, -0.353516, -0.322266, -0.291016, -0.28125, -0.269531, -0.238281, -0.207031, -0.175781, -0.144531, -0.11377, -0.0825195, -0.0512695, ... (32 values)}   actual: {-0.478516, -0.447266, -0.416016, -0.384766, -0.353516, -0.322266, -0.291016, -0.28125, -0.269531, -0.238281, -0.207031, -0.175781, -0.144531, -0.11377, -0.0825195, -0.0512695, ... (32 values)}   ok  (line 164)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.478516, -0.447266, -0.416016, -0.384766, -0.353516, -0.322266, -0.291016, -0.28125, -0.269531, -0.238281, -0.207031, -0.175781, -0.144531, -0.11377, -0.0825195, -0.0512695, ... (32 values)}   actual: {-0.478516, -0.447266, -0.416016, -0.384766, -0.353516, -0.322266, -0.291016, -0.28125, -0.269531, -0.238281, -0.207031, -0.175781, -0.144531, -0.11377, -0.0825195, -0.0512695, ... (32 values)}   ok  (line 164)
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.grad_norm().item<float>() expected: 13.1149 +/- 1e-06   actual: 13.1149   ok  (line 163)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.46875, -0.4375, -0.40625, -0.375, -0.34375, -0.3125, -0.28125, -0.28125, -0.279297, -0.248047, -0.216797, -0.185547, -0.154297, -0.123535, -0.0922852, -0.0610352, ... (32 values)}   actual: {-0.46875, -0.4375, -0.40625, -0.375, -0.34375, -0.3125, -0.28125, -0.28125, -0.279297, -0.248047, -0.216797, -0.185547, -0.154297, -0.123535, -0.0922852, -0.0610352, ... (32 values)}   ok  (line 164)
+    input: shared_val.all_params().to(DType::Float32).tolist() expected: {-0.46875, -0.4375, -0.40625, -0.375, -0.34375, -0.3125, -0.28125, -0.28125, -0.279297, -0.248047, -0.216797, -0.185547, -0.154297, -0.123535, -0.0922852, -0.0610352, ... (32 values)}   actual: {-0.46875, -0.4375, -0.40625, -0.375, -0.34375, -0.3125, -0.28125, -0.28125, -0.279297, -0.248047, -0.216797, -0.185547, -0.154297, -0.123535, -0.0922852, -0.0610352, ... (32 values)}   ok  (line 164)
+
+rank 1: all tests passed
+
+rank 0: all tests passed
