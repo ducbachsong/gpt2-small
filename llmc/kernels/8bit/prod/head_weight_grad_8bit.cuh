@@ -53,9 +53,9 @@
 #define HEAD_WEIGHT_GRAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
 #define HEAD_WEIGHT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define HEAD_WEIGHT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to HEAD_WEIGHT_GRAD_8BIT_MAX_STAGES
-#define HEAD_WEIGHT_GRAD_8BIT_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (head_weight_grad_8bit_auto_splits)
-#define HEAD_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
-#define HEAD_WEIGHT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
+#define HEAD_WEIGHT_GRAD_8BIT_SPLITS 1                           // splits of the sum: 1, none; 0: chosen at each launch (head_weight_grad_8bit_auto_splits)
+#define HEAD_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define HEAD_WEIGHT_GRAD_8BIT_CLUSTER 2                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define HEAD_WEIGHT_GRAD_8BIT_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); HEAD_WEIGHT_GRAD_8BIT_ONE_A_SQUARE: one a square
 #define HEAD_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 48                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_head_weight_grad_8bit sweeps it
 #define HEAD_WEIGHT_GRAD_8BIT_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_head_weight_grad_8bit sweeps it

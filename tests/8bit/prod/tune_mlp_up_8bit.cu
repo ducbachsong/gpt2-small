@@ -4,9 +4,13 @@
 //     part 1   this file's setting, with its rounding (mlp_up_8bit) and without (the product alone), against PyTorch's
 //              bfloat16 matmul (cuBLAS)
 //              (cuBLAS without GELU: mine does it in the product)
-//     part 2   every square (1 or 2 warpgroups x 64 or 128 columns x 1 to 4 sets of tiles)
+//     part 2   every cooperative square (1 or 2 warpgroups x 64, 128 or, with promotion 0, 256 columns x 1 to 4 sets)
+//     part 2b  this file's setting against every ping-pong square (128 or 256 columns x 2 to 4 sets) at orders 1, 4, 16
+//     part 2c  gelu_output as the model makes it: bfloat16 then round_8bit_per_tensor (both copies), against
+//              mlp_up_8bit_gelu_8bit writing both copies itself
 //     part 3   at part 2's fastest square: every block order, block count and cluster
-//     part 4   at this file's square: the producer's registers x the steps in flight, then every promotion
+//     part 4   at this file's square: the producer's registers x the steps in flight, then every promotion (at 128
+//              columns when the square has 256: the promotion's second set of sums needs the room)
 // then the fastest as the #define lines of mlp_up_8bit.cuh. Run it on an H100 (compute capability 9.0), built with
 // -arch=sm_90a; the log goes to tests/results/<GPU>/.
 #include <torch/types.h>              // torch::randn, torch::matmul; before CUDA headers
@@ -62,25 +66,27 @@ struct Product
 
 /// Runs mlp_up_8bit's product on the copies at a setting given (the template choices not given: this file's).
 template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_UP_8BIT_PRODUCER_REGISTERS,
-          int IN_FLIGHT = MLP_UP_8BIT_IN_FLIGHT, int PROMOTION_STEPS = MLP_UP_8BIT_PROMOTION_STEPS
+          int IN_FLIGHT = MLP_UP_8BIT_IN_FLIGHT, int PROMOTION_STEPS = MLP_UP_8BIT_PROMOTION_STEPS, int PINGPONG = MLP_UP_8BIT_PINGPONG
           >
 static void mine_at(const Product &product_val,
                     int block_rows_per_group_val, int blocks_val
                     )
 {
-    mlp_up_8bit_rounded_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS>(
+    mlp_up_8bit_rounded_at<ROW_GROUPS, COLUMNS_ARG, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS, PINGPONG>(
         product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor, product_val.copies_val, block_rows_per_group_val, blocks_val);
 }
 
-/// One square run in a cluster of cluster_val: what the sweeps call.
+/// One cooperative square run in a cluster of cluster_val: what the sweeps call.
 template <int ROW_GROUPS, int COLUMNS_ARG, int STAGES>
 static void square_at(const Product &product_val, int cluster_val,
                       int block_rows_per_group_val, int blocks_val)
 {
     if (cluster_val == 2)
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 2, MLP_UP_8BIT_PRODUCER_REGISTERS, MLP_UP_8BIT_IN_FLIGHT, MLP_UP_8BIT_PROMOTION_STEPS, 0>(
+            product_val, block_rows_per_group_val, blocks_val);
     else
-        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1>(product_val, block_rows_per_group_val, blocks_val);
+        mine_at<ROW_GROUPS, COLUMNS_ARG, STAGES, 1, MLP_UP_8BIT_PRODUCER_REGISTERS, MLP_UP_8BIT_IN_FLIGHT, MLP_UP_8BIT_PROMOTION_STEPS, 0>(
+            product_val, block_rows_per_group_val, blocks_val);
 }
 
 /// A square and its run.
@@ -92,8 +98,18 @@ struct Square
     void (*run_ptr)(const Product &, int, int, int);
 };
 
-/// Every square: 1 or 2 warpgroups x 64 or 128 columns x 1 to 4 sets of tiles.
+/// Every cooperative square that fits: 1 or 2 warpgroups x 64 or 128 columns x 1 to 4 sets of tiles; with promotion 0,
+/// 256 columns (1 x 1 to 4 sets, 2 x 1 to 3).
 static const Square SQUARES_LIST[] = {
+#if MLP_UP_8BIT_PROMOTION_STEPS == 0
+    {1, 256, 1, square_at<1, 256, 1>},
+    {1, 256, 2, square_at<1, 256, 2>},
+    {1, 256, 3, square_at<1, 256, 3>},
+    {1, 256, 4, square_at<1, 256, 4>},
+    {2, 256, 1, square_at<2, 256, 1>},
+    {2, 256, 2, square_at<2, 256, 2>},
+    {2, 256, 3, square_at<2, 256, 3>},
+#endif
     {1, 64, 1, square_at<1, 64, 1>},
     {1, 64, 2, square_at<1, 64, 2>},
     {1, 64, 3, square_at<1, 64, 3>},
@@ -120,7 +136,8 @@ template <int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS
 static void variant_at(const Product &product_val
                        )
 {
-    mine_at<MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS>(product_val,
+    constexpr int COLUMNS_ARG = PROMOTION_STEPS > 0 && MLP_UP_8BIT_COLUMNS > 128 ? 128 : MLP_UP_8BIT_COLUMNS;   // a promotion: no room for 256
+    mine_at<MLP_UP_8BIT_ROW_GROUPS, COLUMNS_ARG, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS>(product_val,
                                                                                                                  MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_8BIT_BLOCKS);
 }
 
@@ -236,8 +253,8 @@ static int time_each_square(const Product &product_val)
     {
         const Square &square_val = SQUARES_LIST[square_index_val];
         double milliseconds_val = totals_list[square_index_val] / averaged_val;
-        bool this_files_val = square_val.row_groups_val == MLP_UP_8BIT_ROW_GROUPS && square_val.columns_val == MLP_UP_8BIT_COLUMNS &&
-                              square_val.stages_val == MLP_UP_8BIT_STAGES;
+        bool this_files_val = MLP_UP_8BIT_PINGPONG == 0 && square_val.row_groups_val == MLP_UP_8BIT_ROW_GROUPS &&
+                              square_val.columns_val == MLP_UP_8BIT_COLUMNS && square_val.stages_val == MLP_UP_8BIT_STAGES;
         printf("        %d x %3d x %d   %8.3f ms   %6.1f TFLOPS%s\n", square_val.row_groups_val, square_val.columns_val, square_val.stages_val,
                milliseconds_val, tflops_of(milliseconds_val), this_files_val ? "   (this file's)" : "");
         if (totals_list[square_index_val] < totals_list[fastest_index_val])
@@ -248,8 +265,6 @@ static int time_each_square(const Product &product_val)
     return fastest_index_val;
 }
 
-// ══ part 3: order, blocks and cluster ═════════════════════════════════════════
-
 /// A launch choice at a square: its cluster, block order and block count
 /// .
 struct Choice
@@ -258,6 +273,159 @@ struct Choice
     int block_rows_per_group_val;
     int blocks_val;
 };
+
+// ══ part 2b: ping-pong against this file's setting ════════════════════════════
+
+/// One ping-pong square (2 warpgroups x COLUMNS x STAGES, clusters of 1) at a block order: what the sweep below times.
+template <int COLUMNS_ARG, int STAGES>
+static void pingpong_at(const Product &product_val, int block_rows_per_group_val)
+{
+    mine_at<2, COLUMNS_ARG, STAGES, 1, MLP_UP_8BIT_PRODUCER_REGISTERS, MLP_UP_8BIT_IN_FLIGHT, MLP_UP_8BIT_PROMOTION_STEPS, 1>(product_val,
+                                                                                                                    block_rows_per_group_val, 0);
+}
+
+/// A ping-pong square and its run.
+struct PingpongSquare
+{
+    int columns_val;
+    int stages_val;
+    void (*run_ptr)(const Product &, int);
+};
+
+/// The ping-pong squares: 128 columns, or 256 with promotion 0, x 2 to 4 sets (256 x 4 fits: a set holds one left tile).
+static const PingpongSquare PINGPONG_SQUARES_LIST[] = {
+    {128, 2, pingpong_at<128, 2>}, {128, 3, pingpong_at<128, 3>}, {128, 4, pingpong_at<128, 4>},
+#if MLP_UP_8BIT_PROMOTION_STEPS == 0
+    {256, 2, pingpong_at<256, 2>}, {256, 3, pingpong_at<256, 3>}, {256, 4, pingpong_at<256, 4>},
+#endif
+};
+
+/// What part 2b found fastest: ping-pong or not, and its square and order.
+struct PingpongChoice
+{
+    bool pingpong_val;
+    int columns_val;
+    int stages_val;
+    int block_rows_per_group_val;
+};
+
+static PingpongChoice time_pingpong_against_this_files_setting(const Product &product_val, const Choice &cooperative_val, int square_index_val)
+{
+    // Prints part 2 and 3's fastest cooperative setting and this file's setting against each ping-pong square (the 2
+    // warpgroups each on their own 64-row squares, their sums in turns, one's store, GELU's included, under the
+    // other's sums) at block orders 1, 4 and 16, persistent, all taking turns over SWEEP_ROUNDS rounds; then the
+    // fastest, and as how many times this file's setting's time. Gives the fastest.
+    struct Run
+    {
+        const char *name_ptr;
+        int row_groups_val;
+        int columns_val;
+        int stages_val;
+        int block_rows_per_group_val;
+        const PingpongSquare *square_ptr;   // nullptr: this file's setting, or (cooperative) part 2's square
+        bool cooperative_val;
+    };
+    const Square &square_val = SQUARES_LIST[square_index_val];
+    std::vector<Run> runs_list = {
+        {"this file's setting", MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, nullptr, false},
+        {"cooperative", square_val.row_groups_val, square_val.columns_val, square_val.stages_val, cooperative_val.block_rows_per_group_val, nullptr, true}};
+    for (const PingpongSquare &pingpong_val : PINGPONG_SQUARES_LIST)
+        for (int block_rows_per_group_val : {1, 4, 16})
+            runs_list.push_back({"ping-pong", 2, pingpong_val.columns_val, pingpong_val.stages_val, block_rows_per_group_val, &pingpong_val, false});
+    std::vector<double> totals_list(runs_list.size(), 0.0);
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+        for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+        {
+            const Run &run_val = runs_list[run_index_val];
+            float milliseconds_val = gpu_milliseconds([&] {
+                if (run_val.square_ptr != nullptr)
+                    run_val.square_ptr->run_ptr(product_val, run_val.block_rows_per_group_val);
+                else if (run_val.cooperative_val)
+                    square_val.run_ptr(product_val, cooperative_val.cluster_val, cooperative_val.block_rows_per_group_val, cooperative_val.blocks_val);
+                else
+                    mine_at<MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_CLUSTER>(product_val,
+                                                                                                 MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_8BIT_BLOCKS);
+            });
+            if (round_index_val > WARM_UP_STEPS)
+                totals_list[run_index_val] += milliseconds_val;
+        }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    size_t fastest_index_val = 1;                                     // this file's setting is one of the others: only they are chosen
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (size_t run_index_val = 0; run_index_val < runs_list.size(); run_index_val++)
+    {
+        const Run &run_val = runs_list[run_index_val];
+        double milliseconds_val = totals_list[run_index_val] / averaged_val;
+        printf("        %-20s %d x %3d x %d, %2d rows a group   %8.3f ms   %6.1f TFLOPS\n", run_val.name_ptr, run_val.row_groups_val,
+               run_val.columns_val, run_val.stages_val, run_val.block_rows_per_group_val, milliseconds_val, tflops_of(milliseconds_val));
+        if (run_index_val > 0 && totals_list[run_index_val] < totals_list[fastest_index_val])
+            fastest_index_val = run_index_val;
+    }
+    const Run &fastest_val = runs_list[fastest_index_val];
+    printf("    fastest: %s %d x %d x %d, %d rows a group: %.3f ms, this file's setting %.2fx as long\n", fastest_val.name_ptr,
+           fastest_val.row_groups_val, fastest_val.columns_val, fastest_val.stages_val, fastest_val.block_rows_per_group_val,
+           totals_list[fastest_index_val] / averaged_val, totals_list[0] / totals_list[fastest_index_val]);
+    return {fastest_val.square_ptr != nullptr, fastest_val.columns_val, fastest_val.stages_val, fastest_val.block_rows_per_group_val};
+}
+
+// ══ part 2c: gelu_output in 8 bits against bfloat16 and a rounding pass ═══════
+
+static void time_gelu_8bit_against_bf16_and_rounding(const Product &product_val)
+{
+    // Prints, at this file's setting, all taking turns over SWEEP_ROUNDS rounds: gelu_output as bfloat16 then rounded by
+    // round_8bit_per_tensor into both 8-bit copies at a delayed scale (what the model did before MODEL_8BIT_GELU_8BIT: a
+    // write of 2 bytes a value, then a read of them and 2 bytes written), the rounding pass alone, and
+    // mlp_up_8bit_gelu_8bit writing both copies itself (2 bytes a value written, nothing read back).
+    Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor row_scales_tensor = Tensor::zeros({ROWS});
+    Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor turned_scales_tensor = Tensor::zeros({COLUMNS});
+    Round8bitHistory bf16_history_val, gelu_8bit_history_val;
+    mlp_up_8bit_rounded(product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor, product_val.copies_val);
+    for (Round8bitHistory *history_ptr : {&bf16_history_val, &gelu_8bit_history_val})   // the first call, exact: the histories started
+        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.gelu_output_tensor, history_ptr);
+    auto round_val = [&] {
+        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.gelu_output_tensor,
+                              &bf16_history_val);
+    };
+    auto gelu_8bit_val = [&] {
+        MlpUp8bitGelu8bit gelu_val;
+        gelu_val.rows_8bit_tensor = rows_8bit_tensor;
+        gelu_val.row_scales_tensor = row_scales_tensor;
+        gelu_val.turned_8bit_tensor = turned_8bit_tensor;
+        gelu_val.turned_scales_tensor = turned_scales_tensor;
+        gelu_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
+        round_8bit_delayed_largest(gelu_8bit_history_val, gelu_val.scale_largest_ptr, gelu_val.next_largest_ptr);
+        mlp_up_8bit_gelu_8bit(product_val.output_tensor, gelu_val, product_val.bias_tensor, product_val.copies_val);
+    };
+    const char *names_list[4] = {"bfloat16 gelu_output", "  + round_8bit_per_tensor", "the rounding pass alone", "mlp_up_8bit_gelu_8bit"};
+    double totals_list[4] = {};
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+    {
+        float times_list[4];
+        times_list[0] = gpu_milliseconds([&] { mlp_up_8bit_rounded(product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor,
+                                                                   product_val.copies_val); });
+        times_list[1] = gpu_milliseconds([&] {
+            mlp_up_8bit_rounded(product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor, product_val.copies_val);
+            round_val();
+        });
+        times_list[2] = gpu_milliseconds(round_val);
+        times_list[3] = gpu_milliseconds(gelu_8bit_val);
+        if (round_index_val > WARM_UP_STEPS)
+            for (int run_index_val = 0; run_index_val < 4; run_index_val++)
+                totals_list[run_index_val] += times_list[run_index_val];
+    }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d, at this file's setting\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (int run_index_val = 0; run_index_val < 4; run_index_val++)
+        printf("        %-28s %8.3f ms\n", names_list[run_index_val], totals_list[run_index_val] / averaged_val);
+    printf("    gelu_output in 8 bits: %.3f ms against %.3f (%.2fx); the backward's turned rounding of it, gone too, is not timed here\n",
+           totals_list[3] / averaged_val, totals_list[1] / averaged_val, totals_list[1] / totals_list[3]);
+}
+
+// ══ part 3: order, blocks and cluster ═════════════════════════════════════════
 
 static Choice time_each_choice(const Product &product_val, int square_index_val)
 {
@@ -371,16 +539,28 @@ int main(void)
     time_against_cublas(product_val);
     int square_index_val = time_each_square(product_val);
     Choice choice_val = time_each_choice(product_val, square_index_val);
+    PingpongChoice pingpong_val = time_pingpong_against_this_files_setting(product_val, choice_val, square_index_val);
+    time_gelu_8bit_against_bf16_and_rounding(product_val);
     Variant variant_val = time_each_variant(product_val);
-    // the fastest, as the defines of the product's file
+    // the fastest, as the defines of the product's file: ping-pong's square and order if part 2b found it fastest
     const Square &square_val = SQUARES_LIST[square_index_val];
     printf("\n    for llmc/kernels/8bit/prod/mlp_up_8bit.cuh:\n");
-    printf("#define MLP_UP_8BIT_ROW_GROUPS %d\n#define MLP_UP_8BIT_COLUMNS %d\n#define MLP_UP_8BIT_STAGES %d\n", square_val.row_groups_val, square_val.columns_val,
-           square_val.stages_val);
-    printf("#define MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP %d\n#define MLP_UP_8BIT_CLUSTER %d\n#define MLP_UP_8BIT_BLOCKS %s\n", choice_val.block_rows_per_group_val,
-           choice_val.cluster_val, choice_val.blocks_val == 0 ? "0" : "MLP_UP_8BIT_ONE_A_SQUARE");
+    if (pingpong_val.pingpong_val)
+    {
+        printf("#define MLP_UP_8BIT_ROW_GROUPS 2\n#define MLP_UP_8BIT_COLUMNS %d\n#define MLP_UP_8BIT_STAGES %d\n", pingpong_val.columns_val,
+               pingpong_val.stages_val);
+        printf("#define MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP %d\n#define MLP_UP_8BIT_CLUSTER 1\n#define MLP_UP_8BIT_BLOCKS 0\n", pingpong_val.block_rows_per_group_val);
+    }
+    else
+    {
+        printf("#define MLP_UP_8BIT_ROW_GROUPS %d\n#define MLP_UP_8BIT_COLUMNS %d\n#define MLP_UP_8BIT_STAGES %d\n", square_val.row_groups_val, square_val.columns_val,
+               square_val.stages_val);
+        printf("#define MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP %d\n#define MLP_UP_8BIT_CLUSTER %d\n#define MLP_UP_8BIT_BLOCKS %s\n", choice_val.block_rows_per_group_val,
+               choice_val.cluster_val, choice_val.blocks_val == 0 ? "0" : "MLP_UP_8BIT_ONE_A_SQUARE");
+    }
     printf("#define MLP_UP_8BIT_PRODUCER_REGISTERS %d\n#define MLP_UP_8BIT_IN_FLIGHT %d\n#define MLP_UP_8BIT_PROMOTION_STEPS %d\n", variant_val.producer_registers_val,
            variant_val.in_flight_val, variant_val.promotion_steps_val);
+    printf("#define MLP_UP_8BIT_PINGPONG %d\n", pingpong_val.pingpong_val ? 1 : 0);
     printf("    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion\n"
            "     changes the bits: take a faster one only if the tests stay within their tolerances)\n");
 

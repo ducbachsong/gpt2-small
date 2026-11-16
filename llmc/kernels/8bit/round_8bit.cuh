@@ -79,6 +79,7 @@ struct Round8bitHistory {
 void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& row_scales_tensor, const Tensor& columns_8bit_tensor,
                            const Tensor& column_scales_tensor, const Tensor& input_tensor,
                            const Round8bitHistory* history_ptr = nullptr, bool same_input_val = false);
+bool round_8bit_delayed_largest(const Round8bitHistory& history_val, const unsigned*& scale_largest_ptr, unsigned*& next_largest_ptr);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
@@ -543,11 +544,8 @@ inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& 
         scale_largest_ptr = slots_ptr + (history_ptr->calls_val - 1) % 2;
     } else {
         //    delayed: the scale from the last call's largest, with room; this tensor's largest into the other slot
-        scale_largest_ptr = slots_ptr + (history_ptr->calls_val - 1) % 2;
-        next_largest_ptr = slots_ptr + history_ptr->calls_val % 2;
+        round_8bit_delayed_largest(*history_ptr, scale_largest_ptr, next_largest_ptr);
         margin_val = ROUND_8BIT_DELAYED_MARGIN;
-        cudaCheck(cudaMemsetAsync(next_largest_ptr, 0, sizeof(unsigned)));
-        history_ptr->calls_val++;
     }
     // 3. the one read, a block a tile
     dim3 grid_val((unsigned)CEIL_DIV(columns_val, (size_t)ROUND_8BIT_TILE), (unsigned)CEIL_DIV(rows_val, (size_t)ROUND_8BIT_TILE));
@@ -557,6 +555,26 @@ inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& 
         has_columns_val ? column_scales_tensor.data() : nullptr, nullptr, nullptr, input_ptr, rows_val, columns_val, scale_largest_ptr,
         margin_val, next_largest_ptr);
     cudaCheck(cudaGetLastError());
+}
+
+/// Takes a delayed scale's turn in a history, for a kernel that rounds a tensor it writes itself with one scale for the
+/// tensor (mlp_up_8bit_gelu_8bit's gelu_output), as round_8bit_per_tensor's later calls do: the scale is to come from
+/// the largest of the tensor rounded there the call before (x ROUND_8BIT_DELAYED_MARGIN), and this tensor's largest is
+/// to be maxed into the other slot, zeroed here; the call is counted. On the history's first call there is no largest
+/// yet: nothing is done, false, and the caller rounds that tensor by round_8bit_per_tensor (exact, which starts the
+/// history).
+///
+///   history_val         the place's history
+///   scale_largest_ptr   given: the largest the scale comes from (a float's bits, GPU memory)
+///   next_largest_ptr    given: where this tensor's largest goes (0 now)
+inline bool round_8bit_delayed_largest(const Round8bitHistory& history_val, const unsigned*& scale_largest_ptr, unsigned*& next_largest_ptr) {
+    if (history_val.calls_val == 0) return false;
+    unsigned* slots_ptr = reinterpret_cast<unsigned*>(history_val.largest_tensor.data());
+    scale_largest_ptr = slots_ptr + (history_val.calls_val - 1) % 2;
+    next_largest_ptr = slots_ptr + history_val.calls_val % 2;
+    cudaCheck(cudaMemsetAsync(next_largest_ptr, 0, sizeof(unsigned)));
+    history_val.calls_val++;
+    return true;
 }
 
 /// Gives round_8bit's block size for rows as they sit, from their width: the fewest threads, a power of 2, that

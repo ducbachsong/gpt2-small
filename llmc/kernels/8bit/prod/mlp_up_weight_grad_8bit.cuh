@@ -54,16 +54,16 @@
 #define MLP_UP_WEIGHT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define MLP_UP_WEIGHT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to MLP_UP_WEIGHT_GRAD_8BIT_MAX_STAGES
 #define MLP_UP_WEIGHT_GRAD_8BIT_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (mlp_up_weight_grad_8bit_auto_splits)
-#define MLP_UP_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 16            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define MLP_UP_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define MLP_UP_WEIGHT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define MLP_UP_WEIGHT_GRAD_8BIT_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); MLP_UP_WEIGHT_GRAD_8BIT_ONE_A_SQUARE: one a square
-#define MLP_UP_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 40                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_mlp_up_weight_grad_8bit sweeps it
-#define MLP_UP_WEIGHT_GRAD_8BIT_IN_FLIGHT 1                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_mlp_up_weight_grad_8bit sweeps it
-#define MLP_UP_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 4                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_mlp_up_weight_grad_8bit sweeps it
+#define MLP_UP_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 48                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_mlp_up_weight_grad_8bit sweeps it
+#define MLP_UP_WEIGHT_GRAD_8BIT_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_mlp_up_weight_grad_8bit sweeps it
+#define MLP_UP_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 0                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_mlp_up_weight_grad_8bit sweeps it
 #define MLP_UP_WEIGHT_GRAD_8BIT_SPLITS_SUM_THREADS_PER_BLOCK 256     // the splits' sum's block size
 #define MLP_UP_WEIGHT_GRAD_8BIT_SPLIT_COST_STEPS 15                  // SPLITS 0: what a split piece's float store and its share of the splits' sum cost, in steps of the walk
 #define MLP_UP_WEIGHT_GRAD_8BIT_MAX_AUTO_SPLITS 16                   // SPLITS 0: the most it picks
-#define MLP_UP_WEIGHT_GRAD_8BIT_STAGED_ROWS 32                       // a split's store: rows a consumer warpgroup stages and stores a round: 16, 32 or 64; tune_mlp_up_weight_grad_8bit sweeps it
+#define MLP_UP_WEIGHT_GRAD_8BIT_STAGED_ROWS 64                       // a split's store: rows a consumer warpgroup stages and stores a round: 16, 32 or 64; tune_mlp_up_weight_grad_8bit sweeps it
 #define MLP_UP_WEIGHT_GRAD_8BIT_STAGED_ROW_PADDING 8                 // floats past COLUMNS in a staged row, a multiple of 4 (rows stay on 16 bytes); tune_mlp_up_weight_grad_8bit sweeps it
 #define MLP_UP_WEIGHT_GRAD_8BIT_STORE_VALUES 4                       // neighbouring values a thread stores at once in a split's slice and the splits' sum: two pairs
 // the walk's own numbers

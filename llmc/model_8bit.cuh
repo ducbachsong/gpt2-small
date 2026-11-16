@@ -77,6 +77,19 @@
 #ifndef MODEL_8BIT_SCALE_PER_TENSOR
 #define MODEL_8BIT_SCALE_PER_TENSOR 1
 #endif
+// MODEL_8BIT_GELU_8BIT 1: mlp_up writes gelu_output straight in 8 bits (mlp_up_8bit_gelu_8bit): its row copy into
+// mlp_down's left side and its turned copy kept for mlp_down's weight_grad, one scale for the tensor from the place's
+// history (delayed), as NVIDIA Transformer Engine fuses its FP8 casts into the product before. No bfloat16 gelu_output
+// is written or kept (2 bytes a value less per layer), and no round_8bit_per_tensor pass reads it back, neither in
+// the forward nor in the backward. A layer's first micro-batch, with no history yet, writes bfloat16 gelu_output
+// into scratch and rounds it exactly (round_8bit_per_tensor), which starts the history. Needs MODEL_8BIT_SCALE_PER_TENSOR
+// 1 and MODEL_8BIT_WEIGHT_GRAD_BF16 0 (a bfloat16 weight_grad reads bfloat16 gelu_output); 0: as before.
+#ifndef MODEL_8BIT_GELU_8BIT
+#define MODEL_8BIT_GELU_8BIT (MODEL_8BIT_SCALE_PER_TENSOR && !MODEL_8BIT_WEIGHT_GRAD_BF16)
+#endif
+#if MODEL_8BIT_GELU_8BIT && !(MODEL_8BIT_SCALE_PER_TENSOR && !MODEL_8BIT_WEIGHT_GRAD_BF16)
+#error "MODEL_8BIT_GELU_8BIT needs MODEL_8BIT_SCALE_PER_TENSOR 1 and MODEL_8BIT_WEIGHT_GRAD_BF16 0"
+#endif
 // a layer's places with a history: its 4 linears' inputs (the forward's), then their output_grads (the backward's)
 #define MODEL_8BIT_HISTORY_QKV_INPUT 0                  // ln1_output
 #define MODEL_8BIT_HISTORY_ATTENTION_OUT_INPUT 1        // attention_output
@@ -153,7 +166,10 @@ struct GPT2Activations8bit {
     std::vector<Tensor> ln2_mean;                           // {B, T}
     std::vector<Tensor> ln2_rstd;                           // {B, T}
     std::vector<Tensor> mlp_up_output;                      // {B, T, 4D}
-    std::vector<Tensor> gelu_output;                        // {B, T, 4D}
+    std::vector<Tensor> gelu_output;                        // {B, T, 4D}; with MODEL_8BIT_GELU_8BIT, none: ...
+    std::vector<Tensor> gelu_turned_8bit;                   // ... gelu_output turned, in E4M3 {4D, B T / 4} Int32 (mlp_down's
+                                                            // weight_grad's right side), written by mlp_up
+    std::vector<Tensor> gelu_turned_scales;                 // ... and its scales {4D} float (one scale, every value)
     // ── only inside one forward or backward, shared by all the layers ──
     Tensor qkv_scratch;                                     // {B, T, 3D}: forward, the qkv linear's output; backward,
                                                             // query, key, value turned back from 8 bits
@@ -312,7 +328,12 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
         ln2_output.push_back(Tensor::zeros({B, T, D}, bf16));
         ln2_mean.push_back(Tensor::zeros({B, T})), ln2_rstd.push_back(Tensor::zeros({B, T}));
         mlp_up_output.push_back(Tensor::zeros({B, T, 4 * D}, bf16));
+#if MODEL_8BIT_GELU_8BIT
+        gelu_turned_8bit.push_back(Tensor::zeros({4 * D, B * T / ROUND_8BIT_VALUES_PER_INT}, DType::Int32));
+        gelu_turned_scales.push_back(Tensor::zeros({4 * D}));
+#else
         gelu_output.push_back(Tensor::zeros({B, T, 4 * D}, bf16));
+#endif
         // the layer's weights in 8 bits, made by the first forward
         qkv_weight_copies.push_back(LinearWeight8bitCopies(3 * D, D));
         attention_out_weight_copies.push_back(LinearWeight8bitCopies(D, D));
@@ -408,12 +429,38 @@ inline void block_8bit_forward(const Tensor& output, const Tensor& input, const 
     // the MLP branch; mlp_up and GELU in one product: GELU as each pair of mlp_up_output is stored
     layer_norm_bf16_forward(a.ln2_output[l], a.ln2_mean[l], a.ln2_rstd[l], a.residual2[l], params.ln2_weight,
                             params.ln2_bias);
+#if MODEL_8BIT_GELU_8BIT
+    //    gelu_output in 8 bits from mlp_up itself: its row copy into mlp_down's left side, its turned copy kept for the
+    //    backward, the scale from the history; a layer's first micro-batch (no history yet): bfloat16 into scratch
+    //    (mlp_up_output_grad, free in the forward), rounded exactly into the same copies
+    MlpUp8bitCopies mlp_up_copies = forward_copies_8bit(a.mlp_up_copies_scratch, a.ln2_output[l], a.mlp_up_weight_copies[l],
+                                                        a.history(l, MODEL_8BIT_HISTORY_MLP_UP_INPUT));
+    const Round8bitHistory& gelu_history = a.history(l, MODEL_8BIT_HISTORY_MLP_DOWN_INPUT);
+    MlpUp8bitGelu8bit gelu_val;
+    gelu_val.rows_8bit_tensor = a.mlp_down_copies_scratch.left_8bit_tensor;
+    gelu_val.row_scales_tensor = a.mlp_down_copies_scratch.left_scales_tensor;
+    gelu_val.turned_8bit_tensor = a.gelu_turned_8bit[l];
+    gelu_val.turned_scales_tensor = a.gelu_turned_scales[l];
+    gelu_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
+    if (round_8bit_delayed_largest(gelu_history, gelu_val.scale_largest_ptr, gelu_val.next_largest_ptr)) {
+        mlp_up_8bit_gelu_8bit(a.mlp_up_output[l], gelu_val, params.mlp_up_bias, mlp_up_copies);
+    } else {
+        mlp_up_8bit_rounded(a.mlp_up_output[l], a.mlp_up_output_grad_scratch, params.mlp_up_bias, mlp_up_copies);
+        round_8bit_per_tensor(gelu_val.rows_8bit_tensor, gelu_val.row_scales_tensor, gelu_val.turned_8bit_tensor, gelu_val.turned_scales_tensor,
+                              a.mlp_up_output_grad_scratch, &gelu_history);
+    }
+    MlpDown8bitCopies mlp_down_copies = a.mlp_down_copies_scratch;
+    mlp_down_copies.right_8bit_tensor = a.mlp_down_weight_copies[l].rows_8bit_tensor;
+    mlp_down_copies.right_scales_tensor = a.mlp_down_weight_copies[l].row_scales_tensor;
+    mlp_down_8bit_rounded(a.branch_output_scratch, params.mlp_down_bias, mlp_down_copies);
+#else
     mlp_up_8bit_rounded(a.mlp_up_output[l], a.gelu_output[l], params.mlp_up_bias,
                         forward_copies_8bit(a.mlp_up_copies_scratch, a.ln2_output[l], a.mlp_up_weight_copies[l],
                                             a.history(l, MODEL_8BIT_HISTORY_MLP_UP_INPUT)));
     mlp_down_8bit_rounded(a.branch_output_scratch, params.mlp_down_bias,
                           forward_copies_8bit(a.mlp_down_copies_scratch, a.gelu_output[l], a.mlp_down_weight_copies[l],
                                               a.history(l, MODEL_8BIT_HISTORY_MLP_DOWN_INPUT)));
+#endif
     residual_bf16_forward(output, a.residual2[l], a.branch_output_scratch);
 }
 
@@ -472,13 +519,25 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     // the MLP branch; LayerNorm 2 adds its part onto residual2_grad
     residual_bf16_backward(a.residual2_grad_scratch, a.branch_output_grad_scratch, output_grad);
     // mlp_down's backward and GELU's in one: its input_grad times gelu' as each pair is stored
+#if MODEL_8BIT_GELU_8BIT
+    //    output_grad both ways in one read; the weight_grad's right side is gelu_output turned, as mlp_up wrote it
+    round_8bit_per_tensor(a.mlp_down_input_grad_copies_scratch.left_8bit_tensor, a.mlp_down_input_grad_copies_scratch.left_scales_tensor,
+                          a.mlp_down_weight_grad_copies_scratch.left_8bit_tensor, a.mlp_down_weight_grad_copies_scratch.left_scales_tensor,
+                          a.branch_output_grad_scratch, &a.history(l, MODEL_8BIT_HISTORY_MLP_DOWN_GRAD));
+    MlpDownWeightGrad8bitCopies mlp_down_weight_grad_copies = a.mlp_down_weight_grad_copies_scratch;
+    mlp_down_weight_grad_copies.right_8bit_tensor = a.gelu_turned_8bit[l];
+    mlp_down_weight_grad_copies.right_scales_tensor = a.gelu_turned_scales[l];
+#else
     linear_8bit_round_backward(a.mlp_down_input_grad_copies_scratch, a.mlp_down_weight_grad_copies_scratch, a.branch_output_grad_scratch, a.gelu_output[l],
                                a.history(l, MODEL_8BIT_HISTORY_MLP_DOWN_GRAD), a.history(l, MODEL_8BIT_HISTORY_MLP_DOWN_INPUT));
+    const MlpDownWeightGrad8bitCopies& mlp_down_weight_grad_copies = a.mlp_down_weight_grad_copies_scratch;
+#endif
     mlp_down_input_grad_8bit_rounded(a.mlp_up_output_grad_scratch, a.mlp_up_output[l], input_grad_copies_8bit(a.mlp_down_input_grad_copies_scratch, a.mlp_down_weight_copies[l]));
 #if MODEL_8BIT_WEIGHT_GRAD_BF16
+    (void)mlp_down_weight_grad_copies;
     mlp_down_weight_grad_bf16(param_grads.mlp_down_weight, a.branch_output_grad_scratch, a.gelu_output[l]);
 #else
-    mlp_down_weight_grad_8bit_rounded(param_grads.mlp_down_weight, a.mlp_down_weight_grad_copies_scratch);
+    mlp_down_weight_grad_8bit_rounded(param_grads.mlp_down_weight, mlp_down_weight_grad_copies);
 #endif
     if (param_grads.has_linear_bias()) linear_bf16_bias_grad(param_grads.mlp_down_bias, a.branch_output_grad_scratch);
     linear_8bit_round_backward(a.mlp_up_input_grad_copies_scratch, a.mlp_up_weight_grad_copies_scratch, a.mlp_up_output_grad_scratch, a.ln2_output[l],

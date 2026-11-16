@@ -53,13 +53,13 @@
 #define QKV_WEIGHT_GRAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
 #define QKV_WEIGHT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define QKV_WEIGHT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to QKV_WEIGHT_GRAD_8BIT_MAX_STAGES
-#define QKV_WEIGHT_GRAD_8BIT_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (qkv_weight_grad_8bit_auto_splits)
-#define QKV_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 16            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define QKV_WEIGHT_GRAD_8BIT_SPLITS 1                           // splits of the sum: 1, none; 0: chosen at each launch (qkv_weight_grad_8bit_auto_splits)
+#define QKV_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define QKV_WEIGHT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define QKV_WEIGHT_GRAD_8BIT_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); QKV_WEIGHT_GRAD_8BIT_ONE_A_SQUARE: one a square
-#define QKV_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 40                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_qkv_weight_grad_8bit sweeps it
-#define QKV_WEIGHT_GRAD_8BIT_IN_FLIGHT 1                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_qkv_weight_grad_8bit sweeps it
-#define QKV_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 4                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_qkv_weight_grad_8bit sweeps it
+#define QKV_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 48                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_qkv_weight_grad_8bit sweeps it
+#define QKV_WEIGHT_GRAD_8BIT_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_qkv_weight_grad_8bit sweeps it
+#define QKV_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 0                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_qkv_weight_grad_8bit sweeps it
 #define QKV_WEIGHT_GRAD_8BIT_SPLITS_SUM_THREADS_PER_BLOCK 256     // the splits' sum's block size
 #define QKV_WEIGHT_GRAD_8BIT_SPLIT_COST_STEPS 15                  // SPLITS 0: what a split piece's float store and its share of the splits' sum cost, in steps of the walk
 #define QKV_WEIGHT_GRAD_8BIT_MAX_AUTO_SPLITS 16                   // SPLITS 0: the most it picks
