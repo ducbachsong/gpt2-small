@@ -40,7 +40,8 @@ suffix), `tests/bf16/` (`_bf16`) or `tests/8bit/` (`_8bit`).
 | `tune_gelu.cu` | GELU against PyTorch; other launches |
 | `tune_gelu_bf16.cu` | GPT-2's MLP with GELU done inside its two bfloat16 WGMMA products (the epilogue) against linear_bf16 + GELU on its own, and what fusing saves over 12 layers; needs an H100 and `-arch=sm_90a` |
 | `tune_gelu_8bit.cu` | the same with the products in 8 bits, against the unfused 8-bit MLP and the fused bfloat16 one; needs an H100 and `-arch=sm_90a` |
-| `tune_model.cu` | the whole GPT-2 small step, bfloat16; the micro-batch size (`--batch-size`) with the best MFU |
+| `tune_model_torchao.py` | PyTorch's own speed on the same model at its fastest: compiled bfloat16, and torchao's float8 training (tensorwise, compiled) as nanochat runs it; `pip install torchao`, then `python3 tests/tune_model_torchao.py` |
+| `tune_model.cu` | the whole model's step, bfloat16 and 8-bit; the micro-batch size (`--batch-size`) with the best MFU; our 8-bit gradients and loss against PyTorch's FP8 model (`torch::_scaled_mm`); tokens/s against PyTorch, bfloat16 against bfloat16, 8-bit against FP8 |
 | `tune_grad_norm.cu` | the grad norm against PyTorch; other launches |
 | `tune_grad_norm_bf16.cu` | the bfloat16 gradients' norm, 8 values a thread (16-byte loads), against the 4-value path and on a slice off a 16-byte boundary, with GB/s and MBU; other launches |
 | `tune_layer_norm.cu` | layer norm against PyTorch; other launches |
