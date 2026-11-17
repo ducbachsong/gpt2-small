@@ -1,0 +1,45 @@
+log: tests/results/H100/model_2026-11-17_080701.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+find_the_micro_batch_with_the_best_mfu
+    bfloat16: 733105152 parameters, 4.79G flops a token at T = 2048; this GPU's peak 819 TFLOPS in bfloat16
+    rows   activations GB   ms a micro-batch   ms a step of 524288   tokens/s   TFLOPS    MFU   loss
+       1             2.80              40.29                10314      50830    243.7   29.7%   10.696
+       2             5.59              67.74                 8671      60467    289.9   35.4%   10.697
+       4            11.18             124.67                 7979      65707    315.1   38.4%   10.705
+       8            22.36             240.48                 7695      68131    326.7   39.9%   10.698
+      16            44.71             471.41                 7543      69511    333.3   40.7%   10.703
+      32   would need about 89.4 GB, with 81.3 GB free: stop
+      26            72.70             763.63                 7519      69730    334.4   40.8%   10.701
+    best: --batch-size 26, 69730 tokens/s, 334.4 TFLOPS, MFU 40.8% (--tokens-per-step must be a multiple of GPUs x rows x 2048)
+
+    8-bit: 733105152 parameters, 4.79G flops a token at T = 2048; this GPU's peak 819 TFLOPS in bfloat16
+    rows   activations GB   ms a micro-batch   ms a step of 524288   tokens/s   TFLOPS    MFU   loss
+       1             4.27              31.33                 8022      65359    313.4   38.2%   10.692
+       2             6.37              55.39                 7090      73951    354.6   43.3%   10.694
+       4            10.86             100.64                 6441      81395    390.3   47.6%   10.704
+       8            19.86             193.46                 6191      84690    406.1   49.6%   10.697
+      16            37.83             376.29                 6021      87083    417.6   51.0%   10.702
+      32   would need about 75.7 GB, with 80.8 GB free: stop
+      30            69.35             698.32                 5959      87983    421.9   51.5%   10.701
+    best: --batch-size 30, 87983 tokens/s, 421.9 TFLOPS, MFU 51.5% (--tokens-per-step must be a multiple of GPUs x rows x 2048)
+
+
+eight_bit_gradients_follow_bfloat16s
+    196 gradients; the least alike: tensor 180 (a vector), cosine 0.9887
+    input: least_cosine_val >= EIGHT_BIT_LEAST_COSINE expected: true   actual: true   ok  (line 374)
+
+time_against_pytorch
+    tokens/s, a micro-batch as the training loop runs it; PyTorch: cuBLAS for every product, its flash attention
+    (which has no window: PyTorch's every layer sees the whole row, ours 18 of 24 layers a window of 512 tokens)
+    rows   ours bf16   ours 8-bit   PyTorch (cuBLAS)   bf16 / PyTorch   8-bit / PyTorch
+       1       50830        65359              60359            0.84x             1.08x
+       2       60467        73951              63852            0.95x             1.16x
+       4       65707        81395              66291            0.99x             1.23x
+       8       68131        84690              68309            1.00x             1.24x
+      16       69511        87083              68741            1.01x             1.27x
+      26       69730            0      out of memory
+    input: (double)gpt2_mean_loss(activations_val) expected: 10.696 +/- 0.05   actual: 10.6958   ok  (line 481)
+
+all tunes done

@@ -1,0 +1,5 @@
+==== 2026-11-17 08:10:15 building 1 programs
+  built   tune_attention_8bit (33 s)
+==== running
+  passed  tune_attention_8bit (5 s)
+==== done 08:10:53

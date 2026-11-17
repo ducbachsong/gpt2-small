@@ -117,14 +117,15 @@ struct EightBitTensors
     }
 
     /// Runs attention_8bit_backward on these tensors, the turn-back and row_dot at these block sizes (the defaults
-    /// if not given).
+    /// if not given), qkv_grad as bfloat16 or (given) in 8 bits.
     void backward(int threads_per_block_val = ATTENTION_8BIT_THREADS_PER_BLOCK,
-                  int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK)
+                  int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK,
+                  const AttentionFlashQkvGrad8bit *qkv_grad_8bit_ptr = nullptr)
     {
         attention_8bit_backward(qkv_grad_tensor, output_grad_tensor, output_tensor, query_8bit_tensor, key_8bit_tensor,
                                 value_8bit_tensor, query_scales_tensor, key_scales_tensor, value_scales_tensor,
                                 logsumexp_tensor, qkv_rounded_tensor, row_dot_tensor, threads_per_block_val,
-                                row_dot_threads_per_block_val, window_val);
+                                row_dot_threads_per_block_val, window_val, qkv_grad_8bit_ptr);
     }
 
     /// Fills qkv and output_grad with random values rounded to bfloat16.
@@ -411,20 +412,89 @@ static void backward_writes_over_qkv_grad_the_same_every_time(void)
     ASSERT_EQ(torch::equal(pytorch_copy_of(mine_val.qkv_grad_tensor), first_tensor), true);
 }
 
+static void qkv_grad_in_8bit_gives_round_8bit_per_tensors_bits(void)
+{
+    // Expect: random qkv and output_grad, {2, 18, 256}, with no window and with a window of 2 tiles. The backward
+    // with qkv_grad in 8 bits (AttentionFlashQkvGrad8bit, as the 8-bit model's backward runs it after a layer's first
+    // micro-batch) writes both copies {512, 6912} and {6912, 512}, their scales lists and the history's next largest
+    // with the bits round_8bit_per_tensor gives from the bfloat16 qkv_grad at the same delayed scale (the first call's
+    // largest x 2): each value rounded to bfloat16 as the bfloat16 store does, divided by the same power of 2 and
+    // rounded to E4M3 the same way. Every byte written (the copies filled with 7s first).
+    if (!eight_bit_runs_here(__func__))
+        return;
+    for (size_t window_val : {(size_t)0, (size_t)(2 * FLASH_TILE)})
+    {
+        // 1. a forward, a bfloat16 backward: qkv_grad, from which both histories start (an exact first call)
+        torch::manual_seed(0);
+        EightBitTensors mine_val(2, GPT2_NUM_HEADS, 4 * FLASH_TILE);
+        mine_val.window_val = window_val;
+        mine_val.fill_random();
+        mine_val.forward();
+        mine_val.backward();
+        size_t rows_val = mine_val.qkv_grad_tensor.size(0) * mine_val.qkv_grad_tensor.size(1);
+        size_t columns_val = mine_val.qkv_grad_tensor.size(2);
+        auto fresh_copies_val = [&](Tensor &rows_8bit_tensor, Tensor &row_scales_tensor, Tensor &turned_8bit_tensor, Tensor &turned_scales_tensor) {
+            rows_8bit_tensor = Tensor::zeros({rows_val, columns_val}, DType::E4M3);
+            turned_8bit_tensor = Tensor::zeros({columns_val, rows_val}, DType::E4M3);
+            row_scales_tensor = Tensor::zeros({rows_val});
+            turned_scales_tensor = Tensor::zeros({columns_val});
+            cudaCheck(cudaMemset(rows_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
+            cudaCheck(cudaMemset(turned_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
+            row_scales_tensor.fill_(7.0);
+            turned_scales_tensor.fill_(7.0);
+        };
+        Tensor reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor;
+        Tensor rows_tensor, row_scales_tensor, turned_tensor, turned_scales_tensor;
+        fresh_copies_val(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor);
+        fresh_copies_val(rows_tensor, row_scales_tensor, turned_tensor, turned_scales_tensor);
+        Round8bitHistory reference_history_val, mine_history_val;
+        for (Round8bitHistory *history_ptr : {&reference_history_val, &mine_history_val})
+            round_8bit_per_tensor(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor,
+                                  mine_val.qkv_grad_tensor, history_ptr);
+        // 2. the reference: round_8bit_per_tensor's delayed call on the bfloat16 qkv_grad
+        round_8bit_per_tensor(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor,
+                              mine_val.qkv_grad_tensor, &reference_history_val);
+        // 3. mine: the backward again, qkv_grad in 8 bits at the history's delayed scale
+        AttentionFlashQkvGrad8bit qkv_grad_val;
+        qkv_grad_val.rows_8bit_ptr = rows_tensor.data_ptr<__nv_fp8_e4m3>();
+        qkv_grad_val.row_scales_ptr = row_scales_tensor.data();
+        qkv_grad_val.turned_8bit_ptr = turned_tensor.data_ptr<__nv_fp8_e4m3>();
+        qkv_grad_val.turned_scales_ptr = turned_scales_tensor.data();
+        qkv_grad_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
+        round_8bit_delayed_largest(mine_history_val, qkv_grad_val.scale_largest_ptr, qkv_grad_val.next_largest_ptr);
+        mine_val.backward(ATTENTION_8BIT_THREADS_PER_BLOCK, ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, &qkv_grad_val);
+        // 4. the same bits
+        print_test_name(__func__);
+        printf("    window %zu:\n", window_val);
+        ASSERT_EQ(bytes_of(rows_tensor) == bytes_of(reference_rows_tensor), true);
+        ASSERT_EQ(bytes_of(turned_tensor) == bytes_of(reference_turned_tensor), true);
+        ASSERT_EQ(row_scales_tensor.tolist(), reference_row_scales_tensor.tolist());
+        ASSERT_EQ(turned_scales_tensor.tolist(), reference_turned_scales_tensor.tolist());
+        ASSERT_EQ(mine_history_val.largest_tensor.tolist(), reference_history_val.largest_tensor.tolist());
+        ASSERT_EQ(mine_history_val.calls_val, reference_history_val.calls_val);
+    }
+}
+
 static void every_kernel_fits_its_block(void)
 {
     // Expect: each kernel can be launched with its threads per block (256; the tile kernel's 128), and nothing
     // is spilled: cudaFuncGetAttributes' numRegs (registers per thread), maxThreadsPerBlock (the largest block)
     // and localSizeBytes (local memory per thread, 0 if nothing spills). The forward kernel holds the scores (32
     // sums) and the output (64 at head size 128) and the attention_probs packed as A (16 registers); its query and
-    // key tiles stay in shared memory. The backward's kernels are attention_bf16.cuh's, tested there.
-    const int kernel_count_val = 3;
+    // key tiles stay in shared memory. The backward's kernels are attention_bf16.cuh's, tested there as bfloat16;
+    // here with qkv_grad in 8 bits (their store at the end the only change).
+    const int kernel_count_val = 5;
     const void *kernels_list[kernel_count_val] = {(const void *)attention_8bit_round_qkv_kernel,
                                                   (const void *)attention_8bit_forward_kernel,
-                                                  (const void *)attention_8bit_turn_back_kernel};
+                                                  (const void *)attention_8bit_turn_back_kernel,
+                                                  (const void *)attention_bf16_flash_key_grad_kernel<ATTENTION_FLASH_BF16_KEY_GRAD_STAGES, true>,
+                                                  (const void *)attention_bf16_flash_query_grad_kernel<ATTENTION_FLASH_BF16_QUERY_GRAD_STAGES, true>};
     const char *names_list[kernel_count_val] = {"attention_8bit_round_qkv_kernel", "attention_8bit_forward_kernel",
-                                                "attention_8bit_turn_back_kernel"};
-    int threads_list[kernel_count_val] = {ATTENTION_8BIT_THREADS_PER_BLOCK, FLASH_THREADS, ATTENTION_8BIT_THREADS_PER_BLOCK};
+                                                "attention_8bit_turn_back_kernel",
+                                                "attention_bf16_flash_key_grad_kernel, qkv_grad in 8 bits",
+                                                "attention_bf16_flash_query_grad_kernel, qkv_grad in 8 bits"};
+    int threads_list[kernel_count_val] = {ATTENTION_8BIT_THREADS_PER_BLOCK, FLASH_THREADS, ATTENTION_8BIT_THREADS_PER_BLOCK, FLASH_THREADS,
+                                          FLASH_THREADS};
     for (int kernel_index_val = 0; kernel_index_val < kernel_count_val; kernel_index_val++)
     {
         // 1. what the compiler wrote down
@@ -490,6 +560,7 @@ int main(void)
     stays_near_pytorch_on_the_values_before_rounding();
 
     backward_writes_over_qkv_grad_the_same_every_time();
+    qkv_grad_in_8bit_gives_round_8bit_per_tensors_bits();
     every_kernel_fits_its_block();
     any_block_size_gives_the_same_bits();
 

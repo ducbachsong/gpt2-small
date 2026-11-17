@@ -69,7 +69,8 @@ void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor& output
                              const Tensor& key_scales_tensor, const Tensor& value_scales_tensor,
                              const Tensor& logsumexp_tensor, const Tensor& qkv_rounded_tensor,
                              const Tensor& row_dot_tensor, int threads_per_block_val = ATTENTION_8BIT_THREADS_PER_BLOCK,
-                             int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, size_t window_val = 0);
+                             int row_dot_threads_per_block_val = ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, size_t window_val = 0,
+                             const AttentionFlashQkvGrad8bit* qkv_grad_8bit_ptr = nullptr);
 
 // ── for both ────────────────────────────────────────────────────────────
 CUtensorMap attention_8bit_tensor_map(const void* matrix_ptr, size_t matrix_rows_val);
@@ -463,13 +464,16 @@ attention_8bit_forward_kernel(const __grid_constant__ CUtensorMap query_map_val,
 ///   row_dot_threads_per_block_val                row_dot's, the same; not given: ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK.
 ///                                                Any sizes give the same bits; only the time changes.
 ///   window_val                                   the forward's sliding window (0, not given: none)
+///   qkv_grad_8bit_ptr                            qkv_grad in 8 bits in place of bfloat16 (attention_bf16_flash_backward's);
+///                                                nullptr (not given): bfloat16 into qkv_grad_tensor
 inline void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor& output_grad_tensor,
                                     const Tensor& output_tensor, const Tensor& query_8bit_tensor,
                                     const Tensor& key_8bit_tensor, const Tensor& value_8bit_tensor,
                                     const Tensor& query_scales_tensor, const Tensor& key_scales_tensor,
                                     const Tensor& value_scales_tensor, const Tensor& logsumexp_tensor,
                                     const Tensor& qkv_rounded_tensor, const Tensor& row_dot_tensor,
-                                    int threads_per_block_val, int row_dot_threads_per_block_val, size_t window_val) {
+                                    int threads_per_block_val, int row_dot_threads_per_block_val, size_t window_val,
+                                    const AttentionFlashQkvGrad8bit* qkv_grad_8bit_ptr) {
     // 1. check the 8-bit tensors as the forward does; the rest is checked by the two calls below
     attention_8bit_check_shapes(output_grad_tensor, query_8bit_tensor, key_8bit_tensor, value_8bit_tensor,
                                 query_scales_tensor, key_scales_tensor, value_scales_tensor, logsumexp_tensor,
@@ -479,7 +483,7 @@ inline void attention_8bit_backward(const Tensor& qkv_grad_tensor, const Tensor&
                              query_scales_tensor, key_scales_tensor, value_scales_tensor, threads_per_block_val);
     // 3. the flash backward on them
     attention_bf16_flash_backward(qkv_grad_tensor, output_grad_tensor, output_tensor, qkv_rounded_tensor,
-                                  logsumexp_tensor, row_dot_tensor, row_dot_threads_per_block_val, window_val);
+                                  logsumexp_tensor, row_dot_tensor, row_dot_threads_per_block_val, window_val, qkv_grad_8bit_ptr);
 }
 
 // ── for both ────────────────────────────────────────────────────────────

@@ -275,7 +275,7 @@ static void time_rounding_and_turn_back_with_other_block_and_thread_counts(void)
     std::vector<uint8_t> usual_8bit_list = bytes_of(tensors_val.query_8bit_tensor);
     std::vector<uint8_t> usual_bf16_list = bytes_of(tensors_val.qkv_rounded_tensor);
     size_t rows_val = (size_t)GPT2_BATCH_SIZE * GPT2_NUM_HEADS * GPT2_SEQ_LEN;
-    size_t total_ints_val = tensors_val.query_8bit_tensor.numel();
+    size_t total_ints_val = tensors_val.query_8bit_tensor.numel() / VALUES_PER_FLOAT4;   // the turn-back's: 4 E4M3s each
     double values_val = (double)rows_val * FLASH_HEAD_SIZE;
     double moved_bytes_val = 3 * values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + 3 * (double)rows_val * sizeof(float);
 

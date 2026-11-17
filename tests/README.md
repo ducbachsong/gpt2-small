@@ -45,7 +45,7 @@ suffix), `tests/bf16/` (`_bf16`) or `tests/8bit/` (`_8bit`).
 | `tune_grad_norm_bf16.cu` | the bfloat16 gradients' norm, 8 values a thread (16-byte loads), against the 4-value path and on a slice off a 16-byte boundary, with GB/s and MBU; other launches |
 | `tune_layer_norm.cu` | layer norm against PyTorch; other launches |
 | `tune_layer_norm_bf16.cu` | bfloat16 layer norm, 8 values a lane (16-byte loads), against the 4-value path, with GB/s and MBU; other launches |
-| `tune_layer_norm_8bit.cu` | layer norm writing its output's E4M3 copy in the same kernel, against layer_norm_bf16 then round_8bit, and what that saves over a forward's 25 LayerNorms; other launches |
+| `tune_layer_norm_8bit.cu` | layer norm writing its output straight in 8 bits (both E4M3 copies, one delayed scale for the tensor), against layer_norm_bf16 then the forward's and the backward's round_8bit_per_tensor, and what that saves over a forward's 49 LayerNorms; each tile (16, 32, 64 rows) and block size |
 | `tune_linear.cu` | GPT-2 small's 5 linear layers in float against PyTorch (fma_matmul_bf16's products in float); any GPU |
 | `tune_linear_bf16.cu` | GPT-2 small's 5 linear layers in bfloat16 against PyTorch's bfloat16 linear (wgmma_matmul_bf16's products); needs an H100 and `-arch=sm_90a` |
 | `tune_linear_8bit.cu` | GPT-2 small's 5 linear layers with 8-bit products (round_8bit + wgmma_matmul_8bit) against the bfloat16 layer and PyTorch; needs an H100 and `-arch=sm_90a` |

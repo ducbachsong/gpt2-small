@@ -7,6 +7,7 @@
 //     part 2   every square (1 or 2 warpgroups x 64 or 128 columns x 1 to 4 sets of tiles)
 //     part 3   at part 2's fastest square: every block order, block count and cluster
 //     part 4   at this file's square: the producer's registers x the steps in flight, then every promotion
+//     part 5   gelu_input_grad in 8 bits (mlp_down_input_grad_8bit_output_8bit) against bfloat16 and a rounding pass
 // then the fastest as the #define lines of mlp_down_input_grad_8bit.cuh. Run it on an H100 (compute capability 9.0), built with
 // -arch=sm_90a; the log goes to tests/results/<GPU>/.
 #include <torch/types.h>              // torch::randn, torch::matmul; before CUDA headers
@@ -358,6 +359,66 @@ static Variant time_each_variant(const Product &product_val)
     return best_val;
 }
 
+// ══ part 5: the output in 8 bits against bfloat16 and a rounding pass ═════════
+
+static void time_output_8bit_against_bf16_and_rounding(const Product &product_val)
+{
+    // Prints, at this file's setting, all taking turns over SWEEP_ROUNDS rounds: gelu_input_grad as bfloat16 then rounded
+    // by round_8bit_per_tensor into both 8-bit copies at a delayed scale (what the model did before: a write of 2 bytes
+    // a value, then a read of them and 2 bytes written), the rounding pass alone, and
+    // mlp_down_input_grad_8bit_output_8bit writing both copies itself (2 bytes a value written, nothing read back).
+    Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS}, DType::E4M3);
+    Tensor row_scales_tensor = Tensor::zeros({ROWS});
+    Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS}, DType::E4M3);
+    Tensor turned_scales_tensor = Tensor::zeros({COLUMNS});
+    Round8bitHistory bf16_history_val, output_8bit_history_val;
+    mlp_down_input_grad_8bit_rounded(product_val.output_tensor, product_val.gelu_input_tensor, product_val.copies_val);
+    for (Round8bitHistory *history_ptr : {&bf16_history_val, &output_8bit_history_val})   // the first call, exact: the histories started
+        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.output_tensor, history_ptr);
+    auto product_bf16_val = [&] {
+        mlp_down_input_grad_8bit_rounded(product_val.output_tensor, product_val.gelu_input_tensor, product_val.copies_val);
+    };
+    auto round_val = [&] {
+        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.output_tensor,
+                              &bf16_history_val);
+    };
+    auto output_8bit_val = [&] {
+        MlpDownInputGrad8bitOutput8bit output_val;
+        output_val.rows_8bit_tensor = rows_8bit_tensor;
+        output_val.row_scales_tensor = row_scales_tensor;
+        output_val.turned_8bit_tensor = turned_8bit_tensor;
+        output_val.turned_scales_tensor = turned_scales_tensor;
+        output_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
+        round_8bit_delayed_largest(output_8bit_history_val, output_val.scale_largest_ptr, output_val.next_largest_ptr);
+        mlp_down_input_grad_8bit_output_8bit(output_val, product_val.gelu_input_tensor, product_val.copies_val);
+    };
+    const int runs_val = 4;
+    const char *names_list[runs_val] = {"bfloat16 gelu_input_grad", "  + round_8bit_per_tensor", "the rounding pass alone",
+                                        "mlp_down_input_grad_8bit_output_8bit"};
+    double totals_list[runs_val] = {};
+    for (int round_index_val = 1; round_index_val <= SWEEP_ROUNDS; round_index_val++)
+    {
+        float times_list[runs_val];
+        times_list[0] = gpu_milliseconds(product_bf16_val);
+        times_list[1] = gpu_milliseconds([&] {
+            product_bf16_val();
+            round_val();
+        });
+        times_list[2] = gpu_milliseconds(round_val);
+        times_list[3] = gpu_milliseconds(output_8bit_val);
+        if (round_index_val > WARM_UP_STEPS)
+            for (int run_index_val = 0; run_index_val < runs_val; run_index_val++)
+                totals_list[run_index_val] += times_list[run_index_val];
+    }
+    const int averaged_val = SWEEP_ROUNDS - WARM_UP_STEPS;
+    print_test_name(__func__);
+    printf("    ms, average of rounds %d..%d, at this file's setting\n", WARM_UP_STEPS + 1, SWEEP_ROUNDS);
+    for (int run_index_val = 0; run_index_val < runs_val; run_index_val++)
+        printf("        %-38s %8.3f ms\n", names_list[run_index_val], totals_list[run_index_val] / averaged_val);
+    printf("    gelu_input_grad in 8 bits: %.3f ms against %.3f (%.2fx)\n", totals_list[3] / averaged_val, totals_list[1] / averaged_val,
+           totals_list[1] / totals_list[3]);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -370,6 +431,7 @@ int main(void)
     int square_index_val = time_each_square(product_val);
     Choice choice_val = time_each_choice(product_val, square_index_val);
     Variant variant_val = time_each_variant(product_val);
+    time_output_8bit_against_bf16_and_rounding(product_val);
     // the fastest, as the defines of the product's file
     const Square &square_val = SQUARES_LIST[square_index_val];
     printf("\n    for llmc/kernels/8bit/prod/mlp_down_input_grad_8bit.cuh:\n");

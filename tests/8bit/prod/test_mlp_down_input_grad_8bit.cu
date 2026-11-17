@@ -4,8 +4,8 @@
 // Part 1 checks against PyTorch: on the same rounded values (the E4M3 copies read back as floats) within bfloat16's
 // rounding, and on the bfloat16 values within E4M3's; part 2 checks the bits: the same as wgmma_matmul_8bit (the
 // general 8-bit product) on the same copies at each promotion, and the same at every square, block order, block count,
-// cluster and variant
-// . Part 3 checks that the kernels' registers fit their block. Run it on an H100 (compute capability 9.0), built with
+// cluster and variant; gelu_input_grad in 8 bits (mlp_down_input_grad_8bit_output_8bit) gives the bits of the bfloat16
+// gelu_input_grad rounded by round_8bit_per_tensor at the same delayed scale, at every square. Part 3 checks that the kernels' registers fit their block. Run it on an H100 (compute capability 9.0), built with
 // -arch=sm_90a. The timings are in tune_mlp_down_input_grad_8bit.cu.
 #include <torch/types.h>              // torch::randn, torch::matmul; before CUDA headers
 #include <torch/utils.h>              // torch::manual_seed
@@ -388,6 +388,148 @@ static void every_variant_gives_the_default_bits(void)
     }
 }
 
+// ── gelu_input_grad in 8 bits ─────────────────────────────────────────────────
+
+/// gelu_input_grad's two 8-bit copies, one scale for the tensor, as mlp_down_input_grad_8bit_output_8bit and
+/// round_8bit_per_tensor write them, for output {rows, columns}, and the place's history; filled with 7s first, so a byte
+/// not written shows.
+struct Output8bitCopies
+{
+    Tensor rows_8bit_tensor;          // {rows, columns} E4M3
+    Tensor row_scales_tensor;         // {rows}
+    Tensor turned_8bit_tensor;        // {columns, rows} E4M3
+    Tensor turned_scales_tensor;      // {columns}
+    Round8bitHistory history_val;     // the place's history: where the delayed scale comes from
+
+    Output8bitCopies(size_t rows_val, size_t columns_val)
+        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val}, DType::E4M3)),
+          row_scales_tensor(Tensor::zeros({rows_val})),
+          turned_8bit_tensor(Tensor::zeros({columns_val, rows_val}, DType::E4M3)),
+          turned_scales_tensor(Tensor::zeros({columns_val}))
+    {
+        cudaCheck(cudaMemset(rows_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
+        cudaCheck(cudaMemset(turned_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
+        row_scales_tensor.fill_(7.0);
+        turned_scales_tensor.fill_(7.0);
+    }
+
+    /// Starts the history as the model's first micro-batch does: `first_tensor` rounded exactly by round_8bit_per_tensor
+    /// (into copies of its own, thrown away), its largest kept.
+    void start_history(const Tensor &first_tensor) const
+    {
+        Output8bitCopies thrown_val(rows_8bit_tensor.size(0), rows_8bit_tensor.size(1));
+        round_8bit_per_tensor(thrown_val.rows_8bit_tensor, thrown_val.row_scales_tensor, thrown_val.turned_8bit_tensor,
+                              thrown_val.turned_scales_tensor, first_tensor, &history_val);
+    }
+};
+
+/// Runs mlp_down_input_grad_8bit_output_8bit on the operands' copies at a setting given, its scale the history's delayed
+/// one (round_8bit_delayed_largest): what the model's backward does after a layer's first micro-batch.
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER>
+static void output_8bit_at(Output8bitCopies &copies_val, const Operands &operands_val)
+{
+    MlpDownInputGrad8bitOutput8bit output_val;
+    output_val.rows_8bit_tensor = copies_val.rows_8bit_tensor;
+    output_val.row_scales_tensor = copies_val.row_scales_tensor;
+    output_val.turned_8bit_tensor = copies_val.turned_8bit_tensor;
+    output_val.turned_scales_tensor = copies_val.turned_scales_tensor;
+    output_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
+    if (!round_8bit_delayed_largest(copies_val.history_val, output_val.scale_largest_ptr, output_val.next_largest_ptr))
+    {
+        fprintf(stderr, "output_8bit_at needs a history with a call already (start_history)\n");
+        exit(EXIT_FAILURE);
+    }
+    mlp_down_input_grad_8bit_output_8bit_at<ROW_GROUPS, COLUMNS, STAGES, CLUSTER>(output_val, operands_val.gelu_input_tensor, operands_val.copies_val,
+                                                                                 MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP,
+                                                                                 MLP_DOWN_INPUT_GRAD_8BIT_BLOCKS);
+}
+
+/// True when two sets of gelu_input_grad's 8-bit copies hold the same bytes, scales and history (the next largest
+/// this call filled, the calls counted).
+static bool same_output_8bit_bits(const Output8bitCopies &first_val, const Output8bitCopies &second_val)
+{
+    return first_val.rows_8bit_tensor.equal(second_val.rows_8bit_tensor) && first_val.turned_8bit_tensor.equal(second_val.turned_8bit_tensor) &&
+           first_val.row_scales_tensor.tolist() == second_val.row_scales_tensor.tolist() &&
+           first_val.turned_scales_tensor.tolist() == second_val.turned_scales_tensor.tolist() &&
+           first_val.history_val.largest_tensor.tolist() == second_val.history_val.largest_tensor.tolist() &&
+           first_val.history_val.calls_val == second_val.history_val.calls_val;
+}
+
+static void output_8bit_gives_round_8bit_per_tensors_bits(void)
+{
+    // Expect: at GPT-2's size and at sizes no square divides, at this file's setting, mlp_down_input_grad_8bit_output_8bit
+    // writes gelu_input_grad's two 8-bit copies, their scales lists and the history's next largest with the bits
+    // round_8bit_per_tensor gives from mlp_down_input_grad_8bit's bfloat16 gelu_input_grad at the same delayed scale (the
+    // tensor's largest of the call before, x 2): each value rounded to bfloat16, divided by the same power of 2 and
+    // rounded to E4M3 the same way. So mlp_up's backward reads what it read before, with no bfloat16 tensor and no
+    // rounding pass.
+    print_test_name(__func__);
+    const size_t sizes_list[2][3] = {{GPT2_ROWS, GPT2_MLP_DIM, GPT2_EMBED_DIM}, {ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH}};
+    for (const auto &size_val : sizes_list)
+    {
+        size_t rows_val = size_val[0], columns_val = size_val[1];
+        Operands operands_val = random_operands(rows_val, columns_val, size_val[2], 7);
+        // 1. the reference: bfloat16 gelu_input_grad, rounded twice by round_8bit_per_tensor (the second at the delayed scale)
+        Outputs outputs_val = fresh_outputs(operands_val, rows_val, columns_val);
+        mine(outputs_val, operands_val);
+        Output8bitCopies reference_val(rows_val, columns_val);
+        reference_val.start_history(outputs_val.output_tensor);
+        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.row_scales_tensor, reference_val.turned_8bit_tensor,
+                              reference_val.turned_scales_tensor, outputs_val.output_tensor, &reference_val.history_val);
+        // 2. mine: a history with the same first call, then the 8-bit output into fresh copies
+        Output8bitCopies mine_val(rows_val, columns_val);
+        mine_val.start_history(outputs_val.output_tensor);
+        output_8bit_at<MLP_DOWN_INPUT_GRAD_8BIT_ROW_GROUPS, MLP_DOWN_INPUT_GRAD_8BIT_COLUMNS, MLP_DOWN_INPUT_GRAD_8BIT_STAGES,
+                       MLP_DOWN_INPUT_GRAD_8BIT_CLUSTER>(mine_val, operands_val);
+        printf("    rows %zu, columns %zu, sum_length %zu:\n", rows_val, columns_val, size_val[2]);
+        ASSERT_EQ(same_output_8bit_bits(mine_val, reference_val), true);
+    }
+}
+
+/// One square with the output in 8 bits (128 columns), in clusters of 1 or 2, and its run.
+struct Output8bitSquare
+{
+    const char *name_ptr;
+    void (*run_ptr)(Output8bitCopies &, const Operands &);
+};
+
+/// The squares with the output in 8 bits: 1 or 2 warpgroups x 128 columns x 1 to 4 sets, in clusters of 1, and this
+/// file's square in clusters of 2.
+static const Output8bitSquare OUTPUT_8BIT_SQUARES_LIST[] = {
+    {"1 x 128 x 1", output_8bit_at<1, 128, 1, 1>},
+    {"1 x 128 x 2", output_8bit_at<1, 128, 2, 1>},
+    {"1 x 128 x 3", output_8bit_at<1, 128, 3, 1>},
+    {"1 x 128 x 4", output_8bit_at<1, 128, 4, 1>},
+    {"2 x 128 x 1", output_8bit_at<2, 128, 1, 1>},
+    {"2 x 128 x 2", output_8bit_at<2, 128, 2, 1>},
+    {"2 x 128 x 3", output_8bit_at<2, 128, 3, 1>},
+    {"2 x 128 x 4", output_8bit_at<2, 128, 4, 1>},
+    {"2 x 128 x 4, clusters of 2", output_8bit_at<2, 128, 4, 2>},
+};
+
+static void output_8bit_at_every_square_gives_the_default_bits(void)
+{
+    // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH: with the output in 8 bits, every square and
+    // cluster gives the bits of this file's setting, its two copies, scales and next largest: who writes a value's byte,
+    // into which room, changes; never the byte.
+    print_test_name(__func__);
+    Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 8);
+    Outputs outputs_val = fresh_outputs(operands_val, ODD_ROWS, ODD_COLUMNS);
+    mine(outputs_val, operands_val);                         // every run's history: the same exact first call, on this
+    Output8bitCopies default_val(ODD_ROWS, ODD_COLUMNS);
+    default_val.start_history(outputs_val.output_tensor);
+    output_8bit_at<MLP_DOWN_INPUT_GRAD_8BIT_ROW_GROUPS, MLP_DOWN_INPUT_GRAD_8BIT_COLUMNS, MLP_DOWN_INPUT_GRAD_8BIT_STAGES,
+                   MLP_DOWN_INPUT_GRAD_8BIT_CLUSTER>(default_val, operands_val);
+    for (const Output8bitSquare &square_val : OUTPUT_8BIT_SQUARES_LIST)
+    {
+        Output8bitCopies copies_val(ODD_ROWS, ODD_COLUMNS);
+        copies_val.start_history(outputs_val.output_tensor);
+        square_val.run_ptr(copies_val, operands_val);
+        printf("    %s:\n", square_val.name_ptr);
+        ASSERT_EQ(same_output_8bit_bits(copies_val, default_val), true);
+    }
+}
+
 // ══ part 3: the kernels fit their launch ══════════════════════════════════════
 
 /// Adds one square's kernels (clusters of 1 and 2
@@ -397,7 +539,18 @@ static void add_kernels_of_square(std::vector<const void *> &kernels_list, std::
 {
     kernels_list.push_back((const void *)mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, 1>);
     kernels_list.push_back((const void *)mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, 2>);
-    for (const char *kind_ptr : {"clusters of 1", "clusters of 2"})
+    std::vector<const char *> kinds_list = {"clusters of 1", "clusters of 2"};
+    if constexpr (COLUMNS % MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K == 0)     // the output in 8 bits: 128 columns
+    {
+        //    the kernel's other template choices as the defines
+        kernels_list.push_back((const void *)mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, 1, false, MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS,
+                                                                             MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT, MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS, 0, 0, true>);
+        kernels_list.push_back((const void *)mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, 2, false, MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS,
+                                                                             MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT, MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS, 0, 0, true>);
+        kinds_list.push_back("clusters of 1, output in 8 bits");
+        kinds_list.push_back("clusters of 2, output in 8 bits");
+    }
+    for (const char *kind_ptr : kinds_list)
     {
         names_list.push_back(std::string("mlp_down_input_grad_8bit_kernel<") + std::to_string(ROW_GROUPS) + " warpgroups, " + std::to_string(COLUMNS) +
                              " columns, " + std::to_string(STAGES) + " sets, " + kind_ptr + ">");
@@ -457,6 +610,8 @@ int main(void)
     every_square_gives_the_default_bits();
     every_order_block_count_and_cluster_gives_the_default_bits();
     every_variant_gives_the_default_bits();
+    output_8bit_gives_round_8bit_per_tensors_bits();
+    output_8bit_at_every_square_gives_the_default_bits();
 
     every_kernel_fits_its_block();
 

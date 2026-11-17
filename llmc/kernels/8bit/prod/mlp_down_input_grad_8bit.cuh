@@ -9,6 +9,8 @@
 //     weight        bfloat16                           {out_features, in_features}            rounded to E4M3 turned: {in, out} (right)
 //     gelu_input    bfloat16                           {rows, in_features}                    TMA, the forward's mlp_up output
 //     gelu_input_grad bfloat16                         {rows, in_features}                    written by TMA
+//                   or E4M3 (mlp_down_input_grad_8bit_output_8bit)   rows {rows, in} and      written by TMA, rounded here: both
+//                   , one scale for the tensor         turned {in, rows}                      copies mlp_up's backward reads
 //     the copies    E4M3, a float scale per row        MlpDownInputGrad8bitCopies's: left {rows, k},            round_8bit writes, TMA reads
 //                                                      right {columns, k}
 //     sums          float                              in registers                           the tensor cores' C
@@ -30,6 +32,15 @@
 //         ) as bfloat16 into its room in TMA's swizzled layout, and one thread asks TMA to store them
 //     before its walk, each consumer warpgroup asks TMA for its 64 rows of gelu_input into its room; at the end it
 //         multiplies each value (rounded to bfloat16, as the unfused path stores it) by gelu'(gelu_input) there
+//     mlp_down_input_grad_8bit_output_8bit: gelu_input_grad straight in 8 bits, as mlp_up's input_grad and weight_grad
+//         read it, in place of bfloat16 that a round_8bit_per_tensor pass would read back (both ways), as
+//         mlp_up_8bit_gelu_8bit writes gelu_output. One scale for the tensor, from the largest of the tensor written
+//         there the micro-batch before (round_8bit_delayed_largest: Transformer Engine's delayed scaling); each value,
+//         rounded to bfloat16 first, divided by it and rounded to E4M3 as round_8bit_per_tensor does (the same bits).
+//         gelu_input sits in the room the copies are written through, so each thread first keeps its values in its
+//         sums, the warpgroup meets, then the row copy goes through the room's first half in TMA's 128-byte swizzle and
+//         the turned copy {in, rows} through its second half, plain; the tensor's largest |value| maxed onto the
+//         history for the next call. COLUMNS 128: a row copy's box is a swizzled row of 128 E4M3s
 // Its settings (the defines below, from tests/8bit/prod/tune_mlp_down_input_grad_8bit.cu): ROW_GROUPS (1 or 2), COLUMNS (64 or 128: a
 // second set of 128 sums a thread for the promotion leaves no room for 256), STAGES, BLOCK_ROWS_PER_GROUP, CLUSTER,
 // BLOCKS, PRODUCER_REGISTERS, IN_FLIGHT and PROMOTION_STEPS
@@ -76,6 +87,7 @@
 //     cluster_sync                           every thread of the cluster at the same point
 //     give_registers, take_registers         setmaxnreg: a warpgroup gives back or takes registers
 //     tensor_map, tensor_map_8bit            (host) TMA's description of a bfloat16 matrix in 64-value boxes, an E4M3 one in 128
+//     tensor_map_turned_8bit                 (host) ... and of gelu_input_grad's turned E4M3 copy, in boxes of COLUMNS lines x 64 bytes, plain
 //     check_tensor                           (host) a tensor TMA can read: bfloat16, rows of whole 16-byte cells
 
 // What the hardware's 128-byte swizzle fixes: a tile's row is one swizzled row of 128 bytes, 128 E4M3s; the
@@ -415,6 +427,45 @@ inline CUtensorMap mlp_down_input_grad_8bit_tensor_map_8bit(const void* matrix_p
     return map_val;
 }
 
+/// Gives TMA's description of gelu_input_grad's turned E4M3 copy for the stores: {lines, bytes_per_line} bytes sitting
+/// line after line (a line: one column of gelu_input_grad, its rows' values), written from shared memory in boxes of
+/// {box_lines, HARDWARE_WGMMA_M bytes} (a warpgroup's 64 rows of COLUMNS columns, turned), no swizzle; past the edges,
+/// nothing written. Made by the driver's cuTensorMapEncodeTiled, found at run time.
+///
+///   matrix_ptr                         its first byte, on a 16-byte piece
+///   lines_val, bytes_per_line_val      its shape: gelu_input_grad's columns, and its rows (a multiple of 16)
+///   box_lines_val                      lines of a box: the product's COLUMNS
+inline CUtensorMap mlp_down_input_grad_8bit_tensor_map_turned_8bit(const void* matrix_ptr, size_t lines_val, size_t bytes_per_line_val,
+                                                                   unsigned box_lines_val) {
+    // 1. the driver's function, found once
+    static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
+        void* function_ptr = nullptr;
+        cudaDriverEntryPointQueryResult status_val;
+        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
+            fprintf(stderr, "error: mlp_down_input_grad_8bit could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
+            exit(EXIT_FAILURE);
+        }
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(function_ptr);
+    }();
+    // 2. the matrix and its boxes, the fastest-moving dimension first: bytes of a line (rows), then lines
+    CUtensorMap map_val;
+    cuuint64_t sizes_list[2] = {bytes_per_line_val, lines_val};
+    cuuint64_t row_bytes_list[1] = {bytes_per_line_val};                                // from one line to the next
+    cuuint32_t box_list[2] = {HARDWARE_WGMMA_M, box_lines_val};
+    cuuint32_t element_steps_list[2] = {1, 1};                                          // every value, no gaps
+    CUresult result_val = encode_ptr(&map_val, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(matrix_ptr), sizes_list,
+                                     row_bytes_list, box_list, element_steps_list, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                     CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                     CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (result_val != CUDA_SUCCESS) {
+        fprintf(stderr, "error: cuTensorMapEncodeTiled gave %d for a turned {%zu, %zu}-byte matrix at %p\n", (int)result_val,
+                lines_val, bytes_per_line_val, matrix_ptr);
+        exit(EXIT_FAILURE);
+    }
+    return map_val;
+}
+
 /// Stops with a message unless TMA can read or write a tensor: bfloat16, its last dim a multiple of
 /// MLP_DOWN_INPUT_GRAD_8BIT_VALUE_MULTIPLE (rows of whole 16-byte cells), starting on a 16-byte cell.
 ///
@@ -448,32 +499,60 @@ struct MlpDownInputGrad8bitCopies {
           right_scales_tensor(Tensor::zeros({columns_val})) {}
 };
 
+/// gelu_input_grad in 8 bits, as mlp_down_input_grad_8bit_output_8bit writes it: both copies mlp_up's backward reads, one
+/// scale for the tensor (every value of the scales lists the same, so the products read them as per-row copies), and
+/// where that scale comes from. rows_8bit and row_scales are mlp_up_input_grad's left side; turned_8bit and
+/// turned_scales mlp_up_weight_grad's left.
+struct MlpDownInputGrad8bitOutput8bit {
+    Tensor rows_8bit_tensor;                       // {rows, columns} E4M3: written
+    Tensor row_scales_tensor;                      // {rows} float: written
+    Tensor turned_8bit_tensor;                     // {columns, rows} E4M3: written
+    Tensor turned_scales_tensor;                   // {columns} float: written
+    const unsigned* scale_largest_ptr = nullptr;   // the largest |value| the scale is made from (a float's bits, in GPU memory)
+    float margin_val = 1.0f;                       // ... times this (ROUND_8BIT_DELAYED_MARGIN for a delayed one)
+    unsigned* next_largest_ptr = nullptr;          // this tensor's largest |value| maxed onto it (0 before), or nullptr
+};
+
 // ── the product ───────────────────────────────────────────────────────────────
 void mlp_down_input_grad_8bit(const Tensor& gelu_input_grad_tensor, const Tensor& output_grad_tensor, const Tensor& weight_tensor, const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val);
 void mlp_down_input_grad_8bit_rounded(const Tensor& gelu_input_grad_tensor, const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val);
+void mlp_down_input_grad_8bit_output_8bit(const MlpDownInputGrad8bitOutput8bit& output_val, const Tensor& gelu_input_tensor,
+                                          const MlpDownInputGrad8bitCopies& copies_val);
 void mlp_down_input_grad_8bit_round(const MlpDownInputGrad8bitCopies& copies_val, const Tensor& output_grad_tensor, const Tensor& weight_tensor);
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT,
           int PROMOTION_STEPS = MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS
           >
 void mlp_down_input_grad_8bit_rounded_at(const Tensor& gelu_input_grad_tensor, const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val,
                     int block_rows_per_group_val, int blocks_val);
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS = MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS, int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT,
+          int PROMOTION_STEPS = MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS>
+void mlp_down_input_grad_8bit_output_8bit_at(const MlpDownInputGrad8bitOutput8bit& output_val, const Tensor& gelu_input_tensor,
+                                             const MlpDownInputGrad8bitCopies& copies_val, int block_rows_per_group_val, int blocks_val);
 
 // ── for it ────────────────────────────────────────────────────────────────────
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS, bool OUTPUT_8BIT>
+void mlp_down_input_grad_8bit_launch(const Tensor& gelu_input_grad_tensor, const MlpDownInputGrad8bitOutput8bit* output_8bit_ptr,
+                                     const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val, int block_rows_per_group_val,
+                                     int blocks_val);
 template <int COLUMNS, int STAGES, int ROW_GROUPS
           >
 constexpr size_t mlp_down_input_grad_8bit_shared_bytes();
 template <int STAGES, int ROW_GROUPS>
 constexpr size_t mlp_down_input_grad_8bit_barrier_bytes();
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS,
-          int STAGED_ROWS, int STAGED_ROW_PADDING>
+          int STAGED_ROWS, int STAGED_ROW_PADDING, bool OUTPUT_8BIT>
 int mlp_down_input_grad_8bit_blocks_at_once();
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT = false, int PRODUCER_REGISTERS = MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS,
-          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT, int PROMOTION_STEPS = MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS, int STAGED_ROWS = 0, int STAGED_ROW_PADDING = 0>
+          int IN_FLIGHT = MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT, int PROMOTION_STEPS = MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS, int STAGED_ROWS = 0, int STAGED_ROW_PADDING = 0,
+          bool OUTPUT_8BIT = false>
 __global__ void mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                            const __grid_constant__ CUtensorMap output_map_val,
+                           const __grid_constant__ CUtensorMap output_turned_map_val,
                            const __grid_constant__ CUtensorMap side_map_val,
                            const float* left_scales_ptr, const float* right_scales_ptr,
-                           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val);
+                           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
+                           float* output_row_scales_ptr, float* output_turned_scales_ptr, const unsigned* output_scale_largest_ptr,
+                           float output_margin_val, unsigned* output_next_largest_ptr);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
@@ -503,6 +582,21 @@ inline void mlp_down_input_grad_8bit_rounded(const Tensor& gelu_input_grad_tenso
                                                                          MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, MLP_DOWN_INPUT_GRAD_8BIT_BLOCKS);
 }
 
+/// Works out the product at this file's setting on copies already made, as mlp_down_input_grad_8bit_rounded, but writes
+/// gelu_input_grad straight in 8 bits (both copies, one scale for the tensor: MlpDownInputGrad8bitOutput8bit) in place
+/// of bfloat16: what mlp_up's input_grad and weight_grad read, with no rounding pass of their own.
+///
+///   output_val          gelu_input_grad's copies, their scale's largest and margin, and where this tensor's largest goes
+///   gelu_input_tensor   {..., in_features} bfloat16: the forward's mlp_up output
+///   copies_val          rounded (mlp_down_input_grad_8bit_round, or the model's backward copies)
+inline void mlp_down_input_grad_8bit_output_8bit(const MlpDownInputGrad8bitOutput8bit& output_val, const Tensor& gelu_input_tensor,
+                                                 const MlpDownInputGrad8bitCopies& copies_val) {
+    mlp_down_input_grad_8bit_output_8bit_at<MLP_DOWN_INPUT_GRAD_8BIT_ROW_GROUPS, MLP_DOWN_INPUT_GRAD_8BIT_COLUMNS, MLP_DOWN_INPUT_GRAD_8BIT_STAGES,
+                                            MLP_DOWN_INPUT_GRAD_8BIT_CLUSTER>(output_val, gelu_input_tensor, copies_val,
+                                                                              MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP,
+                                                                              MLP_DOWN_INPUT_GRAD_8BIT_BLOCKS);
+}
+
 /// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale per row (round_8bit): output_grad {rows, out} as it sits, weight {out, in} turned to {in, out}.
 ///
 ///   copies_val           MlpDownInputGrad8bitCopies: written
@@ -526,12 +620,11 @@ inline void mlp_down_input_grad_8bit_round(const MlpDownInputGrad8bitCopies& cop
     round_8bit(copies_val.right_8bit_tensor, copies_val.right_scales_tensor, weight_tensor, true);
 }
 
-/// Works out the product from the copies at a setting given: checks, describes the tiles for TMA, then launches
-/// mlp_down_input_grad_8bit_kernel made for the setting
-/// .
+/// Works out the product from the copies at a setting given, gelu_input_grad bfloat16: mlp_down_input_grad_8bit_launch
+/// made for the setting.
 ///
-///   gelu_input_grad_tensor gelu_input's shape, bfloat16: written
-///   gelu_input_tensor    {..., in_features} bfloat16: the forward's mlp_up output
+///   gelu_input_grad_tensor         gelu_input's shape, bfloat16: written
+///   gelu_input_tensor              {..., in_features} bfloat16: the forward's mlp_up output
 ///   copies_val                     rounded (mlp_down_input_grad_8bit_round)
 ///   block_rows_per_group_val       the squares' order: rows of squares a group runs down (at least 1)
 ///   blocks_val                     blocks launched: 0, as many as the GPU runs at once; more than the squares: one a square
@@ -540,87 +633,146 @@ template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REG
           >
 inline void mlp_down_input_grad_8bit_rounded_at(const Tensor& gelu_input_grad_tensor, const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val,
                            int block_rows_per_group_val, int blocks_val) {
+    mlp_down_input_grad_8bit_check_tensor("mlp_down_input_grad_8bit", "gelu_input_grad", gelu_input_grad_tensor);
+    mlp_down_input_grad_8bit_launch<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS, false>(
+        gelu_input_grad_tensor, nullptr, gelu_input_tensor, copies_val, block_rows_per_group_val, blocks_val);
+}
+
+/// Works out the product from the copies at a setting given, gelu_input_grad in 8 bits (MlpDownInputGrad8bitOutput8bit):
+/// mlp_down_input_grad_8bit_launch made for the setting. COLUMNS 128: a row copy's TMA box is a swizzled row of 128 bytes.
+///
+///   output_val                                                            as in mlp_down_input_grad_8bit_output_8bit
+///   gelu_input_tensor, copies_val, block_rows_per_group_val, blocks_val   as in mlp_down_input_grad_8bit_rounded_at
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS>
+inline void mlp_down_input_grad_8bit_output_8bit_at(const MlpDownInputGrad8bitOutput8bit& output_val, const Tensor& gelu_input_tensor,
+                                                    const MlpDownInputGrad8bitCopies& copies_val, int block_rows_per_group_val, int blocks_val) {
+    static_assert(COLUMNS % MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K == 0, "gelu_input_grad in 8 bits: COLUMNS 128, whole swizzled rows of 128 E4M3s");
+    // 1. the copies: E4M3, their shapes from the product's; the scale's largest given
+    size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
+    const MlpDownInputGrad8bitOutput8bit& o = output_val;
+    if (!(o.rows_8bit_tensor.dtype() == DType::E4M3 && o.turned_8bit_tensor.dtype() == DType::E4M3 &&
+          o.row_scales_tensor.dtype() == DType::Float32 && o.turned_scales_tensor.dtype() == DType::Float32 &&
+          o.rows_8bit_tensor.dim() >= 1 && o.rows_8bit_tensor.numel() == rows_val * columns_val &&
+          o.rows_8bit_tensor.size(o.rows_8bit_tensor.dim() - 1) == columns_val &&
+          o.turned_8bit_tensor.shape() == Shape({columns_val, rows_val}) &&
+          o.row_scales_tensor.numel() == rows_val && o.turned_scales_tensor.numel() == columns_val &&
+          rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && o.scale_largest_ptr != nullptr)) {
+        fprintf(stderr, "error: mlp_down_input_grad_8bit_output_8bit needs E4M3 copies {rows, columns} and {columns, rows}, float "
+                        "scales {rows} and {columns}, rows a multiple of %d, and the scale's largest\n",
+                ROUND_8BIT_ROW_LENGTH_MULTIPLE);
+        exit(EXIT_FAILURE);
+    }
+    // 2. the launch
+    mlp_down_input_grad_8bit_launch<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS, true>(
+        Tensor(), &output_val, gelu_input_tensor, copies_val, block_rows_per_group_val, blocks_val);
+}
+
+/// Checks, describes the tiles for TMA, then launches mlp_down_input_grad_8bit_kernel made for the setting: what
+/// mlp_down_input_grad_8bit_rounded_at and mlp_down_input_grad_8bit_output_8bit_at share.
+///
+///   gelu_input_grad_tensor   bfloat16 gelu_input_grad (OUTPUT_8BIT false): written; Tensor() with OUTPUT_8BIT
+///   output_8bit_ptr          gelu_input_grad in 8 bits (OUTPUT_8BIT true); nullptr otherwise
+///   gelu_input_tensor, copies_val, block_rows_per_group_val, blocks_val   as in mlp_down_input_grad_8bit_rounded_at
+template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS, bool OUTPUT_8BIT>
+inline void mlp_down_input_grad_8bit_launch(const Tensor& gelu_input_grad_tensor, const MlpDownInputGrad8bitOutput8bit* output_8bit_ptr,
+                                            const Tensor& gelu_input_tensor, const MlpDownInputGrad8bitCopies& copies_val,
+                                            int block_rows_per_group_val, int blocks_val) {
     constexpr int STAGED_ROWS = 0, STAGED_ROW_PADDING = 0;    // no split store
     static_assert(COLUMNS == 64 || COLUMNS == 128, "COLUMNS is 64 or 128: the promotion's second set of sums leaves no room for 256");
     static_assert(STAGES >= 1 && STAGES <= MLP_DOWN_INPUT_GRAD_8BIT_MAX_STAGES, "STAGES is 1 to MLP_DOWN_INPUT_GRAD_8BIT_MAX_STAGES");
     static_assert(ROW_GROUPS >= 1 && ROW_GROUPS <= MLP_DOWN_INPUT_GRAD_8BIT_MAX_ROW_GROUPS, "ROW_GROUPS is 1 to MLP_DOWN_INPUT_GRAD_8BIT_MAX_ROW_GROUPS");
     static_assert(CLUSTER >= 1 && CLUSTER <= MLP_DOWN_INPUT_GRAD_8BIT_MAX_CLUSTER, "CLUSTER is 1 to MLP_DOWN_INPUT_GRAD_8BIT_MAX_CLUSTER");
     static_assert(PROMOTION_STEPS >= 0, "PROMOTION_STEPS is 0 (never) or more");
-    // 1. the sizes, from the copies; the tensors written: bfloat16, rows of whole 16-byte cells, the shapes
+    // 1. the sizes, from the copies; gelu_input (and the bfloat16 output): rows of whole 16-byte cells, the shapes
     size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
     size_t sum_length_val = copies_val.left_8bit_tensor.size(1);
-    mlp_down_input_grad_8bit_check_tensor("mlp_down_input_grad_8bit", "gelu_input_grad", gelu_input_grad_tensor);
     mlp_down_input_grad_8bit_check_tensor("mlp_down_input_grad_8bit", "gelu_input", gelu_input_tensor);
-    if (!(gelu_input_grad_tensor.numel() == rows_val * columns_val && gelu_input_grad_tensor.size(gelu_input_grad_tensor.dim() - 1) == columns_val &&
+    if (!((OUTPUT_8BIT || (gelu_input_grad_tensor.numel() == rows_val * columns_val &&
+                           gelu_input_grad_tensor.size(gelu_input_grad_tensor.dim() - 1) == columns_val)) &&
           gelu_input_tensor.numel() == rows_val * columns_val && gelu_input_tensor.size(gelu_input_tensor.dim() - 1) == columns_val)) {
         fprintf(stderr, "error: mlp_down_input_grad_8bit needs its outputs {..., columns} of the copies' rows and columns\n");
         exit(EXIT_FAILURE);
     }
-    if (block_rows_per_group_val < 1 || blocks_val < 0
-        ) {
-        fprintf(stderr, "error: mlp_down_input_grad_8bit's block_rows_per_group must be 1 or more and the blocks (and splits) 0 or more\n");
+    if (block_rows_per_group_val < 1 || blocks_val < 0) {
+        fprintf(stderr, "error: mlp_down_input_grad_8bit's block_rows_per_group must be 1 or more and the blocks 0 or more\n");
         exit(EXIT_FAILURE);
     }
 
-    // 2. TMA's descriptions: the copies in boxes of {64 rows or COLUMNS lines, MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K bytes}; the output (and
-    //    the side) in bfloat16 boxes of {64 rows, 64 columns}
+    // 2. TMA's descriptions: the copies in boxes of {64 rows or COLUMNS lines, MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K bytes};
+    //    gelu_input in bfloat16 boxes of {64 rows, 64 columns}; the output as bfloat16 the same, or in 8 bits: its row
+    //    copy in boxes of {64 rows, 128 bytes}, its turned copy in boxes of {COLUMNS lines, 64 bytes}
     CUtensorMap left_map_val = mlp_down_input_grad_8bit_tensor_map_8bit(copies_val.left_8bit_tensor.data_ptr(), rows_val, sum_length_val, HARDWARE_WGMMA_M);
     CUtensorMap right_map_val = mlp_down_input_grad_8bit_tensor_map_8bit(copies_val.right_8bit_tensor.data_ptr(), columns_val, sum_length_val, COLUMNS);
-    CUtensorMap output_map_val = mlp_down_input_grad_8bit_tensor_map(gelu_input_grad_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
     CUtensorMap side_map_val = mlp_down_input_grad_8bit_tensor_map(gelu_input_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
+    CUtensorMap output_map_val = side_map_val, output_turned_map_val = side_map_val;   // not read where not used
+    float* output_row_scales_ptr = nullptr;
+    float* output_turned_scales_ptr = nullptr;
+    const unsigned* output_scale_largest_ptr = nullptr;
+    float output_margin_val = 1.0f;
+    unsigned* output_next_largest_ptr = nullptr;
+    if constexpr (OUTPUT_8BIT) {
+        output_map_val = mlp_down_input_grad_8bit_tensor_map_8bit(output_8bit_ptr->rows_8bit_tensor.data_ptr(), rows_val, columns_val, HARDWARE_WGMMA_M);
+        output_turned_map_val = mlp_down_input_grad_8bit_tensor_map_turned_8bit(output_8bit_ptr->turned_8bit_tensor.data_ptr(), columns_val,
+                                                                                rows_val, COLUMNS);
+        output_row_scales_ptr = output_8bit_ptr->row_scales_tensor.data();
+        output_turned_scales_ptr = output_8bit_ptr->turned_scales_tensor.data();
+        output_scale_largest_ptr = output_8bit_ptr->scale_largest_ptr;
+        output_margin_val = output_8bit_ptr->margin_val;
+        output_next_largest_ptr = output_8bit_ptr->next_largest_ptr;
+    } else {
+        output_map_val = mlp_down_input_grad_8bit_tensor_map(gelu_input_grad_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
+    }
 
     // 3. the launch: as many blocks as the GPU runs at once (or blocks_val), in whole clusters, at most one a unit
-    {
-        constexpr bool SPLIT = false;
-        int launch_splits_val = 1;
-        constexpr size_t SHARED_BYTES = mlp_down_input_grad_8bit_shared_bytes<COLUMNS, STAGES, ROW_GROUPS
-                                                         >();
-        constexpr int THREADS = (MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
-        static_assert(SHARED_BYTES + mlp_down_input_grad_8bit_barrier_bytes<STAGES, ROW_GROUPS>() <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK,
-                      "the sets of tiles, the rooms and the barriers fit a block's shared memory");
-        auto kernel_ptr = mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS, STAGED_ROWS,
-                                     STAGED_ROW_PADDING>;
-        int blocks_at_once_val = mlp_down_input_grad_8bit_blocks_at_once<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS,
-                                                    STAGED_ROWS, STAGED_ROW_PADDING>();
-        size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M)) *
-                                 (size_t)launch_splits_val;
-        size_t total_clusters_val = (blocks_val > 0 ? (size_t)blocks_val : (size_t)blocks_at_once_val) / CLUSTER;
-        if (total_clusters_val < 1) total_clusters_val = 1;
-        if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
-        unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
-        const float* left_scales_ptr = copies_val.left_scales_tensor.data();
-        const float* right_scales_ptr = copies_val.right_scales_tensor.data();
-        if (CLUSTER == 1) {
-            kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val,
-                                                                    side_map_val,
-                                                                    left_scales_ptr, right_scales_ptr,
-                                                                    (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val);
-            cudaCheck(cudaGetLastError());
-        } else {
-            cudaLaunchConfig_t config_val = {};
-            cudaLaunchAttribute attributes_list[1];
-            attributes_list[0].id = cudaLaunchAttributeClusterDimension;
-            attributes_list[0].val.clusterDim.x = CLUSTER;
-            attributes_list[0].val.clusterDim.y = 1;
-            attributes_list[0].val.clusterDim.z = 1;
-            config_val.gridDim = dim3(total_blocks_val);
-            config_val.blockDim = dim3(THREADS);
-            config_val.dynamicSmemBytes = SHARED_BYTES;
-            config_val.attrs = attributes_list;
-            config_val.numAttrs = 1;
-            cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val,
-                                         side_map_val,
-                                         left_scales_ptr, right_scales_ptr,
-                                         (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val));
-        }
+    constexpr bool SPLIT = false;
+    constexpr size_t SHARED_BYTES = mlp_down_input_grad_8bit_shared_bytes<COLUMNS, STAGES, ROW_GROUPS>();
+    constexpr int THREADS = (MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS;
+    static_assert(SHARED_BYTES + mlp_down_input_grad_8bit_barrier_bytes<STAGES, ROW_GROUPS>() <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK,
+                  "the sets of tiles, the rooms and the barriers fit a block's shared memory");
+    auto kernel_ptr = mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS,
+                                                      STAGED_ROWS, STAGED_ROW_PADDING, OUTPUT_8BIT>;
+    int blocks_at_once_val = mlp_down_input_grad_8bit_blocks_at_once<ROW_GROUPS, COLUMNS, STAGES, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT,
+                                                                      PROMOTION_STEPS, STAGED_ROWS, STAGED_ROW_PADDING, OUTPUT_8BIT>();
+    size_t total_units_val = CEIL_DIV(columns_val, (size_t)COLUMNS) * CEIL_DIV(rows_val, (size_t)(CLUSTER * ROW_GROUPS * HARDWARE_WGMMA_M));
+    size_t total_clusters_val = (blocks_val > 0 ? (size_t)blocks_val : (size_t)blocks_at_once_val) / CLUSTER;
+    if (total_clusters_val < 1) total_clusters_val = 1;
+    if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
+    unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
+    const float* left_scales_ptr = copies_val.left_scales_tensor.data();
+    const float* right_scales_ptr = copies_val.right_scales_tensor.data();
+    if (CLUSTER == 1) {
+        kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val, output_turned_map_val, side_map_val,
+                                                                left_scales_ptr, right_scales_ptr,
+                                                                (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
+                                                                output_row_scales_ptr, output_turned_scales_ptr, output_scale_largest_ptr,
+                                                                output_margin_val, output_next_largest_ptr);
+        cudaCheck(cudaGetLastError());
+    } else {
+        cudaLaunchConfig_t config_val = {};
+        cudaLaunchAttribute attributes_list[1];
+        attributes_list[0].id = cudaLaunchAttributeClusterDimension;
+        attributes_list[0].val.clusterDim.x = CLUSTER;
+        attributes_list[0].val.clusterDim.y = 1;
+        attributes_list[0].val.clusterDim.z = 1;
+        config_val.gridDim = dim3(total_blocks_val);
+        config_val.blockDim = dim3(THREADS);
+        config_val.dynamicSmemBytes = SHARED_BYTES;
+        config_val.attrs = attributes_list;
+        config_val.numAttrs = 1;
+        cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val, output_turned_map_val, side_map_val,
+                                     left_scales_ptr, right_scales_ptr,
+                                     (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
+                                     output_row_scales_ptr, output_turned_scales_ptr, output_scale_largest_ptr, output_margin_val,
+                                     output_next_largest_ptr));
     }
 }
 
 // ── for it ────────────────────────────────────────────────────────────────────
 
 /// Gives the dynamic shared memory a block takes: STAGES sets of tiles (a left tile a consumer warpgroup and the
-/// right tile), each consumer warpgroup's room for its 64 rows as bfloat16 (TMA's store boxes), and one atom of
-/// room to start the tiles on one.
+/// right tile), each consumer warpgroup's room for its 64 rows as bfloat16 (TMA's store boxes; with the output in 8
+/// bits, its row copy in the room's first half and its turned copy in the second), and one atom of room to start the
+/// tiles on one.
 template <int COLUMNS, int STAGES, int ROW_GROUPS>
 constexpr size_t mlp_down_input_grad_8bit_shared_bytes() {
     return (size_t)STAGES * (ROW_GROUPS * MLP_DOWN_INPUT_GRAD_8BIT_LEFT_TILE_BYTES + COLUMNS * MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K) +
@@ -640,7 +792,7 @@ constexpr size_t mlp_down_input_grad_8bit_barrier_bytes() {
 /// each kernel, it also asks CUDA to allow the kernel's dynamic shared memory (past the 48 KB a block gets without
 /// asking).
 template <int ROW_GROUPS, int COLUMNS, int STAGES, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS,
-          int STAGED_ROWS, int STAGED_ROW_PADDING>
+          int STAGED_ROWS, int STAGED_ROW_PADDING, bool OUTPUT_8BIT>
 inline int mlp_down_input_grad_8bit_blocks_at_once() {
     constexpr size_t SHARED_BYTES = mlp_down_input_grad_8bit_shared_bytes<COLUMNS, STAGES, ROW_GROUPS
                                                      >();
@@ -648,7 +800,7 @@ inline int mlp_down_input_grad_8bit_blocks_at_once() {
     static int blocks_at_once_val = 0;                       // one for each kernel this template makes
     if (blocks_at_once_val == 0) {
         auto kernel_ptr = mlp_down_input_grad_8bit_kernel<COLUMNS, STAGES, ROW_GROUPS, CLUSTER, SPLIT, PRODUCER_REGISTERS, IN_FLIGHT, PROMOTION_STEPS, STAGED_ROWS,
-                                     STAGED_ROW_PADDING>;
+                                     STAGED_ROW_PADDING, OUTPUT_8BIT>;
         int device_index_val = 0, total_sms_val = 0, blocks_per_sm_val = 0;
         cudaCheck(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SHARED_BYTES));
         cudaCheck(cudaGetDevice(&device_index_val));
@@ -681,23 +833,30 @@ __device__ __forceinline__ float2 mlp_down_input_grad_8bit_times_gelu_slope(floa
 }
 
 /// Walks this block's squares of output, square after square (persistent), with a producer warpgroup and ROW_GROUPS
-/// consumer warpgroups (see the top of the file), and stores each square by TMA
-/// .
+/// consumer warpgroups (see the top of the file), and stores each square by TMA: gelu_input_grad as bfloat16 or
+/// (OUTPUT_8BIT) as its two E4M3 copies.
 ///
 ///   left_map_val, right_map_val          TMA's descriptions of the copies' tiles
-///   output_map_val                       ... and the output's
+///   output_map_val                       ... and the output's (bfloat16), or its row copy's (OUTPUT_8BIT)
+///   output_turned_map_val                ... its turned copy's (OUTPUT_8BIT; not read otherwise)
 ///   side_map_val                         ... and gelu_input's
 ///   left_scales_ptr, right_scales_ptr    the copies' scales: {rows}, {columns}
 ///   rows_val, columns_val, sum_length_val   the product's sizes
 ///   block_rows_per_group_val             the squares' order: rows of units a group runs down
+///   output_row_scales_ptr, output_turned_scales_ptr   OUTPUT_8BIT: the output's scales lists {rows}, {columns}: written
+///   output_scale_largest_ptr, output_margin_val       OUTPUT_8BIT: the scale is round_8bit_scale(largest x margin)
+///   output_next_largest_ptr                           OUTPUT_8BIT: the output's largest |value| maxed onto it, or nullptr
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS,
-          int STAGED_ROWS, int STAGED_ROW_PADDING>
+          int STAGED_ROWS, int STAGED_ROW_PADDING, bool OUTPUT_8BIT>
 __global__ void __launch_bounds__((MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
            const __grid_constant__ CUtensorMap output_map_val,
+           const __grid_constant__ CUtensorMap output_turned_map_val,
            const __grid_constant__ CUtensorMap side_map_val,
            const float* left_scales_ptr, const float* right_scales_ptr,
-           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val) {
+           int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
+           float* output_row_scales_ptr, float* output_turned_scales_ptr, const unsigned* output_scale_largest_ptr,
+           float output_margin_val, unsigned* output_next_largest_ptr) {
     constexpr int splits_val = 1;                                                                           // never split
     constexpr int COLUMN_GROUPS = COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS;                                   // groups of 8 across the square
     constexpr int RIGHT_TILE_BYTES = COLUMNS * MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K;                                                 // a right tile: COLUMNS lines of a step's k
@@ -710,6 +869,12 @@ mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val
     constexpr int PROMOTION_PERIOD = PROMOTION_STEPS > 0 ? PROMOTION_STEPS : 1;                               // what the steps are counted in (never 0)
     constexpr int OUTPUT_BOXES = COLUMNS / MLP_DOWN_INPUT_GRAD_8BIT_ROW_VALUES;                                                  // TMA store boxes across a warpgroup's 64 rows
     constexpr int ROOM_BYTES = HARDWARE_WGMMA_M * COLUMNS * (int)sizeof(nv_bfloat16);                       // a consumer warpgroup's room: its 64 rows as bfloat16
+    // the output in 8 bits: the row copy's boxes (64 rows of a swizzled row of 128 E4M3s each) in the room's first half,
+    // the turned copy (COLUMNS lines of 64 E4M3s, plain) in its second
+    constexpr int ROW_8BIT_BOXES = COLUMNS / MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K;
+    constexpr int ROW_8BIT_BOX_BYTES = HARDWARE_WGMMA_M * MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K;
+    constexpr int TURNED_8BIT_OFFSET = HARDWARE_WGMMA_M * COLUMNS;
+    static_assert(!OUTPUT_8BIT || COLUMNS % MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K == 0, "the output in 8 bits: COLUMNS 128");
     constexpr int PRODUCER_THREADS = MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_WARPGROUPS * HARDWARE_WARPGROUP_THREADS;
     // the registers (the worklog's kernel 5b): a block of THREADS gets LAUNCH_REGISTERS a thread; the producer needs
     // few, so with 2 consumer warpgroups it gives back all but PRODUCER_REGISTERS and the consumers take them
@@ -827,6 +992,13 @@ mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val
         uint8_t* room_ptr = rooms_ptr + row_group_index_val * ROOM_BYTES;
         uint32_t store_phase_val = 0;                                              // the store barrier's phase to wait for next
         uint32_t side_phase_val = 0;                                               // ... and the side barrier's
+        // the output in 8 bits: its one scale (a power of 2, so 1 / scale is exact), and this thread's largest |value|
+        // written, for the next call's scale
+        float output_scale_val = 1.0f, output_to_stored_val = 1.0f, thread_largest_val = 0.0f;
+        if constexpr (OUTPUT_8BIT) {
+            output_scale_val = round_8bit_scale(__uint_as_float(*output_scale_largest_ptr) * output_margin_val);
+            output_to_stored_val = 1.0f / output_scale_val;
+        }
         // this warpgroup is done with a step's set: its first thread arrives at the set's empty barrier in every block
         // of the cluster
         auto free_set_val = [&](int set_index_val) {
@@ -919,18 +1091,17 @@ mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val
             // f. gelu_input's rows are in the room (every thread waits)
             mlp_down_input_grad_8bit_barrier_wait(&side_barriers_list[row_group_index_val], side_phase_val);
             side_phase_val ^= 1;
-            // g. each thread's pairs, sums times both scales
-            //    , into the room as bfloat16 at their place (box b: columns 64 b on, rows of 128 bytes, the 16-byte cell c
-            //    of row r at c XOR r % 8, as TMA's 128-byte swizzle has it)
-            //    times gelu' of the pair there (gelu_input)
-            //    ; then TMA stores the room
-            auto write_room_val = [&](auto what_val) {
-                float left_scales_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
+            // each of this thread's pairs, sums times both scales, times gelu' of the pair's gelu_input in the room (box
+            // b: columns 64 b on, rows of 128 bytes, the 16-byte cell c of row r at c XOR r % 8, as TMA's 128-byte
+            // swizzle has it), handed to what_val with its place: the group of 8 columns, which of the thread's two
+            // rows, the row in the warpgroup's 64, the column in the square (the pair's first) and the pair's room place
+            float left_scales_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
 #pragma unroll
-                for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
-                    int row_index_val = group_first_row_index_val + thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                    left_scales_list[thread_row_index_val] = row_index_val < rows_val ? left_scales_ptr[row_index_val] : 0.0f;
-                }
+            for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
+                int row_index_val = group_first_row_index_val + thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
+                left_scales_list[thread_row_index_val] = row_index_val < rows_val ? left_scales_ptr[row_index_val] : 0.0f;
+            }
+            auto each_pair_val = [&](auto what_val) {
 #pragma unroll
                 for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
                     int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
@@ -949,33 +1120,95 @@ mlp_down_input_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val
                             room_ptr + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_STORE_BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
                             swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val);
                         float left_scale_val = left_scales_list[thread_row_index_val];
-                        // wgmma_matmul_8bit's order: sum x left scale x right scale (+ bias)
+                        // wgmma_matmul_8bit's order: sum x left scale x right scale
                         float2 pair_val = make_float2(
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scales_val.x
-                            ,
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scales_val.y
-                        );
-                        float2 result_val = what_val(pair_val, room_pair_ptr);
-                        *room_pair_ptr = __floats2bfloat162_rn(result_val.x, result_val.y);
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scales_val.x,
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scales_val.y);
+                        float2 result_val = mlp_down_input_grad_8bit_times_gelu_slope(pair_val, __bfloat1622float2(*room_pair_ptr));
+                        what_val(group_index_val, thread_row_index_val, row_in_group_val, column_in_square_val, room_pair_ptr, result_val);
                     }
                 }
             };
-            // the room's boxes stored by TMA into map_ptr's tensor, once every thread's writes are visible to it
-            auto store_room_val = [&](const CUtensorMap* map_ptr) {
+            if constexpr (!OUTPUT_8BIT) {
+                // g. as bfloat16: each result over its gelu_input in the room; then, once every thread's writes are
+                //    visible to TMA, TMA stores the room's boxes
+                each_pair_val([](int, int, int, int, nv_bfloat162* room_pair_ptr, float2 result_val) {
+                    *room_pair_ptr = __floats2bfloat162_rn(result_val.x, result_val.y);
+                });
                 mlp_down_input_grad_8bit_fence_for_tma();                                               // this thread's writes visible to TMA
                 meet_warpgroup_val();                                              // every thread's
                 if (warpgroup_first_thread_val) {
 #pragma unroll
                     for (int box_index_val = 0; box_index_val < OUTPUT_BOXES; box_index_val++)
-                        mlp_down_input_grad_8bit_store_box(map_ptr, block_first_column_index_val + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_ROW_VALUES, group_first_row_index_val,
-                                      room_ptr + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_STORE_BOX_BYTES);
+                        mlp_down_input_grad_8bit_store_box(&output_map_val, block_first_column_index_val + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_ROW_VALUES,
+                                                           group_first_row_index_val, room_ptr + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_STORE_BOX_BYTES);
                     mlp_down_input_grad_8bit_store_commit();
                 }
-            };
-            write_room_val([](float2 pair_val, const nv_bfloat162* room_pair_ptr) {
-                return mlp_down_input_grad_8bit_times_gelu_slope(pair_val, __bfloat1622float2(*room_pair_ptr));
-            });
-            store_room_val(&output_map_val);
+            } else {
+                // g. in 8 bits: each result rounded to bfloat16 (what round_8bit_per_tensor would read), kept in the
+                //    thread's own sums (gelu_input still sits in the room, where the copies go), its largest |value| kept
+                //    (inside the matrix only: past the edges the sums are 0s, not values)
+                each_pair_val([&](int group_index_val, int thread_row_index_val, int row_in_group_val, int column_in_square_val, nv_bfloat162*,
+                                  float2 result_val) {
+                    float2 stored_bf16_val = __bfloat1622float2(__floats2bfloat162_rn(result_val.x, result_val.y));
+                    sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] = stored_bf16_val.x;
+                    sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] = stored_bf16_val.y;
+                    if (group_first_row_index_val + row_in_group_val < rows_val && block_first_column_index_val + column_in_square_val < columns_val)
+                        thread_largest_val = fmaxf(thread_largest_val, fmaxf(fabsf(stored_bf16_val.x), fabsf(stored_bf16_val.y)));
+                });
+                //    every thread has read its gelu_input: the room may be written over
+                meet_warpgroup_val();
+                // h. each kept value times 1 / scale, rounded to E4M3 as round_8bit_tile_kernel does (saturating): the
+                //    row copy's pair, 2 bytes of its swizzled row; the turned copy's, one byte in each of 2 lines
+#pragma unroll
+                for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
+                    int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
+#pragma unroll
+                    for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
+                        int row_in_group_val = thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
+                        __nv_fp8x2_e4m3 stored_val(make_float2(
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * output_to_stored_val,
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * output_to_stored_val));
+                        unsigned short stored_bits_val = stored_val.__x;                   // the first value in the low byte
+                        int box_index_val = column_in_square_val / MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K;
+                        int byte_in_row_val = column_in_square_val % MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K;
+                        int swizzled_cell_val = (byte_in_row_val / HARDWARE_TMA_BYTES_PER_CELL) ^ (row_in_group_val % HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN);
+                        *reinterpret_cast<unsigned short*>(room_ptr + box_index_val * ROW_8BIT_BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
+                                                           swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_row_val % HARDWARE_TMA_BYTES_PER_CELL) =
+                            stored_bits_val;
+                        uint8_t* turned_ptr = room_ptr + TURNED_8BIT_OFFSET + column_in_square_val * HARDWARE_WGMMA_M + row_in_group_val;
+                        turned_ptr[0] = (uint8_t)(stored_bits_val & 0xFF);
+                        turned_ptr[HARDWARE_WGMMA_M] = (uint8_t)(stored_bits_val >> 8);
+                    }
+                }
+                mlp_down_input_grad_8bit_fence_for_tma();                                               // this thread's writes visible to TMA
+                meet_warpgroup_val();                                              // every thread's
+                if (warpgroup_first_thread_val) {
+#pragma unroll
+                    for (int box_index_val = 0; box_index_val < ROW_8BIT_BOXES; box_index_val++)
+                        mlp_down_input_grad_8bit_store_box(&output_map_val, block_first_column_index_val + box_index_val * MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_K,
+                                                           group_first_row_index_val, room_ptr + box_index_val * ROW_8BIT_BOX_BYTES);
+                    mlp_down_input_grad_8bit_store_box(&output_turned_map_val, group_first_row_index_val, block_first_column_index_val,
+                                                       room_ptr + TURNED_8BIT_OFFSET);
+                    mlp_down_input_grad_8bit_store_commit();
+                }
+                //    the scales lists: every value the one scale; the rows' by the squares of the first column, the
+                //    columns' by the squares of the first rows
+                if (block_first_column_index_val == 0 && warpgroup_thread_index_val < HARDWARE_WGMMA_M &&
+                    group_first_row_index_val + warpgroup_thread_index_val < rows_val)
+                    output_row_scales_ptr[group_first_row_index_val + warpgroup_thread_index_val] = output_scale_val;
+                if (group_first_row_index_val == 0)
+                    for (int column_in_square_val = warpgroup_thread_index_val; column_in_square_val < COLUMNS;
+                         column_in_square_val += HARDWARE_WARPGROUP_THREADS)
+                        if (block_first_column_index_val + column_in_square_val < columns_val)
+                            output_turned_scales_ptr[block_first_column_index_val + column_in_square_val] = output_scale_val;
+            }
+        }
+        //    the output in 8 bits: this thread's largest onto the next call's, a warp at a time
+        if constexpr (OUTPUT_8BIT) {
+            float warp_largest_val = warp_reduce_max(thread_largest_val);
+            if (output_next_largest_ptr != nullptr && lane_index_val == 0 && warp_largest_val > 0.0f)
+                atomicMax(output_next_largest_ptr, __float_as_uint(warp_largest_val));
         }
     }
 

@@ -1,0 +1,12 @@
+GPT-2 small: 733105152 parameters, 8 bits, on 1 GPU(s)
+train: 1 file(s), 10000000 tokens; val: 10000000 tokens, 10 batches of it on each GPU each time
+1 steps of 1 GPU(s) x 16 x {16, 2048} = 524288 tokens: 524288 tokens, 0.05 epochs
+learning rate: 0.0006, warmup 5 steps, cosine down to 0; weight decay 0.1, clip at 1
+GPU memory, rank 0: 45.7 GB used of 85.0 GB
+data: all on disk before the first step (--data-ready 1)
+checkpoints: none
+
+step     0 | val loss 10.6830
+step     1/1 | loss 10.6773 | norm 31.7182 | lr 1.20e-04 |   6080 ms | data  2.1 ms |   86233 tokens/s
+step     1 | val loss 9.5157
+done: steps 1 .. 1 in 7 s

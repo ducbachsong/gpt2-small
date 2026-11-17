@@ -1,0 +1,103 @@
+log: tests/results/H100/mlp_down_input_grad_8bit_2026-11-17_080657.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+
+time_against_cublas
+    mlp down input grad: output {16384, 6144}, a sum of 1536: 309.2 GFLOP
+    average of steps 3..20:              ms     TFLOPS   of bf16 peak
+        mine, rounding included          0.745      415.3     50.7%
+        mine, the product alone          0.658      470.2     57.4%
+        PyTorch (cuBLAS, bfloat16)       0.586      527.7     64.4%
+    cuBLAS takes 0.79x as long as mine with the rounding, 0.89x as long as the product alone
+
+time_each_square
+    ms, average of rounds 3..20; warpgroups x columns x sets of tiles
+        1 x  64 x 1      1.071 ms    288.7 TFLOPS
+        1 x  64 x 2      0.905 ms    341.6 TFLOPS
+        1 x  64 x 3      0.900 ms    343.5 TFLOPS
+        1 x  64 x 4      0.894 ms    346.0 TFLOPS
+        1 x 128 x 1      0.996 ms    310.6 TFLOPS
+        1 x 128 x 2      0.806 ms    383.9 TFLOPS
+        1 x 128 x 3      0.729 ms    424.4 TFLOPS
+        1 x 128 x 4      1.080 ms    286.2 TFLOPS
+        2 x  64 x 1      1.449 ms    213.4 TFLOPS
+        2 x  64 x 2      1.105 ms    280.0 TFLOPS
+        2 x  64 x 3      0.963 ms    321.1 TFLOPS
+        2 x  64 x 4      0.921 ms    335.7 TFLOPS
+        2 x 128 x 1      1.051 ms    294.3 TFLOPS
+        2 x 128 x 2      0.832 ms    371.8 TFLOPS
+        2 x 128 x 3      0.735 ms    420.9 TFLOPS
+        2 x 128 x 4      0.695 ms    445.0 TFLOPS   (this file's)
+    fastest: 2 x 128 x 4
+
+time_each_choice
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        clusters of 1,  1 rows a group, persistent          0.699 ms    442.3 TFLOPS
+        clusters of 1,  1 rows a group, one a square        0.771 ms    401.0 TFLOPS
+        clusters of 1,  4 rows a group, persistent          0.702 ms    440.7 TFLOPS
+        clusters of 1,  4 rows a group, one a square        0.806 ms    383.9 TFLOPS
+        clusters of 1, 16 rows a group, persistent          0.702 ms    440.5 TFLOPS
+        clusters of 1, 16 rows a group, one a square        0.803 ms    385.0 TFLOPS
+        clusters of 1, 64 rows a group, persistent          0.703 ms    440.0 TFLOPS
+        clusters of 1, 64 rows a group, one a square        0.810 ms    381.7 TFLOPS
+        clusters of 2,  1 rows a group, persistent          0.721 ms    429.2 TFLOPS
+        clusters of 2,  1 rows a group, one a square        0.874 ms    353.9 TFLOPS
+        clusters of 2,  4 rows a group, persistent          0.774 ms    399.7 TFLOPS
+        clusters of 2,  4 rows a group, one a square        0.931 ms    332.1 TFLOPS
+        clusters of 2, 16 rows a group, persistent          0.709 ms    436.0 TFLOPS
+        clusters of 2, 16 rows a group, one a square        0.885 ms    349.5 TFLOPS
+        clusters of 2, 64 rows a group, persistent          0.746 ms    414.3 TFLOPS
+        clusters of 2, 64 rows a group, one a square        0.951 ms    325.2 TFLOPS
+
+time_each_variant
+    ms, average of rounds 3..20, at 2 x 128 x 4
+        producer 24 registers, 0 in flight, promotion 0      0.724 ms    427.4 TFLOPS
+        producer 24 registers, 1 in flight, promotion 0      0.743 ms    416.4 TFLOPS
+        producer 24 registers, 2 in flight, promotion 0      0.803 ms    385.2 TFLOPS
+        producer 24 registers, 3 in flight, promotion 0      0.978 ms    316.3 TFLOPS
+        producer 32 registers, 0 in flight, promotion 0      0.727 ms    425.4 TFLOPS
+        producer 32 registers, 1 in flight, promotion 0      0.746 ms    414.6 TFLOPS
+        producer 32 registers, 2 in flight, promotion 0      0.802 ms    385.7 TFLOPS
+        producer 32 registers, 3 in flight, promotion 0      0.978 ms    316.0 TFLOPS
+        producer 40 registers, 0 in flight, promotion 0      0.728 ms    424.7 TFLOPS
+        producer 40 registers, 1 in flight, promotion 0      0.745 ms    414.9 TFLOPS
+        producer 40 registers, 2 in flight, promotion 0      0.801 ms    385.9 TFLOPS
+        producer 40 registers, 3 in flight, promotion 0      0.976 ms    316.8 TFLOPS
+        producer 48 registers, 0 in flight, promotion 0      0.728 ms    424.6 TFLOPS
+        producer 48 registers, 1 in flight, promotion 0      1.082 ms    285.8 TFLOPS
+        producer 48 registers, 2 in flight, promotion 0      0.803 ms    385.2 TFLOPS
+        producer 48 registers, 3 in flight, promotion 0      0.977 ms    316.6 TFLOPS
+        producer 56 registers, 0 in flight, promotion 0      0.729 ms    424.0 TFLOPS
+        producer 56 registers, 1 in flight, promotion 0      0.746 ms    414.4 TFLOPS
+        producer 56 registers, 2 in flight, promotion 0      0.802 ms    385.8 TFLOPS
+        producer 56 registers, 3 in flight, promotion 0      0.975 ms    317.2 TFLOPS
+        producer 24 registers, 0 in flight, promotion 0      0.728 ms    424.6 TFLOPS
+        producer 24 registers, 0 in flight, promotion 1      0.767 ms    403.0 TFLOPS
+        producer 24 registers, 0 in flight, promotion 2      0.762 ms    406.1 TFLOPS
+        producer 24 registers, 0 in flight, promotion 4      0.747 ms    413.8 TFLOPS
+        producer 24 registers, 0 in flight, promotion 8      0.746 ms    414.4 TFLOPS
+    (the promotion changes the bits a little: every 4 steps was as accurate as every step on an H100 NVL; 0, never,
+     keeps the whole sum in the tensor cores, less accurate over a long sum)
+
+time_output_8bit_against_bf16_and_rounding
+    ms, average of rounds 3..20, at this file's setting
+        bfloat16 gelu_input_grad                  0.746 ms
+          + round_8bit_per_tensor                 1.013 ms
+        the rounding pass alone                   0.270 ms
+        mlp_down_input_grad_8bit_output_8bit      0.796 ms
+    gelu_input_grad in 8 bits: 0.796 ms against 1.013 (1.27x)
+
+    for llmc/kernels/8bit/prod/mlp_down_input_grad_8bit.cuh:
+#define MLP_DOWN_INPUT_GRAD_8BIT_ROW_GROUPS 2
+#define MLP_DOWN_INPUT_GRAD_8BIT_COLUMNS 128
+#define MLP_DOWN_INPUT_GRAD_8BIT_STAGES 4
+#define MLP_DOWN_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1
+#define MLP_DOWN_INPUT_GRAD_8BIT_CLUSTER 1
+#define MLP_DOWN_INPUT_GRAD_8BIT_BLOCKS 0
+#define MLP_DOWN_INPUT_GRAD_8BIT_PRODUCER_REGISTERS 24
+#define MLP_DOWN_INPUT_GRAD_8BIT_IN_FLIGHT 0
+#define MLP_DOWN_INPUT_GRAD_8BIT_PROMOTION_STEPS 0
+    (part 4's at this file's square: if parts 2 and 3 changed it, update the defines and run again; the promotion
+     changes the bits: take a faster one only if the tests stay within their tolerances)
+
+all tunes done
