@@ -10,16 +10,19 @@ nanochat is a from-scratch C/CUDA trainer for nanochat-sized LLMs, with every ke
 |---|---|---|---|---|
 | 1× H100 SXM | 112,426 | 4.66 s | 2026-11-16 | e4c6ab7 |
 | 2× H100 PCIe (NVLink) | 152,283 | 3.44 s | 2026-11-16 | e4c6ab7 |
-| 1× H100 PCIe | 76,417 | 6.86 s | 2026-11-16 | e4c6ab7 |
+| 1× H100 PCIe | 86,233 | 6.08 s | 2026-11-17 | 60374f7 |
 
-Against PyTorch on the same H100 SXM (`tune_model`: one micro-batch as the training loop runs it; PyTorch uses cuBLAS for every product and its own flash attention):
+The SXM and NVLink runs are from before 60374f7, which made the 8-bit model about 3% faster again (LayerNorm, `mlp_down`'s backward and attention's backward writing their outputs straight in 8 bits); they will be run again.
 
-| Rows | Ours bf16 | Ours 8-bit | PyTorch bf16 | 8-bit / PyTorch |
-|---|---|---|---|---|
-| 4 | 94,010 | 101,255 | 101,116 | 1.00× |
-| 8 | 99,335 | 107,233 | 103,789 | 1.03× |
-| 16 | 103,957 | 111,049 | 104,203 | 1.07× |
-At its best our 8-bit step reaches 112,678 tokens/s at 24 rows (MFU 50.5%), and our bf16 one 106,796 at 26 rows (MFU 47.8%); PyTorch runs out of memory at 26. PyTorch's attention has no sliding window, so it does a little more work: in ours, 18 of the 24 layers see only the last 512 tokens. 13 of the 15 8-bit products beat cuBLAS's bfloat16 on their own (1.11× to 1.56×). The two that don't, `mlp_up` and `mlp_down_input_grad`, do GELU inside them and cuBLAS doesn't; `mlp_up` is now 0.97× cuBLAS on an H100 PCIe (b7101a5). Every run's full log is in [tests/results/H100/](tests/results/H100/).
+Against PyTorch's FP8 training at its fastest, on the same H100 PCIe: torchao's float8 training (`convert_to_float8_training`, its tensorwise recipe), compiled (`torch.compile`), as nanochat trains. One micro-batch as the training loop runs it; ours from `tune_model`, PyTorch's from [tests/tune_model_torchao.py](tests/tune_model_torchao.py) (2026-11-17, bc4bdf1):
+
+| Rows | Ours 8-bit | PyTorch FP8 (torchao) | Ours / PyTorch |
+|---|---|---|---|
+| 4 | 81,010 | 67,908 | 1.19× |
+| 8 | 84,564 | 73,029 | 1.16× |
+| 16 | 86,467 | 75,494 | 1.15× |
+
+At its best our 8-bit step reaches 87,188 tokens/s at 30 rows (MFU 51.0%), torchao's 75,494 at 16 rows. PyTorch's attention has no sliding window, so it does a little more work: in ours, 18 of the 24 layers see only the last 512 tokens. Our 8-bit model computes what PyTorch's FP8 model computes: on the same weights its gradients point the same way (the least alike, cosine 0.978) and the losses agree (10.692 against 10.688). 13 of the 15 8-bit products beat cuBLAS's bfloat16 on their own (1.11× to 1.56×). The two that don't, `mlp_up` and `mlp_down_input_grad`, do GELU inside them and cuBLAS doesn't; `mlp_up` is now 0.97× cuBLAS on an H100 PCIe (b7101a5). Every run's full log is in [tests/results/H100/](tests/results/H100/).
 
 ## Getting started
 
@@ -67,11 +70,11 @@ Each step is 524,288 tokens, all GPUs together. `--batch-size` sets the rows per
 | `train_bf16.cu` | bfloat16 | bfloat16 on WGMMA | float master params |
 | `train_8bit.cu` | bfloat16 | FP8 E4M3 on WGMMA, float sums | float master params, m and √v in 8 bits |
 
-In `train_8bit` each product's two sides are rounded to E4M3 just before it, with one scale per tensor taken from its largest values over the last steps (delayed scaling, as Transformer Engine does). Where it can, the rounding happens inside the kernel that writes the tensor: LayerNorm writes its output's 8-bit copy, and `mlp_up` writes GELU's output straight in 8 bits, both the copy the forward reads and the turned copy the backward reads.
+In `train_8bit` each product's two sides are rounded to E4M3 just before it, with one scale per tensor taken from its largest values over the last steps (delayed scaling, as Transformer Engine does). Where it can, the rounding happens inside the kernel that writes the tensor, both the copy the forward reads and the turned copy the backward reads, and no bfloat16 copy is kept: the LayerNorms write their outputs in 8 bits, `mlp_up` writes GELU's output, `mlp_down`'s backward writes the gradient into `mlp_up`, and attention's backward writes the gradient into `qkv`. The scales those kernels use start at 1 (as Transformer Engine's do) for the activations; a gradient's first scale is exact, from its own largest value, since its values are far too small for a scale of 1. The 4 linears have no bias, as in nanochat: the 8-bit model stops if asked for one.
 
 ## Tests and tunes
 
-Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTorch, passes or fails) and a **tune** (`tune_<kernel>.cu`: times its settings on this GPU and against cuBLAS). They sit side by side in `tests/fp32/`, `tests/bf16/` and `tests/8bit/`; [tests/README.md](tests/README.md) lists them all. Each kernel's settings are `#define`s at the top of its file, set from a tune on the GPU it will train on.
+Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTorch, passes or fails) and a **tune** (`tune_<kernel>.cu`: times its settings on this GPU and against cuBLAS). They sit side by side in `tests/fp32/`, `tests/bf16/` and `tests/8bit/`; [tests/README.md](tests/README.md) lists them all. Each kernel's settings are `#define`s at the top of its file, set from a tune on the GPU it will train on. The whole model: `tune_model` finds the best `--batch-size`, checks the 8-bit model's gradients and loss against PyTorch's FP8 model (`torch._scaled_mm`); `tune_model_torchao.py` times PyTorch's FP8 training at its fastest for the comparison above (`pip install torchao`).
 
 ## File structure
 
@@ -107,6 +110,7 @@ Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTo
     ├── test_helpers.h              # ASSERT_EQ, ASSERT_NEAR
     ├── tune_helpers.h              # GPU timing, GB/s and MBU
     ├── test_model.cu, tune_model.cu
+    ├── tune_model_torchao.py       # PyTorch's FP8 training at its fastest on the same model: torchao, compiled
     ├── fp32, bf16, 8bit            # test_<kernel>.cu and tune_<kernel>.cu for every kernel
     └── results                     # what each tune printed, per GPU and per day
 ```
