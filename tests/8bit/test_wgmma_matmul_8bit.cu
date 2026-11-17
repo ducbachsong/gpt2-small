@@ -59,11 +59,11 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
     return difference_tensor.item<double>() / pytorch_tensor.abs().max().item<double>();
 }
 
-/// A matrix and its 8-bit copy: the bfloat16 values as they sit, their E4M3s (4 in each int) and one scale per row.
+/// A matrix and its 8-bit copy: the bfloat16 values as they sit, their E4M3s and one scale per row.
 struct RoundedMatrix
 {
     Tensor values_tensor;              // {rows, row_length} bfloat16, or turned {row_length, rows}
-    Tensor rounded_tensor;             // {rows, row_length / 4} Int32
+    Tensor rounded_tensor;             // {rows, row_length} E4M3
     Tensor scales_tensor;              // {rows} float
     size_t rows_val;
     size_t row_length_val;
@@ -75,7 +75,7 @@ struct RoundedMatrix
     {
         rows_val = values_tensor.size(turned_val ? 1 : 0);
         row_length_val = values_tensor.size(turned_val ? 0 : 1);
-        rounded_tensor = Tensor::zeros({rows_val, row_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+        rounded_tensor = Tensor::zeros({rows_val, row_length_val}, DType::E4M3);
         scales_tensor = Tensor::zeros({rows_val});
         round_8bit(rounded_tensor, scales_tensor, values_tensor, turned_val, threads_per_block_val);
     }

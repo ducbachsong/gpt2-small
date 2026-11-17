@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
     DataLoader train_loader(c.train_files, c.batch_size, c.seq_len, distributed.rank(), distributed.world_size());
     DataLoader val_loader(c.val_files, c.batch_size, c.seq_len, distributed.rank(), distributed.world_size());
     set_steps(c, train_loader, distributed);
+    wait_for_data(c, train_loader, distributed);                        // all there (--data-ready 1), or a lead over the writer
 
     // 2. the model: its params and grads live in AdamWBf16, the model reads and writes views of them. Every rank
     // makes the same starting values from the same seed, and keeps the master of its own slice.
@@ -142,6 +143,7 @@ int main(int argc, char** argv) {
     auto run_started = std::chrono::steady_clock::now();
     for (int step = first_step; step < c.steps; step++) {
         auto started = std::chrono::steady_clock::now();
+        double data_seconds_before = train_loader.seconds_reading();
         optimizer.all_grads().zero_();
         double loss_sum = 0.0;
         for (int micro_batch = 0; micro_batch < micro_batches; micro_batch++) {
@@ -159,8 +161,10 @@ int main(int argc, char** argv) {
         float norm = optimizer.grad_norm().item<float>();              // waits for the GPU: the step is done
         float loss = distributed.mean_of_cpu_value((float)(loss_sum / micro_batches));
         double seconds = seconds_since(started);
-        print0(distributed, "step %5d/%d | loss %.4f | norm %7.4f | lr %.2e | %6.0f ms | %7.0f tokens/s\n", step + 1,
-               c.steps, loss, norm, learning_rate, seconds * 1000.0, c.tokens_per_step / seconds);
+        // data: this rank's batches of the step, file to GPU (a wait for the writer is the loader's own line)
+        print0(distributed, "step %5d/%d | loss %.4f | norm %7.4f | lr %.2e | %6.0f ms | data %4.1f ms | %7.0f tokens/s\n",
+               step + 1, c.steps, loss, norm, learning_rate, seconds * 1000.0,
+               (train_loader.seconds_reading() - data_seconds_before) * 1000.0, c.tokens_per_step / seconds);
 
         int steps_done = step + 1;
         if (steps_done % c.val_every == 0 || steps_done == c.steps) {

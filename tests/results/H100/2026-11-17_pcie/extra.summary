@@ -1,0 +1,6 @@
+built train_8bit
+built train_8bit_gelu_bf16
+climbmix.py done
+train_8bit (GELU 8-bit) exit 0
+train_8bit_gelu_bf16 exit 0
+ALL_DONE

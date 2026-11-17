@@ -8,8 +8,7 @@
 //
 //     tensor                    type in memory                   shape                                    GPT-2 small
 //     input, output             bfloat16                         {batch_size, seq_len, embed_dim}         {4, 1024, 768}
-//     output_8bit               E4M3, 4 in each int of an        {batch_size x seq_len, embed_dim / 4}    {4096, 192}
-//                               Int32 tensor
+//     output_8bit               E4M3                             {batch_size x seq_len, embed_dim}        {4096, 768}
 //     output_scales             float                            {batch_size x seq_len}                   {4096}
 //     weight, bias              bfloat16                         {embed_dim}                              {768}
 //     mean, rstd                float                            {batch_size, seq_len}                    kept for the backward
@@ -32,11 +31,11 @@
 #include <cuda_fp8.h>                    // FP8 E4M3
 #include "../cuda_common.h"              // cudaCheck, check_threads_per_block, warp_reduce_max
 #include "../../common/tensor.cuh"              // read8_as_float, write8_from_float
-#include "round_8bit.cuh"                // round_8bit_scale, ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "round_8bit.cuh"                // round_8bit_scale, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 #include "../bf16/layer_norm_bf16.cuh"   // the 8 values a lane, the row's mean and rstd, the checks, the backward
 
 #define LAYER_NORM_8BIT_VALUES_PER_LOAD LAYER_NORM_BF16_VALUES_PER_LOAD                       // values a lane takes at a time: 8
-#define LAYER_NORM_8BIT_FOURS_PER_LOAD (LAYER_NORM_8BIT_VALUES_PER_LOAD / ROUND_8BIT_VALUES_PER_INT)   // E4M3 fours (ints) in them: 2
+#define LAYER_NORM_8BIT_FOURS_PER_LOAD (LAYER_NORM_8BIT_VALUES_PER_LOAD / VALUES_PER_FLOAT4)   // E4M3 fours (4 bytes each) in them: 2
 #define LAYER_NORM_8BIT_THREADS_PER_BLOCK LAYER_NORM_BF16_THREADS_PER_BLOCK                   // the forward's default block size
 #define LAYER_NORM_8BIT_BACKWARD_THREADS_PER_BLOCK LAYER_NORM_BF16_BACKWARD_THREADS_PER_BLOCK // the backward's: layer_norm_bf16's
 static_assert(sizeof(uint2) == LAYER_NORM_8BIT_VALUES_PER_LOAD * sizeof(__nv_fp8_e4m3), "a load's E4M3s are one 8-byte store");
@@ -65,8 +64,8 @@ __global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8
 ///
 ///   output_tensor, input_tensor   {batch_size, seq_len, embed_dim} bfloat16; embed_dim a multiple of
 ///                                 ROUND_8BIT_ROW_LENGTH_MULTIPLE (the product reads rows of whole 16-byte pieces)
-///   output_8bit_tensor            {batch_size x seq_len, embed_dim / ROUND_8BIT_VALUES_PER_INT} Int32 (or any shape
-///                                 of that many ints, embed_dim / 4 last): written, round_8bit(output)'s E4M3s
+///   output_8bit_tensor            {batch_size x seq_len, embed_dim} E4M3 (or any shape
+///                                 of that many values, embed_dim last): written, round_8bit(output)'s E4M3s
 ///   output_scales_tensor          {batch_size x seq_len} float (any shape of that many): written, one scale per row
 ///   mean_tensor, rstd_tensor      {batch_size, seq_len} float: for the backward
 ///   weight_tensor, bias_tensor    {embed_dim} bfloat16
@@ -81,16 +80,16 @@ inline void layer_norm_8bit_forward(const Tensor& output_tensor, const Tensor& o
                                  bias_tensor);
     size_t rows_val = input_tensor.size(0) * input_tensor.size(1);
     size_t embed_dim_val = input_tensor.size(2);
-    bool fits_val = embed_dim_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && output_8bit_tensor.dtype() == DType::Int32 &&
+    bool fits_val = embed_dim_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && output_8bit_tensor.dtype() == DType::E4M3 &&
                     output_8bit_tensor.dim() >= 1 &&
-                    output_8bit_tensor.size(output_8bit_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT == embed_dim_val &&
-                    output_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * embed_dim_val &&
+                    output_8bit_tensor.size(output_8bit_tensor.dim() - 1) == embed_dim_val &&
+                    output_8bit_tensor.numel() == rows_val * embed_dim_val &&
                     output_scales_tensor.dtype() == DType::Float32 && output_scales_tensor.numel() == rows_val &&
                     (size_t)output_8bit_tensor.data_ptr() % sizeof(uint2) == 0;
     if (!fits_val) {
-        fprintf(stderr, "error: layer_norm_8bit_forward needs embed_dim a multiple of %d, output_8bit {rows, embed_dim / %d} "
-                        "Int32 starting on %zu bytes and output_scales {rows} float; got embed_dim %zu\n",
-                ROUND_8BIT_ROW_LENGTH_MULTIPLE, (int)ROUND_8BIT_VALUES_PER_INT, sizeof(uint2), embed_dim_val);
+        fprintf(stderr, "error: layer_norm_8bit_forward needs embed_dim a multiple of %d, output_8bit {rows, embed_dim} "
+                        "E4M3 starting on %zu bytes and output_scales {rows} float; got embed_dim %zu\n",
+                ROUND_8BIT_ROW_LENGTH_MULTIPLE, sizeof(uint2), embed_dim_val);
         exit(EXIT_FAILURE);
     }
     // 2. launch: one warp per row, the blocks rounded up
@@ -161,7 +160,7 @@ __global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8
             unsigned int fours_list[LAYER_NORM_8BIT_FOURS_PER_LOAD];
 #pragma unroll
             for (int four_index_val = 0; four_index_val < LAYER_NORM_8BIT_FOURS_PER_LOAD; four_index_val++) {
-                const float* four_ptr = output_list + four_index_val * ROUND_8BIT_VALUES_PER_INT;
+                const float* four_ptr = output_list + four_index_val * VALUES_PER_FLOAT4;
                 fours_list[four_index_val] = __nv_fp8x4_e4m3(make_float4(four_ptr[0] * to_stored_val, four_ptr[1] * to_stored_val,
                                                                          four_ptr[2] * to_stored_val, four_ptr[3] * to_stored_val)).__x;
             }

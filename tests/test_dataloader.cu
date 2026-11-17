@@ -1,8 +1,8 @@
 // test_dataloader.cu — tests for llmc/helper/dataloader.cuh (DataLoader). Every check prints its test case, input,
 // expected and actual value, and ok; the first FAIL stops the program.
 //
-// The last four cases have a writer at work (a `writing` file, and files written by a child process a
-// second later), so they take about 3 seconds.
+// The last seven cases have a writer at work (a `writing` file, and files written by a child process a
+// second later), so they take about 6 seconds.
 //
 // Each test writes its own small token files (test_dataloader_*.bin, in the folder it runs from), with
 // tokens counting up, 0, 1, 2, ..., so every batch can be worked out by hand. Batches are {2, 4}: 8 tokens,
@@ -84,12 +84,28 @@ static void write_token_file_soon(const std::string &path_val, const std::vector
     }
 }
 
-/// Makes the `writing` file in this folder, as data/fineweb.py does while it writes token files.
-static void start_writing(void)
+/// Makes the `writing` file in this folder, as data/fineweb.py does while it writes token files: empty, or
+/// holding the writer's process id (writer_process_val > 0), as the data scripts write theirs.
+static void start_writing(long writer_process_val = 0)
 {
     FILE *marker_ptr = fopen("writing", "w");
     assert(marker_ptr != nullptr && "cannot write a test file in this folder");
+    if (writer_process_val > 0)
+        fprintf(marker_ptr, "%ld", writer_process_val);
     fclose(marker_ptr);
+}
+
+/// Gives the id of a process that has ended: a child that stops at once, waited for. The writer a `writing`
+/// file names after it was killed.
+static long ended_process(void)
+{
+    fflush(stdout);
+    pid_t child_val = fork();
+    if (child_val == 0)
+        _exit(0);
+    int status_val = 0;
+    waitpid(child_val, &status_val, 0);
+    return (long)child_val;
 }
 
 /// A batch's token_ids and targets, {rows, columns} ints, both 0 at first.
@@ -264,6 +280,26 @@ static void the_short_tail_of_a_file_is_skipped_then_the_next_file_comes(void)
     ASSERT_EQ(loader_val.epoch(), 2);
 }
 
+static void a_writer_that_died_is_an_error(void)
+{
+    // Expect: `writing` names a process that has ended (a writer killed before its end leaves the file behind)
+    // and there is no file yet: the loader stops with "the writer ... is gone" within a second, instead of
+    // waiting an hour. With file 1 there and the same `writing`, the loader starts (nothing to wait for yet).
+    // 1. no file: the wait for file 1 stops
+    start_writing(ended_process());
+    ASSERT_EQ(stops_with_an_error([] { DataLoader loader_val("test_dataloader_died_%06d.bin", 2, 4); }), true);
+    // 2. file 1 there: no wait, no error; the lead it cannot get stops
+    write_token_file("test_dataloader_died_000001.bin", count_up(0, 20));
+    ASSERT_EQ(stops_with_an_error([] { DataLoader loader_val("test_dataloader_died_%06d.bin", 2, 4); }), false);
+    ASSERT_EQ(stops_with_an_error([] {
+                  DataLoader loader_val("test_dataloader_died_%06d.bin", 2, 4);
+                  loader_val.wait_for_tokens(40);
+              }),
+              true);
+    remove("writing");
+    remove("test_dataloader_died_000001.bin");
+}
+
 // ══ files still being written: training and data/fineweb.py at the same time ═══
 
 static void a_file_written_after_the_start_is_read_next(void)
@@ -348,6 +384,64 @@ static void when_the_writer_ends_with_no_new_file_the_first_file_comes_again(voi
     ASSERT_EQ(batch_val.ids(), count_up(0, BATCH_TOKENS));
     ASSERT_EQ(loader_val.num_files(), 1);
     ASSERT_EQ(loader_val.epoch(), 2);
+}
+
+static void a_writer_named_in_writing_is_waited_for(void)
+{
+    // Expect: `writing` holds the id of a process that is there (this one), and no file yet: the loader waits,
+    // as with an empty `writing`; a second later file 1 (tokens 0 .. 19) is written and `writing` deleted.
+    start_writing((long)getpid());
+    write_token_file_soon("test_dataloader_named_000001.bin", count_up(0, 20), true);
+    DataLoader loader_val("test_dataloader_named_%06d.bin", 2, 4);
+    Batch batch_val;
+    ASSERT_EQ(loader_val.num_files(), 1);
+    batch_val.next_from(loader_val);
+    ASSERT_EQ(batch_val.ids(), count_up(0, BATCH_TOKENS));
+}
+
+static void wait_for_tokens_waits_until_the_files_hold_them(void)
+{
+    // Expect: `writing` there, file 1 alone (20 tokens). wait_for_tokens(10) returns at once: 20 are there,
+    // nothing waited. wait_for_tokens(40) waits; a second later the writer finishes file 2 (30 tokens) and
+    // ends: 2 files, 50 tokens, about a second waited. With no writer, wait_for_tokens(1000) returns at once
+    // though only 50 are there.
+    // 1. enough there: no wait
+    start_writing();
+    write_token_file("test_dataloader_lead_000001.bin", count_up(0, 20));
+    DataLoader loader_val("test_dataloader_lead_%06d.bin", 2, 4);
+    loader_val.wait_for_tokens(10);
+    ASSERT_EQ(loader_val.num_files(), 1);
+    ASSERT_EQ(loader_val.seconds_waiting() == 0.0, true);
+    // 2. not enough: waits for file 2
+    write_token_file_soon("test_dataloader_lead_000002.bin", count_up(100, 30), true);
+    loader_val.wait_for_tokens(40);
+    ASSERT_EQ(loader_val.num_files(), 2);
+    ASSERT_EQ(loader_val.total_tokens(), (size_t)50);
+    ASSERT_EQ(loader_val.seconds_waiting() >= 0.9, true);
+    // 3. the writer done: nothing to wait for
+    double waited_val = loader_val.seconds_waiting();
+    loader_val.wait_for_tokens(1000);
+    ASSERT_EQ(loader_val.seconds_waiting() == waited_val, true);
+}
+
+static void a_wait_inside_a_batch_counts_as_waiting_not_reading(void)
+{
+    // Expect: `writing` there, file 1 alone (20 tokens: 2 batches). Batch 1 reads: seconds_reading() above 0,
+    // nothing waited. Batch 2 ends file 1 and waits a second for file 2: seconds_waiting() about 1,
+    // seconds_reading() still far under it (two batches of 9 tokens).
+    start_writing();
+    write_token_file("test_dataloader_timed_000001.bin", count_up(0, 20));
+    DataLoader loader_val("test_dataloader_timed_%06d.bin", 2, 4);
+    Batch batch_val;
+    batch_val.next_from(loader_val);
+    ASSERT_EQ(loader_val.seconds_reading() > 0.0, true);
+    ASSERT_EQ(loader_val.seconds_waiting() == 0.0, true);
+    write_token_file_soon("test_dataloader_timed_000002.bin", count_up(100, 30), true);
+    batch_val.next_from(loader_val);                         // the end of file 1: waits for file 2
+    ASSERT_EQ(loader_val.seconds_waiting() >= 0.9, true);
+    ASSERT_EQ(loader_val.seconds_reading() < 0.5, true);
+    batch_val.next_from(loader_val);
+    ASSERT_EQ(batch_val.ids(), count_up(100, BATCH_TOKENS));
 }
 
 static void a_file_of_exactly_one_batch_gives_it_every_time(void)
@@ -453,7 +547,8 @@ int main(void)
     remove("writing");                                       // one left by a stopped run would make loaders wait
     // the numbered files an earlier run left: a loader would find them as files already written (file 2 of
     // `growing` or `ends`, file 1 of `first`), so the cases that wait for a new file would not wait
-    for (const char *prefix_ptr : {"test_dataloader_growing", "test_dataloader_half", "test_dataloader_first", "test_dataloader_ends"})
+    for (const char *prefix_ptr : {"test_dataloader_growing", "test_dataloader_half", "test_dataloader_first", "test_dataloader_ends",
+                                   "test_dataloader_died", "test_dataloader_named", "test_dataloader_lead", "test_dataloader_timed"})
         for (int file_index_val = 0; file_index_val <= 3; file_index_val++)
         {
             char path_list[64];
@@ -467,6 +562,7 @@ int main(void)
     a_file_shorter_than_its_header_says_is_an_error();
     a_file_smaller_than_a_round_is_refused();
     seek_to_a_place_no_loader_could_be_is_an_error();
+    a_writer_that_died_is_an_error();
 
     batches_walk_a_file_in_order_then_start_again();
     held_out_batches_are_the_same_after_every_reset();
@@ -480,6 +576,9 @@ int main(void)
     a_half_written_file_is_waited_for_until_it_is_whole();
     the_first_file_is_waited_for_when_there_is_none_yet();
     when_the_writer_ends_with_no_new_file_the_first_file_comes_again();
+    a_writer_named_in_writing_is_waited_for();
+    wait_for_tokens_waits_until_the_files_hold_them();
+    a_wait_inside_a_batch_counts_as_waiting_not_reading();
 
     printf("\nall tests passed\n");
     return 0;

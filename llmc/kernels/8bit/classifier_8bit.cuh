@@ -12,8 +12,8 @@
 //     logits, logits_grad                bfloat16                         {batch_size, seq_len, padded_vocab_size}
 //     targets, losses, losses_grad, max_of_each_row, sum_of_each_row,
 //     tile_max, tile_sum                 as in classifier_bf16.cuh
-//     the 8-bit copies                   E4M3, 4 in each int of an Int32  Linear8bitScratch(rows, embed_dim,
-//                                        tensor, a float scale per row    padded_vocab_size)'s: the head is a linear
+//     the 8-bit copies                   E4M3, a float scale per row      Linear8bitScratch(rows, embed_dim,
+//                                                                         padded_vocab_size)'s: the head is a linear
 //                                                                         layer from embed_dim to padded_vocab_size
 //     sums                               float                            in registers
 //

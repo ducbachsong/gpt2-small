@@ -67,7 +67,7 @@ struct LayerNormTensors
     Tensor bias_tensor;
     Tensor output_grad_tensor;
     Tensor output_tensor;
-    Tensor output_8bit_tensor;         // {rows, embed_dim / 4} Int32
+    Tensor output_8bit_tensor;         // {rows, embed_dim} E4M3
     Tensor output_scales_tensor;       // {rows} float
     Tensor mean_tensor;
     Tensor rstd_tensor;
@@ -80,7 +80,7 @@ struct LayerNormTensors
     {
         LayerNormTensors tensors_val = *this;
         tensors_val.output_tensor = Tensor::zeros(output_tensor.shape(), DType::BFloat16);
-        tensors_val.output_8bit_tensor = Tensor::zeros(output_8bit_tensor.shape(), DType::Int32);
+        tensors_val.output_8bit_tensor = Tensor::zeros(output_8bit_tensor.shape(), DType::E4M3);
         tensors_val.output_scales_tensor = Tensor::zeros(output_scales_tensor.shape());
         tensors_val.mean_tensor = Tensor::zeros(mean_tensor.shape());
         tensors_val.rstd_tensor = Tensor::zeros(rstd_tensor.shape());
@@ -122,7 +122,7 @@ static LayerNormTensors layer_norm_of(size_t batch_size_val, size_t seq_len_val,
     tensors_val.bias_tensor = bf16_of({embed_dim_val}, bias_list.empty() ? random_values({embed_dim_val}) : bias_list);
     tensors_val.output_grad_tensor = bf16_of(shape_list, random_values(shape_list));
     tensors_val.output_tensor = Tensor::zeros(shape_list, DType::BFloat16);
-    tensors_val.output_8bit_tensor = Tensor::zeros({tensors_val.rows_val, embed_dim_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    tensors_val.output_8bit_tensor = Tensor::zeros({tensors_val.rows_val, embed_dim_val}, DType::E4M3);
     tensors_val.output_scales_tensor = Tensor::zeros({tensors_val.rows_val});
     tensors_val.mean_tensor = Tensor::zeros({batch_size_val, seq_len_val});
     tensors_val.rstd_tensor = Tensor::zeros({batch_size_val, seq_len_val});
@@ -168,7 +168,7 @@ static void the_copy_is_round_8bit_s_of_the_output(void)
     LayerNormTensors rounded_val = tensors_val.with_fresh_results();
     round_8bit(rounded_val.output_8bit_tensor, rounded_val.output_scales_tensor, tensors_val.output_tensor);
     // 3. the same bits
-    ASSERT_EQ(tensors_val.output_8bit_tensor.tolist<int>() == rounded_val.output_8bit_tensor.tolist<int>(), true);
+    ASSERT_EQ(tensors_val.output_8bit_tensor.equal(rounded_val.output_8bit_tensor), true);
     ASSERT_EQ(tensors_val.output_scales_tensor.tolist(), rounded_val.output_scales_tensor.tolist());
 }
 
@@ -308,7 +308,7 @@ static void any_block_size_gives_the_same_bits(void)
         ASSERT_EQ(floats_of(tensors_val.output_tensor), floats_of(usual_val.output_tensor));
         ASSERT_EQ(tensors_val.mean_tensor.tolist(), usual_val.mean_tensor.tolist());
         ASSERT_EQ(tensors_val.rstd_tensor.tolist(), usual_val.rstd_tensor.tolist());
-        ASSERT_EQ(tensors_val.output_8bit_tensor.tolist<int>() == usual_val.output_8bit_tensor.tolist<int>(), true);
+        ASSERT_EQ(tensors_val.output_8bit_tensor.equal(usual_val.output_8bit_tensor), true);
         ASSERT_EQ(tensors_val.output_scales_tensor.tolist(), usual_val.output_scales_tensor.tolist());
     }
 }

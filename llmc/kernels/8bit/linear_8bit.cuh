@@ -10,9 +10,8 @@
 //     weight, weight_grad        bfloat16                         {out_features, in_features}           the model's
 //     bias, bias_grad            bfloat16                         {out_features}                        the model's
 //     output, output_grad        bfloat16                         {batch_size, seq_len, out_features}   the model's
-//     the 8-bit copies           E4M3, 4 in each int of an        Linear8bitScratch's                   scratch, made
-//                                Int32 tensor, a float scale                                            again each call
-//                                per row
+//     the 8-bit copies           E4M3, a float scale per row      Linear8bitScratch's                   scratch, made
+//                                                                                                       again each call
 //     sums                       float                            in registers
 //
 // Before each product its two sides are rounded to E4M3 by round_8bit, one power-of-2 scale per row; then
@@ -36,16 +35,16 @@
 
 #include "../cuda_common.h"             // cudaCheck
 #include "../../common/tensor.cuh"
-#include "round_8bit.cuh"            // the 8-bit copies: round_8bit, ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "round_8bit.cuh"            // the 8-bit copies: round_8bit, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 #include "wgmma_matmul_8bit.cuh"     // the products
 #include "../bf16/linear_bf16.cuh"           // the shape checks and bias_grad: linear_bf16_check_forward, _check_backward, linear_bf16_bias_grad
 
-/// The 8-bit copies of one product's two sides: left {rows, k} and right {columns, k}, each E4M3 (4 in each int)
+/// The 8-bit copies of one product's two sides: left {rows, k} and right {columns, k}, each E4M3
 /// with one float scale per row, as round_8bit writes them and wgmma_matmul_8bit reads them.
 struct Linear8bitProductCopies {
-    Tensor left_8bit_tensor;             // {rows, k / ROUND_8BIT_VALUES_PER_INT} Int32
+    Tensor left_8bit_tensor;             // {rows, k} E4M3
     Tensor left_scales_tensor;           // {rows} float
-    Tensor right_8bit_tensor;            // {columns, k / ROUND_8BIT_VALUES_PER_INT} Int32
+    Tensor right_8bit_tensor;            // {columns, k} E4M3
     Tensor right_scales_tensor;          // {columns} float
 
     Linear8bitProductCopies() = default;
@@ -86,9 +85,9 @@ void linear_8bit_check_sizes(const char* name_ptr, const Tensor& input_tensor, c
 ///   rows_val, columns_val   left's and right's rows: the product's shape
 ///   k_val                   the length summed over: a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE
 inline Linear8bitProductCopies::Linear8bitProductCopies(size_t rows_val, size_t columns_val, size_t k_val) {
-    left_8bit_tensor = Tensor::zeros({rows_val, k_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    left_8bit_tensor = Tensor::zeros({rows_val, k_val}, DType::E4M3);
     left_scales_tensor = Tensor::zeros({rows_val});
-    right_8bit_tensor = Tensor::zeros({columns_val, k_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    right_8bit_tensor = Tensor::zeros({columns_val, k_val}, DType::E4M3);
     right_scales_tensor = Tensor::zeros({columns_val});
 }
 
@@ -215,9 +214,9 @@ inline void linear_8bit_check_sizes(const char* name_ptr, const Tensor& input_te
         const Linear8bitProductCopies& copies_val = *copies_list[product_index_val];
         size_t product_rows_val = shapes_list[product_index_val][0];
         size_t product_columns_val = shapes_list[product_index_val][1];
-        size_t k_ints_val = shapes_list[product_index_val][2] / ROUND_8BIT_VALUES_PER_INT;
-        fits_val = fits_val && copies_val.left_8bit_tensor.shape() == Shape({product_rows_val, k_ints_val}) &&
-                   copies_val.right_8bit_tensor.shape() == Shape({product_columns_val, k_ints_val}) &&
+        size_t product_k_val = shapes_list[product_index_val][2];
+        fits_val = fits_val && copies_val.left_8bit_tensor.shape() == Shape({product_rows_val, product_k_val}) &&
+                   copies_val.right_8bit_tensor.shape() == Shape({product_columns_val, product_k_val}) &&
                    copies_val.left_scales_tensor.shape() == Shape({product_rows_val}) &&
                    copies_val.right_scales_tensor.shape() == Shape({product_columns_val});
     }

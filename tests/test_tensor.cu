@@ -375,6 +375,99 @@ static void bfloat16_has_float_s_range_and_8_significant_bits(void) {
     ASSERT_EQ(filled_tensor.to(DType::Float32).tolist(), std::vector<float>(3, 0.10009765625f));
 }
 
+// ── e4m3 tensors ──────────────────────────────────────────────────────────────
+
+static void e4m3_tensors_take_1_byte_a_value(void) {
+    // Expect: a {2, 16} e4m3 tensor has element_size 1, 32 values and strides {16, 1}, counted in values as for
+    // every dtype, so row 1 starts 16 values in, which is 16 x 1 = 16 bytes; zeros gives 32 zero bytes.
+    Tensor t_tensor = Tensor::zeros({2, 16}, DType::E4M3);
+    ASSERT_EQ(t_tensor.dtype() == DType::E4M3, true);
+    ASSERT_EQ(t_tensor.element_size(), (size_t)1);
+    ASSERT_EQ(t_tensor.numel(), (size_t)32);                   // 2 x 16
+    ASSERT_EQ(t_tensor.stride(), Shape({16, 1}));
+    ASSERT_EQ((char*)t_tensor[1].data_ptr() - (char*)t_tensor.data_ptr(), (ptrdiff_t)16);
+    std::vector<float> read_on_cpu_list;
+    for (__nv_fp8_e4m3 value_val : t_tensor.tolist<__nv_fp8_e4m3>()) read_on_cpu_list.push_back(to_float(value_val));
+    ASSERT_EQ(read_on_cpu_list, std::vector<float>(32, 0.0f));
+}
+
+static void e4m3_values_come_back_as_they_went_in(void) {
+    // Expect: an e4m3 has 3 fraction bits, so values round on the CPU (CUDA's __nv_fp8_e4m3, to nearest, past
+    // 448 to 448) and come back from the GPU as they went in:
+    //     1     -> 1:     byte 0x38 = 0 0111 000 (exponent 7 - 7 = 0)
+    //     -2.5  -> -2.5:  byte 0xC2 = 1 1000 010 (1.25 x 2^1)
+    //     0.1   -> 0.1015625: from 0.0625 to 0.125 the e4m3s are 0.0078125 apart: 0.09375 or 0.1015625
+    //     1/3   -> 0.34375: from 0.25 to 0.5 they are 0.03125 apart: 0.3125 or 0.34375
+    //     17    -> 16: from 16 to 32 they are 2 apart; 17 is halfway, a tie goes to the last bit 0
+    //     448   -> 448, the largest e4m3;  1000 -> 448: no inf
+    // item<__nv_fp8_e4m3>() of value 5 is 448.
+    // 1. the values, rounded on the CPU, and what they round to
+    std::vector<float> values_list = {1.0f, -2.5f, 0.1f, 1.0f / 3.0f, 17.0f, 448.0f, 1000.0f};
+    std::vector<float> rounded_list = {1.0f, -2.5f, 0.1015625f, 0.34375f, 16.0f, 448.0f, 448.0f};
+    std::vector<__nv_fp8_e4m3> e4m3s_list;
+    for (float value_val : values_list) e4m3s_list.push_back(__nv_fp8_e4m3(value_val));
+    // 2. to the GPU and back
+    Tensor e4m3s_tensor = Tensor::zeros({7}, DType::E4M3);
+    e4m3s_tensor.copy_from_cpu(e4m3s_list.data());
+    std::vector<__nv_fp8_e4m3> back_list = e4m3s_tensor.tolist<__nv_fp8_e4m3>();
+    std::vector<float> read_on_cpu_list;
+    for (__nv_fp8_e4m3 value_val : back_list) read_on_cpu_list.push_back(to_float(value_val));
+    ASSERT_EQ(read_on_cpu_list, rounded_list);
+    // 3. the bytes and one value
+    ASSERT_EQ((int)back_list[0].__x, 0x38);
+    ASSERT_EQ((int)back_list[1].__x, 0xC2);
+    ASSERT_EQ(to_float(e4m3s_tensor[5].item<__nv_fp8_e4m3>()), 448.0f);
+}
+
+static void e4m3_views_narrow_and_clone(void) {
+    // Expect: a {4, 16} e4m3 tensor holding bytes 0..63 viewed as {64} shares them; narrow(0, 1, 2) is rows 1 and
+    // 2, starting 16 bytes in, holding bytes 16..47; a clone holds the same 64 bytes in memory of its own.
+    // 1. bytes 0..63 (e4m3s of every bit pattern from 0x00 to 0x3F: 0 up to 1.875)
+    std::vector<__nv_fp8_e4m3> e4m3s_list(64);
+    for (int byte_val = 0; byte_val < 64; byte_val++) e4m3s_list[byte_val].__x = (__nv_fp8_storage_t)byte_val;
+    Tensor t_tensor = Tensor::zeros({4, 16}, DType::E4M3);
+    t_tensor.copy_from_cpu(e4m3s_list.data());
+    // 2. a view, a narrow and a clone
+    Tensor flat_tensor = t_tensor.view({64});
+    Tensor rows_tensor = t_tensor.narrow(0, 1, 2);
+    Tensor copy_tensor = t_tensor.clone();
+    // 3. check
+    ASSERT_EQ(flat_tensor.data_ptr() == t_tensor.data_ptr(), true);
+    ASSERT_EQ(rows_tensor.shape(), Shape({2, 16}));
+    ASSERT_EQ((char*)rows_tensor.data_ptr() - (char*)t_tensor.data_ptr(), (ptrdiff_t)16);
+    std::vector<int> rows_bytes_list, copy_bytes_list;
+    for (__nv_fp8_e4m3 value_val : rows_tensor.tolist<__nv_fp8_e4m3>()) rows_bytes_list.push_back(value_val.__x);
+    for (__nv_fp8_e4m3 value_val : copy_tensor.tolist<__nv_fp8_e4m3>()) copy_bytes_list.push_back(value_val.__x);
+    std::vector<int> expected_rows_list, expected_copy_list;
+    for (int byte_val = 16; byte_val < 48; byte_val++) expected_rows_list.push_back(byte_val);
+    for (int byte_val = 0; byte_val < 64; byte_val++) expected_copy_list.push_back(byte_val);
+    ASSERT_EQ(rows_bytes_list, expected_rows_list);
+    ASSERT_EQ(copy_bytes_list, expected_copy_list);
+    ASSERT_EQ(copy_tensor.data_ptr() != t_tensor.data_ptr(), true);
+}
+
+static void equal_compares_shape_dtype_and_bits(void) {
+    // Expect: an e4m3 {2, 16} and its clone are equal; after one byte of the clone changes, not; viewed as {32}, not
+    // (another shape); a float tensor with 0..3 equals another with 0..3, not an int one of the same bytes' count.
+    // 1. e4m3: a clone, one byte changed, another shape
+    std::vector<__nv_fp8_e4m3> e4m3s_list(32);
+    for (int byte_val = 0; byte_val < 32; byte_val++) e4m3s_list[byte_val].__x = (__nv_fp8_storage_t)byte_val;
+    Tensor t_tensor = Tensor::zeros({2, 16}, DType::E4M3);
+    t_tensor.copy_from_cpu(e4m3s_list.data());
+    Tensor copy_tensor = t_tensor.clone();
+    ASSERT_EQ(t_tensor.equal(copy_tensor), true);
+    ASSERT_EQ(t_tensor.equal(t_tensor.view({32})), false);
+    e4m3s_list[5].__x = 0x7E;                                   // 448
+    copy_tensor.copy_from_cpu(e4m3s_list.data());
+    ASSERT_EQ(t_tensor.equal(copy_tensor), false);
+    // 2. floats against floats, and against ints
+    Tensor floats_tensor = Tensor::zeros({4}), other_floats_tensor = Tensor::zeros({4});
+    floats_tensor.copy_from_cpu(sample_data(4).data());
+    other_floats_tensor.copy_from_cpu(sample_data(4).data());
+    ASSERT_EQ(floats_tensor.equal(other_floats_tensor), true);
+    ASSERT_EQ(floats_tensor.equal(Tensor::zeros({4}, DType::Int32)), false);
+}
+
 // ── setting values ────────────────────────────────────────────────────────────
 
 static void zero_sets_every_value_to_0(void) {
@@ -530,6 +623,10 @@ int main(void) {
     randn_in_half_is_randn_in_float_rounded();
     item_and_indexing_on_halves();
     bfloat16_has_float_s_range_and_8_significant_bits();
+    e4m3_tensors_take_1_byte_a_value();
+    e4m3_values_come_back_as_they_went_in();
+    e4m3_views_narrow_and_clone();
+    equal_compares_shape_dtype_and_bits();
     zero_sets_every_value_to_0();
     fill_sets_every_value();
     fill_on_a_narrow_fills_only_those_rows();

@@ -7,8 +7,8 @@
 // a value), not math: the CUDA cores have no faster E4M3 multiply.
 //
 //     tensor                    type in memory                   shape                               read with
-//     left_8bit, right_8bit     E4M3, 4 in each int of an        {rows, sum_length / 4},              4 E4M3s (one int) at a time
-//                               Int32 tensor                     {columns, sum_length / 4}
+//     left_8bit, right_8bit     E4M3                             {rows, sum_length},                  4 E4M3s (4 bytes) at a time
+//                                                                {columns, sum_length}
 //     left_scales, right_scales float                            {rows}, {columns}                    as the sums are stored
 //     bias                      bfloat16                         {columns}, or none                   the same
 //     output                    bfloat16                         {rows, columns}                      written over, or added onto
@@ -23,7 +23,7 @@
 #include "../cuda_common.h"
 #include "../../common/tensor.cuh"
 #include "../bf16/fma_matmul_bf16.cuh"       // the squares, the pieces, fma_matmul_bf16_add_outer_products
-#include "round_8bit.cuh"            // ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "round_8bit.cuh"            // ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // ── the product ───────────────────────────────────────────────────────────────
 void fma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8bit_tensor, const Tensor& left_scales_tensor,
@@ -61,8 +61,8 @@ inline void fma_matmul_8bit(const Tensor& output_tensor, const Tensor& left_8bit
     fma_matmul_8bit_check_shapes(output_tensor, left_8bit_tensor, left_scales_tensor, right_8bit_tensor, right_scales_tensor,
                                  bias_tensor);
     // 2. launch: squares across and down, rounded up, as one line of blocks
-    size_t sum_length_val = right_8bit_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT;
-    size_t rows_val = left_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT / sum_length_val;
+    size_t sum_length_val = right_8bit_tensor.size(1);
+    size_t rows_val = left_8bit_tensor.numel() / sum_length_val;
     size_t columns_val = right_8bit_tensor.size(0);
     unsigned blocks_val = (unsigned)(CEIL_DIV(rows_val, (size_t)FMA_MATMUL_BF16_BLOCK_ROWS) *
                                      CEIL_DIV(columns_val, (size_t)FMA_MATMUL_BF16_BLOCK_COLUMNS));
@@ -178,22 +178,21 @@ inline void fma_matmul_8bit_check_shapes(const Tensor& output_tensor, const Tens
     for (int dim_val = 0; fits_val && dim_val < left_8bit_tensor.dim() - 1; dim_val++)
         fits_val = output_tensor.size(dim_val) == left_8bit_tensor.size(dim_val) && left_scales_tensor.size(dim_val) == left_8bit_tensor.size(dim_val);
     if (!fits_val) {
-        fprintf(stderr, "error: fma_matmul_8bit needs left_8bit {..., sum_length / %d} with left_scales {...}, output {..., "
-                        "columns} with the same rows, right_8bit {columns, sum_length / %d} with right_scales {columns}, "
-                        "bias {columns} or Tensor()\n",
-                (int)ROUND_8BIT_VALUES_PER_INT, (int)ROUND_8BIT_VALUES_PER_INT);
+        fprintf(stderr, "error: fma_matmul_8bit needs left_8bit {..., sum_length} with left_scales {...}, output {..., "
+                        "columns} with the same rows, right_8bit {columns, sum_length} with right_scales {columns}, "
+                        "bias {columns} or Tensor()\n");
         exit(EXIT_FAILURE);
     }
-    // 2. types: the 8-bit copies Int32, the scales float, output and bias bfloat16
-    if (left_8bit_tensor.dtype() != DType::Int32 || right_8bit_tensor.dtype() != DType::Int32 ||
+    // 2. types: the 8-bit copies E4M3, the scales float, output and bias bfloat16
+    if (left_8bit_tensor.dtype() != DType::E4M3 || right_8bit_tensor.dtype() != DType::E4M3 ||
         left_scales_tensor.dtype() != DType::Float32 || right_scales_tensor.dtype() != DType::Float32 ||
         output_tensor.dtype() != DType::BFloat16 || (has_bias_val && bias_tensor.dtype() != DType::BFloat16)) {
-        fprintf(stderr, "error: fma_matmul_8bit needs left_8bit and right_8bit Int32 (round_8bit's), the scales float, output "
+        fprintf(stderr, "error: fma_matmul_8bit needs left_8bit and right_8bit E4M3 (round_8bit's), the scales float, output "
                         "and bias bfloat16\n");
         exit(EXIT_FAILURE);
     }
     // 3. counts and addresses
-    size_t sum_length_val = right_8bit_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT;
+    size_t sum_length_val = right_8bit_tensor.size(1);
     size_t columns_val = right_8bit_tensor.size(0);
     const size_t start_bytes_val = sizeof(float4);
     if (sum_length_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 || columns_val % VALUES_PER_FLOAT4 != 0 ||

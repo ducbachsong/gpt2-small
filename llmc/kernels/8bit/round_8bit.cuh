@@ -4,8 +4,8 @@
 //
 //     tensor     type in memory                  shape                       note
 //     input      bfloat16                        {rows, row_length}          or, turned: {row_length, rows}
-//     rounded    E4M3, 4 in each int of an       {rows, row_length / 4}      always rows first: k next to each other
-//                Int32 tensor                                                (K-major), as the products read it
+//     rounded    E4M3                            {rows, row_length}          always rows first: k next to each other
+//                                                                            (K-major), as the products read it
 //     scales     float                           {rows}
 //
 // Each row is divided by its scale, the smallest power of 2 with
@@ -40,7 +40,6 @@
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_max, HARDWARE_E4M3_LARGEST
 #include "../../common/tensor.cuh"          // read4_as_float, read8_as_float, VALUES_PER_BF16_LOAD
 
-#define ROUND_8BIT_VALUES_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))      // E4M3s in one int of an Int32 tensor: 4
 #define ROUND_8BIT_ROW_LENGTH_MULTIPLE 16                                    // row_length's multiple: the products read rows of whole 16-byte pieces
 #define ROUND_8BIT_THREADS_PER_BLOCK 0                                       // as it sits: the default block size, one block a row: 0, chosen by the row's width (round_8bit_threads_for)
 #define ROUND_8BIT_LOADS_PER_THREAD_AIM 2                                    // ... chosen: the fewest threads, a power of 2, holding the row in this many loads a thread ...
@@ -58,7 +57,6 @@
 #define ROUND_8BIT_DELAYED_MARGIN 2.0f                                       // per tensor, the scale from the call before: room for values this many times its largest (the scale a power of 2: 2 to 4 times)
 #define ROUND_8BIT_LARGEST_THREADS (8 * HARDWARE_THREADS_PER_WARP)           // per tensor, the exact largest's block size
 #define ROUND_8BIT_LARGEST_LOADS_PER_THREAD 16                               // ... and the 16-byte loads a thread of it reads
-static_assert(ROUND_8BIT_VALUES_PER_INT == VALUES_PER_FLOAT4, "the rounding writes an int of E4M3s from one float4");
 static_assert(ROUND_8BIT_ROW_LENGTH_MULTIPLE % ROUND_8BIT_STORE_VALUES == 0 && ROUND_8BIT_ROW_LENGTH_MULTIPLE % ROUND_8BIT_LOAD_VALUES == 0,
               "a row of whole 16-byte pieces is whole loads and whole turned stores");
 static_assert(ROUND_8BIT_TILE % ROUND_8BIT_TILE_ROWS_AT_ONCE == 0, "a tile is whole passes of the block's rows");
@@ -102,7 +100,7 @@ __device__ __forceinline__ float round_8bit_scale(float row_largest_val);
 /// Writes input rounded to E4M3, one power-of-2 scale per row: checks, then launches round_8bit_rows_kernel (one
 /// block a row, the row read once into registers), or for a turned input the tile kernels (round_8bit_by_tiles).
 ///
-///   rounded_tensor          {rows, row_length / ROUND_8BIT_VALUES_PER_INT} Int32 (more dims allowed when not turned,
+///   rounded_tensor          {rows, row_length} E4M3 (more dims allowed when not turned,
 ///                           as input's): written
 ///   scales_tensor           {rows} float (input's dims but the last, when not turned): written
 ///   input_tensor            bfloat16: {..., row_length}, or turned {..., rows} (row_length = all the other dims);
@@ -117,21 +115,21 @@ inline void round_8bit(const Tensor& rounded_tensor, const Tensor& scales_tensor
                        int threads_per_block_val) {
     // 1. check the launch and the tensors; any of them wrong: stop with an error
     bool fits_val = input_tensor.dim() >= 1 && input_tensor.dtype() == DType::BFloat16 &&
-                    rounded_tensor.dtype() == DType::Int32 && scales_tensor.dtype() == DType::Float32;
+                    rounded_tensor.dtype() == DType::E4M3 && scales_tensor.dtype() == DType::Float32;
     size_t last_size_val = fits_val ? input_tensor.size(input_tensor.dim() - 1) : 1;
     size_t rows_val = turned_val ? last_size_val : input_tensor.numel() / last_size_val;
     size_t row_length_val = turned_val ? input_tensor.numel() / last_size_val : last_size_val;
     if (threads_per_block_val == 0) threads_per_block_val = round_8bit_threads_for(row_length_val);
     check_threads_per_block(threads_per_block_val, "round_8bit");
     fits_val = fits_val && row_length_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && (!turned_val || rows_val % ROUND_8BIT_LOAD_VALUES == 0) &&
-               rounded_tensor.dim() >= 1 && rounded_tensor.size(rounded_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT == row_length_val &&
-               rounded_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * row_length_val && scales_tensor.numel() == rows_val &&
+               rounded_tensor.dim() >= 1 && rounded_tensor.size(rounded_tensor.dim() - 1) == row_length_val &&
+               rounded_tensor.numel() == rows_val * row_length_val && scales_tensor.numel() == rows_val &&
                (size_t)input_tensor.data_ptr() % sizeof(uint4) == 0;
     if (!fits_val) {
         fprintf(stderr, "error: round_8bit needs a bfloat16 input {..., row_length} (turned: {..., rows}, rows a multiple of %d) "
-                        "starting on 16 bytes, with row_length a multiple of %d, an Int32 rounded {rows, row_length / %d} and "
+                        "starting on 16 bytes, with row_length a multiple of %d, an E4M3 rounded {rows, row_length} and "
                         "float scales {rows}\n",
-                ROUND_8BIT_LOAD_VALUES, ROUND_8BIT_ROW_LENGTH_MULTIPLE, (int)ROUND_8BIT_VALUES_PER_INT);
+                ROUND_8BIT_LOAD_VALUES, ROUND_8BIT_ROW_LENGTH_MULTIPLE);
         exit(EXIT_FAILURE);
     }
     size_t row_loads_val = row_length_val / ROUND_8BIT_LOAD_VALUES;
@@ -174,9 +172,9 @@ inline void round_8bit(const Tensor& rounded_tensor, const Tensor& scales_tensor
 /// per row) and turned round (round_8bit turned's, one scale per column of input). The same bits as those two
 /// calls. Either copy may be left out (Tensor()), not both.
 ///
-///   rows_8bit_tensor, row_scales_tensor         {rows, columns / ROUND_8BIT_VALUES_PER_INT} Int32 and {rows} float:
+///   rows_8bit_tensor, row_scales_tensor         {rows, columns} E4M3 and {rows} float:
 ///                                               written; or both Tensor()
-///   columns_8bit_tensor, column_scales_tensor   {columns, rows / ROUND_8BIT_VALUES_PER_INT} Int32 and {columns} float:
+///   columns_8bit_tensor, column_scales_tensor   {columns, rows} E4M3 and {columns} float:
 ///                                               written; or both Tensor()
 ///   input_tensor                                bfloat16 {..., columns} (rows = all the other dims); rows and columns
 ///                                               multiples of ROUND_8BIT_ROW_LENGTH_MULTIPLE
@@ -191,20 +189,20 @@ inline void round_8bit_rows_and_columns(const Tensor& rows_8bit_tensor, const Te
     size_t rows_val = input_tensor.numel() / columns_val;
     fits_val = fits_val && rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && columns_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0;
     if (has_rows_val)
-        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::Int32 && row_scales_tensor.dtype() == DType::Float32 &&
-                   rows_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * columns_val &&
-                   rows_8bit_tensor.size(rows_8bit_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT == columns_val &&
+        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::E4M3 && row_scales_tensor.dtype() == DType::Float32 &&
+                   rows_8bit_tensor.numel() == rows_val * columns_val &&
+                   rows_8bit_tensor.size(rows_8bit_tensor.dim() - 1) == columns_val &&
                    row_scales_tensor.numel() == rows_val;
     if (has_columns_val)
-        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::Int32 && column_scales_tensor.dtype() == DType::Float32 &&
-                   columns_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * columns_val &&
-                   columns_8bit_tensor.size(columns_8bit_tensor.dim() - 1) * ROUND_8BIT_VALUES_PER_INT == rows_val &&
+        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::E4M3 && column_scales_tensor.dtype() == DType::Float32 &&
+                   columns_8bit_tensor.numel() == rows_val * columns_val &&
+                   columns_8bit_tensor.size(columns_8bit_tensor.dim() - 1) == rows_val &&
                    column_scales_tensor.numel() == columns_val;
     if (!fits_val) {
         fprintf(stderr, "error: round_8bit_rows_and_columns needs a bfloat16 input {rows, columns}, both multiples of %d, starting "
-                        "on 16 bytes, and Int32 copies {rows, columns / %d} with float scales {rows} and/or {columns, rows / %d} "
+                        "on 16 bytes, and E4M3 copies {rows, columns} with float scales {rows} and/or {columns, rows} "
                         "with {columns}\n",
-                ROUND_8BIT_ROW_LENGTH_MULTIPLE, (int)ROUND_8BIT_VALUES_PER_INT, (int)ROUND_8BIT_VALUES_PER_INT);
+                ROUND_8BIT_ROW_LENGTH_MULTIPLE);
         exit(EXIT_FAILURE);
     }
     // 2. the two reads
@@ -509,17 +507,17 @@ inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& 
     size_t rows_val = input_tensor.numel() / columns_val;
     fits_val = fits_val && rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && columns_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0;
     if (has_rows_val)
-        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::Int32 && row_scales_tensor.dtype() == DType::Float32 &&
-                   rows_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * columns_val && row_scales_tensor.numel() == rows_val;
+        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::E4M3 && row_scales_tensor.dtype() == DType::Float32 &&
+                   rows_8bit_tensor.numel() == rows_val * columns_val && row_scales_tensor.numel() == rows_val;
     if (has_columns_val)
-        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::Int32 && column_scales_tensor.dtype() == DType::Float32 &&
-                   columns_8bit_tensor.numel() * ROUND_8BIT_VALUES_PER_INT == rows_val * columns_val &&
+        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::E4M3 && column_scales_tensor.dtype() == DType::Float32 &&
+                   columns_8bit_tensor.numel() == rows_val * columns_val &&
                    column_scales_tensor.numel() == columns_val;
     if (!fits_val) {
         fprintf(stderr, "error: round_8bit_per_tensor needs a bfloat16 input {rows, columns}, both multiples of %d, starting on 16 "
-                        "bytes, and Int32 copies {rows, columns / %d} with float scales {rows} and/or {columns, rows / %d} with "
+                        "bytes, and E4M3 copies {rows, columns} with float scales {rows} and/or {columns, rows} with "
                         "{columns}\n",
-                ROUND_8BIT_ROW_LENGTH_MULTIPLE, (int)ROUND_8BIT_VALUES_PER_INT, (int)ROUND_8BIT_VALUES_PER_INT);
+                ROUND_8BIT_ROW_LENGTH_MULTIPLE);
         exit(EXIT_FAILURE);
     }
     const nv_bfloat16* input_ptr = input_tensor.data_ptr<nv_bfloat16>();

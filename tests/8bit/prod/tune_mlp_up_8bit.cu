@@ -377,9 +377,9 @@ static void time_gelu_8bit_against_bf16_and_rounding(const Product &product_val)
     // round_8bit_per_tensor into both 8-bit copies at a delayed scale (what the model did before MODEL_8BIT_GELU_8BIT: a
     // write of 2 bytes a value, then a read of them and 2 bytes written), the rounding pass alone, and
     // mlp_up_8bit_gelu_8bit writing both copies itself (2 bytes a value written, nothing read back).
-    Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS}, DType::E4M3);
     Tensor row_scales_tensor = Tensor::zeros({ROWS});
-    Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS}, DType::E4M3);
     Tensor turned_scales_tensor = Tensor::zeros({COLUMNS});
     Round8bitHistory bf16_history_val, gelu_8bit_history_val;
     mlp_up_8bit_rounded(product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor, product_val.copies_val);

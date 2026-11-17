@@ -4,8 +4,8 @@
 //
 //     tensor                      type in memory                  shape                                           why
 //     qkv                         bfloat16                        {batch_size, seq_len, 3 · embed_dim}            the model's
-//     query_8bit, key_8bit,       E4M3, 4 in each int of an       {batch_size, num_heads, seq_len,                half of bfloat16's bytes
-//     value_8bit                  Int32 tensor                     head_size / ATTENTION_8BIT_VALUES_PER_INT}
+//     query_8bit, key_8bit,       E4M3                            {batch_size, num_heads, seq_len, head_size}     half of bfloat16's bytes
+//     value_8bit
 //     query_scales, key_scales,   float                           {batch_size, num_heads, seq_len}                one per head row
 //     value_scales
 //     qkv_rounded                 bfloat16                        {batch_size, seq_len, 3 · embed_dim}            the 8-bit ones turned back,
@@ -23,12 +23,10 @@
 #include "../cuda_common.h"             // cudaCheck, check_threads_per_block, warp_reduce_max
 #include "../../common/tensor.cuh"
 
-#define ATTENTION_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // the rounding's and the turn-back's default: one warp per row, one int per thread
+#define ATTENTION_8BIT_THREADS_PER_BLOCK (8 * HARDWARE_THREADS_PER_WARP)            // the rounding's and the turn-back's default: one warp per row, 4 E4M3s per thread
 #define ATTENTION_8BIT_HEAD_SIZE 128                                                // the head_size the kernels take: 64 (GPT-2 small's) or 128 (the 32 x 2,304 model's, 18 heads)
-#define ATTENTION_8BIT_VALUES_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))         // E4M3s in one int: an Int32 tensor's
 #define ATTENTION_8BIT_PAIRS_PER_LANE (ATTENTION_8BIT_HEAD_SIZE / (2 * HARDWARE_THREADS_PER_WARP))   // the rounding: pairs of a head row each lane takes, 1 or 2
 static_assert(ATTENTION_8BIT_HEAD_SIZE % (2 * HARDWARE_THREADS_PER_WARP) == 0, "the rounding: each lane takes whole pairs of a head row");
-static_assert(ATTENTION_8BIT_VALUES_PER_INT == VALUES_PER_FLOAT4, "the turn-back takes an int of E4M3s as one float4");
 
 // ── the rounding and the turning back ────────────────────────────────────────────────────────────
 void attention_8bit_round_qkv(const Tensor& query_8bit_tensor, const Tensor& key_8bit_tensor, const Tensor& value_8bit_tensor,
@@ -59,8 +57,7 @@ __global__ void attention_8bit_round_qkv_kernel(__nv_fp8_e4m3* query_8bit_ptr, _
 /// attention_8bit_round_qkv_kernel, one warp per head row. F1 of attention_flash_8bit.cuh's forward.
 ///
 ///   query_8bit_tensor, key_8bit_tensor,
-///   value_8bit_tensor                            {batch_size, num_heads, seq_len, head_size / ATTENTION_8BIT_VALUES_PER_INT}
-///                                                Int32, ATTENTION_8BIT_VALUES_PER_INT E4M3s in each int: written
+///   value_8bit_tensor                            {batch_size, num_heads, seq_len, head_size} E4M3: written
 ///   query_scales_tensor, key_scales_tensor,
 ///   value_scales_tensor                          {batch_size, num_heads, seq_len} float: written
 ///   qkv_tensor                                   {batch_size, seq_len, 3 · embed_dim} bfloat16: the qkv linear's output
@@ -165,14 +162,14 @@ __global__ void attention_8bit_turn_back_kernel(nv_bfloat16* qkv_rounded_ptr, co
                                                 const __nv_fp8_e4m3* key_8bit_ptr, const __nv_fp8_e4m3* value_8bit_ptr,
                                                 const float* query_scales_ptr, const float* key_scales_ptr,
                                                 const float* value_scales_ptr, int num_heads_val, int seq_len_val,
-                                                size_t total_ints_val);
+                                                size_t total_fours_val);
 
 /// Writes query, key and value in bfloat16 from their 8-bit copies, where qkv has them: each E4M3 times its
 /// row's scale, exact. Used by attention_flash_8bit.cuh's backward; the tests call it to see the forward's rounded values.
 ///
 ///   qkv_rounded_tensor                                 {batch_size, seq_len, 3 · embed_dim} bfloat16: written
 ///   query_8bit_tensor, key_8bit_tensor,
-///   value_8bit_tensor                                  {batch_size, num_heads, seq_len, head_size / ATTENTION_8BIT_VALUES_PER_INT} Int32
+///   value_8bit_tensor                                  {batch_size, num_heads, seq_len, head_size} E4M3
 ///   query_scales_tensor, key_scales_tensor,
 ///   value_scales_tensor                                {batch_size, num_heads, seq_len} float
 ///   threads_per_block_val                              the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not
@@ -185,38 +182,38 @@ inline void attention_8bit_turn_back(const Tensor& qkv_rounded_tensor, const Ten
     check_threads_per_block(threads_per_block_val, "8-bit attention's turn-back");
     attention_8bit_check_copies(qkv_rounded_tensor, query_8bit_tensor, key_8bit_tensor, value_8bit_tensor,
                                 query_scales_tensor, key_scales_tensor, value_scales_tensor);
-    // 2. launch: one int (ATTENTION_8BIT_VALUES_PER_INT values) of each per thread
-    size_t total_ints_val = query_8bit_tensor.numel();
-    attention_8bit_turn_back_kernel<<<(int)CEIL_DIV(total_ints_val, (size_t)threads_per_block_val), threads_per_block_val>>>(
+    // 2. launch: VALUES_PER_FLOAT4 values of each per thread
+    size_t total_fours_val = query_8bit_tensor.numel() / VALUES_PER_FLOAT4;      // whole: head_size is a multiple of 4
+    attention_8bit_turn_back_kernel<<<(int)CEIL_DIV(total_fours_val, (size_t)threads_per_block_val), threads_per_block_val>>>(
         qkv_rounded_tensor.data_ptr<nv_bfloat16>(), reinterpret_cast<const __nv_fp8_e4m3*>(query_8bit_tensor.data_ptr()),
         reinterpret_cast<const __nv_fp8_e4m3*>(key_8bit_tensor.data_ptr()),
         reinterpret_cast<const __nv_fp8_e4m3*>(value_8bit_tensor.data_ptr()), query_scales_tensor.data(),
         key_scales_tensor.data(), value_scales_tensor.data(), (int)query_8bit_tensor.size(1),
-        (int)query_8bit_tensor.size(2), total_ints_val);
+        (int)query_8bit_tensor.size(2), total_fours_val);
     cudaCheck(cudaGetLastError());
 }
 
-/// Turns ATTENTION_8BIT_VALUES_PER_INT E4M3s of query, key and value back into bfloat16 per thread, each times
+/// Turns VALUES_PER_FLOAT4 E4M3s of query, key and value back into bfloat16 per thread, each times
 /// its head row's scale, and writes them where qkv has them.
 ///
 ///   qkv_rounded_ptr                                       {batch_size, seq_len, 3 · embed_dim} bfloat16: written
 ///   query_8bit_ptr, key_8bit_ptr, value_8bit_ptr          {batch_size, num_heads, seq_len, ATTENTION_8BIT_HEAD_SIZE} E4M3
 ///   query_scales_ptr, key_scales_ptr, value_scales_ptr    one float per head row
 ///   num_heads_val, seq_len_val                            the shape
-///   total_ints_val                                        an 8-bit tensor's values / ATTENTION_8BIT_VALUES_PER_INT
+///   total_fours_val                                       an 8-bit tensor's values / VALUES_PER_FLOAT4
 __global__ void attention_8bit_turn_back_kernel(nv_bfloat16* qkv_rounded_ptr, const __nv_fp8_e4m3* query_8bit_ptr,
                                                 const __nv_fp8_e4m3* key_8bit_ptr, const __nv_fp8_e4m3* value_8bit_ptr,
                                                 const float* query_scales_ptr, const float* key_scales_ptr,
                                                 const float* value_scales_ptr, int num_heads_val, int seq_len_val,
-                                                size_t total_ints_val) {
+                                                size_t total_fours_val) {
     size_t thread_index_val = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t embed_dim_val = (size_t)num_heads_val * ATTENTION_8BIT_HEAD_SIZE;
     const __nv_fp8_e4m3* rounded_list[3] = {query_8bit_ptr, key_8bit_ptr, value_8bit_ptr};
     const float* scales_list[3] = {query_scales_ptr, key_scales_ptr, value_scales_ptr};
-    // Thread n takes ints n, n + every thread launched, ...
-    for (size_t index_val = thread_index_val; index_val < total_ints_val; index_val += (size_t)gridDim.x * blockDim.x) {
-        // 1. which head row the int is in, and where its query part sits in qkv; key and value follow, embed_dim apart
-        size_t value_index_val = index_val * ATTENTION_8BIT_VALUES_PER_INT;          // its first value, per head
+    // Thread n takes fours n, n + every thread launched, ...
+    for (size_t index_val = thread_index_val; index_val < total_fours_val; index_val += (size_t)gridDim.x * blockDim.x) {
+        // 1. which head row the four are in, and where its query part sits in qkv; key and value follow, embed_dim apart
+        size_t value_index_val = index_val * VALUES_PER_FLOAT4;                      // its first value, per head
         size_t row_index_val = value_index_val / ATTENTION_8BIT_HEAD_SIZE;                    // (batch x num_heads + head) x seq_len + token
         size_t column_index_val = value_index_val % ATTENTION_8BIT_HEAD_SIZE;
         size_t batch_head_index_val = row_index_val / seq_len_val;
@@ -225,7 +222,7 @@ __global__ void attention_8bit_turn_back_kernel(nv_bfloat16* qkv_rounded_ptr, co
         size_t head_index_val = batch_head_index_val % num_heads_val;
         nv_bfloat16* query_part_ptr = qkv_rounded_ptr + (batch_index_val * seq_len_val + token_index_val) * 3 * embed_dim_val +
                                       head_index_val * ATTENTION_8BIT_HEAD_SIZE + column_index_val;
-        // 2. each of the three: ATTENTION_8BIT_VALUES_PER_INT E4M3s as a float4, times the row's scale, written as bfloat16s
+        // 2. each of the three: VALUES_PER_FLOAT4 E4M3s as a float4, times the row's scale, written as bfloat16s
 #pragma unroll
         for (int part_index_val = 0; part_index_val < 3; part_index_val++) {
             float4 stored_val = (float4)reinterpret_cast<const __nv_fp8x4_e4m3*>(rounded_list[part_index_val])[index_val];
@@ -252,7 +249,7 @@ inline void attention_8bit_check_copies(const Tensor& qkv_tensor, const Tensor& 
     // 1. shapes, types and addresses together
     bool fits_val = query_8bit_tensor.dim() == 4;
     if (fits_val) {
-        size_t head_size_val = query_8bit_tensor.size(3) * ATTENTION_8BIT_VALUES_PER_INT;
+        size_t head_size_val = query_8bit_tensor.size(3);
         Shape per_token_list = {query_8bit_tensor.size(0), query_8bit_tensor.size(2),
                                 3 * query_8bit_tensor.size(1) * head_size_val};          // qkv's
         Shape per_row_list = {query_8bit_tensor.size(0), query_8bit_tensor.size(1), query_8bit_tensor.size(2)};
@@ -261,7 +258,7 @@ inline void attention_8bit_check_copies(const Tensor& qkv_tensor, const Tensor& 
         for (const Tensor* tensor_ptr : {&key_8bit_tensor, &value_8bit_tensor})
             fits_val = fits_val && tensor_ptr->shape() == query_8bit_tensor.shape();
         for (const Tensor* tensor_ptr : {&query_8bit_tensor, &key_8bit_tensor, &value_8bit_tensor})
-            fits_val = fits_val && tensor_ptr->dtype() == DType::Int32;
+            fits_val = fits_val && tensor_ptr->dtype() == DType::E4M3;
         for (const Tensor* tensor_ptr : {&query_scales_tensor, &key_scales_tensor, &value_scales_tensor})
             fits_val = fits_val && tensor_ptr->shape() == per_row_list && tensor_ptr->dtype() == DType::Float32;
         fits_val = fits_val && head_size_val == ATTENTION_8BIT_HEAD_SIZE;
@@ -269,9 +266,9 @@ inline void attention_8bit_check_copies(const Tensor& qkv_tensor, const Tensor& 
     // 2. any of them wrong: stop with an error
     if (!fits_val) {
         fprintf(stderr, "error: 8-bit attention's rounding and turn-back need a bfloat16 qkv {batch_size, seq_len, 3 * "
-                        "num_heads * %d}, the 8-bit copies Int32 {batch_size, num_heads, seq_len, %d} and float scales "
+                        "num_heads * %d}, the 8-bit copies E4M3 {batch_size, num_heads, seq_len, %d} and float scales "
                         "{batch_size, num_heads, seq_len}\n",
-                ATTENTION_8BIT_HEAD_SIZE, (int)(ATTENTION_8BIT_HEAD_SIZE / ATTENTION_8BIT_VALUES_PER_INT));
+                ATTENTION_8BIT_HEAD_SIZE, ATTENTION_8BIT_HEAD_SIZE);
         exit(EXIT_FAILURE);
     }
 }

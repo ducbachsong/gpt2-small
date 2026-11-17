@@ -60,9 +60,11 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # `writing` is there while this runs: a trainer started at the same time waits for the files still
-    # to come instead of starting its next epoch (llmc/helper/dataloader.cuh). Deleted at the end, whatever happens.
+    # to come instead of starting its next epoch (llmc/helper/dataloader.cuh). Deleted at the end, whatever happens;
+    # it holds this process's id, so a trainer that waits can tell a writer that was killed from one still working.
     writing_marker = os.path.join(OUTPUT_DIR, "writing")
-    open(writing_marker, "w").close()
+    with open(writing_marker, "w") as marker_file:
+        marker_file.write(str(os.getpid()))
     # ParquetPool first: it turns on huggingface_hub's faster downloads, which
     # only works before transformers imports huggingface_hub.
     parquet_pool = ParquetPool(dataset=DATASET, allow_patterns=ALLOW_PATTERNS,

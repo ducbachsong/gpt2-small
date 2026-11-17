@@ -82,8 +82,8 @@ static void time_20_products_of_one_shape(const ProductShape &shape_val)
     torch::manual_seed(0);
     Tensor left_tensor = random_bf16_tensor({shape_val.rows_val, shape_val.sum_length_val});
     Tensor right_tensor = random_bf16_tensor({shape_val.columns_val, shape_val.sum_length_val});
-    Tensor left_8bit_tensor = Tensor::zeros({shape_val.rows_val, shape_val.sum_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
-    Tensor right_8bit_tensor = Tensor::zeros({shape_val.columns_val, shape_val.sum_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor left_8bit_tensor = Tensor::zeros({shape_val.rows_val, shape_val.sum_length_val}, DType::E4M3);
+    Tensor right_8bit_tensor = Tensor::zeros({shape_val.columns_val, shape_val.sum_length_val}, DType::E4M3);
     Tensor left_scales_tensor = Tensor::zeros({shape_val.rows_val});
     Tensor right_scales_tensor = Tensor::zeros({shape_val.columns_val});
     Tensor output_tensor = Tensor::zeros({shape_val.rows_val, shape_val.columns_val}, DType::BFloat16);

@@ -27,8 +27,7 @@
 // ── helpers: 8-bit m and v ────────────────────────────────────────────────────
 
 /// 8-bit m and sqrt(v) for `count` values, all 0 (m = v = 0): 1 byte per value, and one float scale per
-/// ADAMW_VALUES_PER_SCALE values. Tensor has no 1-byte dtype, so an Int32 tensor of count / FP8_PER_INT holds the
-/// bytes, FP8_PER_INT to an int.
+/// ADAMW_VALUES_PER_SCALE values: an E4M3 tensor of count.
 struct EightBitMoments
 {
     Tensor m_tensor;
@@ -36,14 +35,14 @@ struct EightBitMoments
     Tensor sqrt_v_tensor;
     Tensor sqrt_v_scales_tensor;
     explicit EightBitMoments(size_t count_val)
-        : m_tensor(Tensor::zeros({count_val / FP8_PER_INT}, DType::Int32)),
+        : m_tensor(Tensor::zeros({count_val}, DType::E4M3)),
           m_scales_tensor(Tensor::zeros({CEIL_DIV(count_val, (size_t)ADAMW_VALUES_PER_SCALE)})),
-          sqrt_v_tensor(Tensor::zeros({count_val / FP8_PER_INT}, DType::Int32)),
+          sqrt_v_tensor(Tensor::zeros({count_val}, DType::E4M3)),
           sqrt_v_scales_tensor(Tensor::zeros({CEIL_DIV(count_val, (size_t)ADAMW_VALUES_PER_SCALE)}))
     {
     }
-    __nv_fp8_e4m3 *m_bytes() const { return (__nv_fp8_e4m3 *)m_tensor.data_ptr(); }
-    __nv_fp8_e4m3 *sqrt_v_bytes() const { return (__nv_fp8_e4m3 *)sqrt_v_tensor.data_ptr(); }
+    __nv_fp8_e4m3 *m_bytes() const { return m_tensor.data_ptr<__nv_fp8_e4m3>(); }
+    __nv_fp8_e4m3 *sqrt_v_bytes() const { return sqrt_v_tensor.data_ptr<__nv_fp8_e4m3>(); }
 };
 
 // ── helpers: my side ──────────────────────────────────────────────────────────
@@ -157,11 +156,11 @@ static void time_the_three_adamws_on_gpt2_small_size(void)
 
 // ══ part 2: other block and thread counts ═════════════════════════════════════
 
-/// Makes a PyTorch copy of an int tensor of mine (8-bit m or sqrt(v), FP8_PER_INT bytes to an int), on the GPU,
-/// to compare its bytes with a later result there.
+/// Makes a PyTorch copy of an E4M3 tensor of mine (8-bit m or sqrt(v)) as its bytes, on the GPU, to compare them
+/// with a later result there.
 static torch::Tensor pytorch_bytes_copy_of(const Tensor &tensor)
 {
-    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    torch::TensorOptions on_gpu_val = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
     return torch::from_blob(tensor.data_ptr(), {(int64_t)tensor.numel()}, on_gpu_val).clone();
 }
 

@@ -162,10 +162,12 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # `writing` is there while this runs: a trainer started at the same time waits for the files still to come
     # instead of starting its next epoch (llmc/helper/dataloader.cuh), even while the tokenizer trains. Deleted at
-    # the end, whatever happens.
+    # the end, whatever happens; it holds this process's id, so a trainer that waits can tell a writer that was
+    # killed (its `writing` left behind) from one still working.
     writing_marker = os.path.join(OUTPUT_DIR, "writing")
     if not args.tokenizer_only:
-        open(writing_marker, "w").close()
+        with open(writing_marker, "w") as marker_file:
+            marker_file.write(str(os.getpid()))
     try:
         # 1. the tokenizer: trained once, then kept
         if os.path.exists(TOKENIZER_PICKLE):

@@ -12,8 +12,8 @@
 //     tensor                      type in memory                  shape                                           why
 //     qkv, qkv_grad               bfloat16                        {batch_size, seq_len, 3 · embed_dim}            the model's
 //     output, output_grad         bfloat16                        {batch_size, seq_len, embed_dim}                the model's
-//     query_8bit, key_8bit,       E4M3, 4 in each int of an       {batch_size, num_heads, seq_len,                kept for backward
-//     value_8bit                  Int32 tensor                     head_size / ATTENTION_8BIT_VALUES_PER_INT}
+//     query_8bit, key_8bit,       E4M3                            {batch_size, num_heads, seq_len, head_size}     kept for backward
+//     value_8bit
 //     query_scales, key_scales,   float                           {batch_size, num_heads, seq_len}                one per head row
 //     value_scales
 //     qkv_rounded                 bfloat16                        {batch_size, seq_len, 3 · embed_dim}            backward scratch: the 8-bit
@@ -112,8 +112,7 @@ inline bool attention_8bit_fits(size_t seq_len_val, size_t head_size_val) {
 ///
 ///   output_tensor                                {batch_size, seq_len, embed_dim} bfloat16
 ///   query_8bit_tensor, key_8bit_tensor,
-///   value_8bit_tensor                            {batch_size, num_heads, seq_len, head_size / ATTENTION_8BIT_VALUES_PER_INT}
-///                                                Int32, ATTENTION_8BIT_VALUES_PER_INT E4M3s in each int: written
+///   value_8bit_tensor                            {batch_size, num_heads, seq_len, head_size} E4M3: written
 ///   query_scales_tensor, key_scales_tensor,
 ///   value_scales_tensor                          {batch_size, num_heads, seq_len} float: written
 ///   logsumexp_tensor                             {batch_size, num_heads, seq_len} float: written
@@ -136,7 +135,7 @@ inline void attention_8bit_forward(const Tensor& output_tensor, const Tensor& qu
     // 2. the sizes
     size_t num_heads_val = query_8bit_tensor.size(1);
     size_t seq_len_val = query_8bit_tensor.size(2);
-    size_t head_size_val = query_8bit_tensor.size(3) * ATTENTION_8BIT_VALUES_PER_INT;
+    size_t head_size_val = query_8bit_tensor.size(3);
     size_t heads_in_batch_val = query_8bit_tensor.size(0) * num_heads_val;              // batch_size x num_heads
     size_t rows_val = heads_in_batch_val * seq_len_val;                                 // one head row per (batch, head, token)
 
@@ -504,7 +503,7 @@ inline void attention_8bit_check_shapes(const Tensor& output_tensor, const Tenso
         size_t batch_size_val = query_8bit_tensor.size(0);
         size_t num_heads_val = query_8bit_tensor.size(1);
         size_t seq_len_val = query_8bit_tensor.size(2);
-        size_t head_size_val = query_8bit_tensor.size(3) * ATTENTION_8BIT_VALUES_PER_INT;
+        size_t head_size_val = query_8bit_tensor.size(3);
         size_t embed_dim_val = num_heads_val * head_size_val;
         Shape per_row_list = {batch_size_val, num_heads_val, seq_len_val};
         fits_val = attention_8bit_fits(seq_len_val, head_size_val) &&
@@ -512,18 +511,18 @@ inline void attention_8bit_check_shapes(const Tensor& output_tensor, const Tenso
                    qkv_tensor.shape() == Shape({batch_size_val, seq_len_val, 3 * embed_dim_val}) &&
                    output_tensor.dtype() == DType::BFloat16 && qkv_tensor.dtype() == DType::BFloat16;
         for (const Tensor* tensor_ptr : {&query_8bit_tensor, &key_8bit_tensor, &value_8bit_tensor})
-            fits_val = fits_val && tensor_ptr->dtype() == DType::Int32 && (size_t)tensor_ptr->data_ptr() % sizeof(uint4) == 0;
+            fits_val = fits_val && tensor_ptr->dtype() == DType::E4M3 && (size_t)tensor_ptr->data_ptr() % sizeof(uint4) == 0;
         for (const Tensor* tensor_ptr : {&query_scales_tensor, &key_scales_tensor, &value_scales_tensor, &logsumexp_tensor})
             fits_val = fits_val && tensor_ptr->shape() == per_row_list && tensor_ptr->dtype() == DType::Float32;
     }
     // 2. any of them wrong: stop with an error
     if (!fits_val) {
-        fprintf(stderr, "error: 8-bit attention needs query_8bit, key_8bit, value_8bit Int32 {batch_size, num_heads, "
-                        "seq_len, %d} (%d E4M3s in each int) starting on %zu bytes, with seq_len a multiple of %d; float "
+        fprintf(stderr, "error: 8-bit attention needs query_8bit, key_8bit, value_8bit E4M3 {batch_size, num_heads, "
+                        "seq_len, %d} starting on %zu bytes, with seq_len a multiple of %d; float "
                         "scales and logsumexp {batch_size, num_heads, seq_len}; bfloat16 output {batch_size, seq_len, "
                         "embed_dim} and qkv {batch_size, seq_len, 3 * embed_dim}; and a GPU of compute capability %d.%d "
                         "(an H100: WGMMA and TMA)\n",
-                (int)(FLASH_HEAD_SIZE / ATTENTION_8BIT_VALUES_PER_INT), (int)ATTENTION_8BIT_VALUES_PER_INT, sizeof(uint4), FLASH_TILE,
+                FLASH_HEAD_SIZE, sizeof(uint4), FLASH_TILE,
                 HARDWARE_WGMMA_CAPABILITY / 10, HARDWARE_WGMMA_CAPABILITY % 10);
         exit(EXIT_FAILURE);
     }

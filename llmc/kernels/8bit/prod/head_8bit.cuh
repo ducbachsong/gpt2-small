@@ -8,8 +8,8 @@
 //     input         bfloat16                           {rows, in_features}                    rounded to E4M3 (left)
 //     weight        bfloat16                           {out_features, in_features}            rounded to E4M3 (right)
 //     output        bfloat16                           {rows, out_features}                   written by TMA
-//     the copies    E4M3, 4 in an int of an Int32      Head8bitCopies's: left {rows, k / 4},        round_8bit writes, TMA reads
-//                   tensor, a float scale per row      right {columns, k / 4}
+//     the copies    E4M3, a float scale per row        Head8bitCopies's: left {rows, k},            round_8bit writes, TMA reads
+//                                                      right {columns, k}
 //     sums          float                              in registers                           the tensor cores' C
 //
 // As a product: output {rows, columns} = left_scale · right_scale · (left_8bit {rows, k} · right_8bit {columns, k}ᵀ)
@@ -41,7 +41,7 @@
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../../cuda_common.h"       // cudaCheck, check_threads_per_block, the HARDWARE_ numbers
 #include "../../../common/tensor.cuh"
-#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit, ROUND_8BIT_VALUES_PER_INT, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // the setting: tune_head_8bit sweeps each and prints the fastest
 #define HEAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
@@ -425,21 +425,21 @@ inline void head_8bit_check_tensor(const char* caller_ptr, const char* name_ptr,
     }
 }
 
-/// The 8-bit copies of the product's two sides: left {rows, k} and right {columns, k}, each E4M3 (4 in each int)
+/// The 8-bit copies of the product's two sides: left {rows, k} and right {columns, k}, each E4M3
 /// with one float scale per row, as round_8bit writes them and the product reads them. Made once for a size, used
 /// by every call.
 struct Head8bitCopies {
-    Tensor left_8bit_tensor;             // {rows, k / ROUND_8BIT_VALUES_PER_INT} Int32
+    Tensor left_8bit_tensor;             // {rows, k} E4M3
     Tensor left_scales_tensor;           // {rows} float
-    Tensor right_8bit_tensor;            // {columns, k / ROUND_8BIT_VALUES_PER_INT} Int32
+    Tensor right_8bit_tensor;            // {columns, k} E4M3
     Tensor right_scales_tensor;          // {columns} float
 
     Head8bitCopies() = default;
     /// Makes the copies, all 0, for output {rows, columns} with a sum of k (a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE).
     Head8bitCopies(size_t rows_val, size_t columns_val, size_t k_val)
-        : left_8bit_tensor(Tensor::zeros({rows_val, k_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+        : left_8bit_tensor(Tensor::zeros({rows_val, k_val}, DType::E4M3)),
           left_scales_tensor(Tensor::zeros({rows_val})),
-          right_8bit_tensor(Tensor::zeros({columns_val, k_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          right_8bit_tensor(Tensor::zeros({columns_val, k_val}, DType::E4M3)),
           right_scales_tensor(Tensor::zeros({columns_val})) {}
 };
 
@@ -507,8 +507,8 @@ inline void head_8bit_round(const Head8bitCopies& copies_val, const Tensor& inpu
     size_t columns_val = weight_tensor.dim() == 2 && weight_tensor.size(1) == k_val ? weight_tensor.size(0) : 0;
     if (rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 || columns_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 ||
         k_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 ||
-        copies_val.left_8bit_tensor.shape() != Shape({rows_val, k_val / ROUND_8BIT_VALUES_PER_INT}) ||
-        copies_val.right_8bit_tensor.shape() != Shape({columns_val, k_val / ROUND_8BIT_VALUES_PER_INT}) ||
+        copies_val.left_8bit_tensor.shape() != Shape({rows_val, k_val}) ||
+        copies_val.right_8bit_tensor.shape() != Shape({columns_val, k_val}) ||
         copies_val.left_scales_tensor.shape() != Shape({rows_val}) || copies_val.right_scales_tensor.shape() != Shape({columns_val})) {
         fprintf(stderr, "error: head_8bit needs rows, columns and k multiples of %d and its copies made with Head8bitCopies(rows, columns, k): "
                         "got %zu, %zu, %zu\n", ROUND_8BIT_ROW_LENGTH_MULTIPLE, rows_val, columns_val, k_val);
@@ -540,7 +540,7 @@ inline void head_8bit_rounded_at(const Tensor& output_tensor, const Head8bitCopi
     static_assert(PROMOTION_STEPS >= 0, "PROMOTION_STEPS is 0 (never) or more");
     // 1. the sizes, from the copies; the tensors written: bfloat16, rows of whole 16-byte cells, the shapes
     size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
-    size_t sum_length_val = copies_val.left_8bit_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT;
+    size_t sum_length_val = copies_val.left_8bit_tensor.size(1);
     head_8bit_check_tensor("head_8bit", "output", output_tensor);
     if (!(output_tensor.numel() == rows_val * columns_val && output_tensor.size(output_tensor.dim() - 1) == columns_val)) {
         fprintf(stderr, "error: head_8bit needs its outputs {..., columns} of the copies' rows and columns\n");

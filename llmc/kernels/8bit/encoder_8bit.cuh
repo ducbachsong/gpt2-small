@@ -8,8 +8,7 @@
 //
 //     tensor                    type in memory                   shape                                 GPT-2 small
 //     wte, wte_grad             bfloat16                         {vocab_size, embed_dim}               {50304, 768}
-//     wte_8bit                  E4M3, 4 in each int of an        {vocab_size, embed_dim / 4}           {50304, 192}
-//                               Int32 tensor
+//     wte_8bit                  E4M3                             {vocab_size, embed_dim}               {50304, 768}
 //     wte_scales                float                            {vocab_size}                          {50304}
 //     wpe, wpe_grad             bfloat16                         {max_seq_len, embed_dim}              {1024, 768}
 //     encoded, encoded_grad     bfloat16                         {batch_size, seq_len, embed_dim}      {4, 1024, 768}
@@ -35,11 +34,11 @@
 #include <cuda_fp8.h>                    // FP8 E4M3
 #include "../cuda_common.h"              // cudaCheck, check_threads_per_block
 #include "../../common/tensor.cuh"
-#include "round_8bit.cuh"                // the 8-bit copy: round_8bit, ROUND_8BIT_VALUES_PER_INT
+#include "round_8bit.cuh"                // the 8-bit copy: round_8bit
 #include "../bf16/encoder_bf16.cuh"      // the 8 values a thread, the checks, the backward
 
 #define ENCODER_8BIT_VALUES_PER_THREAD ENCODER_BF16_VALUES_PER_LOAD     // values a thread takes at a time: 8, encoder_bf16's
-#define ENCODER_8BIT_FOURS_PER_THREAD (ENCODER_8BIT_VALUES_PER_THREAD / ROUND_8BIT_VALUES_PER_INT)   // E4M3 fours (ints) in them: 2
+#define ENCODER_8BIT_FOURS_PER_THREAD (ENCODER_8BIT_VALUES_PER_THREAD / VALUES_PER_FLOAT4)   // E4M3 fours (4 bytes each) in them: 2
 #define ENCODER_8BIT_BLOCKS ENCODER_BF16_BLOCKS                          // blocks in the gather's launch
 #define ENCODER_8BIT_FORWARD_THREADS ENCODER_BF16_FORWARD_THREADS        // the gather's default block size
 #define ENCODER_8BIT_THREADS ENCODER_BF16_THREADS                        // the backward's default block size: encoder_bf16's
@@ -64,7 +63,7 @@ __global__ void encoder_8bit_forward_kernel(nv_bfloat16* encoded_ptr, const int*
 /// launches encoder_8bit_forward_kernel. The ids are not checked: an id >= vocab_size reads past the copy.
 ///
 ///   encoded_tensor          {batch_size, seq_len, embed_dim} bfloat16: the result, the first block's input
-///   wte_8bit_tensor         {vocab_size, embed_dim / ROUND_8BIT_VALUES_PER_INT} Int32: written, wte in E4M3, for the
+///   wte_8bit_tensor         {vocab_size, embed_dim} E4M3: written, wte in E4M3, for the
 ///                           head too
 ///   wte_scales_tensor       {vocab_size} float: written, one scale per row of wte
 ///   token_ids_tensor        {batch_size, seq_len} ints
@@ -82,14 +81,14 @@ inline void encoder_8bit_forward(const Tensor& encoded_tensor, const Tensor& wte
     encoder_bf16_check_shapes("encoder_8bit_forward", encoded_tensor, token_ids_tensor, wte_tensor, wpe_tensor);
     size_t vocab_size_val = wte_tensor.size(0);
     size_t embed_dim_val = wte_tensor.size(1);
-    bool fits_val = wte_8bit_tensor.dim() == 2 && wte_8bit_tensor.dtype() == DType::Int32 &&
+    bool fits_val = wte_8bit_tensor.dim() == 2 && wte_8bit_tensor.dtype() == DType::E4M3 &&
                     wte_8bit_tensor.size(0) == vocab_size_val &&
-                    wte_8bit_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT == embed_dim_val &&
+                    wte_8bit_tensor.size(1) == embed_dim_val &&
                     wte_scales_tensor.dtype() == DType::Float32 && wte_scales_tensor.numel() == vocab_size_val &&
                     (size_t)wte_8bit_tensor.data_ptr() % sizeof(uint2) == 0;
     if (!fits_val) {
-        fprintf(stderr, "error: encoder_8bit_forward needs wte_8bit {vocab_size, embed_dim / %d} Int32 starting on %zu bytes "
-                        "and wte_scales {vocab_size} float\n", (int)ROUND_8BIT_VALUES_PER_INT, sizeof(uint2));
+        fprintf(stderr, "error: encoder_8bit_forward needs wte_8bit {vocab_size, embed_dim} E4M3 starting on %zu bytes "
+                        "and wte_scales {vocab_size} float\n", sizeof(uint2));
         exit(EXIT_FAILURE);
     }
     // 2. the 8-bit copy of wte: all its rows, one scale each
@@ -133,7 +132,7 @@ __global__ void encoder_8bit_forward_kernel(nv_bfloat16* encoded_ptr, const int*
             __nv_fp8x4_e4m3 four_val;
             four_val.__x = fours_list[four_index_val];
             float4 values_val = static_cast<float4>(four_val);
-            float* first_ptr = token_embed_list + four_index_val * ROUND_8BIT_VALUES_PER_INT;
+            float* first_ptr = token_embed_list + four_index_val * VALUES_PER_FLOAT4;
             first_ptr[0] = values_val.x * scale_val;
             first_ptr[1] = values_val.y * scale_val;
             first_ptr[2] = values_val.z * scale_val;

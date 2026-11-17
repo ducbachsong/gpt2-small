@@ -75,7 +75,7 @@ struct EightBitTensors
     // forward
     Tensor qkv_tensor;                 // bfloat16
     Tensor output_tensor;              // bfloat16
-    Tensor query_8bit_tensor;          // Int32, 4 E4M3s in each int
+    Tensor query_8bit_tensor;          // E4M3
     Tensor key_8bit_tensor;
     Tensor value_8bit_tensor;
     Tensor query_scales_tensor;        // float, one per head row
@@ -92,13 +92,13 @@ struct EightBitTensors
     EightBitTensors(size_t batch_size_val, size_t num_heads_val, size_t seq_len_val)
     {
         size_t embed_dim_val = num_heads_val * FLASH_HEAD_SIZE;
-        Shape per_head_8bit_list = {batch_size_val, num_heads_val, seq_len_val, FLASH_HEAD_SIZE / ATTENTION_8BIT_VALUES_PER_INT};
+        Shape per_head_8bit_list = {batch_size_val, num_heads_val, seq_len_val, FLASH_HEAD_SIZE};
         Shape per_row_list = {batch_size_val, num_heads_val, seq_len_val};
         qkv_tensor = Tensor::zeros({batch_size_val, seq_len_val, 3 * embed_dim_val}, DType::BFloat16);
         output_tensor = Tensor::zeros({batch_size_val, seq_len_val, embed_dim_val}, DType::BFloat16);
-        query_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::Int32);
-        key_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::Int32);
-        value_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::Int32);
+        query_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::E4M3);
+        key_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::E4M3);
+        value_8bit_tensor = Tensor::zeros(per_head_8bit_list, DType::E4M3);
         query_scales_tensor = Tensor::zeros(per_row_list), key_scales_tensor = Tensor::zeros(per_row_list);
         value_scales_tensor = Tensor::zeros(per_row_list), logsumexp_tensor = Tensor::zeros(per_row_list);
         output_grad_tensor = Tensor::zeros(output_tensor.shape(), DType::BFloat16);

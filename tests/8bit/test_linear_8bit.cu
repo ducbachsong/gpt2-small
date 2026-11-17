@@ -72,12 +72,12 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
 /// Gives an 8-bit copy turned back, by PyTorch: each E4M3 (read as PyTorch's float8_e4m3fn) times its row's scale,
 /// exact. {rows, k} float.
 ///
-///   rounded_tensor   {rows, k / ROUND_8BIT_VALUES_PER_INT} Int32, as round_8bit wrote it
+///   rounded_tensor   {rows, k} E4M3, as round_8bit wrote it
 ///   scales_tensor    {rows} float
 static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scales_tensor)
 {
     int64_t rows_val = (int64_t)rounded_tensor.size(0);
-    int64_t k_val = (int64_t)(rounded_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT);
+    int64_t k_val = (int64_t)rounded_tensor.size(1);
     torch::Tensor e4m3_tensor = torch::from_blob(rounded_tensor.data_ptr(), {rows_val, k_val},
                                                  torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
     return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scales_tensor).unsqueeze(1);

@@ -6,12 +6,16 @@
 // The next batch starts B x T on; at a file's end the next file, after the last the first again (next epoch).
 // A token file (llm.c's): a header of 256 int32s ([0] 20240520, [1] 1, [2] N), then N uint16 tokens.
 // Several ranks take turns: in each round rank r reads batch r, then the round moves world_size batches on.
-// While data/fineweb.py writes (its `writing` file is there), the loader skips files not yet whole and waits
-// for the next one.
+// While data/fineweb.py or data/climbmix.py writes (its `writing` file is there, holding its process id), the
+// loader skips files not yet whole and waits for the next one; it stops at once if that process has died, and
+// says how long each wait took. It keeps the seconds its batches took and the seconds it waited, for the trainer's
+// step line: the GPU should never wait for data.
 #ifndef DATALOADER_CUH
 #define DATALOADER_CUH
 
+#include <cerrno>
 #include <chrono>
+#include <csignal>                           // kill(pid, 0): is the writer's process still there
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +41,7 @@ public:
     void next_batch(const Tensor& token_ids, const Tensor& targets);    // the next {B, T} of each, onto the GPU
     void reset();                                                       // back to file 0's first token, epoch 1
     void seek(int file, size_t position, int epoch);                    // to where a checkpoint saved it
+    void wait_for_tokens(size_t tokens);                                // while the writer works, until that many are there
 
     // ── reading ─────────────────────────────────────────────────────────────────
     int num_files() const;                                              // how many whole files it found so far
@@ -47,6 +52,8 @@ public:
     size_t position() const;                                            // the next round's first token in it
     int epoch() const;                                                  // 1 on the first pass over the files
     bool more_files_coming() const;                                     // the writer is still writing files
+    double seconds_reading() const;                                     // all its batches so far: file to GPU
+    double seconds_waiting() const;                                     // all its waits for the writer so far
 
 private:
     size_t batch_size_;
@@ -65,10 +72,14 @@ private:
     std::vector<uint16_t> file_values_;      // the B x T + 1 tokens just read, as in the file
     std::vector<int> token_id_values_;       // the first B x T of them as ints, for token_ids
     std::vector<int> target_values_;         // the last B x T, for targets
+    double seconds_reading_ = 0.0;           // in next_batch, its waits for a file left out
+    double seconds_waiting_ = 0.0;           // in wait_for_file and wait_for_tokens
 
     void open_file(int k);                                              // file k, at its first token
     void find_new_files();                                              // adds the whole files written since
     void wait_for_file(int k);                                          // while the writer works, until file k
+    void wait_a_second(int seconds_so_far, const char* what) const;     // one second of a wait; stops if it is hopeless
+    long writer_process() const;                                        // the process id in `writing`; 0: none there
     std::string path_of(int number) const;                              // the pattern with this number put in
     static bool is_whole(const std::string& path);                      // its size is what its header says
     static size_t read_header(const std::string& path);                 // checks the header, gives N
@@ -124,6 +135,8 @@ inline void DataLoader::next_batch(const Tensor& token_ids, const Tensor& target
                 seq_len_);
         exit(EXIT_FAILURE);
     }
+    auto started = std::chrono::steady_clock::now();
+    double waiting_before = seconds_waiting_;
     size_t batch_tokens = batch_size_ * seq_len_;
     size_t round_tokens = world_size_ * batch_tokens;
     size_t first = position_ + rank_ * batch_tokens;                    // this rank's batch
@@ -148,9 +161,16 @@ inline void DataLoader::next_batch(const Tensor& token_ids, const Tensor& target
         if (next >= num_files()) {                                      // the last file: the next epoch
             next = 0;
             epoch_++;
+            if (rank_ == 0) {
+                printf("data loader: the %d file(s) of %s ran out (%zu tokens): epoch %d starts\n", num_files(),
+                       pattern_.c_str(), total_tokens(), epoch_);
+                fflush(stdout);
+            }
         }
         open_file(next);
     }
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    seconds_reading_ += seconds - (seconds_waiting_ - waiting_before);  // a wait for the next file is not reading
 }
 
 /// Goes back to file 0's first token, epoch 1: the val loss reads the same batches every time.
@@ -174,6 +194,32 @@ inline void DataLoader::seek(int file, size_t position, int epoch) {
     open_file(file);
     position_ = position;
     epoch_ = epoch;
+}
+
+/// Waits, while the writer works, until the whole files found hold `tokens` tokens: a lead over the writer before
+/// the first step, so the trainer does not catch up with it. Returns at once with no writer, or with enough there.
+///
+///   tokens   wanted in whole files; the writer ending with fewer is not an error here
+inline void DataLoader::wait_for_tokens(size_t tokens) {
+    find_new_files();
+    auto started = std::chrono::steady_clock::now();
+    int seconds = 0;
+    for (; total_tokens() < tokens && more_files_coming(); seconds++) {
+        if (seconds == 0 && rank_ == 0) {
+            printf("data loader: waiting for %zu tokens of %s before the first step (%zu there; the writer is still "
+                   "working)\n", tokens, pattern_.c_str(), total_tokens());
+            fflush(stdout);
+        }
+        wait_a_second(seconds, "a lead of tokens");
+        find_new_files();
+    }
+    find_new_files();       // the last file may have finished just before `writing` went
+    if (seconds == 0) return;
+    seconds_waiting_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (rank_ == 0) {
+        printf("data loader: waited %d s; %d file(s), %zu tokens there\n", seconds, num_files(), total_tokens());
+        fflush(stdout);
+    }
 }
 
 // ── reading ───────────────────────────────────────────────────────────────────
@@ -210,6 +256,13 @@ inline bool DataLoader::more_files_coming() const {
     fclose(marker);
     return true;
 }
+
+/// Gives the seconds all its batches took so far, from the file to the GPU (the waits for the writer left out):
+/// what the GPU stood still for data in a step, when taken before and after it.
+inline double DataLoader::seconds_reading() const { return seconds_reading_; }
+
+/// Gives the seconds it waited for the writer so far: for a file at a file's end, and for wait_for_tokens' lead.
+inline double DataLoader::seconds_waiting() const { return seconds_waiting_; }
 
 // ── private ───────────────────────────────────────────────────────────────────
 
@@ -257,24 +310,63 @@ inline void DataLoader::find_new_files() {
     next_number_ = number;
 }
 
-/// Looks for file k, every second while the writer works, for at most an hour. Returns with file k found, or
-/// the writer done and no file k.
+/// Looks for file k, every second while the writer works, for at most an hour; stops at once if the writer's
+/// process has died. Returns with file k found, or the writer done and no file k. Says how long it waited: the
+/// GPU stood still that long.
 ///
 ///   k   the file wanted
 inline void DataLoader::wait_for_file(int k) {
     find_new_files();
-    for (int seconds = 0; k >= num_files() && more_files_coming(); seconds++) {
-        if (seconds == 0 && rank_ == 0)
+    auto started = std::chrono::steady_clock::now();
+    int seconds = 0;
+    for (; k >= num_files() && more_files_coming(); seconds++) {
+        if (seconds == 0 && rank_ == 0) {
             printf("data loader: waiting for token file %d of %s (the writer is still working)\n", k, pattern_.c_str());
-        if (seconds >= 3600) {
-            fprintf(stderr, "error: waited an hour for token file %d of %s; if data/fineweb.py has stopped, delete "
-                            "%s\n", k, pattern_.c_str(), writing_marker_.c_str());
-            exit(EXIT_FAILURE);
+            fflush(stdout);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        wait_a_second(seconds, "the next token file");
         find_new_files();
     }
     find_new_files();       // the last file may have finished just before `writing` went
+    if (seconds == 0) return;
+    seconds_waiting_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (rank_ == 0) {
+        printf("data loader: waited %d s for token file %d of %s: the writer is slower than the training\n", seconds,
+               k, pattern_.c_str());
+        fflush(stdout);
+    }
+}
+
+/// Sleeps one second of a wait for the writer, after checking the wait can still end: stops with an error if
+/// the process named in `writing` is gone (a writer that crashed leaves its `writing` file behind), or after an hour.
+///
+///   seconds_so_far   of this wait
+///   what             what is waited for, for the message
+inline void DataLoader::wait_a_second(int seconds_so_far, const char* what) const {
+    long writer = writer_process();
+    if (writer > 0 && kill((pid_t)writer, 0) != 0 && errno == ESRCH) {
+        fprintf(stderr, "error: waiting for %s of %s, but the writer (process %ld, named in %s) is gone: it stopped "
+                        "before its end. Run it again, or delete %s to train on the files there\n", what,
+                pattern_.c_str(), writer, writing_marker_.c_str(), writing_marker_.c_str());
+        exit(EXIT_FAILURE);
+    }
+    if (seconds_so_far >= 3600) {
+        fprintf(stderr, "error: waited an hour for %s of %s; if the writer has stopped, delete %s\n", what,
+                pattern_.c_str(), writing_marker_.c_str());
+        exit(EXIT_FAILURE);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+/// Gives the writer's process id, as it wrote it into its `writing` file; 0 with no such file or an empty one
+/// (a writer that names no process: only waited for).
+inline long DataLoader::writer_process() const {
+    FILE* marker = fopen(writing_marker_.c_str(), "rb");
+    if (marker == nullptr) return 0;
+    long writer = 0;
+    if (fscanf(marker, "%ld", &writer) != 1) writer = 0;
+    fclose(marker);
+    return writer;
 }
 
 /// Gives the path of file `number`: the pattern with it put in for %d.

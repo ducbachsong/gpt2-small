@@ -25,6 +25,8 @@ struct TrainConfig {
     size_t tokens_per_step = 524288;         // all GPUs together: 2^19, GPT-2 small's ~0.5M (GPT-3 paper, llm.c)
     bool linear_bias = true;                 // the model's 4 linears have biases (GPT2Config::linear_bias); train_bf16 and train_8bit only
     int steps = -1;                          // -1: one pass over the train files, 19,073 for 10B tokens
+    bool data_ready = false;                 // the run's train tokens must all be on disk before it starts: the GPUs never wait
+    size_t data_lead_tokens = 500000000;     // else, with the writer still working: this many there before the first step
     float max_learning_rate = 6e-4f;
     float min_learning_rate = 0.0f;          // where the cosine ends
     int warmup_steps = 700;
@@ -50,6 +52,7 @@ AdamWConfig adamw_config_of(const TrainConfig& c);
 // ── the run's size ────────────────────────────────────────────────────────────
 int micro_batches_of(const TrainConfig& c, const Distributed& distributed);
 void set_steps(TrainConfig& c, const DataLoader& train_loader, const Distributed& distributed);
+void wait_for_data(const TrainConfig& c, DataLoader& train_loader, const Distributed& distributed);
 
 // ── the params and grads ──────────────────────────────────────────────────────
 GPT2Params params_of(const Optimizer& optimizer, const GPT2Config& config);
@@ -85,6 +88,10 @@ inline void print_usage_and_stop(const char* program, int exit_code, const Train
     printf("  --linear-bias 0|1             %d   the linears' biases (the LayerNorms keep theirs); train_bf16, train_8bit\n",
            d.linear_bias ? 1 : 0);
     printf("  --steps N                     one pass over the train files\n");
+    printf("  --data-ready 0|1              %d   1: start only with every train token of the run on disk, the writer done\n",
+           d.data_ready ? 1 : 0);
+    printf("  --data-lead-tokens N          %zu   with the writer still working: there before the first step\n",
+           d.data_lead_tokens);
     printf("  --max-learning-rate X         %g\n", d.max_learning_rate);
     printf("  --min-learning-rate X         %g\n", d.min_learning_rate);
     printf("  --warmup-steps N              %d\n", d.warmup_steps);
@@ -124,6 +131,8 @@ inline TrainConfig parse_args(int argc, char** argv, const TrainConfig& defaults
         else if (flag == "--tokens-per-step") c.tokens_per_step = (size_t)atoll(value);
         else if (flag == "--linear-bias") c.linear_bias = atoi(value) != 0;
         else if (flag == "--steps") c.steps = atoi(value);
+        else if (flag == "--data-ready") c.data_ready = atoi(value) != 0;
+        else if (flag == "--data-lead-tokens") c.data_lead_tokens = (size_t)atoll(value);
         else if (flag == "--max-learning-rate") c.max_learning_rate = (float)atof(value);
         else if (flag == "--min-learning-rate") c.min_learning_rate = (float)atof(value);
         else if (flag == "--warmup-steps") c.warmup_steps = atoi(value);
@@ -227,6 +236,35 @@ inline void set_steps(TrainConfig& c, const DataLoader& train_loader, const Dist
     }
 }
 
+/// Makes sure the train tokens are there before the first step, so the GPUs do not stand still for data later.
+/// With --data-ready 1: stops unless the writer is done and the files hold the whole run's tokens (the real run:
+/// tokenize or download first, then train). Without it, while the writer still works: waits until the files hold
+/// --data-lead-tokens (or the whole run's, if fewer), a lead the writer keeps if it is faster than the training.
+///
+///   c              c.steps set (set_steps first)
+///   train_loader   the train files; it waits
+///   distributed    for printing on rank 0
+inline void wait_for_data(const TrainConfig& c, DataLoader& train_loader, const Distributed& distributed) {
+    size_t run_tokens = c.tokens_per_step * (size_t)c.steps;
+    if (c.data_ready) {
+        if (train_loader.more_files_coming()) {
+            print0(distributed, "error: --data-ready 1, but the train files are still being written (%zu tokens of "
+                                "the run's %zu there): wait for the writer's end, or pass --data-ready 0\n",
+                   train_loader.total_tokens(), run_tokens);
+            exit(EXIT_FAILURE);
+        }
+        if (train_loader.total_tokens() < run_tokens) {
+            print0(distributed, "error: --data-ready 1, but the train files hold %zu tokens and %d steps need %zu: "
+                                "write more, or pass --data-ready 0 to go over them more than once\n",
+                   train_loader.total_tokens(), c.steps, run_tokens);
+            exit(EXIT_FAILURE);
+        }
+        return;
+    }
+    if (train_loader.more_files_coming())
+        train_loader.wait_for_tokens(run_tokens < c.data_lead_tokens ? run_tokens : c.data_lead_tokens);
+}
+
 // ── the params and grads ──────────────────────────────────────────────────────
 
 /// Gives the model's params as views of the AdamW's buffer: the model reads them, the AdamW updates them.
@@ -290,6 +328,9 @@ inline void print_run(const char* model_name, const TrainConfig& c, const Optimi
            c.max_learning_rate, c.warmup_steps, c.min_learning_rate, c.weight_decay, c.max_norm);
     print0(distributed, "GPU memory, rank 0: %.1f GB used of %.1f GB\n", (total_bytes - free_bytes) / 1e9,
            total_bytes / 1e9);
+    print0(distributed, "data: %s\n", c.data_ready ? "all on disk before the first step (--data-ready 1)" :
+           train_loader.more_files_coming() ? "the writer still working: a step's `data` time and the loader's "
+                                              "`waited` lines show what the GPUs wait" : "all on disk");
     if (c.checkpoint_dir.empty()) print0(distributed, "checkpoints: none\n");
     else print0(distributed, "checkpoints: every %d steps into %s, the newest %d kept\n", c.checkpoint_every,
                 c.checkpoint_dir.c_str(), c.keep_checkpoints);

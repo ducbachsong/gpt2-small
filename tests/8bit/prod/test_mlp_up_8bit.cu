@@ -74,7 +74,7 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
 /// exact. {rows, k} float.
 static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scales_tensor)
 {
-    int64_t rows_val = (int64_t)rounded_tensor.size(0), k_val = (int64_t)(rounded_tensor.size(1) * ROUND_8BIT_VALUES_PER_INT);
+    int64_t rows_val = (int64_t)rounded_tensor.size(0), k_val = (int64_t)rounded_tensor.size(1);
     torch::Tensor e4m3_tensor = torch::from_blob(rounded_tensor.data_ptr(), {rows_val, k_val},
                                                  torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
     return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scales_tensor).unsqueeze(1);
@@ -455,16 +455,16 @@ static void pingpong_gives_the_default_bits(void)
 /// them, for output {rows, columns}; filled with 7s first, so a byte not written shows.
 struct Gelu8bitCopies
 {
-    Tensor rows_8bit_tensor;          // {rows, columns / 4} Int32
+    Tensor rows_8bit_tensor;          // {rows, columns} E4M3
     Tensor row_scales_tensor;         // {rows}
-    Tensor turned_8bit_tensor;        // {columns, rows / 4} Int32
+    Tensor turned_8bit_tensor;        // {columns, rows} E4M3
     Tensor turned_scales_tensor;      // {columns}
     Round8bitHistory history_val;     // the place's history: where the delayed scale comes from
 
     Gelu8bitCopies(size_t rows_val, size_t columns_val)
-        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val}, DType::E4M3)),
           row_scales_tensor(Tensor::zeros({rows_val})),
-          turned_8bit_tensor(Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          turned_8bit_tensor(Tensor::zeros({columns_val, rows_val}, DType::E4M3)),
           turned_scales_tensor(Tensor::zeros({columns_val}))
     {
         cudaCheck(cudaMemset(rows_8bit_tensor.data_ptr(), 7, rows_8bit_tensor.numel() * rows_8bit_tensor.element_size()));

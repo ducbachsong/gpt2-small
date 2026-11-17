@@ -41,9 +41,9 @@ struct Gpt2LayerNorm
     Tensor output_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_SEQ_LEN, GPT2_EMBED_DIM}, DType::BFloat16);
     Tensor mean_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_SEQ_LEN});
     Tensor rstd_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_SEQ_LEN});
-    Tensor output_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor output_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM}, DType::E4M3);
     Tensor output_scales_tensor = Tensor::zeros({GPT2_ROWS});
-    Tensor rounded_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rounded_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM}, DType::E4M3);
     Tensor rounded_scales_tensor = Tensor::zeros({GPT2_ROWS});
 
     /// Launches layer_norm_8bit_forward_kernel with `threads_val` threads a block, one warp a row, the blocks rounded up.
@@ -91,7 +91,7 @@ static void time_8bit_forward_against_bf16_and_round_8bit(void)
     Gpt2LayerNorm layer_norm_val;
     layer_norm_val.forward_8bit(LAYER_NORM_8BIT_THREADS_PER_BLOCK);
     round_8bit(layer_norm_val.rounded_8bit_tensor, layer_norm_val.rounded_scales_tensor, layer_norm_val.output_tensor);
-    bool same_val = layer_norm_val.output_8bit_tensor.tolist<int>() == layer_norm_val.rounded_8bit_tensor.tolist<int>() &&
+    bool same_val = layer_norm_val.output_8bit_tensor.equal(layer_norm_val.rounded_8bit_tensor) &&
                     layer_norm_val.output_scales_tensor.tolist() == layer_norm_val.rounded_scales_tensor.tolist();
 
     // 2. the 3 runs, taking turns over SWEEP_ROUNDS rounds
@@ -150,7 +150,7 @@ static void time_forward_with_other_thread_counts(void)
     torch::manual_seed(0);
     Gpt2LayerNorm layer_norm_val;
     layer_norm_val.forward_8bit(LAYER_NORM_8BIT_THREADS_PER_BLOCK);
-    std::vector<int> usual_copy_list = layer_norm_val.output_8bit_tensor.tolist<int>();
+    Tensor usual_copy_tensor = layer_norm_val.output_8bit_tensor.clone();
     std::vector<float> usual_scales_list = layer_norm_val.output_scales_tensor.tolist();
     warm_up_gpu([&] { layer_norm_val.forward_8bit(LAYER_NORM_8BIT_THREADS_PER_BLOCK); });
 
@@ -177,7 +177,7 @@ static void time_forward_with_other_thread_counts(void)
         layer_norm_val.output_8bit_tensor.zero_();
         layer_norm_val.output_scales_tensor.zero_();
         layer_norm_val.forward_8bit(threads_val);
-        bool same_val = layer_norm_val.output_8bit_tensor.tolist<int>() == usual_copy_list &&
+        bool same_val = layer_norm_val.output_8bit_tensor.equal(usual_copy_tensor) &&
                         layer_norm_val.output_scales_tensor.tolist() == usual_scales_list;
         if (same_val)
             launches_with_the_same_result_val++;

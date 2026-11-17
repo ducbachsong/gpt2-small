@@ -48,11 +48,11 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
     return difference_tensor.item<double>() / pytorch_tensor.abs().max().item<double>();
 }
 
-/// A matrix and its 8-bit copy: the bfloat16 values as they sit, their E4M3s (4 in each int) and one scale per row.
+/// A matrix and its 8-bit copy: the bfloat16 values as they sit, their E4M3s and one scale per row.
 struct RoundedMatrix
 {
     Tensor values_tensor;              // {rows, row_length} bfloat16, or turned {row_length, rows}
-    Tensor rounded_tensor;             // {rows, row_length / 4} Int32
+    Tensor rounded_tensor;             // {rows, row_length} E4M3
     Tensor scales_tensor;              // {rows} float
     size_t rows_val;
     size_t row_length_val;
@@ -64,7 +64,7 @@ struct RoundedMatrix
     {
         rows_val = values_tensor.size(turned_val ? 1 : 0);
         row_length_val = values_tensor.size(turned_val ? 0 : 1);
-        rounded_tensor = Tensor::zeros({rows_val, row_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+        rounded_tensor = Tensor::zeros({rows_val, row_length_val}, DType::E4M3);
         scales_tensor = Tensor::zeros({rows_val});
         round_8bit(rounded_tensor, scales_tensor, values_tensor, turned_val, threads_per_block_val);
     }
@@ -198,31 +198,24 @@ static void rows_and_columns_give_the_bits_of_both_roundings(const char *test_pt
     RoundedMatrix plain_val(values_tensor);
     RoundedMatrix turned_val(values_tensor, true);
     // 2. round_8bit_rows_and_columns: both, then rows alone, then columns alone
-    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val}, DType::E4M3);
     Tensor row_scales_tensor = Tensor::zeros({rows_val});
-    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val}, DType::E4M3);
     Tensor column_scales_tensor = Tensor::zeros({columns_val});
-    // the same bits: the Int32 copies compared as ints, on the CPU
-    auto same_ints_val = [](const Tensor &first_tensor, const Tensor &second_tensor) {
-        std::vector<int> first_list(first_tensor.numel()), second_list(second_tensor.numel());
-        cudaCheck(cudaMemcpy(first_list.data(), first_tensor.data_ptr(), first_list.size() * sizeof(int), cudaMemcpyDeviceToHost));
-        cudaCheck(cudaMemcpy(second_list.data(), second_tensor.data_ptr(), second_list.size() * sizeof(int), cudaMemcpyDeviceToHost));
-        return first_list == second_list;
-    };
     print_test_name(test_ptr);
     printf("    input {%zu, %zu}: both copies\n", rows_val, columns_val);
     round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, values_tensor);
-    ASSERT_EQ(same_ints_val(rows_8bit_tensor, plain_val.rounded_tensor), true);
+    ASSERT_EQ(rows_8bit_tensor.equal(plain_val.rounded_tensor), true);
     ASSERT_EQ(row_scales_tensor.tolist() == plain_val.scales_tensor.tolist(), true);
-    ASSERT_EQ(same_ints_val(columns_8bit_tensor, turned_val.rounded_tensor), true);
+    ASSERT_EQ(columns_8bit_tensor.equal(turned_val.rounded_tensor), true);
     ASSERT_EQ(column_scales_tensor.tolist() == turned_val.scales_tensor.tolist(), true);
     printf("    the row copy alone, then the turned copy alone\n");
     rows_8bit_tensor.zero_(), row_scales_tensor.zero_(), columns_8bit_tensor.zero_(), column_scales_tensor.zero_();
     round_8bit_rows_and_columns(rows_8bit_tensor, row_scales_tensor, Tensor(), Tensor(), values_tensor);
-    ASSERT_EQ(same_ints_val(rows_8bit_tensor, plain_val.rounded_tensor), true);
+    ASSERT_EQ(rows_8bit_tensor.equal(plain_val.rounded_tensor), true);
     ASSERT_EQ(row_scales_tensor.tolist() == plain_val.scales_tensor.tolist(), true);
     round_8bit_rows_and_columns(Tensor(), Tensor(), columns_8bit_tensor, column_scales_tensor, values_tensor);
-    ASSERT_EQ(same_ints_val(columns_8bit_tensor, turned_val.rounded_tensor), true);
+    ASSERT_EQ(columns_8bit_tensor.equal(turned_val.rounded_tensor), true);
     ASSERT_EQ(column_scales_tensor.tolist() == turned_val.scales_tensor.tolist(), true);
 }
 
@@ -245,17 +238,17 @@ static void rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_
 /// The copies round_8bit_per_tensor writes of one {rows, columns} matrix, and PyTorch's reading of them.
 struct PerTensorCopies
 {
-    Tensor rows_8bit_tensor;           // {rows, columns / 4} Int32
+    Tensor rows_8bit_tensor;           // {rows, columns} E4M3
     Tensor row_scales_tensor;          // {rows}
-    Tensor columns_8bit_tensor;        // {columns, rows / 4} Int32
+    Tensor columns_8bit_tensor;        // {columns, rows} E4M3
     Tensor column_scales_tensor;       // {columns}
     size_t rows_val;
     size_t columns_val;
 
     PerTensorCopies(size_t rows_val, size_t columns_val)
-        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+        : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val}, DType::E4M3)),
           row_scales_tensor(Tensor::zeros({rows_val})),
-          columns_8bit_tensor(Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+          columns_8bit_tensor(Tensor::zeros({columns_val, rows_val}, DType::E4M3)),
           column_scales_tensor(Tensor::zeros({columns_val})), rows_val(rows_val), columns_val(columns_val) {}
 
     /// Rounds values into both copies by round_8bit_per_tensor.

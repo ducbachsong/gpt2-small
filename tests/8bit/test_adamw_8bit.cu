@@ -21,8 +21,7 @@ static const double STEPS_TOLERANCE = 1e-3;
 // ── helpers: 8-bit m and v ────────────────────────────────────────────────────
 
 /// 8-bit m and sqrt(v) for `count` values, all 0 (m = v = 0): 1 byte per value, and one float scale per
-/// ADAMW_VALUES_PER_SCALE values. Tensor has no 1-byte dtype, so an Int32 tensor of count / FP8_PER_INT holds the
-/// bytes, FP8_PER_INT to an int.
+/// ADAMW_VALUES_PER_SCALE values: an E4M3 tensor of count.
 struct EightBitMoments
 {
     Tensor m_tensor;
@@ -30,14 +29,14 @@ struct EightBitMoments
     Tensor sqrt_v_tensor;
     Tensor sqrt_v_scales_tensor;
     explicit EightBitMoments(size_t count_val)
-        : m_tensor(Tensor::zeros({count_val / FP8_PER_INT}, DType::Int32)),
+        : m_tensor(Tensor::zeros({count_val}, DType::E4M3)),
           m_scales_tensor(Tensor::zeros({CEIL_DIV(count_val, (size_t)ADAMW_VALUES_PER_SCALE)})),
-          sqrt_v_tensor(Tensor::zeros({count_val / FP8_PER_INT}, DType::Int32)),
+          sqrt_v_tensor(Tensor::zeros({count_val}, DType::E4M3)),
           sqrt_v_scales_tensor(Tensor::zeros({CEIL_DIV(count_val, (size_t)ADAMW_VALUES_PER_SCALE)}))
     {
     }
-    __nv_fp8_e4m3 *m_bytes() const { return (__nv_fp8_e4m3 *)m_tensor.data_ptr(); }
-    __nv_fp8_e4m3 *sqrt_v_bytes() const { return (__nv_fp8_e4m3 *)sqrt_v_tensor.data_ptr(); }
+    __nv_fp8_e4m3 *m_bytes() const { return m_tensor.data_ptr<__nv_fp8_e4m3>(); }
+    __nv_fp8_e4m3 *sqrt_v_bytes() const { return sqrt_v_tensor.data_ptr<__nv_fp8_e4m3>(); }
 };
 
 /// Gives the first `count_val` 8-bit values of `bytes_tensor` as they are stored, as floats: -448 .. 448.

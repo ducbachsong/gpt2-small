@@ -68,7 +68,7 @@ static void time_rows_at_each_block_size(const char *name_ptr, size_t row_length
     // 1. random values; the default's rounding
     torch::manual_seed(0);
     Tensor input_tensor = random_bf16_tensor({GPT2_ROWS, row_length_val});
-    Tensor rounded_tensor = Tensor::zeros({GPT2_ROWS, row_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rounded_tensor = Tensor::zeros({GPT2_ROWS, row_length_val}, DType::E4M3);
     Tensor scales_tensor = Tensor::zeros({GPT2_ROWS});
     round_8bit(rounded_tensor, scales_tensor, input_tensor);
     torch::Tensor usual_tensor = turned_back(rounded_tensor, scales_tensor, GPT2_ROWS, (int64_t)row_length_val);
@@ -131,7 +131,7 @@ static void time_turned_rounding_of_one_shape(const char *name_ptr, size_t row_l
     torch::manual_seed(0);
     Tensor turned_input_tensor = random_bf16_tensor({row_length_val, rows_val});
     Tensor plain_input_tensor = random_bf16_tensor({rows_val, row_length_val});
-    Tensor rounded_tensor = Tensor::zeros({rows_val, row_length_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rounded_tensor = Tensor::zeros({rows_val, row_length_val}, DType::E4M3);
     Tensor scales_tensor = Tensor::zeros({rows_val});
     // 2. time both
     double totals_list[2] = {0.0, 0.0};
@@ -182,9 +182,9 @@ static void time_both_copies_of_one_shape(const char *name_ptr, size_t rows_val,
     // 1. random values; the copies
     torch::manual_seed(0);
     Tensor input_tensor = random_bf16_tensor({rows_val, columns_val});
-    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor rows_8bit_tensor = Tensor::zeros({rows_val, columns_val}, DType::E4M3);
     Tensor row_scales_tensor = Tensor::zeros({rows_val});
-    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor columns_8bit_tensor = Tensor::zeros({columns_val, rows_val}, DType::E4M3);
     Tensor column_scales_tensor = Tensor::zeros({columns_val});
     // 2. time both ways, taking turns
     double totals_list[2] = {0.0, 0.0};
@@ -221,9 +221,9 @@ static void time_both_copies_of_one_shape(const char *name_ptr, size_t rows_val,
                moved_list[side_index_val] / MEGA, speed_val, 100.0 * speed_val / peak_val);
     }
     // 4. the same bits both ways
-    Tensor plain_8bit_tensor = Tensor::zeros(rows_8bit_tensor.shape(), DType::Int32);
+    Tensor plain_8bit_tensor = Tensor::zeros(rows_8bit_tensor.shape(), DType::E4M3);
     Tensor plain_scales_tensor = Tensor::zeros({rows_val});
-    Tensor turned_8bit_tensor = Tensor::zeros(columns_8bit_tensor.shape(), DType::Int32);
+    Tensor turned_8bit_tensor = Tensor::zeros(columns_8bit_tensor.shape(), DType::E4M3);
     Tensor turned_scales_tensor = Tensor::zeros({columns_val});
     round_8bit(plain_8bit_tensor, plain_scales_tensor, input_tensor);
     round_8bit(turned_8bit_tensor, turned_scales_tensor, input_tensor, true);

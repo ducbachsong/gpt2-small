@@ -65,7 +65,7 @@ struct Gpt2Encoder
     Tensor wte_tensor = random_bf16_tensor({GPT2_PADDED_VOCAB_SIZE, GPT2_EMBED_DIM});
     Tensor wpe_tensor = random_bf16_tensor({GPT2_MAX_SEQ_LEN, GPT2_EMBED_DIM});
     Tensor token_ids_tensor = random_token_ids();
-    Tensor wte_8bit_tensor = Tensor::zeros({GPT2_PADDED_VOCAB_SIZE, GPT2_EMBED_DIM / ROUND_8BIT_VALUES_PER_INT}, DType::Int32);
+    Tensor wte_8bit_tensor = Tensor::zeros({GPT2_PADDED_VOCAB_SIZE, GPT2_EMBED_DIM}, DType::E4M3);
     Tensor wte_scales_tensor = Tensor::zeros({GPT2_PADDED_VOCAB_SIZE});
     Tensor encoded_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_MAX_SEQ_LEN, GPT2_EMBED_DIM}, DType::BFloat16);
     Tensor bf16_encoded_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_MAX_SEQ_LEN, GPT2_EMBED_DIM}, DType::BFloat16);

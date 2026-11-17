@@ -35,17 +35,25 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128   #
 
 ### Train
 
-Get the data and the tokenizer first. The tokens are written in the background, a file at a time, and the trainer waits for each file as it comes, so you can start training straight away:
+The GPUs should never wait for data, so the tokens come first. Tokenize once, on any machine (no GPU needed; about 1.3M tokens a second with 16 threads), and keep the files in a dataset on the Hugging Face Hub. Ours is public, [ducbachsong/climbmix-tokens-32768](https://huggingface.co/datasets/ducbachsong/climbmix-tokens-32768) (CC BY-NC 4.0, as ClimbMix), so you can skip this step and just download it:
 
 ```bash
-python data/climbmix.py --train-tokens 6000M --threads 16 &
-nvcc -ccbin g++ -O3 -std=c++17 -arch=sm_90a train_8bit.cu -o train_8bit -lnccl
-torchrun --standalone --nproc_per_node=8 --no-python ./train_8bit   # 8 GPUs
+python data/climbmix.py --train-tokens 6000M --threads 16
+python data/token_hub.py upload --repo <user>/climbmix-tokens-32768
 ```
 
-One GPU runs the same steps, just 8× slower: `./train_8bit`. For a quick try:
+Then on each GPU machine download them, a few minutes, and train. `--data-ready 1` starts only when every token of the run is on disk:
 
 ```bash
+python data/token_hub.py download --repo <user>/climbmix-tokens-32768
+nvcc -ccbin g++ -O3 -std=c++17 -arch=sm_90a train_8bit.cu -o train_8bit -lnccl
+torchrun --standalone --nproc_per_node=8 --no-python ./train_8bit --data-ready 1 --steps 11444   # 8 GPUs
+```
+
+One GPU runs the same steps, just 8× slower: `./train_8bit`. For a quick try you can also train while the files are still being written or downloaded: the trainer waits for a lead of `--data-lead-tokens` (500M) before the first step, each step's line shows its `data` milliseconds, and the loader says so whenever the GPUs had to wait for a file:
+
+```bash
+python data/climbmix.py --train-tokens 400M --threads 16 &
 ./train_8bit --steps 20 --tokens-per-step 32768 --val-every 10
 ```
 
@@ -78,6 +86,7 @@ Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTo
 ├── data
 │   ├── climbmix.py                 # ClimbMix into token files, trains nanochat's tokenizer
 │   ├── fineweb.py                  # FineWeb-Edu into llm.c's token files (GPT-2's tokenizer)
+│   ├── token_hub.py                # uploads and downloads the token files: tokenize once, keep them on the Hub
 │   ├── parquetpool.py              # downloads the parquet shards into RAM in the background
 │   ├── tokenpool.py                # tokenizes in threads
 │   └── data_common.py              # the token-file and tokenizer-file formats

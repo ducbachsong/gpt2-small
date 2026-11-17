@@ -8,7 +8,11 @@
 //     float      24                 7 digits  3.4e38    1 sign, 8 exponent, 23 fraction
 //     half       11                 3 digits  65504     1 sign, 5 exponent, 10 fraction
 //     bfloat16    8                 2 digits  3.4e38    1 sign, 8 exponent,  7 fraction: a float's first 16 bits
+//     e4m3        4                 1 digit   448       1 sign, 4 exponent,  3 fraction: FP8, 1 byte
 //     int        4 bytes, for token ids
+// An e4m3 tensor holds what the 8-bit kernels write: one byte a value, in the values' real shape ({6144, 1536} for
+// a {6144, 1536} weight's 8-bit copy). Going to e4m3 needs a scale, so only those kernels write one: fill_,
+// normal_, copy_ from another dtype and to(E4M3) stop; zeros, views, clone and the CPU copies work as for any dtype.
 // Kernels do their math in float: read4_as_float reads 4 values as a float4, write4_from_float writes them
 // back (end of file).
 #ifndef TENSOR_CUH
@@ -19,13 +23,14 @@
 #include <cstring>
 #include <cuda_bf16.h>                  // nv_bfloat16
 #include <cuda_fp16.h>                  // half
+#include <cuda_fp8.h>                   // __nv_fp8_e4m3
 #include <memory>
 #include <type_traits>
 #include <vector>
 #include "../kernels/cuda_common.h"
 
 /// What one value is.
-enum class DType { Float32, Float16, BFloat16, Int32 };
+enum class DType { Float32, Float16, BFloat16, Int32, E4M3 };
 
 // ── one value of each float dtype, as a float ─────────────────────────────────
 // to_float is exact; from_float<T> rounds to the nearest T, a tie to the one whose last bit is 0. CPU and GPU.
@@ -33,6 +38,7 @@ enum class DType { Float32, Float16, BFloat16, Int32 };
 __host__ __device__ __forceinline__ float to_float(float value) { return value; }
 __host__ __device__ __forceinline__ float to_float(half value) { return __half2float(value); }
 __host__ __device__ __forceinline__ float to_float(nv_bfloat16 value) { return __bfloat162float(value); }
+__host__ __device__ __forceinline__ float to_float(__nv_fp8_e4m3 value) { return float(value); }
 
 template <typename T> __host__ __device__ __forceinline__ T from_float(float value);
 template <> __host__ __device__ __forceinline__ float from_float<float>(float value) { return value; }
@@ -58,8 +64,8 @@ public:
     static void manual_seed(uint64_t seed);                             // same seed, same random numbers
 
     // ── shape and info ──────────────────────────────────────────────────────────
-    DType dtype() const;                                                // Float32, Float16, BFloat16 or Int32
-    size_t element_size() const;                                        // bytes per value: 4, 2, 2 or 4
+    DType dtype() const;                                                // Float32, Float16, BFloat16, Int32 or E4M3
+    size_t element_size() const;                                        // bytes per value: 4, 2, 2, 4 or 1
     int dim() const;                                                    // how many dims: 2 for a matrix
     size_t numel() const;                                               // how many values
     const Shape& shape() const;                                         // {2, 4}
@@ -67,7 +73,7 @@ public:
     size_t size(int d) const;                                           // shape()[d], checked
     size_t stride(int d) const;                                         // stride()[d], checked
     float* data() const;                                                // first value on the GPU (float tensor)
-    template <typename T> T* data_ptr() const;                          // as float*, half*, nv_bfloat16* or int*
+    template <typename T> T* data_ptr() const;                          // as float*, half*, nv_bfloat16*, int* or __nv_fp8_e4m3*
     void* data_ptr() const;                                             // first value's address, any dtype
 
     // ── views: the same values, shared, not copied ──────────────────────────────
@@ -88,6 +94,7 @@ public:
     template <typename T> void copy_to_cpu(T* values) const;            // numel values out, to the CPU
     template <typename T = float> std::vector<T> tolist() const;        // every value, as a CPU vector
     template <typename T = float> T item() const;                       // the one value: t[1][2].item()
+    bool equal(const Tensor& other) const;                              // same shape, dtype and bits: a.equal(b)
 
 private:
     std::shared_ptr<void> memory_;       // frees the GPU memory after the last tensor using it; empty for from_blob
@@ -101,8 +108,8 @@ private:
     size_t bytes() const;                                               // numel x element_size
     void* element(size_t offset) const;                                 // the address of value `offset`
     static size_t numel_of(const Shape& shape);                         // the shape multiplied
-    static size_t element_size_of(DType dtype);                         // 4, 2, 2 or 4
-    static const char* dtype_name(DType dtype);                         // "float", "half", "bfloat16", "int"
+    static size_t element_size_of(DType dtype);                         // 4, 2, 2, 4 or 1
+    static const char* dtype_name(DType dtype);                         // "float", "half", "bfloat16", "int", "e4m3"
     void check_dim(int d) const;                                        // stops if there is no dim d
     template <typename T> void check_dtype() const;                     // stops if T is not the dtype
 
@@ -197,7 +204,7 @@ inline void* Tensor::data_ptr() const { return data_; }
 
 /// Gives the first value's address as T*; the wrong T stops the program.
 ///
-///   T   float, half, nv_bfloat16 or int: the tensor's dtype
+///   T   float, half, nv_bfloat16, int or __nv_fp8_e4m3: the tensor's dtype
 template <typename T>
 inline T* Tensor::data_ptr() const {
     check_dtype<T>();
@@ -269,9 +276,14 @@ __global__ void tensor_fill_kernel(Word* data, size_t n, Word bits) {
 }
 
 /// Sets every value; a 2-byte dtype gets it rounded: fill_(0.1) is 0.0999756 in a half, 0.100098 in a bfloat16.
+/// Not e4m3: its values need a scale (zero_ works).
 ///
 ///   value   1.5 for floats, 7 for ints
 inline const Tensor& Tensor::fill_(double value) const {
+    if (dtype_ == DType::E4M3) {
+        fprintf(stderr, "error: fill_ on an e4m3 tensor: its values need a scale (the 8-bit kernels write them)\n");
+        exit(EXIT_FAILURE);
+    }
     if (numel_ == 0) return *this;
     unsigned blocks = (unsigned)CEIL_DIV(numel_, 256);
     if (element_size() == 2) {
@@ -303,8 +315,8 @@ inline const Tensor& Tensor::fill_(double value) const {
 ///
 ///   mean, std   normal_(0, 0.02)
 inline const Tensor& Tensor::normal_(float mean, float std) const {
-    if (dtype_ == DType::Int32) {
-        fprintf(stderr, "error: normal_ on an int tensor: it needs float, half or bfloat16\n");
+    if (dtype_ == DType::Int32 || dtype_ == DType::E4M3) {
+        fprintf(stderr, "error: normal_ on a %s tensor: it needs float, half or bfloat16\n", dtype_name(dtype_));
         exit(EXIT_FAILURE);
     }
     std::vector<float> values(numel_);
@@ -351,8 +363,8 @@ inline void tensor_convert(To* to, const void* from, DType from_dtype, size_t n)
         tensor_convert_kernel<<<blocks, 256>>>(to, (const nv_bfloat16*)from, n);
 }
 
-/// Copies other's values in, GPU to GPU: as they are in the same dtype, converted between float dtypes.
-/// Ints copy only into ints.
+/// Copies other's values in, GPU to GPU: as they are in the same dtype, converted between float, half and
+/// bfloat16. Ints copy only into ints, e4m3s only into e4m3s (going to e4m3 needs a scale).
 ///
 ///   other   the same numel; the shape may differ
 inline const Tensor& Tensor::copy_(const Tensor& other) const {
@@ -364,7 +376,7 @@ inline const Tensor& Tensor::copy_(const Tensor& other) const {
         cudaCheck(cudaMemcpy(data_, other.data_, bytes(), cudaMemcpyDeviceToDevice));
         return *this;
     }
-    if (dtype_ == DType::Int32 || other.dtype_ == DType::Int32) {
+    if (dtype_ == DType::Int32 || other.dtype_ == DType::Int32 || dtype_ == DType::E4M3 || other.dtype_ == DType::E4M3) {
         fprintf(stderr, "error: copy_ of a %s tensor into a %s tensor\n", dtype_name(other.dtype_), dtype_name(dtype_));
         exit(EXIT_FAILURE);
     }
@@ -441,6 +453,18 @@ inline T Tensor::item() const {
     return value;
 }
 
+/// Tells if other holds the same values bit for bit, as libtorch's a.equal(b): the same shape and dtype, and the
+/// same bytes. For comparing two runs' results, e4m3 ones too (an e4m3 has no ==). Copies both to the CPU.
+///
+///   other   any tensor
+inline bool Tensor::equal(const Tensor& other) const {
+    if (shape_ != other.shape_ || dtype_ != other.dtype_) return false;
+    std::vector<char> these_bytes(bytes()), other_bytes(other.bytes());
+    cudaCheck(cudaMemcpy(these_bytes.data(), data_, bytes(), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(other_bytes.data(), other.data_, other.bytes(), cudaMemcpyDeviceToHost));
+    return these_bytes == other_bytes;
+}
+
 // ── private helpers ───────────────────────────────────────────────────────────
 
 /// Makes a tensor on memory, working out the strides and numel. Shape {} is 1 value with no dims.
@@ -467,11 +491,15 @@ inline size_t Tensor::numel_of(const Shape& shape) {
 }
 
 inline size_t Tensor::element_size_of(DType dtype) {
-    return dtype == DType::Float16 || dtype == DType::BFloat16 ? 2 : 4;
+    return dtype == DType::E4M3 ? 1 : dtype == DType::Float16 || dtype == DType::BFloat16 ? 2 : 4;
 }
 
 inline const char* Tensor::dtype_name(DType dtype) {
-    return dtype == DType::Float32 ? "float" : dtype == DType::Float16 ? "half" : dtype == DType::BFloat16 ? "bfloat16" : "int";
+    return dtype == DType::Float32    ? "float"
+           : dtype == DType::Float16  ? "half"
+           : dtype == DType::BFloat16 ? "bfloat16"
+           : dtype == DType::E4M3     ? "e4m3"
+                                      : "int";
 }
 
 inline void Tensor::check_dim(int d) const {
@@ -484,12 +512,14 @@ inline void Tensor::check_dim(int d) const {
 template <typename T>
 inline void Tensor::check_dtype() const {
     static_assert(std::is_same<T, float>::value || std::is_same<T, half>::value ||
-                      std::is_same<T, nv_bfloat16>::value || std::is_same<T, int>::value,
-                  "a Tensor holds float, half, nv_bfloat16 or int");
-    DType wanted = std::is_same<T, float>::value         ? DType::Float32
-                   : std::is_same<T, half>::value        ? DType::Float16
-                   : std::is_same<T, nv_bfloat16>::value ? DType::BFloat16
-                                                         : DType::Int32;
+                      std::is_same<T, nv_bfloat16>::value || std::is_same<T, int>::value ||
+                      std::is_same<T, __nv_fp8_e4m3>::value,
+                  "a Tensor holds float, half, nv_bfloat16, int or __nv_fp8_e4m3");
+    DType wanted = std::is_same<T, float>::value           ? DType::Float32
+                   : std::is_same<T, half>::value          ? DType::Float16
+                   : std::is_same<T, nv_bfloat16>::value   ? DType::BFloat16
+                   : std::is_same<T, __nv_fp8_e4m3>::value ? DType::E4M3
+                                                           : DType::Int32;
     if (wanted != dtype_) {
         fprintf(stderr, "error: a %s tensor read or written as %s\n", dtype_name(dtype_), dtype_name(wanted));
         exit(EXIT_FAILURE);

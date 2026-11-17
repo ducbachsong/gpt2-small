@@ -93,7 +93,7 @@ static Tensor ids_of(const Shape &shape_list, const std::vector<int> &ids_list)
     return tensor;
 }
 
-/// wte's 8-bit copy, the tensors encoder_8bit_forward writes it into: {vocab_size, embed_dim / 4} Int32 and
+/// wte's 8-bit copy, the tensors encoder_8bit_forward writes it into: {vocab_size, embed_dim} E4M3 and
 /// {vocab_size} float, made for a wte of `vocab_size_val` rows of `embed_dim_val`.
 struct WteCopy
 {
@@ -103,7 +103,7 @@ struct WteCopy
     size_t embed_dim_val;
 
     WteCopy(size_t vocab_size, size_t embed_dim)
-        : wte_8bit_tensor(Tensor::zeros({vocab_size, embed_dim / ROUND_8BIT_VALUES_PER_INT}, DType::Int32)),
+        : wte_8bit_tensor(Tensor::zeros({vocab_size, embed_dim}, DType::E4M3)),
           wte_scales_tensor(Tensor::zeros({vocab_size})), vocab_size_val(vocab_size), embed_dim_val(embed_dim)
     {
     }
@@ -169,7 +169,7 @@ static void the_copy_is_round_8bit_s(void)
     round_8bit(rounded_val.wte_8bit_tensor, rounded_val.wte_scales_tensor, wte_tensor);
 
     // 3. the same bits
-    ASSERT_EQ(copy_val.wte_8bit_tensor.tolist<int>() == rounded_val.wte_8bit_tensor.tolist<int>(), true);
+    ASSERT_EQ(copy_val.wte_8bit_tensor.equal(rounded_val.wte_8bit_tensor), true);
     ASSERT_EQ(copy_val.wte_scales_tensor.tolist(), rounded_val.wte_scales_tensor.tolist());
 }
 
@@ -380,7 +380,7 @@ static void any_block_size_gives_the_same_bits(void)
         encoder_8bit_forward(encoded_tensor, copy_val.wte_8bit_tensor, copy_val.wte_scales_tensor, token_ids_tensor, wte_tensor,
                              wpe_tensor, threads_per_block_val);
         ASSERT_EQ(floats_of(encoded_tensor), floats_of(usual_encoded_tensor));
-        ASSERT_EQ(copy_val.wte_8bit_tensor.tolist<int>() == usual_copy_val.wte_8bit_tensor.tolist<int>(), true);
+        ASSERT_EQ(copy_val.wte_8bit_tensor.equal(usual_copy_val.wte_8bit_tensor), true);
         ASSERT_EQ(copy_val.wte_scales_tensor.tolist(), usual_copy_val.wte_scales_tensor.tolist());
     }
 }

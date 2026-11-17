@@ -17,7 +17,6 @@
 #define ADAMW_8BIT_THREADS_PER_BLOCK (4 * HARDWARE_THREADS_PER_WARP)             // the default block size: 4 warps; with ADAMW_8BIT_BLOCKS 0.623 ms against 0.652 for one float4 a thread at 8 warps (H100 NVL)
 #define ADAMW_8BIT_BLOCKS 40960                                                  // blocks in the launch, at most: past that each thread takes several float4s
 #define ADAMW_VALUES_PER_SCALE (HARDWARE_THREADS_PER_WARP * VALUES_PER_FLOAT4)   // one scale per warp, a float4 per thread
-#define FP8_PER_INT (sizeof(int) / sizeof(__nv_fp8_e4m3))                        // 8-bit values one int holds, when an Int32 tensor holds them: 4
 
 /// Moves one parameter one AdamW step: clips g, decays p, updates m and v, then steps p against m, scaled by
 /// sqrt(v). Returns the new p; m and v are written back through their pointers.
