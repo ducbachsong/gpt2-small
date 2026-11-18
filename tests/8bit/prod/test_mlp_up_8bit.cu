@@ -70,14 +70,23 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
     return difference_tensor.item<double>() / pytorch_tensor.abs().max().item<double>();
 }
 
-/// Gives a copy's rounded values turned back by PyTorch: each E4M3 (read as float8_e4m3fn) times its row's scale,
-/// exact. {rows, k} float.
-static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scales_tensor)
+/// Gives a copy's rounded values turned back by PyTorch: each E4M3 (read as float8_e4m3fn) times the tensor's one
+/// scale, exact. {rows, k} float.
+static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scale_tensor)
 {
     int64_t rows_val = (int64_t)rounded_tensor.size(0), k_val = (int64_t)rounded_tensor.size(1);
     torch::Tensor e4m3_tensor = torch::from_blob(rounded_tensor.data_ptr(), {rows_val, k_val},
                                                  torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scales_tensor).unsqueeze(1);
+    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scale_tensor);
+}
+
+/// Gives a copy's one scale as a list of every row's, for the general kernel (one scale a row): {rows_val} float, every
+/// value the scale.
+static Tensor scales_list(const Tensor &scale_tensor, size_t rows_val)
+{
+    Tensor scales_tensor = Tensor::zeros({rows_val});
+    scales_tensor.fill_(scale_tensor.tolist<float>()[0]);
+    return scales_tensor;
 }
 
 /// The product's operands, as mlp_up_8bit takes them, for output {rows, columns} with a sum of sum_length, and their copies.
@@ -143,8 +152,9 @@ static void mine(const Outputs &outputs_val, const Operands &operands_val)
 static void reference(const Outputs &outputs_val, const Operands &operands_val, int promotion_steps_val)
 {
     const MlpUp8bitCopies &copies_val = operands_val.copies_val;
-    wgmma_matmul_8bit(outputs_val.output_tensor, copies_val.left_8bit_tensor, copies_val.left_scales_tensor, copies_val.right_8bit_tensor,
-                      copies_val.right_scales_tensor, operands_val.bias_tensor, false, GeluBf16ForwardEpilogue{outputs_val.gelu_output_tensor.data_ptr<nv_bfloat16>()}, promotion_steps_val);
+    wgmma_matmul_8bit(outputs_val.output_tensor, copies_val.left_8bit_tensor,
+                      scales_list(copies_val.left_scale_tensor, copies_val.left_8bit_tensor.size(0)), copies_val.right_8bit_tensor,
+                      scales_list(copies_val.right_scale_tensor, copies_val.right_8bit_tensor.size(0)), operands_val.bias_tensor, false, GeluBf16ForwardEpilogue{outputs_val.gelu_output_tensor.data_ptr<nv_bfloat16>()}, promotion_steps_val);
 }
 
 /// Gives PyTorch's float product of the same rounded values (the copies read back): the output mine must be near
@@ -152,8 +162,8 @@ static void reference(const Outputs &outputs_val, const Operands &operands_val, 
 static torch::Tensor pytorch_on_rounded(const Operands &operands_val)
 {
     const MlpUp8bitCopies &copies_val = operands_val.copies_val;
-    torch::Tensor expected_tensor = turned_back(copies_val.left_8bit_tensor, copies_val.left_scales_tensor)
-                                        .matmul(turned_back(copies_val.right_8bit_tensor, copies_val.right_scales_tensor).t());
+    torch::Tensor expected_tensor = turned_back(copies_val.left_8bit_tensor, copies_val.left_scale_tensor)
+                                        .matmul(turned_back(copies_val.right_8bit_tensor, copies_val.right_scale_tensor).t());
     if (operands_val.bias_tensor.numel() > 0)                                // Tensor(): no bias
         expected_tensor = expected_tensor + pytorch_copy_of(operands_val.bias_tensor);
     return expected_tensor;
@@ -456,21 +466,18 @@ static void pingpong_gives_the_default_bits(void)
 struct Gelu8bitCopies
 {
     Tensor rows_8bit_tensor;          // {rows, columns} E4M3
-    Tensor row_scales_tensor;         // {rows}
     Tensor turned_8bit_tensor;        // {columns, rows} E4M3
-    Tensor turned_scales_tensor;      // {columns}
+    Tensor scale_tensor;       // {1}: both copies' one scale
     Round8bitHistory history_val;     // the place's history: where the delayed scale comes from
 
     Gelu8bitCopies(size_t rows_val, size_t columns_val)
         : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val}, DType::E4M3)),
-          row_scales_tensor(Tensor::zeros({rows_val})),
           turned_8bit_tensor(Tensor::zeros({columns_val, rows_val}, DType::E4M3)),
-          turned_scales_tensor(Tensor::zeros({columns_val}))
+          scale_tensor(Tensor::zeros({1}))
     {
         cudaCheck(cudaMemset(rows_8bit_tensor.data_ptr(), 7, rows_8bit_tensor.numel() * rows_8bit_tensor.element_size()));
         cudaCheck(cudaMemset(turned_8bit_tensor.data_ptr(), 7, turned_8bit_tensor.numel() * turned_8bit_tensor.element_size()));
-        row_scales_tensor.fill_(7.0);
-        turned_scales_tensor.fill_(7.0);
+        scale_tensor.fill_(7.0);
     }
 };
 
@@ -481,9 +488,8 @@ static void gelu_8bit_at(const Tensor &gelu_input_tensor, Gelu8bitCopies &copies
 {
     MlpUp8bitGelu8bit gelu_val;
     gelu_val.rows_8bit_tensor = copies_val.rows_8bit_tensor;
-    gelu_val.row_scales_tensor = copies_val.row_scales_tensor;
     gelu_val.turned_8bit_tensor = copies_val.turned_8bit_tensor;
-    gelu_val.turned_scales_tensor = copies_val.turned_scales_tensor;
+    gelu_val.scale_tensor = copies_val.scale_tensor;
     gelu_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
     if (!round_8bit_delayed_largest(copies_val.history_val, gelu_val.scale_largest_ptr, gelu_val.next_largest_ptr))
     {
@@ -500,15 +506,14 @@ static bool same_gelu_8bit_bits(const Gelu8bitCopies &first_val, const Gelu8bitC
 {
     return bytes_of(first_val.rows_8bit_tensor) == bytes_of(second_val.rows_8bit_tensor) &&
            bytes_of(first_val.turned_8bit_tensor) == bytes_of(second_val.turned_8bit_tensor) &&
-           bytes_of(first_val.row_scales_tensor) == bytes_of(second_val.row_scales_tensor) &&
-           bytes_of(first_val.turned_scales_tensor) == bytes_of(second_val.turned_scales_tensor) &&
+           bytes_of(first_val.scale_tensor) == bytes_of(second_val.scale_tensor) &&
            bytes_of(first_val.history_val.largest_tensor) == bytes_of(second_val.history_val.largest_tensor);
 }
 
 static void gelu_8bit_gives_round_8bit_per_tensors_bits(void)
 {
     // Expect: at GPT-2's size and at sizes no square divides, at this file's setting, mlp_up_8bit_gelu_8bit writes
-    // gelu_input with the bits mlp_up_8bit writes, and gelu_output's two 8-bit copies, their scales lists and the
+    // gelu_input with the bits mlp_up_8bit writes, and gelu_output's two 8-bit copies, their one scale and the
     // history's next largest with the bits round_8bit_per_tensor gives from mlp_up_8bit's bfloat16 gelu_output at the
     // same delayed scale (the tensor's largest of the call before, x 2): each value is GELU rounded to bfloat16,
     // divided by the same power of 2 and rounded to E4M3 the same way. So the model trains as it did with a bfloat16
@@ -523,15 +528,15 @@ static void gelu_8bit_gives_round_8bit_per_tensors_bits(void)
         Outputs outputs_val = fresh_outputs(operands_val, rows_val, columns_val);
         mine(outputs_val, operands_val);
         Gelu8bitCopies reference_val(rows_val, columns_val);
-        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.row_scales_tensor, reference_val.turned_8bit_tensor,
-                              reference_val.turned_scales_tensor, outputs_val.gelu_output_tensor, &reference_val.history_val);
-        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.row_scales_tensor, reference_val.turned_8bit_tensor,
-                              reference_val.turned_scales_tensor, outputs_val.gelu_output_tensor, &reference_val.history_val);
+        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.turned_8bit_tensor, reference_val.scale_tensor,
+                              outputs_val.gelu_output_tensor, &reference_val.history_val);
+        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.turned_8bit_tensor, reference_val.scale_tensor,
+                              outputs_val.gelu_output_tensor, &reference_val.history_val);
         // 2. mine: a history with the same first call, then mlp_up_8bit_gelu_8bit into fresh copies
         Gelu8bitCopies mine_val(rows_val, columns_val);
         Gelu8bitCopies first_call_val(rows_val, columns_val);
-        round_8bit_per_tensor(first_call_val.rows_8bit_tensor, first_call_val.row_scales_tensor, first_call_val.turned_8bit_tensor,
-                              first_call_val.turned_scales_tensor, outputs_val.gelu_output_tensor, &mine_val.history_val);
+        round_8bit_per_tensor(first_call_val.rows_8bit_tensor, first_call_val.turned_8bit_tensor, first_call_val.scale_tensor,
+                              outputs_val.gelu_output_tensor, &mine_val.history_val);
         Tensor gelu_input_tensor = Tensor::zeros({rows_val, columns_val}, DType::BFloat16);
         gelu_input_tensor.fill_(7.0);
         gelu_8bit_at<MLP_UP_8BIT_ROW_GROUPS, MLP_UP_8BIT_COLUMNS, MLP_UP_8BIT_STAGES, MLP_UP_8BIT_PINGPONG>(gelu_input_tensor, mine_val, operands_val);
@@ -564,7 +569,7 @@ static const Gelu8bitSquare GELU_8BIT_SQUARES_LIST[] = {
 static void gelu_8bit_at_every_square_gives_the_default_bits(void)
 {
     // Expect: output {ODD_ROWS, ODD_COLUMNS} with a sum of ODD_SUM_LENGTH: with gelu_output in 8 bits, every square
-    // (cooperative and ping-pong, 128 and 256 columns) gives the bits of this file's setting, its two copies, scales
+    // (cooperative and ping-pong, 128 and 256 columns) gives the bits of this file's setting, its two copies, scale
     // and next largest: who writes a value's byte, into which half of which room, changes; never the byte.
     print_test_name(__func__);
     Operands operands_val = random_operands(ODD_ROWS, ODD_COLUMNS, ODD_SUM_LENGTH, 9);
@@ -573,8 +578,8 @@ static void gelu_8bit_at_every_square_gives_the_default_bits(void)
     // every run's history: the same exact first call
     auto fresh_copies_val = [&](Gelu8bitCopies &copies_val) {
         Gelu8bitCopies first_call_val(ODD_ROWS, ODD_COLUMNS);
-        round_8bit_per_tensor(first_call_val.rows_8bit_tensor, first_call_val.row_scales_tensor, first_call_val.turned_8bit_tensor,
-                              first_call_val.turned_scales_tensor, outputs_val.gelu_output_tensor, &copies_val.history_val);
+        round_8bit_per_tensor(first_call_val.rows_8bit_tensor, first_call_val.turned_8bit_tensor, first_call_val.scale_tensor,
+                              outputs_val.gelu_output_tensor, &copies_val.history_val);
     };
     Tensor gelu_input_tensor = Tensor::zeros({ODD_ROWS, ODD_COLUMNS}, DType::BFloat16);
     Gelu8bitCopies default_val(ODD_ROWS, ODD_COLUMNS);

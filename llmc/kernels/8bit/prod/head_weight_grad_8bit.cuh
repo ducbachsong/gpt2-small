@@ -9,7 +9,7 @@
 //     input         bfloat16                           {rows, in_features}                    rounded to E4M3 turned: {in, rows} (right)
 //     weight_grad   bfloat16                           {out_features, in_features}            added onto, by TMA
 //     split sums    float                              {splits, out_features, in_features}    scratch, only when split
-//     the copies    E4M3, a float scale per row        HeadWeightGrad8bitCopies's: left {rows, k},            round_8bit writes, TMA reads
+//     the copies    E4M3, one float scale each         HeadWeightGrad8bitCopies's: left {rows, k},            round_8bit_per_tensor writes, TMA reads
 //                                                      right {columns, k}
 //     sums          float                              in registers                           the tensor cores' C
 //
@@ -47,7 +47,7 @@
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../../cuda_common.h"       // cudaCheck, check_threads_per_block, the HARDWARE_ numbers
 #include "../../../common/tensor.cuh"
-#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit_per_tensor, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // the setting: tune_head_weight_grad_8bit sweeps each and prints the fastest
 #define HEAD_WEIGHT_GRAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
@@ -439,21 +439,21 @@ inline void head_weight_grad_8bit_check_tensor(const char* caller_ptr, const cha
 }
 
 /// The 8-bit copies of the product's two sides: left {rows, k} and right {columns, k}, each E4M3
-/// with one float scale per row, as round_8bit writes them and the product reads them. Made once for a size, used
+/// with one float scale for the whole side, as round_8bit_per_tensor writes them and the product reads them. Made once for a size, used
 /// by every call.
 struct HeadWeightGrad8bitCopies {
     Tensor left_8bit_tensor;             // {rows, k} E4M3
-    Tensor left_scales_tensor;           // {rows} float
+    Tensor left_scale_tensor;            // {1} float: every value's scale
     Tensor right_8bit_tensor;            // {columns, k} E4M3
-    Tensor right_scales_tensor;          // {columns} float
+    Tensor right_scale_tensor;           // {1} float: every value's scale
 
     HeadWeightGrad8bitCopies() = default;
     /// Makes the copies, all 0, for output {rows, columns} with a sum of k (a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE).
     HeadWeightGrad8bitCopies(size_t rows_val, size_t columns_val, size_t k_val)
         : left_8bit_tensor(Tensor::zeros({rows_val, k_val}, DType::E4M3)),
-          left_scales_tensor(Tensor::zeros({rows_val})),
+          left_scale_tensor(Tensor::zeros({1})),
           right_8bit_tensor(Tensor::zeros({columns_val, k_val}, DType::E4M3)),
-          right_scales_tensor(Tensor::zeros({columns_val})) {}
+          right_scale_tensor(Tensor::zeros({1})) {}
 };
 
 // ── the product ───────────────────────────────────────────────────────────────
@@ -484,11 +484,11 @@ template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT = fal
           int IN_FLIGHT = HEAD_WEIGHT_GRAD_8BIT_IN_FLIGHT, int PROMOTION_STEPS = HEAD_WEIGHT_GRAD_8BIT_PROMOTION_STEPS, int STAGED_ROWS = 0, int STAGED_ROW_PADDING = 0>
 __global__ void head_weight_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                            const __grid_constant__ CUtensorMap output_map_val,
-                           const float* left_scales_ptr, const float* right_scales_ptr,
+                           const float* left_scale_ptr, const float* right_scale_ptr,
                            float* split_sums_ptr, int splits_val,
                            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val);
-__global__ void head_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_ptr, const float* split_sums_ptr, const float* left_scales_ptr,
-                                      const float* right_scales_ptr, size_t rows_val, size_t columns_val, int splits_val);
+__global__ void head_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_ptr, const float* split_sums_ptr, const float* left_scale_ptr,
+                                      const float* right_scale_ptr, size_t rows_val, size_t columns_val, int splits_val);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
 
@@ -517,7 +517,7 @@ inline void head_weight_grad_8bit_rounded(const Tensor& weight_grad_tensor, cons
                                                                          HEAD_WEIGHT_GRAD_8BIT_SPLITS, HEAD_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_WEIGHT_GRAD_8BIT_BLOCKS);
 }
 
-/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale per row (round_8bit): output_grad {rows, out} turned to {out, rows}, input {rows, in} turned to {in, rows}.
+/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale for each side (round_8bit_per_tensor): output_grad {rows, out} turned to {out, rows}, input {rows, in} turned to {in, rows}.
 ///
 ///   copies_val           HeadWeightGrad8bitCopies: written
 ///   output_grad_tensor   {..., out_features} bfloat16
@@ -531,14 +531,14 @@ inline void head_weight_grad_8bit_round(const HeadWeightGrad8bitCopies& copies_v
         k_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 ||
         copies_val.left_8bit_tensor.shape() != Shape({rows_val, k_val}) ||
         copies_val.right_8bit_tensor.shape() != Shape({columns_val, k_val}) ||
-        copies_val.left_scales_tensor.shape() != Shape({rows_val}) || copies_val.right_scales_tensor.shape() != Shape({columns_val})) {
+        copies_val.left_scale_tensor.numel() != 1 || copies_val.right_scale_tensor.numel() != 1) {
         fprintf(stderr, "error: head_weight_grad_8bit needs rows, columns and k multiples of %d and its copies made with HeadWeightGrad8bitCopies(rows, columns, k): "
                         "got %zu, %zu, %zu\n", ROUND_8BIT_ROW_LENGTH_MULTIPLE, rows_val, columns_val, k_val);
         exit(EXIT_FAILURE);
     }
     // 2. the copies
-    round_8bit(copies_val.left_8bit_tensor, copies_val.left_scales_tensor, output_grad_tensor, true);
-    round_8bit(copies_val.right_8bit_tensor, copies_val.right_scales_tensor, input_tensor, true);
+    round_8bit_per_tensor(Tensor(), copies_val.left_8bit_tensor, copies_val.left_scale_tensor, output_grad_tensor);
+    round_8bit_per_tensor(Tensor(), copies_val.right_8bit_tensor, copies_val.right_scale_tensor, input_tensor);
 }
 
 /// Works out the product from the copies at a setting given: checks, describes the tiles for TMA, then launches
@@ -565,7 +565,7 @@ inline void head_weight_grad_8bit_rounded_at(const Tensor& weight_grad_tensor, c
     static_assert(CLUSTER >= 1 && CLUSTER <= HEAD_WEIGHT_GRAD_8BIT_MAX_CLUSTER, "CLUSTER is 1 to HEAD_WEIGHT_GRAD_8BIT_MAX_CLUSTER");
     static_assert(PROMOTION_STEPS >= 0, "PROMOTION_STEPS is 0 (never) or more");
     // 1. the sizes, from the copies; the tensors written: bfloat16, rows of whole 16-byte cells, the shapes
-    size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
+    size_t rows_val = copies_val.left_8bit_tensor.size(0), columns_val = copies_val.right_8bit_tensor.size(0);
     size_t sum_length_val = copies_val.left_8bit_tensor.size(1);
     head_weight_grad_8bit_check_tensor("head_weight_grad_8bit", "weight_grad", weight_grad_tensor);
     if (!(weight_grad_tensor.numel() == rows_val * columns_val && weight_grad_tensor.size(weight_grad_tensor.dim() - 1) == columns_val)) {
@@ -609,11 +609,11 @@ inline void head_weight_grad_8bit_rounded_at(const Tensor& weight_grad_tensor, c
         if (total_clusters_val < 1) total_clusters_val = 1;
         if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
         unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
-        const float* left_scales_ptr = copies_val.left_scales_tensor.data();
-        const float* right_scales_ptr = copies_val.right_scales_tensor.data();
+        const float* left_scale_ptr = copies_val.left_scale_tensor.data();
+        const float* right_scale_ptr = copies_val.right_scale_tensor.data();
         if (CLUSTER == 1) {
             kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val,
-                                                                    left_scales_ptr, right_scales_ptr,
+                                                                    left_scale_ptr, right_scale_ptr,
                                                                     split_sums_ptr, launch_splits_val,
                                                                     (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val);
             cudaCheck(cudaGetLastError());
@@ -630,7 +630,7 @@ inline void head_weight_grad_8bit_rounded_at(const Tensor& weight_grad_tensor, c
             config_val.attrs = attributes_list;
             config_val.numAttrs = 1;
             cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val,
-                                         left_scales_ptr, right_scales_ptr,
+                                         left_scale_ptr, right_scale_ptr,
                                          split_sums_ptr, launch_splits_val,
                                          (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val));
         }
@@ -645,8 +645,8 @@ inline void head_weight_grad_8bit_rounded_at(const Tensor& weight_grad_tensor, c
         check_threads_per_block(sum_threads_per_block_val, "head_weight_grad_8bit_splits_sum_kernel");
         size_t total_stores_val = rows_val * columns_val / HEAD_WEIGHT_GRAD_8BIT_STORE_VALUES;
         head_weight_grad_8bit_splits_sum_kernel<<<(unsigned)CEIL_DIV(total_stores_val, (size_t)sum_threads_per_block_val), sum_threads_per_block_val>>>(
-            weight_grad_tensor.data_ptr<nv_bfloat16>(), split_sums_tensor.data(), copies_val.left_scales_tensor.data(),
-            copies_val.right_scales_tensor.data(), rows_val, columns_val, splits_val);
+            weight_grad_tensor.data_ptr<nv_bfloat16>(), split_sums_tensor.data(), copies_val.left_scale_tensor.data(),
+            copies_val.right_scale_tensor.data(), rows_val, columns_val, splits_val);
         cudaCheck(cudaGetLastError());
     } else {
         launch_val(std::false_type(), nullptr, 1);
@@ -741,7 +741,7 @@ inline int head_weight_grad_8bit_blocks_at_once() {
 ///
 ///   left_map_val, right_map_val          TMA's descriptions of the copies' tiles
 ///   output_map_val                       ... and the output's
-///   left_scales_ptr, right_scales_ptr    the copies' scales: {rows}, {columns}
+///   left_scale_ptr, right_scale_ptr    the copies' scales: one float each
 ///   split_sums_ptr, splits_val           SPLIT: the scratch {splits, rows, columns} and the splits; otherwise nullptr, 1
 ///   rows_val, columns_val, sum_length_val   the product's sizes
 ///   block_rows_per_group_val             the squares' order: rows of units a group runs down
@@ -750,7 +750,7 @@ template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int 
 __global__ void __launch_bounds__((HEAD_WEIGHT_GRAD_8BIT_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 head_weight_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
            const __grid_constant__ CUtensorMap output_map_val,
-           const float* left_scales_ptr, const float* right_scales_ptr,
+           const float* left_scale_ptr, const float* right_scale_ptr,
            float* split_sums_ptr, int splits_val,
            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val) {
     // (the kernel's own numbers below)
@@ -1020,18 +1020,11 @@ head_weight_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, c
             //    added onto the old value there, rounded once
             //    ; then TMA stores the room
             auto write_room_val = [&](auto what_val) {
-                float left_scales_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
-#pragma unroll
-                for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
-                    int row_index_val = group_first_row_index_val + thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                    left_scales_list[thread_row_index_val] = row_index_val < rows_val ? left_scales_ptr[row_index_val] : 0.0f;
-                }
+                float left_scale_val = *left_scale_ptr, right_scale_val = *right_scale_ptr;   // one each: every value's
 #pragma unroll
                 for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
                     int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
                     int column_index_val = block_first_column_index_val + column_in_square_val;
-                    float2 right_scales_val = column_index_val < columns_val ? *reinterpret_cast<const float2*>(right_scales_ptr + column_index_val)
-                                                                             : make_float2(0.0f, 0.0f);
                     int box_index_val = column_in_square_val / HEAD_WEIGHT_GRAD_8BIT_ROW_VALUES;
                     int column_in_box_val = column_in_square_val % HEAD_WEIGHT_GRAD_8BIT_ROW_VALUES;
                     int cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL;
@@ -1043,12 +1036,11 @@ head_weight_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, c
                         nv_bfloat162* room_pair_ptr = reinterpret_cast<nv_bfloat162*>(
                             room_ptr + box_index_val * HEAD_WEIGHT_GRAD_8BIT_STORE_BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
                             swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val);
-                        float left_scale_val = left_scales_list[thread_row_index_val];
                         // wgmma_matmul_8bit's order: sum x left scale x right scale (+ bias)
                         float2 pair_val = make_float2(
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scales_val.x
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scale_val
                             ,
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scales_val.y
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scale_val
                         );
                         float2 result_val = what_val(pair_val, room_pair_ptr);
                         *room_pair_ptr = __floats2bfloat162_rn(result_val.x, result_val.y);
@@ -1090,11 +1082,11 @@ head_weight_grad_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, c
 ///
 ///   output_ptr                          weight_grad {rows, columns}: added onto
 ///   split_sums_ptr                      {splits, rows, columns} float: each split's sums
-///   left_scales_ptr, right_scales_ptr   the copies' scales: {rows}, {columns}
+///   left_scale_ptr, right_scale_ptr   the copies' scales: one float each
 ///   rows_val, columns_val               weight_grad's shape (columns a multiple of HEAD_WEIGHT_GRAD_8BIT_STORE_VALUES)
 ///   splits_val                          the slices
-__global__ void head_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_ptr, const float* split_sums_ptr, const float* left_scales_ptr,
-                                      const float* right_scales_ptr, size_t rows_val, size_t columns_val, int splits_val) {
+__global__ void head_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_ptr, const float* split_sums_ptr, const float* left_scale_ptr,
+                                      const float* right_scale_ptr, size_t rows_val, size_t columns_val, int splits_val) {
     size_t output_index_val = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * HEAD_WEIGHT_GRAD_8BIT_STORE_VALUES;
     if (output_index_val >= rows_val * columns_val) return;
     // 1. the splits' sums, in order
@@ -1105,14 +1097,13 @@ __global__ void head_weight_grad_8bit_splits_sum_kernel(nv_bfloat16* output_ptr,
         sum_val = make_float4(sum_val.x + split_val.x, sum_val.y + split_val.y, sum_val.z + split_val.z, sum_val.w + split_val.w);
     }
     // 2. times both scales, + weight_grad, rounded once, one 8-byte store
-    float left_scale_val = left_scales_ptr[output_index_val / columns_val];
-    float4 right_scales_val = *reinterpret_cast<const float4*>(right_scales_ptr + output_index_val % columns_val);
+    float left_scale_val = *left_scale_ptr, right_scale_val = *right_scale_ptr;   // one each: every value's
     nv_bfloat162* output_pairs_ptr = reinterpret_cast<nv_bfloat162*>(output_ptr + output_index_val);
     float2 first_old_val = __bfloat1622float2(output_pairs_ptr[0]);
     float2 second_old_val = __bfloat1622float2(output_pairs_ptr[1]);
     nv_bfloat162 pairs_list[2] = {
-        __floats2bfloat162_rn(sum_val.x * left_scale_val * right_scales_val.x + first_old_val.x, sum_val.y * left_scale_val * right_scales_val.y + first_old_val.y),
-        __floats2bfloat162_rn(sum_val.z * left_scale_val * right_scales_val.z + second_old_val.x, sum_val.w * left_scale_val * right_scales_val.w + second_old_val.y)};
+        __floats2bfloat162_rn(sum_val.x * left_scale_val * right_scale_val + first_old_val.x, sum_val.y * left_scale_val * right_scale_val + first_old_val.y),
+        __floats2bfloat162_rn(sum_val.z * left_scale_val * right_scale_val + second_old_val.x, sum_val.w * left_scale_val * right_scale_val + second_old_val.y)};
     *reinterpret_cast<uint2*>(output_pairs_ptr) = *reinterpret_cast<const uint2*>(pairs_list);
 }
 

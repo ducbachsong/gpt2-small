@@ -378,23 +378,21 @@ static void time_gelu_8bit_against_bf16_and_rounding(const Product &product_val)
     // write of 2 bytes a value, then a read of them and 2 bytes written), the rounding pass alone, and
     // mlp_up_8bit_gelu_8bit writing both copies itself (2 bytes a value written, nothing read back).
     Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS}, DType::E4M3);
-    Tensor row_scales_tensor = Tensor::zeros({ROWS});
     Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS}, DType::E4M3);
-    Tensor turned_scales_tensor = Tensor::zeros({COLUMNS});
+    Tensor scale_tensor = Tensor::zeros({1});
     Round8bitHistory bf16_history_val, gelu_8bit_history_val;
     mlp_up_8bit_rounded(product_val.output_tensor, product_val.gelu_output_tensor, product_val.bias_tensor, product_val.copies_val);
     for (Round8bitHistory *history_ptr : {&bf16_history_val, &gelu_8bit_history_val})   // the first call, exact: the histories started
-        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.gelu_output_tensor, history_ptr);
+        round_8bit_per_tensor(rows_8bit_tensor, turned_8bit_tensor, scale_tensor, product_val.gelu_output_tensor, history_ptr);
     auto round_val = [&] {
-        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.gelu_output_tensor,
+        round_8bit_per_tensor(rows_8bit_tensor, turned_8bit_tensor, scale_tensor, product_val.gelu_output_tensor,
                               &bf16_history_val);
     };
     auto gelu_8bit_val = [&] {
         MlpUp8bitGelu8bit gelu_val;
         gelu_val.rows_8bit_tensor = rows_8bit_tensor;
-        gelu_val.row_scales_tensor = row_scales_tensor;
         gelu_val.turned_8bit_tensor = turned_8bit_tensor;
-        gelu_val.turned_scales_tensor = turned_scales_tensor;
+        gelu_val.scale_tensor = scale_tensor;
         gelu_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
         round_8bit_delayed_largest(gelu_8bit_history_val, gelu_val.scale_largest_ptr, gelu_val.next_largest_ptr);
         mlp_up_8bit_gelu_8bit(product_val.output_tensor, gelu_val, product_val.bias_tensor, product_val.copies_val);

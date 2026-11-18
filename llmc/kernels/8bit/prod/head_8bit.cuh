@@ -8,7 +8,7 @@
 //     input         bfloat16                           {rows, in_features}                    rounded to E4M3 (left)
 //     weight        bfloat16                           {out_features, in_features}            rounded to E4M3 (right)
 //     output        bfloat16                           {rows, out_features}                   written by TMA
-//     the copies    E4M3, a float scale per row        Head8bitCopies's: left {rows, k},            round_8bit writes, TMA reads
+//     the copies    E4M3, one float scale each         Head8bitCopies's: left {rows, k},            round_8bit_per_tensor writes, TMA reads
 //                                                      right {columns, k}
 //     sums          float                              in registers                           the tensor cores' C
 //
@@ -41,7 +41,7 @@
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../../cuda_common.h"       // cudaCheck, check_threads_per_block, the HARDWARE_ numbers
 #include "../../../common/tensor.cuh"
-#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit_per_tensor, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // the setting: tune_head_8bit sweeps each and prints the fastest
 #define HEAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
@@ -426,21 +426,21 @@ inline void head_8bit_check_tensor(const char* caller_ptr, const char* name_ptr,
 }
 
 /// The 8-bit copies of the product's two sides: left {rows, k} and right {columns, k}, each E4M3
-/// with one float scale per row, as round_8bit writes them and the product reads them. Made once for a size, used
+/// with one float scale for the whole side, as round_8bit_per_tensor writes them and the product reads them. Made once for a size, used
 /// by every call.
 struct Head8bitCopies {
     Tensor left_8bit_tensor;             // {rows, k} E4M3
-    Tensor left_scales_tensor;           // {rows} float
+    Tensor left_scale_tensor;            // {1} float: every value's scale
     Tensor right_8bit_tensor;            // {columns, k} E4M3
-    Tensor right_scales_tensor;          // {columns} float
+    Tensor right_scale_tensor;           // {1} float: every value's scale
 
     Head8bitCopies() = default;
     /// Makes the copies, all 0, for output {rows, columns} with a sum of k (a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE).
     Head8bitCopies(size_t rows_val, size_t columns_val, size_t k_val)
         : left_8bit_tensor(Tensor::zeros({rows_val, k_val}, DType::E4M3)),
-          left_scales_tensor(Tensor::zeros({rows_val})),
+          left_scale_tensor(Tensor::zeros({1})),
           right_8bit_tensor(Tensor::zeros({columns_val, k_val}, DType::E4M3)),
-          right_scales_tensor(Tensor::zeros({columns_val})) {}
+          right_scale_tensor(Tensor::zeros({1})) {}
 };
 
 // ── the product ───────────────────────────────────────────────────────────────
@@ -466,7 +466,7 @@ template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT = fal
           int IN_FLIGHT = HEAD_8BIT_IN_FLIGHT, int PROMOTION_STEPS = HEAD_8BIT_PROMOTION_STEPS, int STAGED_ROWS = 0, int STAGED_ROW_PADDING = 0>
 __global__ void head_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
                            const __grid_constant__ CUtensorMap output_map_val,
-                           const float* left_scales_ptr, const float* right_scales_ptr,
+                           const float* left_scale_ptr, const float* right_scale_ptr,
                            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
@@ -496,7 +496,7 @@ inline void head_8bit_rounded(const Tensor& output_tensor, const Head8bitCopies&
                                                                          HEAD_8BIT_BLOCK_ROWS_PER_GROUP, HEAD_8BIT_BLOCKS);
 }
 
-/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale per row (round_8bit): input {rows, in} and weight {out, in}, both as they sit.
+/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale for each side (round_8bit_per_tensor): input {rows, in} and weight {out, in}, both as they sit.
 ///
 ///   copies_val           Head8bitCopies: written
 ///   input_tensor         {..., in_features} bfloat16
@@ -509,14 +509,14 @@ inline void head_8bit_round(const Head8bitCopies& copies_val, const Tensor& inpu
         k_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 ||
         copies_val.left_8bit_tensor.shape() != Shape({rows_val, k_val}) ||
         copies_val.right_8bit_tensor.shape() != Shape({columns_val, k_val}) ||
-        copies_val.left_scales_tensor.shape() != Shape({rows_val}) || copies_val.right_scales_tensor.shape() != Shape({columns_val})) {
+        copies_val.left_scale_tensor.numel() != 1 || copies_val.right_scale_tensor.numel() != 1) {
         fprintf(stderr, "error: head_8bit needs rows, columns and k multiples of %d and its copies made with Head8bitCopies(rows, columns, k): "
                         "got %zu, %zu, %zu\n", ROUND_8BIT_ROW_LENGTH_MULTIPLE, rows_val, columns_val, k_val);
         exit(EXIT_FAILURE);
     }
     // 2. the copies
-    round_8bit(copies_val.left_8bit_tensor, copies_val.left_scales_tensor, input_tensor, false);
-    round_8bit(copies_val.right_8bit_tensor, copies_val.right_scales_tensor, weight_tensor, false);
+    round_8bit_per_tensor(copies_val.left_8bit_tensor, Tensor(), copies_val.left_scale_tensor, input_tensor);
+    round_8bit_per_tensor(copies_val.right_8bit_tensor, Tensor(), copies_val.right_scale_tensor, weight_tensor);
 }
 
 /// Works out the product from the copies at a setting given: checks, describes the tiles for TMA, then launches
@@ -539,7 +539,7 @@ inline void head_8bit_rounded_at(const Tensor& output_tensor, const Head8bitCopi
     static_assert(CLUSTER >= 1 && CLUSTER <= HEAD_8BIT_MAX_CLUSTER, "CLUSTER is 1 to HEAD_8BIT_MAX_CLUSTER");
     static_assert(PROMOTION_STEPS >= 0, "PROMOTION_STEPS is 0 (never) or more");
     // 1. the sizes, from the copies; the tensors written: bfloat16, rows of whole 16-byte cells, the shapes
-    size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
+    size_t rows_val = copies_val.left_8bit_tensor.size(0), columns_val = copies_val.right_8bit_tensor.size(0);
     size_t sum_length_val = copies_val.left_8bit_tensor.size(1);
     head_8bit_check_tensor("head_8bit", "output", output_tensor);
     if (!(output_tensor.numel() == rows_val * columns_val && output_tensor.size(output_tensor.dim() - 1) == columns_val)) {
@@ -577,11 +577,11 @@ inline void head_8bit_rounded_at(const Tensor& output_tensor, const Head8bitCopi
         if (total_clusters_val < 1) total_clusters_val = 1;
         if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
         unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
-        const float* left_scales_ptr = copies_val.left_scales_tensor.data();
-        const float* right_scales_ptr = copies_val.right_scales_tensor.data();
+        const float* left_scale_ptr = copies_val.left_scale_tensor.data();
+        const float* right_scale_ptr = copies_val.right_scale_tensor.data();
         if (CLUSTER == 1) {
             kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val,
-                                                                    left_scales_ptr, right_scales_ptr,
+                                                                    left_scale_ptr, right_scale_ptr,
                                                                     (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val);
             cudaCheck(cudaGetLastError());
         } else {
@@ -597,7 +597,7 @@ inline void head_8bit_rounded_at(const Tensor& output_tensor, const Head8bitCopi
             config_val.attrs = attributes_list;
             config_val.numAttrs = 1;
             cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val,
-                                         left_scales_ptr, right_scales_ptr,
+                                         left_scale_ptr, right_scale_ptr,
                                          (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val));
         }
     }
@@ -651,7 +651,7 @@ inline int head_8bit_blocks_at_once() {
 ///
 ///   left_map_val, right_map_val          TMA's descriptions of the copies' tiles
 ///   output_map_val                       ... and the output's
-///   left_scales_ptr, right_scales_ptr    the copies' scales: {rows}, {columns}
+///   left_scale_ptr, right_scale_ptr    the copies' scales: one float each
 ///   rows_val, columns_val, sum_length_val   the product's sizes
 ///   block_rows_per_group_val             the squares' order: rows of units a group runs down
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS,
@@ -659,7 +659,7 @@ template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int 
 __global__ void __launch_bounds__((HEAD_8BIT_PRODUCER_WARPGROUPS + ROW_GROUPS) * HARDWARE_WARPGROUP_THREADS)
 head_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_constant__ CUtensorMap right_map_val,
            const __grid_constant__ CUtensorMap output_map_val,
-           const float* left_scales_ptr, const float* right_scales_ptr,
+           const float* left_scale_ptr, const float* right_scale_ptr,
            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val) {
     constexpr int splits_val = 1;                                                                           // never split
     constexpr int COLUMN_GROUPS = COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS;                                   // groups of 8 across the square
@@ -873,18 +873,11 @@ head_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_
             //    of row r at c XOR r % 8, as TMA's 128-byte swizzle has it)
             //    ; then TMA stores the room
             auto write_room_val = [&](auto what_val) {
-                float left_scales_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
-#pragma unroll
-                for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
-                    int row_index_val = group_first_row_index_val + thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                    left_scales_list[thread_row_index_val] = row_index_val < rows_val ? left_scales_ptr[row_index_val] : 0.0f;
-                }
+                float left_scale_val = *left_scale_ptr, right_scale_val = *right_scale_ptr;   // one each: every value's
 #pragma unroll
                 for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
                     int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
                     int column_index_val = block_first_column_index_val + column_in_square_val;
-                    float2 right_scales_val = column_index_val < columns_val ? *reinterpret_cast<const float2*>(right_scales_ptr + column_index_val)
-                                                                             : make_float2(0.0f, 0.0f);
                     int box_index_val = column_in_square_val / HEAD_8BIT_ROW_VALUES;
                     int column_in_box_val = column_in_square_val % HEAD_8BIT_ROW_VALUES;
                     int cell_val = column_in_box_val * (int)sizeof(nv_bfloat16) / HARDWARE_TMA_BYTES_PER_CELL;
@@ -896,12 +889,11 @@ head_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __grid_
                         nv_bfloat162* room_pair_ptr = reinterpret_cast<nv_bfloat162*>(
                             room_ptr + box_index_val * HEAD_8BIT_STORE_BOX_BYTES + row_in_group_val * HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW +
                             swizzled_cell_val * HARDWARE_TMA_BYTES_PER_CELL + byte_in_cell_val);
-                        float left_scale_val = left_scales_list[thread_row_index_val];
                         // wgmma_matmul_8bit's order: sum x left scale x right scale (+ bias)
                         float2 pair_val = make_float2(
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scales_val.x
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scale_val
                             ,
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scales_val.y
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scale_val
                         );
                         float2 result_val = what_val(pair_val, room_pair_ptr);
                         *room_pair_ptr = __floats2bfloat162_rn(result_val.x, result_val.y);

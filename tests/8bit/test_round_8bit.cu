@@ -239,31 +239,28 @@ static void rows_and_columns_give_the_bits_of_both_roundings_with_sizes_no_tile_
 struct PerTensorCopies
 {
     Tensor rows_8bit_tensor;           // {rows, columns} E4M3
-    Tensor row_scales_tensor;          // {rows}
     Tensor columns_8bit_tensor;        // {columns, rows} E4M3
-    Tensor column_scales_tensor;       // {columns}
+    Tensor scale_tensor;               // {1}: both copies' one scale
     size_t rows_val;
     size_t columns_val;
 
     PerTensorCopies(size_t rows_val, size_t columns_val)
         : rows_8bit_tensor(Tensor::zeros({rows_val, columns_val}, DType::E4M3)),
-          row_scales_tensor(Tensor::zeros({rows_val})),
           columns_8bit_tensor(Tensor::zeros({columns_val, rows_val}, DType::E4M3)),
-          column_scales_tensor(Tensor::zeros({columns_val})), rows_val(rows_val), columns_val(columns_val) {}
+          scale_tensor(Tensor::zeros({1})), rows_val(rows_val), columns_val(columns_val) {}
 
     /// Rounds values into both copies by round_8bit_per_tensor.
     void round(const Tensor &values_tensor, const Round8bitHistory *history_ptr = nullptr, bool same_input_val = false)
     {
-        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, values_tensor, history_ptr,
-                              same_input_val);
+        round_8bit_per_tensor(rows_8bit_tensor, columns_8bit_tensor, scale_tensor, values_tensor, history_ptr, same_input_val);
     }
 
-    /// Gives the row copy turned back by PyTorch (each E4M3 as float8_e4m3fn, times its row's scale): {rows, columns}.
+    /// Gives the row copy turned back by PyTorch (each E4M3 as float8_e4m3fn, times the one scale): {rows, columns}.
     torch::Tensor rows_turned_back() const
     {
         torch::Tensor e4m3_tensor = torch::from_blob(rows_8bit_tensor.data_ptr(), {(int64_t)rows_val, (int64_t)columns_val},
                                                      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-        return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(row_scales_tensor).unsqueeze(1);
+        return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scale_tensor);
     }
 
     /// Gives the turned copy turned back by PyTorch, and turned round again: {rows, columns}.
@@ -271,7 +268,7 @@ struct PerTensorCopies
     {
         torch::Tensor e4m3_tensor = torch::from_blob(columns_8bit_tensor.data_ptr(), {(int64_t)columns_val, (int64_t)rows_val},
                                                      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-        return (e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(column_scales_tensor).unsqueeze(1)).t();
+        return (e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scale_tensor)).t();
     }
 };
 
@@ -281,22 +278,21 @@ static double scale_of(double largest_val)
     return std::exp2(std::ceil(std::log2(largest_val / HARDWARE_E4M3_LARGEST)));
 }
 
-/// Checks both of copies_val's copies: every row's and column's scale is scale_val, and the E4M3s turned back are
+/// Checks both of copies_val's copies: their one scale is scale_val, and the E4M3s turned back are
 /// PyTorch's rounding of values at that scale, clamped to the largest E4M3 first (what saturating gives).
 static void check_per_tensor(const PerTensorCopies &copies_val, const Tensor &values_tensor, double scale_val)
 {
     torch::Tensor clamped_tensor = (pytorch_copy_of(values_tensor) / scale_val).clamp(-HARDWARE_E4M3_LARGEST, HARDWARE_E4M3_LARGEST);
     torch::Tensor expected_tensor = clamped_tensor.to(torch::kFloat8_e4m3fn).to(torch::kFloat) * scale_val;
-    ASSERT_EQ((pytorch_copy_of(copies_val.row_scales_tensor) != scale_val).sum().item<int64_t>(), (int64_t)0);
-    ASSERT_EQ((pytorch_copy_of(copies_val.column_scales_tensor) != scale_val).sum().item<int64_t>(), (int64_t)0);
+    ASSERT_EQ((double)copies_val.scale_tensor.tolist()[0], scale_val);
     ASSERT_EQ(torch::equal(copies_val.rows_turned_back(), expected_tensor), true);
     ASSERT_EQ(torch::equal(copies_val.columns_turned_back(), expected_tensor), true);
 }
 
 static void per_tensor_gives_one_scale_and_pytorch_s_float8(void)
 {
-    // Expect: random {208, 272} (no tile divides it), row 5 a hundred times larger, row 0 all 0, no history. Every
-    // row's and column's scale is the one scale of the whole tensor's largest |value| (a power of 2, largest / scale
+    // Expect: random {208, 272} (no tile divides it), row 5 a hundred times larger, row 0 all 0, no history. The
+    // copies' one scale is the scale of the whole tensor's largest |value| (a power of 2, largest / scale
     // in (224, 448]), and both copies turned back are exactly PyTorch's float8_e4m3fn at that scale. The same at the
     // qkv output_grad's size.
     torch::manual_seed(4);

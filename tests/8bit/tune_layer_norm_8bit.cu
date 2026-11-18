@@ -43,9 +43,8 @@ struct Gpt2LayerNorm
     Tensor mean_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_SEQ_LEN});
     Tensor rstd_tensor = Tensor::zeros({GPT2_BATCH_SIZE, GPT2_SEQ_LEN});
     Tensor rows_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM}, DType::E4M3);
-    Tensor row_scales_tensor = Tensor::zeros({GPT2_ROWS});
     Tensor turned_8bit_tensor = Tensor::zeros({GPT2_EMBED_DIM, GPT2_ROWS}, DType::E4M3);
-    Tensor turned_scales_tensor = Tensor::zeros({GPT2_EMBED_DIM});
+    Tensor scale_tensor = Tensor::zeros({1});
     Tensor largest_tensor = Tensor::zeros({2});        // [the largest the scale comes from, the next largest], float bits
 
     Gpt2LayerNorm(void)
@@ -61,9 +60,8 @@ struct Gpt2LayerNorm
         unsigned *slots_ptr = reinterpret_cast<unsigned *>(largest_tensor.data());
         LayerNorm8bitCopies copies_val;
         copies_val.rows_8bit_tensor = rows_8bit_tensor;
-        copies_val.row_scales_tensor = row_scales_tensor;
         copies_val.turned_8bit_tensor = turned_8bit_tensor;
-        copies_val.turned_scales_tensor = turned_scales_tensor;
+        copies_val.scale_tensor = scale_tensor;
         copies_val.scale_largest_ptr = slots_ptr;
         copies_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
         copies_val.next_largest_ptr = slots_ptr + 1;
@@ -82,19 +80,19 @@ struct Gpt2LayerNorm
 /// Gives the bytes asked for, in run order: the 8-bit forward, layer_norm_bf16_forward, the forward's rounding of its
 /// output (the row copy), the backward's (the turned copy). Weight and bias are left out.
 ///
-///     8-bit forward      reads input; writes both copies, row scales, mean, rstd           2 + 1 + 1 bytes a value
+///     8-bit forward      reads input; writes both copies, the scale, mean, rstd            2 + 1 + 1 bytes a value
 ///     bfloat16 forward   reads input; writes output, mean, rstd                            2 + 2
-///     forward rounding   reads output; writes the row copy, its scales                     2 + 1
-///     backward rounding  reads output; writes the turned copy, its scales                  2 + 1
+///     forward rounding   reads output; writes the row copy, the scale                      2 + 1
+///     backward rounding  reads output; writes the turned copy, the scale                   2 + 1
 static void run_bytes(double (&bytes_list)[4])
 {
     double values_val = (double)GPT2_ROWS * GPT2_EMBED_DIM;
     double row_floats_bytes_val = (double)GPT2_ROWS * sizeof(float);
-    double column_floats_bytes_val = (double)GPT2_EMBED_DIM * sizeof(float);
-    bytes_list[0] = values_val * (sizeof(nv_bfloat16) + 2 * sizeof(__nv_fp8_e4m3)) + 3 * row_floats_bytes_val + column_floats_bytes_val;
+    double scale_bytes_val = sizeof(float);
+    bytes_list[0] = values_val * (sizeof(nv_bfloat16) + 2 * sizeof(__nv_fp8_e4m3)) + 2 * row_floats_bytes_val + scale_bytes_val;
     bytes_list[1] = values_val * 2 * sizeof(nv_bfloat16) + 2 * row_floats_bytes_val;
-    bytes_list[2] = values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + row_floats_bytes_val;
-    bytes_list[3] = values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + column_floats_bytes_val;
+    bytes_list[2] = values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + scale_bytes_val;
+    bytes_list[3] = values_val * (sizeof(nv_bfloat16) + sizeof(__nv_fp8_e4m3)) + scale_bytes_val;
 }
 
 // ══ part 1: both copies made inside LayerNorm against LayerNorm then two roundings ═
@@ -117,23 +115,20 @@ static void time_8bit_forward_against_bf16_and_roundings(void)
     Gpt2LayerNorm layer_norm_val;
     const Gpt2LayerNorm &l = layer_norm_val;
     Tensor reference_rows_8bit_tensor = Tensor::zeros({GPT2_ROWS, GPT2_EMBED_DIM}, DType::E4M3);
-    Tensor reference_row_scales_tensor = Tensor::zeros({GPT2_ROWS});
     Tensor reference_turned_8bit_tensor = Tensor::zeros({GPT2_EMBED_DIM, GPT2_ROWS}, DType::E4M3);
-    Tensor reference_turned_scales_tensor = Tensor::zeros({GPT2_EMBED_DIM});
+    Tensor reference_scale_tensor = Tensor::zeros({1});
     Round8bitHistory mine_history_val, reference_history_val;
     layer_norm_bf16_forward(l.output_tensor, l.mean_tensor, l.rstd_tensor, l.input_tensor, l.weight_tensor, l.bias_tensor);
     for (Round8bitHistory *history_ptr : {&mine_history_val, &reference_history_val})
-        round_8bit_per_tensor(reference_rows_8bit_tensor, reference_row_scales_tensor, reference_turned_8bit_tensor,
-                              reference_turned_scales_tensor, l.output_tensor, history_ptr);
+        round_8bit_per_tensor(reference_rows_8bit_tensor, reference_turned_8bit_tensor, reference_scale_tensor, l.output_tensor, history_ptr);
     LayerNorm8bitCopies mine_copies_val = l.copies();                // its scale and next largest from the history instead
     round_8bit_delayed_largest(mine_history_val, mine_copies_val.scale_largest_ptr, mine_copies_val.next_largest_ptr);
     layer_norm_8bit_forward(l.output_tensor, mine_copies_val, l.mean_tensor, l.rstd_tensor, l.input_tensor, l.weight_tensor,
                             l.bias_tensor);
-    round_8bit_per_tensor(reference_rows_8bit_tensor, reference_row_scales_tensor, reference_turned_8bit_tensor,
-                          reference_turned_scales_tensor, l.output_tensor, &reference_history_val);
+    round_8bit_per_tensor(reference_rows_8bit_tensor, reference_turned_8bit_tensor, reference_scale_tensor, l.output_tensor,
+                          &reference_history_val);
     bool same_val = l.rows_8bit_tensor.equal(reference_rows_8bit_tensor) && l.turned_8bit_tensor.equal(reference_turned_8bit_tensor) &&
-                    l.row_scales_tensor.tolist() == reference_row_scales_tensor.tolist() &&
-                    l.turned_scales_tensor.tolist() == reference_turned_scales_tensor.tolist();
+                    l.scale_tensor.tolist() == reference_scale_tensor.tolist();
 
     // 2. the 4 runs, taking turns over SWEEP_ROUNDS rounds
     const int runs_val = 4;
@@ -143,10 +138,9 @@ static void time_8bit_forward_against_bf16_and_roundings(void)
         else if (run_index_val == 1)
             layer_norm_bf16_forward(l.output_tensor, l.mean_tensor, l.rstd_tensor, l.input_tensor, l.weight_tensor, l.bias_tensor);
         else if (run_index_val == 2)
-            round_8bit_per_tensor(reference_rows_8bit_tensor, reference_row_scales_tensor, Tensor(), Tensor(), l.output_tensor,
-                                  &reference_history_val);
+            round_8bit_per_tensor(reference_rows_8bit_tensor, Tensor(), reference_scale_tensor, l.output_tensor, &reference_history_val);
         else
-            round_8bit_per_tensor(Tensor(), Tensor(), reference_turned_8bit_tensor, reference_turned_scales_tensor, l.output_tensor,
+            round_8bit_per_tensor(Tensor(), reference_turned_8bit_tensor, reference_scale_tensor, l.output_tensor,
                                   &reference_history_val, true);
     };
     warm_up_gpu([&] { run_val(0); });
@@ -212,7 +206,7 @@ static void time_each_tile_and_block_size(void)
     // WARM_UP_STEPS + 1 .. SWEEP_ROUNDS taking turns, with GB/s and MBU, and the fastest. A tile of more rows makes
     // each column's turned piece longer (more of a 32-byte sector written at once) but fewer blocks fit on an SM.
     //
-    // Expect: every setting gives the default's copies, scales and next largest to the last bit. Only the time
+    // Expect: every setting gives the default's copies, scale and next largest to the last bit. Only the time
     // changes.
     const Tile tiles_list[] = {{16, forward_at_tile<16>}, {32, forward_at_tile<32>}, {64, forward_at_tile<64>}};
     const int threads_list[] = {2 * HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP,
@@ -226,8 +220,7 @@ static void time_each_tile_and_block_size(void)
     layer_norm_val.forward_8bit<LAYER_NORM_8BIT_TILE_ROWS>(LAYER_NORM_8BIT_THREADS_PER_BLOCK);
     Tensor usual_rows_tensor = layer_norm_val.rows_8bit_tensor.clone();
     Tensor usual_turned_tensor = layer_norm_val.turned_8bit_tensor.clone();
-    std::vector<float> usual_row_scales_list = layer_norm_val.row_scales_tensor.tolist();
-    std::vector<float> usual_turned_scales_list = layer_norm_val.turned_scales_tensor.tolist();
+    std::vector<float> usual_scale_list = layer_norm_val.scale_tensor.tolist();
     warm_up_gpu([&] { layer_norm_val.forward_8bit<LAYER_NORM_8BIT_TILE_ROWS>(LAYER_NORM_8BIT_THREADS_PER_BLOCK); });
 
     // 2. time every setting, taking turns over SWEEP_ROUNDS rounds
@@ -258,13 +251,11 @@ static void time_each_tile_and_block_size(void)
             int block_threads_val = threads_list[threads_index_val];
             layer_norm_val.rows_8bit_tensor.zero_();
             layer_norm_val.turned_8bit_tensor.zero_();
-            layer_norm_val.row_scales_tensor.zero_();
-            layer_norm_val.turned_scales_tensor.zero_();
+            layer_norm_val.scale_tensor.zero_();
             tile_val.run_ptr(layer_norm_val, block_threads_val);
             bool same_val = layer_norm_val.rows_8bit_tensor.equal(usual_rows_tensor) &&
                             layer_norm_val.turned_8bit_tensor.equal(usual_turned_tensor) &&
-                            layer_norm_val.row_scales_tensor.tolist() == usual_row_scales_list &&
-                            layer_norm_val.turned_scales_tensor.tolist() == usual_turned_scales_list;
+                            layer_norm_val.scale_tensor.tolist() == usual_scale_list;
             if (same_val)
                 settings_with_the_same_result_val++;
             float ms_val = total_ms_list[tile_index_val][threads_index_val] / (SWEEP_ROUNDS - WARM_UP_STEPS);

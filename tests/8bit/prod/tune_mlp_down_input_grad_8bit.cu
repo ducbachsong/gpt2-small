@@ -368,26 +368,24 @@ static void time_output_8bit_against_bf16_and_rounding(const Product &product_va
     // a value, then a read of them and 2 bytes written), the rounding pass alone, and
     // mlp_down_input_grad_8bit_output_8bit writing both copies itself (2 bytes a value written, nothing read back).
     Tensor rows_8bit_tensor = Tensor::zeros({ROWS, COLUMNS}, DType::E4M3);
-    Tensor row_scales_tensor = Tensor::zeros({ROWS});
     Tensor turned_8bit_tensor = Tensor::zeros({COLUMNS, ROWS}, DType::E4M3);
-    Tensor turned_scales_tensor = Tensor::zeros({COLUMNS});
+    Tensor scale_tensor = Tensor::zeros({1});
     Round8bitHistory bf16_history_val, output_8bit_history_val;
     mlp_down_input_grad_8bit_rounded(product_val.output_tensor, product_val.gelu_input_tensor, product_val.copies_val);
     for (Round8bitHistory *history_ptr : {&bf16_history_val, &output_8bit_history_val})   // the first call, exact: the histories started
-        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.output_tensor, history_ptr);
+        round_8bit_per_tensor(rows_8bit_tensor, turned_8bit_tensor, scale_tensor, product_val.output_tensor, history_ptr);
     auto product_bf16_val = [&] {
         mlp_down_input_grad_8bit_rounded(product_val.output_tensor, product_val.gelu_input_tensor, product_val.copies_val);
     };
     auto round_val = [&] {
-        round_8bit_per_tensor(rows_8bit_tensor, row_scales_tensor, turned_8bit_tensor, turned_scales_tensor, product_val.output_tensor,
+        round_8bit_per_tensor(rows_8bit_tensor, turned_8bit_tensor, scale_tensor, product_val.output_tensor,
                               &bf16_history_val);
     };
     auto output_8bit_val = [&] {
         MlpDownInputGrad8bitOutput8bit output_val;
         output_val.rows_8bit_tensor = rows_8bit_tensor;
-        output_val.row_scales_tensor = row_scales_tensor;
         output_val.turned_8bit_tensor = turned_8bit_tensor;
-        output_val.turned_scales_tensor = turned_scales_tensor;
+        output_val.scale_tensor = scale_tensor;
         output_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
         round_8bit_delayed_largest(output_8bit_history_val, output_val.scale_largest_ptr, output_val.next_largest_ptr);
         mlp_down_input_grad_8bit_output_8bit(output_val, product_val.gelu_input_tensor, product_val.copies_val);

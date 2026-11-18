@@ -68,14 +68,12 @@ static_assert(FLASH_TILE == WGMMA_MATMUL_BF16_ROW_VALUES, "a tile turned round h
 static_assert(FLASH_TILE_GROUPS == WGMMA_MATMUL_BF16_COLUMN_GROUPS,
               "a product over a head row is one WGMMA m64n64k16 a step: the sums wgmma_matmul_bf16_multiply_add takes");
 
-/// qkv_grad in 8 bits, as the backward writes it when given one: both copies the qkv linear's backward reads, one scale
-/// for the tensor (every value of the scales lists the same, so the products read them as per-row copies), and where
-/// that scale comes from. Pointers, passed to the kernels as they are.
+/// qkv_grad in 8 bits, as the backward writes it when given one: both copies the qkv linear's backward reads, their one
+/// scale (a float in GPU memory, written here), and where that scale comes from. Pointers, passed to the kernels as they are.
 struct AttentionFlashQkvGrad8bit {
     __nv_fp8_e4m3* rows_8bit_ptr = nullptr;        // {batch_size x seq_len, 3 · embed_dim} E4M3: written (qkv input_grad's left)
-    float* row_scales_ptr = nullptr;               // {batch_size x seq_len}: written
     __nv_fp8_e4m3* turned_8bit_ptr = nullptr;      // {3 · embed_dim, batch_size x seq_len} E4M3: written (qkv weight_grad's left)
-    float* turned_scales_ptr = nullptr;            // {3 · embed_dim}: written
+    float* scale_ptr = nullptr;                    // {1}: written, both copies' one scale
     const unsigned* scale_largest_ptr = nullptr;   // the largest |value| the scale is made from (a float's bits, in GPU memory)
     float margin_val = 1.0f;                       // ... times this (ROUND_8BIT_DELAYED_MARGIN for a delayed one)
     unsigned* next_largest_ptr = nullptr;          // this tensor's largest |value| maxed onto it (0 before), or nullptr
@@ -128,7 +126,7 @@ template <int PARTS, typename VALUE_AT>
 __device__ __forceinline__ void attention_bf16_flash_store_grad_8bit(const AttentionFlashQkvGrad8bit& grad_8bit_val, VALUE_AT value_at_val,
                                                                      uint8_t* staging_ptr, int first_part_val, int batch_index_val,
                                                                      int head_index_val, int tile_first_token_val, int num_heads_val,
-                                                                     int seq_len_val, bool writes_row_scales_val, bool writes_turned_scales_val);
+                                                                     int seq_len_val, bool writes_scale_val);
 size_t attention_bf16_flash_forward_shared_bytes();
 template <int STAGES>
 size_t attention_bf16_flash_key_grad_shared_bytes();
@@ -236,11 +234,11 @@ inline void attention_bf16_flash_backward(const Tensor& qkv_grad_tensor, const T
     attention_bf16_flash_check_shapes(output_grad_tensor, logsumexp_tensor, qkv_tensor);
     attention_bf16_flash_check_shapes(output_tensor, row_dot_tensor, qkv_grad_tensor);
     if (qkv_grad_8bit_ptr != nullptr &&
-        (qkv_grad_8bit_ptr->rows_8bit_ptr == nullptr || qkv_grad_8bit_ptr->row_scales_ptr == nullptr ||
-         qkv_grad_8bit_ptr->turned_8bit_ptr == nullptr || qkv_grad_8bit_ptr->turned_scales_ptr == nullptr ||
+        (qkv_grad_8bit_ptr->rows_8bit_ptr == nullptr || qkv_grad_8bit_ptr->turned_8bit_ptr == nullptr ||
+         qkv_grad_8bit_ptr->scale_ptr == nullptr ||
          qkv_grad_8bit_ptr->scale_largest_ptr == nullptr || (size_t)qkv_grad_8bit_ptr->turned_8bit_ptr % sizeof(uint4) != 0)) {
         fprintf(stderr, "error: flash attention's qkv_grad in 8 bits needs both copies (the turned one on %zu bytes), their "
-                        "scales and the scale's largest\n", sizeof(uint4));
+                        "scale and the scale's largest\n", sizeof(uint4));
         exit(EXIT_FAILURE);
     }
     size_t batch_size_val = logsumexp_tensor.size(0);
@@ -975,8 +973,8 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
         }
     } else {
         //    in 8 bits: the key part (part 1 of qkv_grad's row) and the value part (part 2), the same values as above;
-        //    the key and value tiles' shared memory (the walk is over) holds the turned copy on its way out. The rows'
-        //    scales are the query kernel's to write; the columns' the first key tile's blocks of the first batch row
+        //    the key and value tiles' shared memory (the walk is over) holds the turned copy on its way out. The scale
+        //    is the query kernel's to write
         (void)qkv_grad_ptr;
         attention_bf16_flash_store_grad_8bit<2>(
             grad_8bit_val,
@@ -985,7 +983,7 @@ attention_bf16_flash_key_grad_kernel(const __grid_constant__ CUtensorMap qkv_map
                                            : value_grad_list[group_column_index_val][c_value_index_val];
             },
             reinterpret_cast<uint8_t*>(key_tile_ptr), 1, batch_index_val, head_index_val, key_block_index_val * FLASH_TILE,
-            num_heads_val, seq_len_val, false, key_block_index_val == 0 && batch_index_val == 0);
+            num_heads_val, seq_len_val, false);
     }
 }
 
@@ -1194,8 +1192,8 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
         }
     } else {
         //    in 8 bits: the query part (part 0), the same values as above; the query tile's shared memory (the walk is
-        //    over) holds the turned copy on its way out. The rows' scales by the blocks of head 0 (every token once);
-        //    the columns' by the first query tile's blocks of the first batch row
+        //    over) holds the turned copy on its way out. The scale by one block: the first
+        //    query tile's of head 0 of the first batch row
         (void)qkv_grad_ptr;
         attention_bf16_flash_store_grad_8bit<1>(
             grad_8bit_val,
@@ -1203,7 +1201,7 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
                 return query_grad_list[group_column_index_val][c_value_index_val] * scale_val;
             },
             reinterpret_cast<uint8_t*>(query_tile_ptr), 0, batch_index_val, head_index_val, query_block_index_val * FLASH_TILE,
-            num_heads_val, seq_len_val, head_index_val == 0, query_block_index_val == 0 && batch_index_val == 0);
+            num_heads_val, seq_len_val, head_index_val == 0 && query_block_index_val == 0 && batch_index_val == 0);
     }
 }
 
@@ -1214,20 +1212,19 @@ attention_bf16_flash_query_grad_kernel(const __grid_constant__ CUtensorMap qkv_m
 /// turned copy's into shared memory first, a line (one column of qkv_grad) of FLASH_TILE tokens each, then out 16 bytes
 /// a store. This tile's largest |value| is maxed onto the next call's, a warp at a time.
 ///
-///   grad_8bit_val              the copies, their scales, the scale's largest and margin, the next largest
+///   grad_8bit_val              the copies, their scale, the scale's largest and margin, the next largest
 ///   value_at_val               (part, group of columns, value of the group) -> this thread's value, as WGMMA's C holds it
 ///   staging_ptr                PARTS x FLASH_HEAD_SIZE x FLASH_TILE bytes of shared memory the block is done with
 ///   first_part_val             qkv_grad's part of the first: 0 query, 1 key, 2 value
 ///   batch_index_val, head_index_val, tile_first_token_val   where the tile is: its batch row, head, first token
 ///   num_heads_val, seq_len_val the shape
-///   writes_row_scales_val      this block writes its tokens' row scales (one block of each token)
-///   writes_turned_scales_val   this block writes its parts' columns' scales (one block of each head)
+///   writes_scale_val           this block writes the one scale (one block of the whole backward)
 /// PARTS: 1 or 2; VALUE_AT: value_at_val's type (a lambda, inlined).
 template <int PARTS, typename VALUE_AT>
 __device__ __forceinline__ void attention_bf16_flash_store_grad_8bit(const AttentionFlashQkvGrad8bit& grad_8bit_val, VALUE_AT value_at_val,
                                                                      uint8_t* staging_ptr, int first_part_val, int batch_index_val,
                                                                      int head_index_val, int tile_first_token_val, int num_heads_val,
-                                                                     int seq_len_val, bool writes_row_scales_val, bool writes_turned_scales_val) {
+                                                                     int seq_len_val, bool writes_scale_val) {
     constexpr int STORES_PER_LINE = FLASH_TILE / (int)sizeof(uint4);                // a turned line's 16-byte stores
     static_assert(FLASH_TILE % sizeof(uint4) == 0, "a turned line is whole 16-byte stores");
     int warp_index_val = threadIdx.x / HARDWARE_THREADS_PER_WARP;
@@ -1285,12 +1282,8 @@ __device__ __forceinline__ void attention_bf16_flash_store_grad_8bit(const Atten
             *reinterpret_cast<const uint4*>(staging_ptr + (size_t)line_in_tile_val * FLASH_TILE + store_index_val * sizeof(uint4));
     }
 
-    // 4. the scales lists: every value the one scale
-    if (writes_row_scales_val && threadIdx.x < FLASH_TILE) grad_8bit_val.row_scales_ptr[tile_first_row_index_val + threadIdx.x] = scale_val;
-    if (writes_turned_scales_val)
-        for (int line_in_tile_val = threadIdx.x; line_in_tile_val < PARTS * FLASH_HEAD_SIZE; line_in_tile_val += blockDim.x)
-            grad_8bit_val.turned_scales_ptr[(size_t)(first_part_val + line_in_tile_val / FLASH_HEAD_SIZE) * embed_dim_val +
-                                            (size_t)head_index_val * FLASH_HEAD_SIZE + line_in_tile_val % FLASH_HEAD_SIZE] = scale_val;
+    // 4. the one scale, by one block (every block works out the same)
+    if (writes_scale_val && threadIdx.x == 0) *grad_8bit_val.scale_ptr = scale_val;
 
     // 5. this tile's largest |value| onto the next call's, a warp at a time
     float warp_largest_val = warp_reduce_max(thread_largest_val);

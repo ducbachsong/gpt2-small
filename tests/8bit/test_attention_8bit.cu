@@ -416,7 +416,7 @@ static void qkv_grad_in_8bit_gives_round_8bit_per_tensors_bits(void)
 {
     // Expect: random qkv and output_grad, {2, 18, 256}, with no window and with a window of 2 tiles. The backward
     // with qkv_grad in 8 bits (AttentionFlashQkvGrad8bit, as the 8-bit model's backward runs it after a layer's first
-    // micro-batch) writes both copies {512, 6912} and {6912, 512}, their scales lists and the history's next largest
+    // micro-batch) writes both copies {512, 6912} and {6912, 512}, their one scale and the history's next largest
     // with the bits round_8bit_per_tensor gives from the bfloat16 qkv_grad at the same delayed scale (the first call's
     // largest x 2): each value rounded to bfloat16 as the bfloat16 store does, divided by the same power of 2 and
     // rounded to E4M3 the same way. Every byte written (the copies filled with 7s first).
@@ -433,33 +433,29 @@ static void qkv_grad_in_8bit_gives_round_8bit_per_tensors_bits(void)
         mine_val.backward();
         size_t rows_val = mine_val.qkv_grad_tensor.size(0) * mine_val.qkv_grad_tensor.size(1);
         size_t columns_val = mine_val.qkv_grad_tensor.size(2);
-        auto fresh_copies_val = [&](Tensor &rows_8bit_tensor, Tensor &row_scales_tensor, Tensor &turned_8bit_tensor, Tensor &turned_scales_tensor) {
+        auto fresh_copies_val = [&](Tensor &rows_8bit_tensor, Tensor &turned_8bit_tensor, Tensor &scale_tensor) {
             rows_8bit_tensor = Tensor::zeros({rows_val, columns_val}, DType::E4M3);
             turned_8bit_tensor = Tensor::zeros({columns_val, rows_val}, DType::E4M3);
-            row_scales_tensor = Tensor::zeros({rows_val});
-            turned_scales_tensor = Tensor::zeros({columns_val});
+            scale_tensor = Tensor::zeros({1});
             cudaCheck(cudaMemset(rows_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
             cudaCheck(cudaMemset(turned_8bit_tensor.data_ptr(), 7, rows_val * columns_val));
-            row_scales_tensor.fill_(7.0);
-            turned_scales_tensor.fill_(7.0);
+            scale_tensor.fill_(7.0);
         };
-        Tensor reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor;
-        Tensor rows_tensor, row_scales_tensor, turned_tensor, turned_scales_tensor;
-        fresh_copies_val(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor);
-        fresh_copies_val(rows_tensor, row_scales_tensor, turned_tensor, turned_scales_tensor);
+        Tensor reference_rows_tensor, reference_turned_tensor, reference_scale_tensor;
+        Tensor rows_tensor, turned_tensor, scale_tensor;
+        fresh_copies_val(reference_rows_tensor, reference_turned_tensor, reference_scale_tensor);
+        fresh_copies_val(rows_tensor, turned_tensor, scale_tensor);
         Round8bitHistory reference_history_val, mine_history_val;
         for (Round8bitHistory *history_ptr : {&reference_history_val, &mine_history_val})
-            round_8bit_per_tensor(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor,
-                                  mine_val.qkv_grad_tensor, history_ptr);
+            round_8bit_per_tensor(reference_rows_tensor, reference_turned_tensor, reference_scale_tensor, mine_val.qkv_grad_tensor, history_ptr);
         // 2. the reference: round_8bit_per_tensor's delayed call on the bfloat16 qkv_grad
-        round_8bit_per_tensor(reference_rows_tensor, reference_row_scales_tensor, reference_turned_tensor, reference_turned_scales_tensor,
-                              mine_val.qkv_grad_tensor, &reference_history_val);
+        round_8bit_per_tensor(reference_rows_tensor, reference_turned_tensor, reference_scale_tensor, mine_val.qkv_grad_tensor,
+                              &reference_history_val);
         // 3. mine: the backward again, qkv_grad in 8 bits at the history's delayed scale
         AttentionFlashQkvGrad8bit qkv_grad_val;
         qkv_grad_val.rows_8bit_ptr = rows_tensor.data_ptr<__nv_fp8_e4m3>();
-        qkv_grad_val.row_scales_ptr = row_scales_tensor.data();
         qkv_grad_val.turned_8bit_ptr = turned_tensor.data_ptr<__nv_fp8_e4m3>();
-        qkv_grad_val.turned_scales_ptr = turned_scales_tensor.data();
+        qkv_grad_val.scale_ptr = scale_tensor.data();
         qkv_grad_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
         round_8bit_delayed_largest(mine_history_val, qkv_grad_val.scale_largest_ptr, qkv_grad_val.next_largest_ptr);
         mine_val.backward(ATTENTION_8BIT_THREADS_PER_BLOCK, ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, &qkv_grad_val);
@@ -468,8 +464,7 @@ static void qkv_grad_in_8bit_gives_round_8bit_per_tensors_bits(void)
         printf("    window %zu:\n", window_val);
         ASSERT_EQ(bytes_of(rows_tensor) == bytes_of(reference_rows_tensor), true);
         ASSERT_EQ(bytes_of(turned_tensor) == bytes_of(reference_turned_tensor), true);
-        ASSERT_EQ(row_scales_tensor.tolist(), reference_row_scales_tensor.tolist());
-        ASSERT_EQ(turned_scales_tensor.tolist(), reference_turned_scales_tensor.tolist());
+        ASSERT_EQ(scale_tensor.tolist(), reference_scale_tensor.tolist());
         ASSERT_EQ(mine_history_val.largest_tensor.tolist(), reference_history_val.largest_tensor.tolist());
         ASSERT_EQ(mine_history_val.calls_val, reference_history_val.calls_val);
     }

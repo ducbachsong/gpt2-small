@@ -66,17 +66,17 @@ static std::vector<float> floats_of(const torch::Tensor &tensor)
     return std::vector<float>(cpu_tensor.data_ptr<float>(), cpu_tensor.data_ptr<float>() + cpu_tensor.numel());
 }
 
-/// Gives an E4M3 copy turned back by PyTorch: each E4M3 (read as PyTorch's float8_e4m3fn) times its row's scale,
-/// exact. {rows, row_length} float.
-static torch::Tensor turned_back(const Tensor &copy_8bit_tensor, const Tensor &scales_tensor, size_t rows_val, size_t row_length_val)
+/// Gives an E4M3 copy turned back by PyTorch: each E4M3 (read as PyTorch's float8_e4m3fn) times the tensor's one
+/// scale, exact. {rows, row_length} float.
+static torch::Tensor turned_back(const Tensor &copy_8bit_tensor, const Tensor &scale_tensor, size_t rows_val, size_t row_length_val)
 {
     torch::Tensor e4m3_tensor = torch::from_blob(copy_8bit_tensor.data_ptr(), {(int64_t)rows_val, (int64_t)row_length_val},
                                                  torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scales_tensor).unsqueeze(1);
+    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scale_tensor);
 }
 
 /// One 8-bit LayerNorm's tensors: the inputs, the forward's results (the bfloat16 output, both E4M3 copies and their
-/// scales, mean and rstd, the place's history) and the gradients. Results 0 at first; the copies and their scales 7s,
+/// one scale, mean and rstd, the place's history) and the gradients. Results 0 at first; the copies and their scale 7s,
 /// so a byte not written shows.
 struct LayerNormTensors
 {
@@ -88,9 +88,8 @@ struct LayerNormTensors
     Tensor output_grad_tensor;
     Tensor output_tensor;              // bfloat16; Tensor(): not written
     Tensor rows_8bit_tensor;           // {rows, embed_dim} E4M3
-    Tensor row_scales_tensor;          // {rows} float
     Tensor turned_8bit_tensor;         // {embed_dim, rows} E4M3
-    Tensor turned_scales_tensor;       // {embed_dim} float
+    Tensor scale_tensor;               // {1} float: both copies' one scale
     Tensor mean_tensor;
     Tensor rstd_tensor;
     Tensor input_grad_tensor;
@@ -105,13 +104,11 @@ struct LayerNormTensors
         LayerNormTensors tensors_val = *this;
         tensors_val.output_tensor = Tensor::zeros(input_tensor.shape(), DType::BFloat16);
         tensors_val.rows_8bit_tensor = Tensor::zeros({rows_val, embed_dim_val}, DType::E4M3);
-        tensors_val.row_scales_tensor = Tensor::zeros({rows_val});
         tensors_val.turned_8bit_tensor = Tensor::zeros({embed_dim_val, rows_val}, DType::E4M3);
-        tensors_val.turned_scales_tensor = Tensor::zeros({embed_dim_val});
+        tensors_val.scale_tensor = Tensor::zeros({1});
         cudaCheck(cudaMemset(tensors_val.rows_8bit_tensor.data_ptr(), 7, rows_val * embed_dim_val));
         cudaCheck(cudaMemset(tensors_val.turned_8bit_tensor.data_ptr(), 7, rows_val * embed_dim_val));
-        tensors_val.row_scales_tensor.fill_(7.0);
-        tensors_val.turned_scales_tensor.fill_(7.0);
+        tensors_val.scale_tensor.fill_(7.0);
         tensors_val.mean_tensor = Tensor::zeros(mean_tensor.shape());
         tensors_val.rstd_tensor = Tensor::zeros(rstd_tensor.shape());
         tensors_val.input_grad_tensor = Tensor::zeros(input_tensor.shape(), DType::BFloat16);
@@ -128,9 +125,8 @@ struct LayerNormTensors
     {
         LayerNorm8bitCopies copies_val;
         copies_val.rows_8bit_tensor = rows_8bit_tensor;
-        copies_val.row_scales_tensor = row_scales_tensor;
         copies_val.turned_8bit_tensor = turned_8bit_tensor;
-        copies_val.turned_scales_tensor = turned_scales_tensor;
+        copies_val.scale_tensor = scale_tensor;
         copies_val.scale_largest_ptr = scale_largest_ptr;
         copies_val.margin_val = margin_val;
         copies_val.next_largest_ptr = next_largest_ptr;
@@ -141,9 +137,8 @@ struct LayerNormTensors
     /// (into copies of its own, thrown away), its largest kept.
     void start_history(const Tensor &first_tensor) const
     {
-        round_8bit_per_tensor(Tensor::zeros({rows_val, embed_dim_val}, DType::E4M3), Tensor::zeros({rows_val}),
-                              Tensor::zeros({embed_dim_val, rows_val}, DType::E4M3), Tensor::zeros({embed_dim_val}), first_tensor,
-                              &history_val);
+        round_8bit_per_tensor(Tensor::zeros({rows_val, embed_dim_val}, DType::E4M3), Tensor::zeros({embed_dim_val, rows_val}, DType::E4M3),
+                              Tensor::zeros({1}), first_tensor, &history_val);
     }
 
     /// Runs layer_norm_8bit_forward with the history's delayed scale (round_8bit_delayed_largest, x
@@ -176,13 +171,13 @@ struct LayerNormTensors
     /// Gives the row copy turned back: {rows, embed_dim} float.
     torch::Tensor rows_turned_back(void) const
     {
-        return turned_back(rows_8bit_tensor, row_scales_tensor, rows_val, embed_dim_val);
+        return turned_back(rows_8bit_tensor, scale_tensor, rows_val, embed_dim_val);
     }
 
     /// Gives the turned copy turned back: {embed_dim, rows} float.
     torch::Tensor turned_turned_back(void) const
     {
-        return turned_back(turned_8bit_tensor, turned_scales_tensor, embed_dim_val, rows_val);
+        return turned_back(turned_8bit_tensor, scale_tensor, embed_dim_val, rows_val);
     }
 
     /// Gives the largest |value| forward_with_largest's run found for the next call.
@@ -211,13 +206,12 @@ static LayerNormTensors layer_norm_of(size_t batch_size_val, size_t seq_len_val,
     return tensors_val.with_fresh_results();
 }
 
-/// True when two LayerNorms' copies hold the same bytes and scales lists.
+/// True when two LayerNorms' copies hold the same bytes and scale.
 static bool same_copies(const LayerNormTensors &first_val, const LayerNormTensors &second_val)
 {
     return first_val.rows_8bit_tensor.equal(second_val.rows_8bit_tensor) &&
            first_val.turned_8bit_tensor.equal(second_val.turned_8bit_tensor) &&
-           first_val.row_scales_tensor.tolist() == second_val.row_scales_tensor.tolist() &&
-           first_val.turned_scales_tensor.tolist() == second_val.turned_scales_tensor.tolist();
+           first_val.scale_tensor.tolist() == second_val.scale_tensor.tolist();
 }
 
 // ══ part 1: mine against layer_norm_bf16's and round_8bit_per_tensor's ════════
@@ -247,7 +241,7 @@ static void the_copies_are_round_8bit_per_tensor_s_of_the_output(void)
 {
     // Expect: as the model's forward runs it after a layer's first micro-batch, at GPT-2 small's size and at one no
     // tile divides (48 rows of 80): a history started by an exact first call, then mine at its delayed scale (the
-    // first call's largest x 2). Both copies, their scales lists and the history (its next largest, its calls) are
+    // first call's largest x 2). Both copies, their one scale and the history (its next largest, its calls) are
     // round_8bit_per_tensor's on the bfloat16 output mine wrote, at the same delayed scale, to the last bit: each value
     // rounded to bfloat16, divided by the same power of 2 and rounded to E4M3 the same way. So the products can take
     // these copies in place of rounding the output, forward and backward.
@@ -265,8 +259,8 @@ static void the_copies_are_round_8bit_per_tensor_s_of_the_output(void)
         reference_val.start_history(reference_val.output_tensor);
         // 2. mine at the delayed scale; the reference: round_8bit_per_tensor's on my output, the same delayed turn
         mine_val.forward();
-        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.row_scales_tensor, reference_val.turned_8bit_tensor,
-                              reference_val.turned_scales_tensor, mine_val.output_tensor, &reference_val.history_val);
+        round_8bit_per_tensor(reference_val.rows_8bit_tensor, reference_val.turned_8bit_tensor, reference_val.scale_tensor,
+                              mine_val.output_tensor, &reference_val.history_val);
         // 3. the same bits
         printf("    rows %zu, embed_dim %zu:\n", mine_val.rows_val, mine_val.embed_dim_val);
         ASSERT_EQ(same_copies(mine_val, reference_val), true);
@@ -278,7 +272,7 @@ static void the_copies_are_round_8bit_per_tensor_s_of_the_output(void)
 static void without_an_output_the_copies_are_the_same(void)
 {
     // Expect: 256 random rows of 768, the forward run twice from the same inputs and scale: once writing the bfloat16
-    // output, once with Tensor() in its place (the model's way: nothing but the copies kept). The copies, their scales,
+    // output, once with Tensor() in its place (the model's way: nothing but the copies kept). The copies, their scale,
     // mean, rstd and the next largest are the same bits; the bfloat16 output is only written, never read.
     // 1. random tensors; with and without the output
     Tensor::manual_seed(0);
@@ -349,11 +343,10 @@ static void a_row_e4m3_holds_is_copied_exactly(void)
     LayerNormTensors tensors_val = layer_norm_of(1, SMALL_ROWS, SMALL_EMBED_DIM, rows_of(SMALL_ROWS, row_of(1, 3)), row_of(1, 1),
                                                  row_of(0, 0));
     tensors_val.forward_with_largest(1.0f, 1.0f);
-    // 2. check: output, scales, both copies turned back, the next largest
+    // 2. check: output, scale, both copies turned back, the next largest
     std::vector<float> expected_list = rows_of(SMALL_ROWS, row_of(-1, 1));
     ASSERT_EQ(floats_of(tensors_val.output_tensor), expected_list);
-    ASSERT_EQ(tensors_val.row_scales_tensor.tolist(), std::vector<float>(SMALL_ROWS, 0.00390625f));
-    ASSERT_EQ(tensors_val.turned_scales_tensor.tolist(), std::vector<float>(SMALL_EMBED_DIM, 0.00390625f));
+    ASSERT_EQ(tensors_val.scale_tensor.tolist(), std::vector<float>(1, 0.00390625f));
     ASSERT_EQ(floats_of(tensors_val.rows_turned_back()), expected_list);
     ASSERT_EQ(floats_of(tensors_val.turned_turned_back().t()), expected_list);
     ASSERT_EQ(tensors_val.next_largest(), 1.0f);
@@ -372,13 +365,13 @@ static void a_value_e4m3_cannot_hold_is_rounded_in_the_copies_only(void)
     LayerNormTensors tensors_val = layer_norm_of(1, SMALL_ROWS, SMALL_EMBED_DIM, rows_of(SMALL_ROWS, row_of(1, 3)), row_of(1, 1),
                                                  bias_list);
     tensors_val.forward_with_largest(17.0f, 1.0f);
-    // 2. check: output, scales, both copies turned back, the next largest
+    // 2. check: output, scale, both copies turned back, the next largest
     std::vector<float> output_row_list = row_of(-1, 1);
     output_row_list[0] = 17.0f;
     std::vector<float> copy_row_list = row_of(-1, 1);
     copy_row_list[0] = 16.0f;
     ASSERT_EQ(floats_of(tensors_val.output_tensor), rows_of(SMALL_ROWS, output_row_list));
-    ASSERT_EQ(tensors_val.row_scales_tensor.tolist(), std::vector<float>(SMALL_ROWS, 0.0625f));
+    ASSERT_EQ(tensors_val.scale_tensor.tolist(), std::vector<float>(1, 0.0625f));
     ASSERT_EQ(floats_of(tensors_val.rows_turned_back()), rows_of(SMALL_ROWS, copy_row_list));
     ASSERT_EQ(floats_of(tensors_val.turned_turned_back().t()), rows_of(SMALL_ROWS, copy_row_list));
     ASSERT_EQ(tensors_val.next_largest(), 17.0f);
@@ -397,10 +390,10 @@ static void a_value_past_the_delayed_scale_is_clamped(void)
     LayerNormTensors tensors_val = layer_norm_of(1, SMALL_ROWS, SMALL_EMBED_DIM, rows_of(SMALL_ROWS, row_of(1, 3)), row_of(1, 1),
                                                  bias_list);
     tensors_val.forward_with_largest(1.0f, ROUND_8BIT_DELAYED_MARGIN);
-    // 2. check: scales, both copies turned back, the next largest
+    // 2. check: scale, both copies turned back, the next largest
     std::vector<float> copy_row_list = row_of(-1, 1);
     copy_row_list[0] = 3.5f;
-    ASSERT_EQ(tensors_val.row_scales_tensor.tolist(), std::vector<float>(SMALL_ROWS, 0.0078125f));
+    ASSERT_EQ(tensors_val.scale_tensor.tolist(), std::vector<float>(1, 0.0078125f));
     ASSERT_EQ(floats_of(tensors_val.rows_turned_back()), rows_of(SMALL_ROWS, copy_row_list));
     ASSERT_EQ(floats_of(tensors_val.turned_turned_back().t()), rows_of(SMALL_ROWS, copy_row_list));
     ASSERT_EQ(tensors_val.next_largest(), 17.0f);
@@ -421,8 +414,7 @@ static void every_scale_is_the_tensor_s_one(void)
     std::vector<float> expected_list = rows_of(SMALL_ROWS / 2, row_of(-1, 1));
     std::vector<float> zeros_list = rows_of(SMALL_ROWS / 2, row_of(0, 0));
     expected_list.insert(expected_list.end(), zeros_list.begin(), zeros_list.end());
-    ASSERT_EQ(tensors_val.row_scales_tensor.tolist(), std::vector<float>(SMALL_ROWS, 0.00390625f));
-    ASSERT_EQ(tensors_val.turned_scales_tensor.tolist(), std::vector<float>(SMALL_EMBED_DIM, 0.00390625f));
+    ASSERT_EQ(tensors_val.scale_tensor.tolist(), std::vector<float>(1, 0.00390625f));
     ASSERT_EQ(floats_of(tensors_val.rows_turned_back()), expected_list);
     ASSERT_EQ(floats_of(tensors_val.turned_turned_back().t()), expected_list);
     ASSERT_EQ(tensors_val.next_largest(), 1.0f);
@@ -479,7 +471,7 @@ static void any_block_size_and_tile_gives_the_same_bits(void)
 {
     // Expect: 4 x 48 random rows of 768 (192 rows: a short last tile at 64), the forward called at every tile with
     // threads_per_block 32, 128, 256 and 512. Each row is one warp's and each value rounded alone, whatever the block
-    // and the tile, so output, mean, rstd, both copies, their scales and the next largest are the default's to the
+    // and the tile, so output, mean, rstd, both copies, their scale and the next largest are the default's to the
     // last bit.
     const int block_sizes_list[] = {HARDWARE_THREADS_PER_WARP, 4 * HARDWARE_THREADS_PER_WARP, 8 * HARDWARE_THREADS_PER_WARP,
                                     16 * HARDWARE_THREADS_PER_WARP};

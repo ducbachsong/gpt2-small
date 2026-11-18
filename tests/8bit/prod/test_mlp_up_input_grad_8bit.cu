@@ -62,14 +62,23 @@ static double relative_difference_on_gpu(const Tensor &mine_tensor, const torch:
     return difference_tensor.item<double>() / pytorch_tensor.abs().max().item<double>();
 }
 
-/// Gives a copy's rounded values turned back by PyTorch: each E4M3 (read as float8_e4m3fn) times its row's scale,
-/// exact. {rows, k} float.
-static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scales_tensor)
+/// Gives a copy's rounded values turned back by PyTorch: each E4M3 (read as float8_e4m3fn) times the tensor's one
+/// scale, exact. {rows, k} float.
+static torch::Tensor turned_back(const Tensor &rounded_tensor, const Tensor &scale_tensor)
 {
     int64_t rows_val = (int64_t)rounded_tensor.size(0), k_val = (int64_t)rounded_tensor.size(1);
     torch::Tensor e4m3_tensor = torch::from_blob(rounded_tensor.data_ptr(), {rows_val, k_val},
                                                  torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scales_tensor).unsqueeze(1);
+    return e4m3_tensor.to(torch::kFloat) * pytorch_copy_of(scale_tensor);
+}
+
+/// Gives a copy's one scale as a list of every row's, for the general kernel (one scale a row): {rows_val} float, every
+/// value the scale.
+static Tensor scales_list(const Tensor &scale_tensor, size_t rows_val)
+{
+    Tensor scales_tensor = Tensor::zeros({rows_val});
+    scales_tensor.fill_(scale_tensor.tolist<float>()[0]);
+    return scales_tensor;
 }
 
 /// The product's operands, as mlp_up_input_grad_8bit takes them, for output {rows, columns} with a sum of sum_length, and their copies.
@@ -130,8 +139,9 @@ static void mine(const Outputs &outputs_val, const Operands &operands_val)
 static void reference(const Outputs &outputs_val, const Operands &operands_val, int promotion_steps_val)
 {
     const MlpUpInputGrad8bitCopies &copies_val = operands_val.copies_val;
-    wgmma_matmul_8bit(outputs_val.output_tensor, copies_val.left_8bit_tensor, copies_val.left_scales_tensor, copies_val.right_8bit_tensor,
-                      copies_val.right_scales_tensor, Tensor(), false, WgmmaMatmul8bitStore(), promotion_steps_val);
+    wgmma_matmul_8bit(outputs_val.output_tensor, copies_val.left_8bit_tensor,
+                      scales_list(copies_val.left_scale_tensor, copies_val.left_8bit_tensor.size(0)), copies_val.right_8bit_tensor,
+                      scales_list(copies_val.right_scale_tensor, copies_val.right_8bit_tensor.size(0)), Tensor(), false, WgmmaMatmul8bitStore(), promotion_steps_val);
 }
 
 /// Gives PyTorch's float product of the same rounded values (the copies read back): the output mine must be near
@@ -139,8 +149,8 @@ static void reference(const Outputs &outputs_val, const Operands &operands_val, 
 static torch::Tensor pytorch_on_rounded(const Operands &operands_val)
 {
     const MlpUpInputGrad8bitCopies &copies_val = operands_val.copies_val;
-    torch::Tensor expected_tensor = turned_back(copies_val.left_8bit_tensor, copies_val.left_scales_tensor)
-                                        .matmul(turned_back(copies_val.right_8bit_tensor, copies_val.right_scales_tensor).t());
+    torch::Tensor expected_tensor = turned_back(copies_val.left_8bit_tensor, copies_val.left_scale_tensor)
+                                        .matmul(turned_back(copies_val.right_8bit_tensor, copies_val.right_scale_tensor).t());
     return expected_tensor;
 }
 

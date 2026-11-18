@@ -12,7 +12,7 @@
 //     gelu_output   bfloat16                           {rows, out_features}                   written by TMA: gelu of gelu_input
 //                   or E4M3 (mlp_up_8bit_gelu_8bit)    rows {rows, out} and turned            written by TMA: gelu of gelu_input, rounded
 //                   , one scale for the tensor         {out, rows}                            here, both copies mlp_down reads
-//     the copies    E4M3, a float scale per row        MlpUp8bitCopies's: left {rows, k},            round_8bit writes, TMA reads
+//     the copies    E4M3, one float scale each         MlpUp8bitCopies's: left {rows, k},            round_8bit_per_tensor writes, TMA reads
 //                                                      right {columns, k}
 //     sums          float                              in registers                           the tensor cores' C
 //
@@ -63,7 +63,7 @@
 #include <cuda_fp8.h>                // FP8 E4M3
 #include "../../cuda_common.h"       // cudaCheck, check_threads_per_block, the HARDWARE_ numbers
 #include "../../../common/tensor.cuh"
-#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit, ROUND_8BIT_ROW_LENGTH_MULTIPLE
+#include "../round_8bit.cuh"         // the 8-bit copies: round_8bit_per_tensor, ROUND_8BIT_ROW_LENGTH_MULTIPLE
 
 // the setting: tune_mlp_up_8bit sweeps each and prints the fastest
 #define MLP_UP_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
@@ -520,31 +520,30 @@ inline void mlp_up_8bit_check_tensor(const char* caller_ptr, const char* name_pt
 }
 
 /// The 8-bit copies of the product's two sides: left {rows, k} and right {columns, k}, each E4M3
-/// with one float scale per row, as round_8bit writes them and the product reads them. Made once for a size, used
+/// with one float scale for the whole side, as round_8bit_per_tensor writes them and the product reads them. Made once for a size, used
 /// by every call.
 struct MlpUp8bitCopies {
     Tensor left_8bit_tensor;             // {rows, k} E4M3
-    Tensor left_scales_tensor;           // {rows} float
+    Tensor left_scale_tensor;            // {1} float: every value's scale
     Tensor right_8bit_tensor;            // {columns, k} E4M3
-    Tensor right_scales_tensor;          // {columns} float
+    Tensor right_scale_tensor;           // {1} float: every value's scale
 
     MlpUp8bitCopies() = default;
     /// Makes the copies, all 0, for output {rows, columns} with a sum of k (a multiple of ROUND_8BIT_ROW_LENGTH_MULTIPLE).
     MlpUp8bitCopies(size_t rows_val, size_t columns_val, size_t k_val)
         : left_8bit_tensor(Tensor::zeros({rows_val, k_val}, DType::E4M3)),
-          left_scales_tensor(Tensor::zeros({rows_val})),
+          left_scale_tensor(Tensor::zeros({1})),
           right_8bit_tensor(Tensor::zeros({columns_val, k_val}, DType::E4M3)),
-          right_scales_tensor(Tensor::zeros({columns_val})) {}
+          right_scale_tensor(Tensor::zeros({1})) {}
 };
 
-/// gelu_output in 8 bits, as mlp_up_8bit_gelu_8bit writes it: both copies mlp_down reads, one scale for the tensor (every
-/// value of the scales lists the same, so the products read them as per-row copies), and where that scale comes from.
-/// rows_8bit and row_scales are mlp_down's left side (its forward); turned_8bit and turned_scales its weight_grad's right.
+/// gelu_output in 8 bits, as mlp_up_8bit_gelu_8bit writes it: both copies mlp_down reads, their one scale (a float in GPU
+/// memory, written here), and where that scale comes from. rows_8bit is mlp_down's left side (its forward), turned_8bit
+/// its weight_grad's right; scale both's.
 struct MlpUp8bitGelu8bit {
     Tensor rows_8bit_tensor;                 // {rows, columns} E4M3: written
-    Tensor row_scales_tensor;                // {rows} float: written
+    Tensor scale_tensor;                     // {1} float: written, the one scale of both copies
     Tensor turned_8bit_tensor;               // {columns, rows} E4M3: written
-    Tensor turned_scales_tensor;             // {columns} float: written
     const unsigned* scale_largest_ptr = nullptr;   // the largest |value| the scale is made from (a float's bits, in GPU memory)
     float margin_val = 1.0f;                       // ... times this (ROUND_8BIT_DELAYED_MARGIN for a delayed one)
     unsigned* next_largest_ptr = nullptr;          // this tensor's largest |value| maxed onto it (0 before), or nullptr
@@ -584,10 +583,10 @@ __global__ void mlp_up_8bit_kernel(const __grid_constant__ CUtensorMap left_map_
                            const __grid_constant__ CUtensorMap output_map_val,
                            const __grid_constant__ CUtensorMap side_map_val,
                            const __grid_constant__ CUtensorMap side_turned_map_val,
-                           const float* left_scales_ptr, const float* right_scales_ptr,
+                           const float* left_scale_ptr, const float* right_scale_ptr,
                            const nv_bfloat16* bias_ptr,
                            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
-                           float* side_row_scales_ptr, float* side_turned_scales_ptr, const unsigned* side_scale_largest_ptr,
+                           float* side_scale_ptr, const unsigned* side_scale_largest_ptr,
                            float side_margin_val, unsigned* side_next_largest_ptr);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
@@ -633,7 +632,7 @@ inline void mlp_up_8bit_gelu_8bit(const Tensor& gelu_input_tensor, const MlpUp8b
         gelu_input_tensor, gelu_val, bias_tensor, copies_val, MLP_UP_8BIT_BLOCK_ROWS_PER_GROUP, MLP_UP_8BIT_BLOCKS);
 }
 
-/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale per row (round_8bit): input {rows, in} and weight {out, in}, both as they sit.
+/// Rounds the product's two sides to E4M3 into the copies, one power-of-2 scale for each side (round_8bit_per_tensor): input {rows, in} and weight {out, in}, both as they sit.
 ///
 ///   copies_val           MlpUp8bitCopies: written
 ///   input_tensor         {..., in_features} bfloat16
@@ -646,14 +645,14 @@ inline void mlp_up_8bit_round(const MlpUp8bitCopies& copies_val, const Tensor& i
         k_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE != 0 ||
         copies_val.left_8bit_tensor.shape() != Shape({rows_val, k_val}) ||
         copies_val.right_8bit_tensor.shape() != Shape({columns_val, k_val}) ||
-        copies_val.left_scales_tensor.shape() != Shape({rows_val}) || copies_val.right_scales_tensor.shape() != Shape({columns_val})) {
+        copies_val.left_scale_tensor.numel() != 1 || copies_val.right_scale_tensor.numel() != 1) {
         fprintf(stderr, "error: mlp_up_8bit needs rows, columns and k multiples of %d and its copies made with MlpUp8bitCopies(rows, columns, k): "
                         "got %zu, %zu, %zu\n", ROUND_8BIT_ROW_LENGTH_MULTIPLE, rows_val, columns_val, k_val);
         exit(EXIT_FAILURE);
     }
     // 2. the copies
-    round_8bit(copies_val.left_8bit_tensor, copies_val.left_scales_tensor, input_tensor, false);
-    round_8bit(copies_val.right_8bit_tensor, copies_val.right_scales_tensor, weight_tensor, false);
+    round_8bit_per_tensor(copies_val.left_8bit_tensor, Tensor(), copies_val.left_scale_tensor, input_tensor);
+    round_8bit_per_tensor(copies_val.right_8bit_tensor, Tensor(), copies_val.right_scale_tensor, weight_tensor);
 }
 
 //// Works out the product from the copies at a setting given, gelu_output bfloat16: mlp_up_8bit_launch made for the
@@ -685,16 +684,15 @@ inline void mlp_up_8bit_gelu_8bit_at(const Tensor& gelu_input_tensor, const MlpU
                                      const MlpUp8bitCopies& copies_val, int block_rows_per_group_val, int blocks_val) {
     static_assert(COLUMNS % MLP_UP_8BIT_BLOCK_K == 0, "gelu_output in 8 bits: COLUMNS 128 or 256, whole swizzled rows of 128 E4M3s");
     // 1. the copies: E4M3, their shapes from the product's; the scale's largest given
-    size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
+    size_t rows_val = copies_val.left_8bit_tensor.size(0), columns_val = copies_val.right_8bit_tensor.size(0);
     if (!(gelu_val.rows_8bit_tensor.dtype() == DType::E4M3 && gelu_val.turned_8bit_tensor.dtype() == DType::E4M3 &&
-          gelu_val.row_scales_tensor.dtype() == DType::Float32 && gelu_val.turned_scales_tensor.dtype() == DType::Float32 &&
+          gelu_val.scale_tensor.dtype() == DType::Float32 && gelu_val.scale_tensor.numel() == 1 &&
           gelu_val.rows_8bit_tensor.numel() == rows_val * columns_val &&
           gelu_val.rows_8bit_tensor.size(gelu_val.rows_8bit_tensor.dim() - 1) == columns_val &&
           gelu_val.turned_8bit_tensor.shape() == Shape({columns_val, rows_val}) &&
-          gelu_val.row_scales_tensor.numel() == rows_val && gelu_val.turned_scales_tensor.numel() == columns_val &&
           rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && gelu_val.scale_largest_ptr != nullptr)) {
-        fprintf(stderr, "error: mlp_up_8bit_gelu_8bit needs E4M3 copies {rows, columns} and {columns, rows}, float scales "
-                        "{rows} and {columns}, rows a multiple of %d, and the scale's largest\n",
+        fprintf(stderr, "error: mlp_up_8bit_gelu_8bit needs E4M3 copies {rows, columns} and {columns, rows}, a float scale {1}, "
+                        "rows a multiple of %d, and the scale's largest\n",
                 ROUND_8BIT_ROW_LENGTH_MULTIPLE);
         exit(EXIT_FAILURE);
     }
@@ -722,7 +720,7 @@ inline void mlp_up_8bit_launch(const Tensor& gelu_input_tensor, const Tensor& ge
     static_assert(PROMOTION_STEPS >= 0, "PROMOTION_STEPS is 0 (never) or more");
     static_assert(PINGPONG == 0 || (PINGPONG == 1 && ROW_GROUPS == 2 && CLUSTER == 1), "PINGPONG 1 takes 2 consumer warpgroups and no clusters");
     // 1. the sizes, from the copies; gelu_input: bfloat16, rows of whole 16-byte cells, the shape
-    size_t rows_val = copies_val.left_scales_tensor.size(0), columns_val = copies_val.right_scales_tensor.size(0);
+    size_t rows_val = copies_val.left_8bit_tensor.size(0), columns_val = copies_val.right_8bit_tensor.size(0);
     size_t sum_length_val = copies_val.left_8bit_tensor.size(1);
     mlp_up_8bit_check_tensor("mlp_up_8bit", "gelu_input", gelu_input_tensor);
     if (!(gelu_input_tensor.numel() == rows_val * columns_val && gelu_input_tensor.size(gelu_input_tensor.dim() - 1) == columns_val &&
@@ -744,16 +742,14 @@ inline void mlp_up_8bit_launch(const Tensor& gelu_input_tensor, const Tensor& ge
     CUtensorMap right_map_val = mlp_up_8bit_tensor_map_8bit(copies_val.right_8bit_tensor.data_ptr(), columns_val, sum_length_val, COLUMNS);
     CUtensorMap output_map_val = mlp_up_8bit_tensor_map(gelu_input_tensor.data_ptr<nv_bfloat16>(), rows_val, columns_val, HARDWARE_WGMMA_M);
     CUtensorMap side_map_val = output_map_val, side_turned_map_val = output_map_val;   // not read where not used
-    float* side_row_scales_ptr = nullptr;
-    float* side_turned_scales_ptr = nullptr;
+    float* side_scale_ptr = nullptr;
     const unsigned* side_scale_largest_ptr = nullptr;
     float side_margin_val = 1.0f;
     unsigned* side_next_largest_ptr = nullptr;
     if constexpr (GELU_8BIT) {
         side_map_val = mlp_up_8bit_tensor_map_8bit(gelu_8bit_ptr->rows_8bit_tensor.data_ptr(), rows_val, columns_val, HARDWARE_WGMMA_M);
         side_turned_map_val = mlp_up_8bit_tensor_map_turned_8bit(gelu_8bit_ptr->turned_8bit_tensor.data_ptr(), columns_val, rows_val, COLUMNS);
-        side_row_scales_ptr = gelu_8bit_ptr->row_scales_tensor.data();
-        side_turned_scales_ptr = gelu_8bit_ptr->turned_scales_tensor.data();
+        side_scale_ptr = gelu_8bit_ptr->scale_tensor.data();
         side_scale_largest_ptr = gelu_8bit_ptr->scale_largest_ptr;
         side_margin_val = gelu_8bit_ptr->margin_val;
         side_next_largest_ptr = gelu_8bit_ptr->next_largest_ptr;
@@ -778,14 +774,14 @@ inline void mlp_up_8bit_launch(const Tensor& gelu_input_tensor, const Tensor& ge
     if (total_clusters_val < 1) total_clusters_val = 1;
     if (total_clusters_val > total_units_val) total_clusters_val = total_units_val;
     unsigned total_blocks_val = (unsigned)(total_clusters_val * CLUSTER);
-    const float* left_scales_ptr = copies_val.left_scales_tensor.data();
-    const float* right_scales_ptr = copies_val.right_scales_tensor.data();
+    const float* left_scale_ptr = copies_val.left_scale_tensor.data();
+    const float* right_scale_ptr = copies_val.right_scale_tensor.data();
     const nv_bfloat16* bias_ptr = bias_tensor.numel() > 0 ? bias_tensor.data_ptr<nv_bfloat16>() : nullptr;   // nullptr: no bias
     if (CLUSTER == 1) {
         kernel_ptr<<<total_blocks_val, THREADS, SHARED_BYTES>>>(left_map_val, right_map_val, output_map_val, side_map_val, side_turned_map_val,
-                                                                left_scales_ptr, right_scales_ptr, bias_ptr,
+                                                                left_scale_ptr, right_scale_ptr, bias_ptr,
                                                                 (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
-                                                                side_row_scales_ptr, side_turned_scales_ptr, side_scale_largest_ptr, side_margin_val,
+                                                                side_scale_ptr, side_scale_largest_ptr, side_margin_val,
                                                                 side_next_largest_ptr);
         cudaCheck(cudaGetLastError());
     } else {
@@ -801,9 +797,9 @@ inline void mlp_up_8bit_launch(const Tensor& gelu_input_tensor, const Tensor& ge
         config_val.attrs = attributes_list;
         config_val.numAttrs = 1;
         cudaCheck(cudaLaunchKernelEx(&config_val, kernel_ptr, left_map_val, right_map_val, output_map_val, side_map_val, side_turned_map_val,
-                                     left_scales_ptr, right_scales_ptr, bias_ptr,
+                                     left_scale_ptr, right_scale_ptr, bias_ptr,
                                      (int)rows_val, (int)columns_val, (int)sum_length_val, block_rows_per_group_val,
-                                     side_row_scales_ptr, side_turned_scales_ptr, side_scale_largest_ptr, side_margin_val, side_next_largest_ptr));
+                                     side_scale_ptr, side_scale_largest_ptr, side_margin_val, side_next_largest_ptr));
     }
 }
 
@@ -875,11 +871,11 @@ __device__ __forceinline__ float2 mlp_up_8bit_gelu_of(float2 pair_val) {
 ///   output_map_val                       ... and gelu_input's
 ///   side_map_val                         ... and gelu_output's (bfloat16), or its row copy's (GELU_8BIT)
 ///   side_turned_map_val                  ... its turned copy's (GELU_8BIT; not read otherwise)
-///   left_scales_ptr, right_scales_ptr    the copies' scales: {rows}, {columns}
+///   left_scale_ptr, right_scale_ptr    the copies' scales: one float each
 ///   bias_ptr                             {columns}, or nullptr for none
 ///   rows_val, columns_val, sum_length_val   the product's sizes
 ///   block_rows_per_group_val             the squares' order: rows of units a group runs down
-///   side_row_scales_ptr, side_turned_scales_ptr   GELU_8BIT: gelu_output's scales lists {rows}, {columns}: written
+///   side_scale_ptr                               GELU_8BIT: gelu_output's one scale {1}: written
 ///   side_scale_largest_ptr, side_margin_val       GELU_8BIT: the scale is round_8bit_scale(largest x margin)
 ///   side_next_largest_ptr                         GELU_8BIT: gelu_output's largest |value| maxed onto it, or nullptr
 template <int COLUMNS, int STAGES, int ROW_GROUPS, int CLUSTER, bool SPLIT, int PRODUCER_REGISTERS, int IN_FLIGHT, int PROMOTION_STEPS,
@@ -889,10 +885,10 @@ mlp_up_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __gri
            const __grid_constant__ CUtensorMap output_map_val,
            const __grid_constant__ CUtensorMap side_map_val,
            const __grid_constant__ CUtensorMap side_turned_map_val,
-           const float* left_scales_ptr, const float* right_scales_ptr,
+           const float* left_scale_ptr, const float* right_scale_ptr,
            const nv_bfloat16* bias_ptr,
            int rows_val, int columns_val, int sum_length_val, int block_rows_per_group_val,
-           float* side_row_scales_ptr, float* side_turned_scales_ptr, const unsigned* side_scale_largest_ptr,
+           float* side_scale_ptr, const unsigned* side_scale_largest_ptr,
            float side_margin_val, unsigned* side_next_largest_ptr) {
     constexpr int COLUMN_GROUPS = COLUMNS / HARDWARE_WGMMA_GROUP_COLUMNS;                                   // groups of 8 across the square
     constexpr int RIGHT_TILE_BYTES = COLUMNS * MLP_UP_8BIT_BLOCK_K;                                                 // a right tile: COLUMNS lines of a step's k
@@ -1123,31 +1119,23 @@ mlp_up_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __gri
             // each of this thread's pairs, sums times both scales (+ bias), handed to what_val with its place: the
             // group of 8 columns, which of the thread's two rows, the row in the warpgroup's 64 and the column in the
             // square (the pair's first)
-            float left_scales_list[HARDWARE_WGMMA_ROWS_PER_THREAD];
-#pragma unroll
-            for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {
-                int row_index_val = group_first_row_index_val + thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                left_scales_list[thread_row_index_val] = row_index_val < rows_val ? left_scales_ptr[row_index_val] : 0.0f;
-            }
+            float left_scale_val = *left_scale_ptr, right_scale_val = *right_scale_ptr;   // one each: every value's
             auto each_pair_val = [&](auto what_val) {
 #pragma unroll
                 for (int group_index_val = 0; group_index_val < COLUMN_GROUPS; group_index_val++) {
                     int column_in_square_val = group_index_val * HARDWARE_WGMMA_GROUP_COLUMNS + thread_pair_column_index_val;
                     int column_index_val = block_first_column_index_val + column_in_square_val;
-                    float2 right_scales_val = column_index_val < columns_val ? *reinterpret_cast<const float2*>(right_scales_ptr + column_index_val)
-                                                                             : make_float2(0.0f, 0.0f);
                     float2 bias_val = bias_ptr != nullptr && column_index_val < columns_val
                                           ? __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(bias_ptr + column_index_val))
                                           : make_float2(0.0f, 0.0f);
 #pragma unroll
                     for (int thread_row_index_val = 0; thread_row_index_val < HARDWARE_WGMMA_ROWS_PER_THREAD; thread_row_index_val++) {   // rows group and group + 8
                         int row_in_group_val = thread_first_row_in_group_val + thread_row_index_val * HARDWARE_WGMMA_ROWS_PER_WARP;
-                        float left_scale_val = left_scales_list[thread_row_index_val];
                         // wgmma_matmul_8bit's order: sum x left scale x right scale (+ bias)
                         float2 pair_val = make_float2(
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scales_val.x
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val] * left_scale_val * right_scale_val
                                 + bias_val.x,
-                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scales_val.y
+                            sums_list[group_index_val][HARDWARE_WGMMA_COLUMNS_PER_THREAD * thread_row_index_val + 1] * left_scale_val * right_scale_val
                                 + bias_val.y);
                         what_val(row_in_group_val, column_in_square_val, pair_val);
                     }
@@ -1230,16 +1218,9 @@ mlp_up_8bit_kernel(const __grid_constant__ CUtensorMap left_map_val, const __gri
                     mlp_up_8bit_store_box(&side_turned_map_val, group_first_row_index_val, block_first_column_index_val, room_ptr + TURNED_8BIT_OFFSET);
                     mlp_up_8bit_store_commit();
                 }
-                //    the scales lists: every value the one scale; the rows' by the squares of the first column, the
-                //    columns' by the squares of the first rows
-                if (block_first_column_index_val == 0 && warpgroup_thread_index_val < HARDWARE_WGMMA_M &&
-                    group_first_row_index_val + warpgroup_thread_index_val < rows_val)
-                    side_row_scales_ptr[group_first_row_index_val + warpgroup_thread_index_val] = side_scale_val;
-                if (group_first_row_index_val == 0)
-                    for (int column_in_square_val = warpgroup_thread_index_val; column_in_square_val < COLUMNS;
-                         column_in_square_val += HARDWARE_WARPGROUP_THREADS)
-                        if (block_first_column_index_val + column_in_square_val < columns_val)
-                            side_turned_scales_ptr[block_first_column_index_val + column_in_square_val] = side_scale_val;
+                //    the one scale, by the first square's first thread (every block works out the same)
+                if (warpgroup_first_thread_val && block_first_column_index_val == 0 && group_first_row_index_val == 0)
+                    *side_scale_ptr = side_scale_val;
             }
         }
         //    gelu_output in 8 bits: this thread's largest onto the next call's, a warp at a time

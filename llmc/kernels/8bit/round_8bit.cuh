@@ -30,8 +30,7 @@
 // taken from the tensor the same place held the call before, times ROUND_8BIT_DELAYED_MARGIN (Transformer Engine's
 // delayed scaling: an activation's range moves little from one micro-batch to the next), while this read finds this
 // tensor's largest for the next call. A value past the scale's range is clamped to the largest E4M3 (448 x scale).
-// The scales lists are still written (every row the same), so the products read the copies as before. What it
-// costs: a row much smaller than the tensor's largest keeps fewer of its bits (E4M3 has 2^-9 .. 448: values under
+// The scale is written as one float {1}, both copies' (the products take one scale for each side). What it costs: a row much smaller than the tensor's largest keeps fewer of its bits (E4M3 has 2^-9 .. 448: values under
 // 2^-18 of the largest round to 0).
 #ifndef ROUND_8BIT_CUH
 #define ROUND_8BIT_CUH
@@ -74,9 +73,8 @@ struct Round8bitHistory {
     Tensor largest_tensor = Tensor::zeros({2});             // the last two tensors' largest |value|, as float bits
     mutable size_t calls_val = 0;                           // tensors rounded here so far: the last one's slot is (calls - 1) % 2
 };
-void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& row_scales_tensor, const Tensor& columns_8bit_tensor,
-                           const Tensor& column_scales_tensor, const Tensor& input_tensor,
-                           const Round8bitHistory* history_ptr = nullptr, bool same_input_val = false);
+void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& columns_8bit_tensor, const Tensor& scale_tensor,
+                           const Tensor& input_tensor, const Round8bitHistory* history_ptr = nullptr, bool same_input_val = false);
 bool round_8bit_delayed_largest(const Round8bitHistory& history_val, const unsigned*& scale_largest_ptr, unsigned*& next_largest_ptr);
 
 // ══ the code, in the order of the list above ══════════════════════════════════
@@ -90,7 +88,7 @@ __global__ void __launch_bounds__(ROUND_8BIT_TILE_THREADS)
 round_8bit_tile_kernel(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv_fp8_e4m3* columns_8bit_ptr, float* column_scales_ptr,
                        const unsigned* row_largest_ptr, const unsigned* column_largest_ptr, const nv_bfloat16* input_ptr,
                        size_t rows_val, size_t columns_val, const unsigned* tensor_largest_ptr, float margin_val,
-                       unsigned* next_largest_ptr);
+                       unsigned* next_largest_ptr, float* tensor_scale_ptr);
 __global__ void round_8bit_tensor_largest_kernel(unsigned* largest_ptr, const nv_bfloat16* input_ptr, size_t loads_val);
 void round_8bit_by_tiles(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv_fp8_e4m3* columns_8bit_ptr, float* column_scales_ptr,
                          const nv_bfloat16* input_ptr, size_t rows_val, size_t columns_val);
@@ -336,20 +334,23 @@ round_8bit_largest_kernel(unsigned* row_largest_ptr, unsigned* column_largest_pt
 /// The blocks of the first tile row write the columns' scales, those of the first tile column the rows'. Rounding
 /// as round_8bit_rows_kernel does (__nv_fp8x4_e4m3, saturating), so the same bits.
 ///
-///   rows_8bit_ptr, row_scales_ptr           {rows, columns} E4M3 and {rows}: written; or nullptr
-///   columns_8bit_ptr, column_scales_ptr     {columns, rows} E4M3 and {columns}: written; or nullptr
+///   rows_8bit_ptr, row_scales_ptr           {rows, columns} E4M3 and {rows}: written; or nullptr (the scales
+///                                           nullptr alone: one scale per tensor, into tensor_scale_ptr)
+///   columns_8bit_ptr, column_scales_ptr     {columns, rows} E4M3 and {columns}: written; or nullptr (likewise)
 ///   row_largest_ptr, column_largest_ptr     round_8bit_largest_kernel's (nullptr where it was given nullptr)
 ///   input_ptr, rows_val, columns_val        as there: rows a multiple of ROUND_8BIT_STORE_VALUES when turned
 ///   tensor_largest_ptr, margin_val          one scale per tensor (round_8bit_per_tensor): a largest |value| (float
-///                                           bits) and what to multiply it by; every row's and column's scale is the
-///                                           scale of that. nullptr: one scale per row and column, from their lists
+///                                           bits) and what to multiply it by; every value's scale is the scale of
+///                                           that. nullptr: one scale per row and column, from their lists
 ///   next_largest_ptr                        this tensor's largest |value| maxed onto it (float bits, 0 before), or
 ///                                           nullptr
+///   tensor_scale_ptr                        one scale per tensor: that scale, one float, written by the first block's
+///                                           first thread (the scales lists then nullptr); or nullptr
 __global__ void __launch_bounds__(ROUND_8BIT_TILE_THREADS)
 round_8bit_tile_kernel(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv_fp8_e4m3* columns_8bit_ptr, float* column_scales_ptr,
                        const unsigned* row_largest_ptr, const unsigned* column_largest_ptr, const nv_bfloat16* input_ptr,
                        size_t rows_val, size_t columns_val, const unsigned* tensor_largest_ptr, float margin_val,
-                       unsigned* next_largest_ptr) {
+                       unsigned* next_largest_ptr, float* tensor_scale_ptr) {
     __shared__ __align__(16) nv_bfloat16 tile_list[ROUND_8BIT_TILE][ROUND_8BIT_TILE + ROUND_8BIT_TILE_PADDING];
     // 1. this thread's load in the tile
     int load_index_val = threadIdx.x % ROUND_8BIT_LOADS_PER_TILE_ROW;
@@ -361,6 +362,7 @@ round_8bit_tile_kernel(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr, __nv
     bool per_tensor_val = tensor_largest_ptr != nullptr;
     float tensor_scale_val = per_tensor_val ? round_8bit_scale(__uint_as_float(*tensor_largest_ptr) * margin_val) : 1.0f;
     float thread_largest_val = 0.0f;                                    // per tensor: this thread's loads' largest |value|
+    if (tensor_scale_ptr != nullptr && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) *tensor_scale_ptr = tensor_scale_val;
 
     // 2. the tile's rows: the row copy written, the values kept for the turned copy
     for (int tile_row_val = first_tile_row_val; tile_row_val < ROUND_8BIT_TILE; tile_row_val += ROUND_8BIT_TILE_ROWS_AT_ONCE) {
@@ -450,7 +452,7 @@ inline void round_8bit_by_tiles(__nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_
     cudaCheck(cudaGetLastError());
     round_8bit_tile_kernel<<<grid_val, ROUND_8BIT_TILE_THREADS>>>(rows_8bit_ptr, row_scales_ptr, columns_8bit_ptr, column_scales_ptr,
                                                                   row_largest_ptr, column_largest_ptr, input_ptr, rows_val, columns_val,
-                                                                  nullptr, 1.0f, nullptr);
+                                                                  nullptr, 1.0f, nullptr, nullptr);
     cudaCheck(cudaGetLastError());
 }
 
@@ -480,9 +482,8 @@ __global__ void round_8bit_tensor_largest_kernel(unsigned* largest_ptr, const nv
 }
 
 /// Writes the 8-bit copies of one matrix with ONE scale for the whole tensor: as it sits and/or turned round (as
-/// round_8bit_rows_and_columns: either may be left out), in one read by the tile kernel. Every scale of row_scales and
-/// column_scales is that one scale (a power of 2), so the products read the copies as they read per-row ones.
-/// Where the scale comes from:
+/// round_8bit_rows_and_columns: either may be left out), in one read by the tile kernel, and that scale (a power of 2,
+/// both copies'). Where the scale comes from:
 ///     no history                  this tensor's largest |value|, by a read of its own first: exact
 ///     a history, its first call   the same, kept in the history
 ///     a history, later calls      the largest of the tensor rounded there the call before, x ROUND_8BIT_DELAYED_MARGIN
@@ -491,32 +492,31 @@ __global__ void round_8bit_tensor_largest_kernel(unsigned* largest_ptr, const nv
 ///     same_input_val              the tensor is the one the history's last call rounded (a linear's input, rounded as
 ///                                 it sits by the forward, now turned for the weight_grad): its largest is known, exact
 ///
-///   rows_8bit_tensor, row_scales_tensor, columns_8bit_tensor, column_scales_tensor, input_tensor
-///                     as in round_8bit_rows_and_columns
-///   history_ptr       the place's history, or nullptr (not given)
-///   same_input_val    see above; needs a history
-inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& row_scales_tensor, const Tensor& columns_8bit_tensor,
-                                  const Tensor& column_scales_tensor, const Tensor& input_tensor, const Round8bitHistory* history_ptr,
-                                  bool same_input_val) {
+///   rows_8bit_tensor      {rows, columns} E4M3: written; or Tensor()
+///   columns_8bit_tensor   {columns, rows} E4M3, turned round: written; or Tensor() (not both)
+///   scale_tensor          {1} float: written, both copies' scale
+///   input_tensor          bfloat16 {..., columns} (rows = all the other dims); rows and columns multiples of
+///                         ROUND_8BIT_ROW_LENGTH_MULTIPLE
+///   history_ptr           the place's history, or nullptr (not given)
+///   same_input_val        see above; needs a history
+inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& columns_8bit_tensor, const Tensor& scale_tensor,
+                                  const Tensor& input_tensor, const Round8bitHistory* history_ptr, bool same_input_val) {
     // 1. check the tensors; any of them wrong: stop with an error
     bool has_rows_val = rows_8bit_tensor.numel() > 0;
     bool has_columns_val = columns_8bit_tensor.numel() > 0;
     bool fits_val = input_tensor.dim() >= 1 && input_tensor.dtype() == DType::BFloat16 && (has_rows_val || has_columns_val) &&
-                    (size_t)input_tensor.data_ptr() % sizeof(uint4) == 0;
+                    (size_t)input_tensor.data_ptr() % sizeof(uint4) == 0 && scale_tensor.dtype() == DType::Float32 &&
+                    scale_tensor.numel() == 1;
     size_t columns_val = fits_val ? input_tensor.size(input_tensor.dim() - 1) : 1;
     size_t rows_val = input_tensor.numel() / columns_val;
     fits_val = fits_val && rows_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0 && columns_val % ROUND_8BIT_ROW_LENGTH_MULTIPLE == 0;
     if (has_rows_val)
-        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::E4M3 && row_scales_tensor.dtype() == DType::Float32 &&
-                   rows_8bit_tensor.numel() == rows_val * columns_val && row_scales_tensor.numel() == rows_val;
+        fits_val = fits_val && rows_8bit_tensor.dtype() == DType::E4M3 && rows_8bit_tensor.numel() == rows_val * columns_val;
     if (has_columns_val)
-        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::E4M3 && column_scales_tensor.dtype() == DType::Float32 &&
-                   columns_8bit_tensor.numel() == rows_val * columns_val &&
-                   column_scales_tensor.numel() == columns_val;
+        fits_val = fits_val && columns_8bit_tensor.dtype() == DType::E4M3 && columns_8bit_tensor.numel() == rows_val * columns_val;
     if (!fits_val) {
         fprintf(stderr, "error: round_8bit_per_tensor needs a bfloat16 input {rows, columns}, both multiples of %d, starting on 16 "
-                        "bytes, and E4M3 copies {rows, columns} with float scales {rows} and/or {columns, rows} with "
-                        "{columns}\n",
+                        "bytes, E4M3 copies {rows, columns} and/or {columns, rows}, and a float scale {1}\n",
                 ROUND_8BIT_ROW_LENGTH_MULTIPLE);
         exit(EXIT_FAILURE);
     }
@@ -548,10 +548,9 @@ inline void round_8bit_per_tensor(const Tensor& rows_8bit_tensor, const Tensor& 
     // 3. the one read, a block a tile
     dim3 grid_val((unsigned)CEIL_DIV(columns_val, (size_t)ROUND_8BIT_TILE), (unsigned)CEIL_DIV(rows_val, (size_t)ROUND_8BIT_TILE));
     round_8bit_tile_kernel<<<grid_val, ROUND_8BIT_TILE_THREADS>>>(
-        has_rows_val ? reinterpret_cast<__nv_fp8_e4m3*>(rows_8bit_tensor.data_ptr()) : nullptr, has_rows_val ? row_scales_tensor.data() : nullptr,
-        has_columns_val ? reinterpret_cast<__nv_fp8_e4m3*>(columns_8bit_tensor.data_ptr()) : nullptr,
-        has_columns_val ? column_scales_tensor.data() : nullptr, nullptr, nullptr, input_ptr, rows_val, columns_val, scale_largest_ptr,
-        margin_val, next_largest_ptr);
+        has_rows_val ? reinterpret_cast<__nv_fp8_e4m3*>(rows_8bit_tensor.data_ptr()) : nullptr, nullptr,
+        has_columns_val ? reinterpret_cast<__nv_fp8_e4m3*>(columns_8bit_tensor.data_ptr()) : nullptr, nullptr, nullptr, nullptr,
+        input_ptr, rows_val, columns_val, scale_largest_ptr, margin_val, next_largest_ptr, scale_tensor.data());
     cudaCheck(cudaGetLastError());
 }
 

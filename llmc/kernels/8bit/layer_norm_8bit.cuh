@@ -10,9 +10,8 @@
 //     input, output   bfloat16         {batch_size, seq_len, embed_dim}      output: Tensor() when not wanted
 //     rows_8bit       E4M3             {rows, embed_dim}                     rows = batch_size x seq_len: the forward
 //                                                                            product's left side (qkv, mlp_up, head)
-//     row_scales      float            {rows}                                every one the tensor's scale
 //     turned_8bit     E4M3             {embed_dim, rows}                     the weight_grad product's right side
-//     turned_scales   float            {embed_dim}                           every one the tensor's scale
+//     scale           float            {1}                                   both copies' one scale
 //     weight, bias    bfloat16         {embed_dim}
 //     mean, rstd      float            {batch_size, seq_len}                 kept for the backward
 //
@@ -61,13 +60,12 @@ static_assert(sizeof(uint4) == LAYER_NORM_8BIT_TURNED_STORE_VALUES * sizeof(__nv
 static_assert(LAYER_NORM_8BIT_TILE_ROWS % LAYER_NORM_8BIT_TURNED_STORE_VALUES == 0, "a tile is whole turned stores");
 
 /// The output in 8 bits, as layer_norm_8bit_forward writes it: both copies the products read, with one scale for the
-/// tensor (every value of both scales lists) made from a largest |value| in GPU memory, and where this tensor's
+/// tensor (one float, written here) made from a largest |value| in GPU memory, and where this tensor's
 /// largest goes for the next call.
 struct LayerNorm8bitCopies {
     Tensor rows_8bit_tensor;                       // {rows, embed_dim} E4M3: as it sits
-    Tensor row_scales_tensor;                      // {rows} float
     Tensor turned_8bit_tensor;                     // {embed_dim, rows} E4M3: turned round
-    Tensor turned_scales_tensor;                   // {embed_dim} float
+    Tensor scale_tensor;                           // {1} float: both copies' one scale
     const unsigned* scale_largest_ptr = nullptr;   // the largest |value| the scale is made from (a float's bits, in GPU memory)
     float margin_val = 1.0f;                       // ... times this (ROUND_8BIT_DELAYED_MARGIN for a delayed one)
     unsigned* next_largest_ptr = nullptr;          // this tensor's largest |value| maxed onto it (0 before), or nullptr
@@ -91,8 +89,8 @@ void layer_norm_8bit_backward(const Tensor& input_grad_tensor, const Tensor& wei
 // ── forward ───────────────────────────────────────────────────────────────────
 
 template <int TILE_ROWS>
-__global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr,
-                                               __nv_fp8_e4m3* turned_8bit_ptr, float* turned_scales_ptr, float* mean_ptr,
+__global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8_e4m3* rows_8bit_ptr,
+                                               __nv_fp8_e4m3* turned_8bit_ptr, float* scale_ptr, float* mean_ptr,
                                                float* rstd_ptr, const nv_bfloat16* input_ptr, const nv_bfloat16* weight_ptr,
                                                const nv_bfloat16* bias_ptr, size_t rows_val, size_t embed_dim_val,
                                                const unsigned* scale_largest_ptr, float margin_val, unsigned* next_largest_ptr);
@@ -113,7 +111,7 @@ inline void layer_norm_8bit_forward(const Tensor& output_tensor, const LayerNorm
 /// row.
 ///
 ///   output_tensor                 {batch_size, seq_len, embed_dim} bfloat16: written; or Tensor() (not written)
-///   copies_val                    the two copies, their scales lists, the largest the scale comes from (not nullptr),
+///   copies_val                    the two copies, their one scale {1}, the largest the scale comes from (not nullptr),
 ///                                 its margin and where this tensor's largest goes; rows = batch_size x seq_len and
 ///                                 embed_dim multiples of ROUND_8BIT_ROW_LENGTH_MULTIPLE (a copy's rows are whole
 ///                                 16-byte pieces)
@@ -143,16 +141,15 @@ inline void layer_norm_8bit_forward_at(const Tensor& output_tensor, const LayerN
                     c.rows_8bit_tensor.dtype() == DType::E4M3 && c.rows_8bit_tensor.dim() >= 1 &&
                     c.rows_8bit_tensor.numel() == rows_val * embed_dim_val &&
                     c.rows_8bit_tensor.size(c.rows_8bit_tensor.dim() - 1) == embed_dim_val &&
-                    c.row_scales_tensor.dtype() == DType::Float32 && c.row_scales_tensor.numel() == rows_val &&
                     c.turned_8bit_tensor.dtype() == DType::E4M3 && c.turned_8bit_tensor.dim() >= 1 &&
                     c.turned_8bit_tensor.numel() == rows_val * embed_dim_val &&
                     c.turned_8bit_tensor.size(c.turned_8bit_tensor.dim() - 1) == rows_val &&
-                    c.turned_scales_tensor.dtype() == DType::Float32 && c.turned_scales_tensor.numel() == embed_dim_val &&
+                    c.scale_tensor.dtype() == DType::Float32 && c.scale_tensor.numel() == 1 &&
                     (size_t)c.rows_8bit_tensor.data_ptr() % sizeof(uint2) == 0 && (size_t)c.turned_8bit_tensor.data_ptr() % sizeof(uint4) == 0 &&
                     c.scale_largest_ptr != nullptr && shared_bytes_val <= HARDWARE_MAX_SHARED_BYTES_PER_BLOCK;
     if (!fits_val) {
         fprintf(stderr, "error: layer_norm_8bit_forward needs rows and embed_dim multiples of %d, E4M3 copies {rows, embed_dim} "
-                        "and {embed_dim, rows} on 8 and 16 bytes with float scales {rows} and {embed_dim}, a largest for the "
+                        "and {embed_dim, rows} on 8 and 16 bytes with a float scale {1}, a largest for the "
                         "scale, and %d x embed_dim bytes of shared memory at most %d; got rows %zu, embed_dim %zu\n",
                 ROUND_8BIT_ROW_LENGTH_MULTIPLE, TILE_ROWS, HARDWARE_MAX_SHARED_BYTES_PER_BLOCK, rows_val, embed_dim_val);
         exit(EXIT_FAILURE);
@@ -168,7 +165,7 @@ inline void layer_norm_8bit_forward_at(const Tensor& output_tensor, const LayerN
     int blocks_val = (int)CEIL_DIV(rows_val, (size_t)TILE_ROWS);
     layer_norm_8bit_forward_kernel<TILE_ROWS><<<blocks_val, threads_per_block_val, shared_bytes_val>>>(
         has_output_val ? output_tensor.data_ptr<nv_bfloat16>() : nullptr, reinterpret_cast<__nv_fp8_e4m3*>(c.rows_8bit_tensor.data_ptr()),
-        c.row_scales_tensor.data(), reinterpret_cast<__nv_fp8_e4m3*>(c.turned_8bit_tensor.data_ptr()), c.turned_scales_tensor.data(),
+        reinterpret_cast<__nv_fp8_e4m3*>(c.turned_8bit_tensor.data_ptr()), c.scale_tensor.data(),
         mean_tensor.data(), rstd_tensor.data(), input_tensor.data_ptr<nv_bfloat16>(), weight_tensor.data_ptr<nv_bfloat16>(),
         bias_tensor.data_ptr<nv_bfloat16>(), rows_val, embed_dim_val, c.scale_largest_ptr, c.margin_val, c.next_largest_ptr);
     cudaCheck(cudaGetLastError());
@@ -180,8 +177,9 @@ inline void layer_norm_8bit_forward_at(const Tensor& output_tensor, const LayerN
 /// writes the kept E4M3s turned round, LAYER_NORM_8BIT_TURNED_STORE_VALUES rows of one column a store.
 ///
 ///   output_ptr                                    {rows, embed_dim} bfloat16: written; or nullptr
-///   rows_8bit_ptr, row_scales_ptr                 {rows, embed_dim} E4M3 and {rows} float: written
-///   turned_8bit_ptr, turned_scales_ptr            {embed_dim, rows} E4M3 and {embed_dim} float: written
+///   rows_8bit_ptr                                 {rows, embed_dim} E4M3: written
+///   turned_8bit_ptr                               {embed_dim, rows} E4M3: written
+///   scale_ptr                                     both copies' one scale {1}: written (by the first block)
 ///   mean_ptr, rstd_ptr, input_ptr, weight_ptr, bias_ptr   as in layer_norm_8bit_forward_at
 ///   rows_val                                      batch_size x seq_len: a multiple of LAYER_NORM_8BIT_TURNED_STORE_VALUES
 ///   embed_dim_val                                 the row length
@@ -189,8 +187,8 @@ inline void layer_norm_8bit_forward_at(const Tensor& output_tensor, const LayerN
 ///   next_largest_ptr                              this tensor's largest |value| maxed onto it, or nullptr
 /// TILE_ROWS: as in layer_norm_8bit_forward_at; the dynamic shared memory holds TILE_ROWS x embed_dim E4M3s.
 template <int TILE_ROWS>
-__global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8_e4m3* rows_8bit_ptr, float* row_scales_ptr,
-                                               __nv_fp8_e4m3* turned_8bit_ptr, float* turned_scales_ptr, float* mean_ptr,
+__global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8_e4m3* rows_8bit_ptr,
+                                               __nv_fp8_e4m3* turned_8bit_ptr, float* scale_ptr, float* mean_ptr,
                                                float* rstd_ptr, const nv_bfloat16* input_ptr, const nv_bfloat16* weight_ptr,
                                                const nv_bfloat16* bias_ptr, size_t rows_val, size_t embed_dim_val,
                                                const unsigned* scale_largest_ptr, float margin_val, unsigned* next_largest_ptr) {
@@ -205,6 +203,7 @@ __global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8
     float scale_val = round_8bit_scale(__uint_as_float(*scale_largest_ptr) * margin_val);
     float to_stored_val = 1.0f / scale_val;                       // exact: a power of 2
     float thread_largest_val = 0.0f;                              // this lane's largest |value| of the output as stored
+    if (blockIdx.x == 0 && threadIdx.x == 0) *scale_ptr = scale_val;   // both copies' (every block works out the same)
 
     // 2. the tile's rows: warp w takes tile rows w, w + warps, ...: the same for all its lanes, so the warp stays whole
     for (int tile_row_index_val = warp_index_val; tile_row_index_val < TILE_ROWS; tile_row_index_val += warps_val) {
@@ -246,11 +245,10 @@ __global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8
             *reinterpret_cast<uint2*>(tile_row_ptr + first_index_val) = stored_val;
         }
 
-        // 2c. lane 0 keeps the row's mean, rstd and scale
+        // 2c. lane 0 keeps the row's mean and rstd
         if (lane_index_val == 0) {
             mean_ptr[row_index_val] = row_mean_val;
             rstd_ptr[row_index_val] = row_rstd_val;
-            row_scales_ptr[row_index_val] = scale_val;
         }
     }
 
@@ -284,7 +282,6 @@ __global__ void layer_norm_8bit_forward_kernel(nv_bfloat16* output_ptr, __nv_fp8
         }
         *reinterpret_cast<uint4*>(turned_8bit_ptr + column_index_val * rows_val + piece_first_row_index_val) =
             make_uint4(words_list[0], words_list[1], words_list[2], words_list[3]);
-        if (blockIdx.x == 0 && first_tile_row_index_val == 0) turned_scales_ptr[column_index_val] = scale_val;
     }
 }
 
