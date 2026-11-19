@@ -54,7 +54,7 @@
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_MAX_STAGES
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_SPLITS 0                           // splits of the sum: 1, none; 0: chosen at each launch (attention_output_weight_grad_8bit_auto_splits)
-#define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4            // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_ONE_A_SQUARE: one a square
 #define ATTENTION_OUTPUT_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 24                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_attention_output_weight_grad_8bit sweeps it
@@ -361,7 +361,7 @@ inline CUtensorMap attention_output_weight_grad_8bit_tensor_map(const nv_bfloat1
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: wgmma_matmul_bf16 could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);
@@ -398,7 +398,7 @@ inline CUtensorMap attention_output_weight_grad_8bit_tensor_map_8bit(const void*
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: attention_output_weight_grad_8bit could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);

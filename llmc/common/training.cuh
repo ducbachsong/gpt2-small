@@ -102,7 +102,7 @@ inline void print_usage_and_stop(const char* program, int exit_code, const Train
     printf("  --seed N                      %llu\n", d.seed);
     printf("  --nccl-id-file PATH           /tmp/gpt2_nccl_id_<TORCHELASTIC_RUN_ID>.bin; several GPUs only\n");
     printf("  --progress-every N            %d   a line with the time left\n", d.progress_every);
-    printf("  --checkpoint-dir DIR          none: no checkpoints (train_8bit: none yet)\n");
+    printf("  --checkpoint-dir DIR          none: no checkpoints (train_8bit's: checkpoint_8bit.cuh)\n");
     printf("  --checkpoint-every N          %d\n", d.checkpoint_every);
     printf("  --keep-checkpoints N          %d   the newest; older ones are deleted\n", d.keep_checkpoints);
     printf("  --resume PATH                 a checkpoint dir (its latest) or one step folder of it\n");

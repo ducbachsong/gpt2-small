@@ -1,0 +1,147 @@
+"""safetensors_model.py — the model in plain PyTorch, read from an export_safetensors.py folder (model.safetensors +
+config.json): what anyone who downloads the model runs it with, since transformers' GPT-2 cannot. It also checks an
+export: the val loss on the val token files, the same tokens as the trainer's `val loss` line, so the two can be put
+side by side. A weight cut, named or turned wrongly gives a loss far off (a model that knows nothing: about 10.4).
+
+    python data/safetensors_model.py --model d24-8bit --batch-size 16 --batches 10
+
+--batches is the trainer's --val-batches times its GPUs: the trainer's GPUs take turns batch by batch from the val
+file's start (dataloader.cuh), and its val loss is the mean of all those batches' mean losses, as here.
+
+The model, as llmc's model_bf16.cuh and model_8bit.cuh run it (computed here in float32):
+    x = wte[tokens] + wpe[positions]
+    each layer:   x = x + proj(attention(qkv(ln_1(x))))       qkv rows q, k, v; heads of head_size side by side
+                  x = x + down(gelu_tanh(up(ln_2(x))))
+    logits = ln_f(x) @ wte^T                                    no head bias
+With config.json's qk_norm, each head row of q and k is gain * x / sqrt(mean(x^2) + eps) before attention (no
+weight); with logit_softcap c > 0, logits = c * tanh(logits / c). Folders made before these keys: neither.
+Attention is causal; a short layer's query sees its own key and the attention_window keys before it (of every 4
+layers the first 3 are short, the last layer long). LayerNorm's epsilon is config.json's.
+"""
+import argparse
+import json
+import math
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from safetensors.torch import load_file
+
+HEADER_INTS = 256                        # a token file's header: 256 int32s ([2] the tokens), then uint16 tokens
+
+
+def layer_window(config, layer):
+    """Gives a layer's sliding window: config's attention_window for a short layer, 0 (the whole row) for a long one:
+    of every 4 layers the 4th is long, and the last layer always (gpt2_attention_window in model_params.cuh)."""
+    long_layer = layer % 4 == 3 or layer + 1 == config["n_layer"]
+    return 0 if long_layer else config["attention_window"]
+
+
+class Model:
+    """The model's weights from model.safetensors, and its forward: logits for a batch of token ids."""
+
+    def __init__(self, folder, device):
+        """Reads config.json and model.safetensors from `folder` onto `device`, in float32."""
+        with open(os.path.join(folder, "config.json")) as config_file:
+            self.config = json.load(config_file)
+        self.weights = {name: tensor.to(device=device, dtype=torch.float32)
+                        for name, tensor in load_file(os.path.join(folder, "model.safetensors")).items()}
+        self.device = device
+        self.masks = {}                  # (T, window): the attention mask, made once
+
+    def mask(self, seq_len, window):
+        """Gives the {T, T} mask of which keys each query sees: those before it and its own, and with a window only
+        the `window` keys before it."""
+        if (seq_len, window) not in self.masks:
+            positions = torch.arange(seq_len, device=self.device)
+            distance = positions[:, None] - positions[None, :]           # query - key
+            self.masks[(seq_len, window)] = (distance >= 0) & (distance <= window)
+        return self.masks[(seq_len, window)]
+
+    def layer_norm(self, x, name):
+        """Gives LayerNorm `name` of x: its .weight and .bias, config's epsilon."""
+        w = self.weights
+        return F.layer_norm(x, (x.shape[-1],), w[f"{name}.weight"], w[f"{name}.bias"], self.config["layer_norm_epsilon"])
+
+    def linear(self, x, name):
+        """Gives x times linear `name`'s weight {out, in} turned, plus its bias if the model has linear biases."""
+        return F.linear(x, self.weights[f"{name}.weight"], self.weights.get(f"{name}.bias"))
+
+    def attention(self, x, layer):
+        """Gives layer `layer`'s attention branch of x {B, T, D} (before the residual add)."""
+        B, T, D = x.shape
+        NH, HS = self.config["n_head"], self.config["head_size"]
+        qkv = self.linear(self.layer_norm(x, f"h.{layer}.ln_1"), f"h.{layer}.attn.qkv")
+        q, k, v = (part.view(B, T, NH, HS).transpose(1, 2) for part in qkv.split(D, dim=-1))
+        if self.config.get("qk_norm"):                    # QK-norm: each head row to RMS gain, no weight
+            gain, eps = self.config["qk_norm_gain"], self.config["qk_norm_epsilon"]
+            q = gain * q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + eps)
+            k = gain * k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + eps)
+        window = layer_window(self.config, layer)
+        if window == 0:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask(T, window))
+        return self.linear(y.transpose(1, 2).reshape(B, T, D), f"h.{layer}.attn.proj")
+
+    def mlp(self, x, layer):
+        """Gives layer `layer`'s MLP branch of x (before the residual add)."""
+        up = self.linear(self.layer_norm(x, f"h.{layer}.ln_2"), f"h.{layer}.mlp.up")
+        return self.linear(F.gelu(up, approximate="tanh"), f"h.{layer}.mlp.down")
+
+    @torch.no_grad()
+    def logits(self, token_ids):
+        """Gives the logits {B, T, padded_vocab} for token ids {B, T}."""
+        w = self.weights
+        T = token_ids.shape[1]
+        x = w["wte.weight"][token_ids] + w["wpe.weight"][:T]
+        for layer in range(self.config["n_layer"]):
+            x = x + self.attention(x, layer)
+            x = x + self.mlp(x, layer)
+        logits = self.layer_norm(x, "ln_f") @ w["wte.weight"].T
+        softcap = self.config.get("logit_softcap", 0)
+        return softcap * torch.tanh(logits / softcap) if softcap > 0 else logits
+
+
+def val_loss(model, val_file, batch_size, seq_len, batches):
+    """Gives the mean of `batches` batches' mean losses, the batches one after another from the val file's start, each
+    B x T + 1 tokens (the targets the next tokens), as the trainer's GPUs read them."""
+    header = np.fromfile(val_file, dtype=np.int32, count=HEADER_INTS)
+    batch_tokens = batch_size * seq_len
+    if int(header[2]) < batches * batch_tokens + 1:
+        raise SystemExit(f"{val_file} holds {int(header[2]):,} tokens, {batches} batches need {batches * batch_tokens + 1:,}")
+    tokens = np.fromfile(val_file, dtype=np.uint16, count=batches * batch_tokens + 1, offset=HEADER_INTS * 4)
+    losses = []
+    for batch in range(batches):
+        chunk = torch.from_numpy(tokens[batch * batch_tokens:(batch + 1) * batch_tokens + 1].astype(np.int64)).to(model.device)
+        token_ids, targets = chunk[:-1].view(batch_size, seq_len), chunk[1:].view(batch_size, seq_len)
+        logits = model.logits(token_ids)
+        losses.append(F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.reshape(-1)).item())
+    return sum(losses) / len(losses), losses
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--model", required=True, help="an export_safetensors.py folder")
+    parser.add_argument("--val-files", default="data/climbmix/climbmix_val_%06d.bin", help="the trainer's --val-files")
+    parser.add_argument("--batch-size", type=int, default=8, help="the trainer's --batch-size (rows)")
+    parser.add_argument("--seq-len", type=int, help="the trainer's --seq-len; default the model's context")
+    parser.add_argument("--batches", type=int, default=20, help="the trainer's --val-batches x its GPUs")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    model = Model(args.model, args.device)
+    config = model.config
+    params = sum(tensor.numel() for tensor in model.weights.values())
+    print(f"{args.model}: {len(model.weights)} tensors, {params:,} params, {config['n_layer']} layers x {config['n_embd']}, "
+          f"{config.get('training', {})}")
+    seq_len = args.seq_len or config["n_positions"]
+    mean, losses = val_loss(model, args.val_files % 0, args.batch_size, seq_len, args.batches)
+    print("batch losses: " + " ".join(f"{loss:.4f}" for loss in losses))
+    print(f"val loss {mean:.4f}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

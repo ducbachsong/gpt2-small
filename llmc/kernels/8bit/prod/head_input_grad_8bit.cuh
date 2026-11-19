@@ -47,9 +47,9 @@
 #define HEAD_INPUT_GRAD_8BIT_ROW_GROUPS 2                       // consumer warpgroups a block, 64 rows each: 1 or 2
 #define HEAD_INPUT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define HEAD_INPUT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to HEAD_INPUT_GRAD_8BIT_MAX_STAGES
-#define HEAD_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 16            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define HEAD_INPUT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4             // rows of squares a group of blocks runs down before the next column (1: row after row)
 #define HEAD_INPUT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
-#define HEAD_INPUT_GRAD_8BIT_BLOCKS HEAD_INPUT_GRAD_8BIT_ONE_A_SQUARE                           // blocks a launch: 0, as many as the GPU runs at once (persistent); HEAD_INPUT_GRAD_8BIT_ONE_A_SQUARE: one a square
+#define HEAD_INPUT_GRAD_8BIT_BLOCKS 0                                                           // blocks a launch: 0, as many as the GPU runs at once (persistent); HEAD_INPUT_GRAD_8BIT_ONE_A_SQUARE: one a square
 #define HEAD_INPUT_GRAD_8BIT_PRODUCER_REGISTERS 24                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_head_input_grad_8bit sweeps it
 #define HEAD_INPUT_GRAD_8BIT_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_head_input_grad_8bit sweeps it
 #define HEAD_INPUT_GRAD_8BIT_PROMOTION_STEPS 8                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_head_input_grad_8bit sweeps it
@@ -348,7 +348,7 @@ inline CUtensorMap head_input_grad_8bit_tensor_map(const nv_bfloat16* matrix_ptr
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: wgmma_matmul_bf16 could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);
@@ -385,7 +385,7 @@ inline CUtensorMap head_input_grad_8bit_tensor_map_8bit(const void* matrix_ptr, 
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: head_input_grad_8bit could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);

@@ -32,6 +32,11 @@ struct GPT2Config {
     size_t attention_window = 0;         // the short layers' sliding window: a token sees itself and this many tokens
                                          // before it (a multiple of 64; model_bf16 and model_8bit, flash attention
                                          // only); 0: every layer sees the whole row, as GPT-2
+    bool qk_norm = false;                // model_8bit only: each head row of query and key scaled to a root mean square
+                                         // of 1.2 before attention (nanochat's QK-norm, kernels/8bit/qk_norm_8bit.cuh);
+                                         // false: GPT-2's, as it comes out of the qkv linear
+    float logit_softcap = 0.0f;          // model_8bit only: each logit capped to c · tanh(logit / c) before the softmax
+                                         // (nanochat's 15); 0: none, GPT-2's
 };
 
 /// Gives a layer's sliding window, in nanochat's pattern SSSL: of every 4 layers the first 3 are short

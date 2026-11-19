@@ -422,7 +422,7 @@ inline CUtensorMap attention_output_weight_grad_bf16_tensor_map(const nv_bfloat1
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: wgmma_matmul_bf16 could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);

@@ -16,6 +16,10 @@
 static const double FLOAT_TOLERANCE = 1e-5;
 // logits_grad is rounded to bfloat16 here, by up to 2^-9 of each value: twice that, as a fraction of the largest.
 static const double BFLOAT16_TOLERANCE = 8e-3;
+// With the softcap each capped logit is c · tanh.approx (about 2^-11 relative), off by up to ~4e-3 at |capped| 8; the
+// exps carry that into the sum and the gradient: within 1e-2 of the largest value.
+static const double SOFTCAP_TOLERANCE = 1e-2;
+#define NANOCHAT_LOGIT_SOFTCAP 15.0f  // the 8-bit model's c (TRAIN_8BIT_LOGIT_SOFTCAP)
 
 #define GPT2_VOCAB_SIZE 50257         // GPT-2's real words
 #define GPT2_PADDED_VOCAB_SIZE 50304  // the row length: the words, then padding up to a multiple of 128
@@ -56,11 +60,11 @@ struct SoftmaxLossTensors
     }
 
     /// Runs the fused launch: losses, row max and sum, and logits_grad for the mean over the rows.
-    void forward_backward(int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK)
+    void forward_backward(int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, float softcap_val = 0.0f)
     {
         softmax_loss_bf16_forward_backward(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, logits_grad_tensor,
                                            logits_tensor, targets_tensor, vocab_size_val, mean_loss_grad(),
-                                           threads_per_block_val);
+                                           threads_per_block_val, softcap_val);
     }
 
     /// Gives d(mean loss) / d(each row's loss): 1 / rows.
@@ -102,39 +106,44 @@ static std::vector<float> list_of(const Tensor &tensor)
 // ══ part 1: mine against PyTorch's ═══════════════════════════════════════════
 
 /// Runs the fused launch on random logits and targets, and PyTorch's cross_entropy over the first vocab_size columns
-/// in float with autograd (the mean over the rows); checks losses, row max (mine times ln 2 back to natural units),
-/// row sum within FLOAT_TOLERANCE, logits_grad's words within BFLOAT16_TOLERANCE and its padding exactly 0.
+/// in float with autograd (the mean over the rows), the logits capped first to c · tanh(logit / c) if softcap_val > 0;
+/// checks losses, row max (mine times ln 2 back to natural units), row sum within FLOAT_TOLERANCE (with the softcap:
+/// SOFTCAP_TOLERANCE), logits_grad's words within BFLOAT16_TOLERANCE (SOFTCAP_TOLERANCE) and its padding exactly 0.
 static void fused_matches_pytorch(const char *test_ptr, size_t batch_size_val, size_t seq_len_val, size_t vocab_size_val,
-                                  size_t padded_vocab_size_val)
+                                  size_t padded_vocab_size_val, float softcap_val = 0.0f)
 {
     // 1. mine
     torch::manual_seed(0);
     SoftmaxLossTensors mine_val(batch_size_val, seq_len_val, vocab_size_val, padded_vocab_size_val);
-    mine_val.forward_backward();
-    // 2. PyTorch's, in float on the same values: the words only
+    mine_val.forward_backward(SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, softcap_val);
+    // 2. PyTorch's, in float on the same values: the words only, capped first with a softcap (autograd through it)
     int64_t rows_val = (int64_t)(batch_size_val * seq_len_val);
     torch::Tensor word_logits_tensor = pytorch_copy_of(mine_val.logits_tensor)
                                            .reshape({rows_val, (int64_t)padded_vocab_size_val})
                                            .narrow(1, 0, (int64_t)vocab_size_val)
                                            .clone()
                                            .requires_grad_(true);
+    torch::Tensor capped_tensor = softcap_val > 0.0f ? softcap_val * torch::tanh(word_logits_tensor / softcap_val) : word_logits_tensor;
     torch::Tensor targets_tensor = pytorch_targets_of(mine_val.targets_tensor);
-    torch::Tensor losses_tensor = torch::cross_entropy_loss(word_logits_tensor, targets_tensor, {}, at::Reduction::None);
+    torch::Tensor losses_tensor = torch::cross_entropy_loss(capped_tensor, targets_tensor, {}, at::Reduction::None);
     losses_tensor.mean().backward();
-    torch::Tensor max_tensor = std::get<0>(word_logits_tensor.detach().max(1));
-    torch::Tensor sum_tensor = (word_logits_tensor.detach() - max_tensor.unsqueeze(1)).exp().sum(1);
+    torch::Tensor max_tensor = std::get<0>(capped_tensor.detach().max(1));
+    torch::Tensor sum_tensor = (capped_tensor.detach() - max_tensor.unsqueeze(1)).exp().sum(1);
     // 3. check
+    double float_tolerance_val = softcap_val > 0.0f ? SOFTCAP_TOLERANCE : FLOAT_TOLERANCE;
+    double grad_tolerance_val = softcap_val > 0.0f ? SOFTCAP_TOLERANCE : BFLOAT16_TOLERANCE;
     print_test_name(test_ptr);
-    printf("    %zu rows of %zu words, %zu columns\n", (size_t)rows_val, vocab_size_val, padded_vocab_size_val);
+    printf("    %zu rows of %zu words, %zu columns, softcap %g\n", (size_t)rows_val, vocab_size_val, padded_vocab_size_val,
+           softcap_val);
     torch::Tensor mine_max_tensor = pytorch_copy_of(mine_val.max_of_each_row_tensor).reshape({-1}) * SOFTMAX_LOSS_BF16_LN_2;
-    ASSERT_NEAR(relative_difference_on_gpu(mine_val.losses_tensor, losses_tensor.detach()), 0.0, FLOAT_TOLERANCE);
-    ASSERT_NEAR(((mine_max_tensor - max_tensor).abs().max() / max_tensor.abs().max()).item<double>(), 0.0, FLOAT_TOLERANCE);
-    ASSERT_NEAR(relative_difference_on_gpu(mine_val.sum_of_each_row_tensor, sum_tensor), 0.0, FLOAT_TOLERANCE);
+    ASSERT_NEAR(relative_difference_on_gpu(mine_val.losses_tensor, losses_tensor.detach()), 0.0, float_tolerance_val);
+    ASSERT_NEAR(((mine_max_tensor - max_tensor).abs().max() / max_tensor.abs().max()).item<double>(), 0.0, float_tolerance_val);
+    ASSERT_NEAR(relative_difference_on_gpu(mine_val.sum_of_each_row_tensor, sum_tensor), 0.0, float_tolerance_val);
     torch::Tensor mine_grad_tensor = pytorch_copy_of(mine_val.logits_grad_tensor).reshape({rows_val, (int64_t)padded_vocab_size_val});
     torch::Tensor mine_word_grad_tensor = mine_grad_tensor.narrow(1, 0, (int64_t)vocab_size_val);
     torch::Tensor word_grad_tensor = word_logits_tensor.grad();
     ASSERT_NEAR(((mine_word_grad_tensor - word_grad_tensor).abs().max() / word_grad_tensor.abs().max()).item<double>(), 0.0,
-                BFLOAT16_TOLERANCE);
+                grad_tolerance_val);
     if (padded_vocab_size_val > vocab_size_val)
         ASSERT_EQ(mine_grad_tensor.narrow(1, (int64_t)vocab_size_val, (int64_t)(padded_vocab_size_val - vocab_size_val))
                       .abs().max().item<float>(),
@@ -154,6 +163,21 @@ static void fused_matches_pytorch_with_a_part_load_of_words(void)
     // Expect: 3 x 5 rows of 50 words padded to 64: the 7th load holds 2 words and 6 padding values, the 8th only
     // padding. The same checks.
     fused_matches_pytorch(__func__, 3, 5, 50, 64);
+}
+
+static void softcap_matches_pytorch_on_d24_rows(void)
+{
+    // Expect: 4 x 256 rows of the d24 model's 32768 words (no padding), random logits std 2 (the largest about 9, where
+    // tanh already bends), softcap 15: losses, row max, row sum and logits_grad within SOFTCAP_TOLERANCE of PyTorch's
+    // cross_entropy of 15 · tanh(logits / 15), its gradient by autograd through the tanh.
+    fused_matches_pytorch(__func__, 4, 256, 32768, 32768, NANOCHAT_LOGIT_SOFTCAP);
+}
+
+static void softcap_matches_pytorch_with_a_part_load_of_words(void)
+{
+    // Expect: 3 x 5 rows of 50 words padded to 64, softcap 2 (most logits past the bend: tanh' far from 1): the same
+    // checks, the padding's gradient exactly 0.
+    fused_matches_pytorch(__func__, 3, 5, 50, 64, 2.0f);
 }
 
 // ══ part 2: worked out by hand ════════════════════════════════════════════════
@@ -307,6 +331,8 @@ int main(void)
     start_run_log(TESTS_LOG_FOLDER, __FILE__);    // the console, and logs/tests/<test>_<date>_<time>.log
     fused_matches_pytorch_on_gpt2_rows();
     fused_matches_pytorch_with_a_part_load_of_words();
+    softcap_matches_pytorch_on_d24_rows();
+    softcap_matches_pytorch_with_a_part_load_of_words();
 
     one_row_by_hand();
 

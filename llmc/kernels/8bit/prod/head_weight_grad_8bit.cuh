@@ -54,12 +54,12 @@
 #define HEAD_WEIGHT_GRAD_8BIT_COLUMNS 128                        // a square's columns, its WGMMA's N: 64 or 128
 #define HEAD_WEIGHT_GRAD_8BIT_STAGES 4                           // sets of tiles in shared memory: 1 to HEAD_WEIGHT_GRAD_8BIT_MAX_STAGES
 #define HEAD_WEIGHT_GRAD_8BIT_SPLITS 1                           // splits of the sum: 1, none; 0: chosen at each launch (head_weight_grad_8bit_auto_splits)
-#define HEAD_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 4            // rows of squares a group of blocks runs down before the next column (1: row after row)
-#define HEAD_WEIGHT_GRAD_8BIT_CLUSTER 2                          // blocks a cluster, sharing each right tile: 1 (none) or 2
+#define HEAD_WEIGHT_GRAD_8BIT_BLOCK_ROWS_PER_GROUP 1            // rows of squares a group of blocks runs down before the next column (1: row after row)
+#define HEAD_WEIGHT_GRAD_8BIT_CLUSTER 1                          // blocks a cluster, sharing each right tile: 1 (none) or 2
 #define HEAD_WEIGHT_GRAD_8BIT_BLOCKS 0                           // blocks a launch: 0, as many as the GPU runs at once (persistent); HEAD_WEIGHT_GRAD_8BIT_ONE_A_SQUARE: one a square
 #define HEAD_WEIGHT_GRAD_8BIT_PRODUCER_REGISTERS 48                // with 2 consumer warpgroups: the producer's registers a thread (setmaxnreg), the consumers take the rest; tune_head_weight_grad_8bit sweeps it
 #define HEAD_WEIGHT_GRAD_8BIT_IN_FLIGHT 0                          // steps of WGMMAs left running while the threads go on (STAGES - 1 at most: the set must be free); tune_head_weight_grad_8bit sweeps it
-#define HEAD_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 4                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_head_weight_grad_8bit sweeps it
+#define HEAD_WEIGHT_GRAD_8BIT_PROMOTION_STEPS 0                    // steps the tensor cores add up before their sum moves into float registers; 0: never. wgmma_matmul_8bit's 4: as accurate as 1 (H100 NVL); tune_head_weight_grad_8bit sweeps it
 #define HEAD_WEIGHT_GRAD_8BIT_SPLITS_SUM_THREADS_PER_BLOCK 256     // the splits' sum's block size
 #define HEAD_WEIGHT_GRAD_8BIT_SPLIT_COST_STEPS 15                  // SPLITS 0: what a split piece's float store and its share of the splits' sum cost, in steps of the walk
 #define HEAD_WEIGHT_GRAD_8BIT_MAX_AUTO_SPLITS 16                   // SPLITS 0: the most it picks
@@ -361,7 +361,7 @@ inline CUtensorMap head_weight_grad_8bit_tensor_map(const nv_bfloat16* matrix_pt
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: wgmma_matmul_bf16 could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);
@@ -398,7 +398,7 @@ inline CUtensorMap head_weight_grad_8bit_tensor_map_8bit(const void* matrix_ptr,
     static PFN_cuTensorMapEncodeTiled_v12000 encode_ptr = [] {
         void* function_ptr = nullptr;
         cudaDriverEntryPointQueryResult status_val;
-        cudaCheck(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &function_ptr, cudaEnableDefault, &status_val));
+        cudaCheck(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function_ptr, 12000, cudaEnableDefault, &status_val));
         if (status_val != cudaDriverEntryPointSuccess || function_ptr == nullptr) {
             fprintf(stderr, "error: head_weight_grad_8bit could not find the driver's cuTensorMapEncodeTiled (a driver for CUDA 12 or later)\n");
             exit(EXIT_FAILURE);

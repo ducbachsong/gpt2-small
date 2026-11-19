@@ -1,7 +1,8 @@
 // train_8bit.cu — trains a GPT-2 of 32 layers x 2,304 (about 2.15B parameters) from scratch on the FineWeb-Edu token files with its products in 8 bits
 // (model_8bit.cuh), on one H100 or on several of one machine: the params, grads and activations bfloat16,
 // each product's two sides rounded to FP8 E4M3 just before it; AdamW8bit keeps float master params and m and
-// sqrt(v) in 8 bits for this GPU's slice. No checkpoints yet. The other two: train_fp32.cu and train_bf16.cu.
+// sqrt(v) in 8 bits for this GPU's slice. Its checkpoints are its own (checkpoint_8bit.cuh: m and sqrt(v) as bytes
+// and scales), not train_bf16's. The other two: train_fp32.cu and train_bf16.cu.
 // The defaults are llm.c's GPT-2 (124M) run: 524,288 tokens a step, one pass over the train files (10B tokens:
 // 19,073 steps), warmup 700 steps, learning rate 6e-4 down to 0.
 //
@@ -9,6 +10,8 @@
 //     torchrun --standalone --nproc_per_node=8 --no-python ./train_8bit   # 8 GPUs (distributed.cuh)
 //     ./train_8bit                                                        # one GPU: the same steps, 8x the time
 //     ./train_8bit --steps 20 --tokens-per-step 32768 --val-every 10      # a quick try
+//     ./train_8bit --checkpoint-dir ckpt_8bit                             # a checkpoint every 1000 steps
+//     ./train_8bit --checkpoint-dir ckpt_8bit --resume ckpt_8bit          # on from the newest (checkpoint_8bit.cuh)
 //
 // One step trains on tokens_per_step tokens, all GPUs together: each GPU runs micro_batches batches of
 // {8, 2048}, 524,288 / (GPUs x 16,384) of them: 4 on 8 GPUs, 32 on one. 8 rows, as train_bf16.cu runs.
@@ -23,8 +26,10 @@
 // The learning rate, the val loss, the progress lines and the flags are train_bf16.cu's; the settings, flags
 // and printing all three programs share: common/training.cuh.
 #include <chrono>
+#include <cstring>                                  // strlen: the model's name for print_run
 #include "llmc/common/training.cuh"                 // TrainConfig, parse_args, learning_rate_at, print0, ...
 #include "llmc/model_8bit.cuh"                      // GPT2Activations8bit, gpt2_8bit_train_step, AdamW8bit
+#include "llmc/helper/checkpoint_8bit.cuh"          // the 8-bit run's own checkpoints
 #include "llmc/kernels/bf16/grad_norm_bf16.cuh"     // GradNormBf16: the grads stay bfloat16
 
 // The model it trains (in place of GPT-2 small's 12 layers x 768, 12 heads, 1,024 tokens): nanochat's d24 size, about
@@ -40,9 +45,12 @@
 #define TRAIN_8BIT_BATCH_SIZE 8                         // the default rows a micro-batch: about 4.5 GB of activations a row at 2,048 tokens (tune_model finds the best)
 #define TRAIN_8BIT_LINEAR_BIAS 0                      // the 4 linears' biases: 0, none (as nanochat; no bias grads, 32 x 9 x 2,304 fewer
                                                        // values); 1, GPT-2's. --linear-bias changes it. The LayerNorms keep theirs
+#define TRAIN_8BIT_QK_NORM 1                           // 1: QK-norm before attention (nanochat's: query's and key's head rows to RMS 1.2);
+                                                       // 0: none. Without it (and the softcap) the d24 run got worse from step ~1700
+#define TRAIN_8BIT_LOGIT_SOFTCAP 15.0f                 // each logit capped to c · tanh(logit / c) before the softmax (nanochat's 15); 0: none
 
-/// Gives the model this program trains: GPT2Config with the sizes above, and the linears'
-/// biases or not as the run says.
+/// Gives the model this program trains: GPT2Config with the sizes above, QK-norm and the logit softcap as the
+/// defines say, and the linears' biases or not as the run says.
 ///
 ///   c   the run's settings: linear_bias
 static GPT2Config model_config_of(const TrainConfig& c) {
@@ -55,6 +63,8 @@ static GPT2Config model_config_of(const TrainConfig& c) {
     config.vocab_size = TRAIN_8BIT_VOCAB_SIZE;
     config.padded_vocab_size = TRAIN_8BIT_VOCAB_SIZE;
     config.attention_window = TRAIN_8BIT_ATTENTION_WINDOW;
+    config.qk_norm = TRAIN_8BIT_QK_NORM != 0;
+    config.logit_softcap = TRAIN_8BIT_LOGIT_SOFTCAP;
     return config;
 }
 
@@ -92,14 +102,8 @@ static float val_loss(DataLoader& val_loader, const Tensor& token_ids, const Ten
 }
 
 int main(int argc, char** argv) {
-    // 1. the settings (no checkpoints yet), the GPUs and the data: every file's header checked before anything
-    // else
+    // 1. the settings, the GPUs and the data: every file's header checked before anything else
     TrainConfig c = parse_args(argc, argv, train_defaults_of());
-    if (!c.checkpoint_dir.empty() || !c.resume.empty()) {
-        fprintf(stderr, "error: train_8bit has no checkpoints yet (no --checkpoint-dir or --resume): its m and v "
-                        "are 8 bits\n");
-        exit(EXIT_FAILURE);
-    }
     Distributed distributed(c.nccl_id_file);                            // first: it picks this process's GPU
     int micro_batches = micro_batches_of(c, distributed);
     DataLoader train_loader(c.train_files, c.batch_size, c.seq_len, distributed.rank(), distributed.world_size());
@@ -123,9 +127,23 @@ int main(int argc, char** argv) {
     Tensor grads_slice = optimizer.all_grads().narrow(0, optimizer.slice_start(), optimizer.slice_size());
     Tensor grad_norm_block_sums = Tensor::zeros({2, GRAD_NORM_BF16_BLOCKS});
     GradNormBf16 grad_norm(grad_norm_block_sums);
-    print_run("8 bits", c, optimizer, micro_batches, train_loader, val_loader, distributed);
+    char model_name_list[128];                                          // "8 bits", then QK-norm and the softcap if on
+    snprintf(model_name_list, sizeof(model_name_list), "8 bits%s%s", model_config.qk_norm ? ", QK-norm" : "",
+             model_config.logit_softcap > 0.0f ? ", logit softcap " : "");
+    if (model_config.logit_softcap > 0.0f)
+        snprintf(model_name_list + strlen(model_name_list), sizeof(model_name_list) - strlen(model_name_list), "%g",
+                 model_config.logit_softcap);
+    print_run(model_name_list, c, optimizer, micro_batches, train_loader, val_loader, distributed);
 
-    int first_step = 0;                                                 // no checkpoints: always from scratch
+    // 3. from a checkpoint: its master, m and sqrt(v), step count, rounding histories, params and the train
+    // loader's place; the weights' 8-bit copies made again from the loaded params
+    int first_step = 0;
+    if (!c.resume.empty()) {
+        first_step = checkpoint_8bit_load(c.resume, c.steps, optimizer, activations.round_histories, train_loader,
+                                          distributed);
+        gpt2_8bit_weights_changed(activations);
+        print0(distributed, "resumed from %s: %d steps done\n", c.resume.c_str(), first_step);
+    }
     print0(distributed, "\n");
 
     // 4. the steps; the val loss before the first, then after every val_every steps and after the last
@@ -164,6 +182,13 @@ int main(int argc, char** argv) {
             float loss_now = val_loss(val_loader, token_ids, targets, params, activations, model_config, c.val_batches,
                                       distributed);
             print0(distributed, "step %5d | val loss %.4f\n", steps_done, loss_now);
+        }
+        if (!c.checkpoint_dir.empty() && (steps_done % c.checkpoint_every == 0 || steps_done == c.steps)) {
+            auto saving_started = std::chrono::steady_clock::now();
+            checkpoint_8bit_save(c.checkpoint_dir, steps_done, c.steps, optimizer, activations.round_histories,
+                                 train_loader, distributed, c.keep_checkpoints);
+            print0(distributed, "step %5d | checkpoint %s/%s (%s)\n", steps_done, c.checkpoint_dir.c_str(),
+                   checkpoint_folder_name(steps_done).c_str(), duration_text(seconds_since(saving_started)).c_str());
         }
         print_progress(steps_done, first_step, c, seconds_since(run_started), distributed);
     }

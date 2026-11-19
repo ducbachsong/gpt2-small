@@ -7,8 +7,8 @@
 //     model_buffer   [ params | grads ]             bfloat16
 //     buffer         [ master params | grad_norm ]  float
 //     m_bytes, m_scales, sqrt_v_bytes, sqrt_v_scales
-// One launch of adamw_update_8bit (kernels/8bit/adamw_8bit.cuh) a step. No checkpoints yet: m_slice() and
-// v_slice() stop.
+// One launch of adamw_update_8bit (kernels/8bit/adamw_8bit.cuh) a step. m_slice() and v_slice() stop (no float m
+// or v); checkpoints are helper/checkpoint_8bit.cuh's, from m_bytes(), m_scales(), sqrt_v_bytes(), sqrt_v_scales().
 //     token_ids ─ encoder ─ block 0 ─ ... ─ block 11 ─ LayerNorm f ─ head ─ classifier ─ losses
 //
 //     step                              kernel                          in 8 bits
@@ -18,9 +18,15 @@
 //     the 4 linears of a block          8bit/prod/<product>_8bit.cuh    output, input_grad, weight_grad: a kernel each
 //     GELU                              8bit/prod/mlp_up_8bit.cuh,      inside mlp_up's forward, mlp_down's backward
 //                                       mlp_down_input_grad_8bit.cuh
+//     QK-norm (GPT2Config::qk_norm)     8bit/qk_norm_8bit.cuh           nothing: query's and key's head rows scaled to
+//                                                                       RMS 1.2 in bfloat16 qkv, before attention rounds them
 //     attention                         8bit/attention_flash_8bit.cuh   query · keyᵀ; query, key, value kept in E4M3
 //     head                              8bit/prod/head*_8bit.cuh        logits, lnf_output_grad, wte_grad
-//     loss                              bf16/softmax_loss_bf16.cuh      nothing: from the bfloat16 logits
+//     loss                              bf16/softmax_loss_bf16.cuh      nothing: from the bfloat16 logits, capped first to
+//                                                                       c · tanh(logit / c) with GPT2Config::logit_softcap
+// QK-norm and the softcap are nanochat's: they keep attention's scores and the logits bounded however the weights
+// grow (the d24 run without them got worse from step ~1700 on, its gradient norm spiking to 10-30). With QK-norm,
+// attention's backward writes qkv_grad in bfloat16 (the norm's backward reads it), rounded to 8 bits after.
 // The 4 linears have no bias (GPT2Config::linear_bias false, as nanochat's; GPT2Activations8bit stops otherwise):
 // Tensor() biases the products take as none. A bias's gradient would read its linear's output_grad in bfloat16, which
 // qkv's and mlp_up's backward never get: attention's and mlp_down's backward write them straight in 8 bits.
@@ -42,6 +48,7 @@
 #include "kernels/bf16/residual_bf16.cuh"
 #include "kernels/bf16/softmax_loss_bf16.cuh"      // the softmax, the loss and its gradient from the bfloat16 logits
 #include "kernels/8bit/attention_flash_8bit.cuh"   // attention_8bit_forward, _backward
+#include "kernels/8bit/qk_norm_8bit.cuh"           // QK-norm before attention (GPT2Config::qk_norm)
 #include "kernels/8bit/adamw_8bit.cuh"            // AdamW8bit's update
 // GPT-2's 15 matrix products in 8 bits, each a kernel of its own with its own setting (its file's defines, from its
 // tests/8bit/prod/tune_<product>_8bit.cu) and its own 8-bit copies: a layer's forward, its backward's input_grad and
@@ -150,6 +157,8 @@ struct GPT2Activations8bit {
     std::vector<Tensor> key_scales;                         // {B, NH, T}
     std::vector<Tensor> value_scales;                       // {B, NH, T}
     std::vector<Tensor> attention_logsumexp;                // {B, NH, T}
+    std::vector<Tensor> query_rstd;                         // {B, NH, T}: QK-norm's 1 / RMS of each query head row
+    std::vector<Tensor> key_rstd;                           // {B, NH, T}: ...of each key head row (none without QK-norm)
     std::vector<Tensor> attention_output;                   // {B, T, D}: the heads merged, before the projection
     std::vector<Tensor> residual2;                          // {B, T, D}: input + the attention branch
     std::vector<Tensor> ln2_turned_8bit;                    // ln2_output turned, in E4M3 {D, B T} (mlp_up's weight_grad's
@@ -199,8 +208,9 @@ struct GPT2Activations8bit {
     std::vector<LinearWeight8bitCopies> mlp_down_weight_copies;        // {D, 4D}
     LinearWeight8bitCopies wte_copies;                                 // {padded_vocab_size, D}: the head's
     mutable bool weight_copies_made = false;                           // they hold the params' current values
-    // ── each layer's sliding window, and the rounding's histories ──
+    // ── each layer's sliding window, QK-norm, and the rounding's histories ──
     std::vector<size_t> attention_windows;                             // gpt2_attention_window of each layer; 0: none
+    bool qk_norm = false;                                              // GPT2Config::qk_norm
     std::vector<Round8bitHistory> round_histories;                     // MODEL_8BIT_HISTORIES_PER_LAYER a layer, then the head's
     const Round8bitHistory& history(size_t layer, int place) const;    // a layer's
     const Round8bitHistory& head_history(int place) const;             // the head's
@@ -247,6 +257,12 @@ public:
     Tensor master_slice() const override;                               // this slice's master, flat
     const Tensor& m_slice() const override;                             // stops: no float or bfloat16 m
     const Tensor& v_slice() const override;                             // ...nor v
+
+    // ── for checkpoints (checkpoint_8bit.cuh): m and sqrt(v) as they are kept ───
+    const Tensor& m_bytes() const;                                      // {slice_size} E4M3
+    const Tensor& m_scales() const;                                     // {slice_size / ADAMW_VALUES_PER_SCALE, rounded up} float
+    const Tensor& sqrt_v_bytes() const;                                 // {slice_size} E4M3
+    const Tensor& sqrt_v_scales() const;                                // the same as m_scales
 
 protected:
     void update(int t) override;                                        // AdamW's step t: one launch
@@ -303,6 +319,7 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
     DType bf16 = DType::BFloat16;
     Shape head_rows_8bit = {B, NH, T, HS};
     for (size_t l = 0; l < config.num_layers; l++) attention_windows.push_back(gpt2_attention_window(config, l));
+    qk_norm = config.qk_norm;
     round_histories.resize(config.num_layers * MODEL_8BIT_HISTORIES_PER_LAYER + MODEL_8BIT_HEAD_HISTORIES);
     for (size_t l = 0; l < config.num_layers; l++)          // the places their kernel rounds as it writes: scale 1 first
         for (int place : {MODEL_8BIT_HISTORY_QKV_INPUT, MODEL_8BIT_HISTORY_MLP_UP_INPUT, MODEL_8BIT_HISTORY_MLP_DOWN_INPUT})
@@ -325,6 +342,7 @@ inline GPT2Activations8bit::GPT2Activations8bit(size_t batch_size, size_t seq_le
         query_scales.push_back(Tensor::zeros({B, NH, T})), key_scales.push_back(Tensor::zeros({B, NH, T}));
         value_scales.push_back(Tensor::zeros({B, NH, T}));
         attention_logsumexp.push_back(Tensor::zeros({B, NH, T}));
+        if (config.qk_norm) query_rstd.push_back(Tensor::zeros({B, NH, T})), key_rstd.push_back(Tensor::zeros({B, NH, T}));
         attention_output.push_back(Tensor::zeros({B, T, D}, bf16));
         residual2.push_back(Tensor::zeros({B, T, D}, bf16));
         ln2_turned_8bit.push_back(Tensor::zeros({D, B * T}, DType::E4M3)), ln2_scale.push_back(Tensor::zeros({1}));
@@ -488,6 +506,9 @@ inline void block_8bit_forward(const Tensor& output, const Tensor& input, const 
                                             activations.ln1_rstd[layer], input, params.ln1_weight, params.ln1_bias,
                                             activations.qkv_weight_copies[layer],
                                             activations.history(layer, MODEL_8BIT_HISTORY_QKV_INPUT)));
+    // QK-norm: query's and key's head rows to RMS 1.2 in place, before attention rounds them to 8 bits
+    if (activations.qk_norm)
+        qk_norm_8bit_forward(activations.qkv_scratch, activations.query_rstd[layer], activations.key_rstd[layer]);
     attention_8bit_forward(activations.attention_output[layer], activations.query_8bit[layer], activations.key_8bit[layer],
                            activations.value_8bit[layer], activations.query_scales[layer], activations.key_scales[layer],
                            activations.value_scales[layer], activations.attention_logsumexp[layer], activations.qkv_scratch,
@@ -607,20 +628,26 @@ inline void block_8bit_backward(const Tensor& input_grad, const BlockParams& par
     attention_output_weight_grad_8bit_rounded(param_grads.attention_out_weight, activations.attention_output_weight_grad_copies_scratch);
     //    attention's backward with qkv_grad straight in 8 bits: its row copy into qkv_input_grad's left side, its turned
     //    copy into qkv_weight_grad's left, the scale from the history. A layer's first micro-batch (no history yet: a
-    //    gradient cannot start at scale 1): bfloat16 into scratch, then rounded exactly into the same copies
+    //    gradient cannot start at scale 1): bfloat16 into scratch, then rounded exactly into the same copies. With
+    //    QK-norm always bfloat16 into scratch: the norm's backward turns query's and key's gradient there first (from
+    //    query and key as attention's backward turned them back into qkv_scratch), then the same rounding
     const Round8bitHistory& qkv_grad_history = activations.history(layer, MODEL_8BIT_HISTORY_QKV_GRAD);
     AttentionFlashQkvGrad8bit qkv_grad_val;
     qkv_grad_val.rows_8bit_ptr = activations.qkv_input_grad_copies_scratch.left_8bit_tensor.data_ptr<__nv_fp8_e4m3>();
     qkv_grad_val.turned_8bit_ptr = activations.qkv_weight_grad_copies_scratch.left_8bit_tensor.data_ptr<__nv_fp8_e4m3>();
     qkv_grad_val.scale_ptr = activations.qkv_input_grad_copies_scratch.left_scale_tensor.data();   // the weight_grad's too
     qkv_grad_val.margin_val = ROUND_8BIT_DELAYED_MARGIN;
-    bool qkv_grad_8bit_val = round_8bit_delayed_largest(qkv_grad_history, qkv_grad_val.scale_largest_ptr, qkv_grad_val.next_largest_ptr);
+    bool qkv_grad_8bit_val = !activations.qk_norm &&      // with QK-norm the history's turn is round_8bit_per_tensor's
+                             round_8bit_delayed_largest(qkv_grad_history, qkv_grad_val.scale_largest_ptr, qkv_grad_val.next_largest_ptr);
     attention_8bit_backward(activations.qkv_grad_scratch, activations.attention_output_grad_scratch, activations.attention_output[layer],
                             activations.query_8bit[layer], activations.key_8bit[layer], activations.value_8bit[layer],
                             activations.query_scales[layer], activations.key_scales[layer], activations.value_scales[layer],
                             activations.attention_logsumexp[layer], activations.qkv_scratch, activations.attention_row_dot_scratch,
                             ATTENTION_8BIT_THREADS_PER_BLOCK, ATTENTION_BF16_ROW_DOT_THREADS_PER_BLOCK, activations.attention_windows[layer],
                             qkv_grad_8bit_val ? &qkv_grad_val : nullptr);
+    if (activations.qk_norm)
+        qk_norm_8bit_backward(activations.qkv_grad_scratch, activations.qkv_scratch, activations.query_rstd[layer],
+                              activations.key_rstd[layer]);
     if (!qkv_grad_8bit_val)
         round_8bit_per_tensor(activations.qkv_input_grad_copies_scratch.left_8bit_tensor, activations.qkv_weight_grad_copies_scratch.left_8bit_tensor,
                               activations.qkv_input_grad_copies_scratch.left_scale_tensor, activations.qkv_grad_scratch, &qkv_grad_history);
@@ -692,7 +719,7 @@ inline void gpt2_8bit_forward(const GPT2Activations8bit& activations, const Tens
                                              params.lnf_weight, params.lnf_bias, activations.wte_copies,
                                              activations.head_history(MODEL_8BIT_HISTORY_HEAD_INPUT)));
     softmax_loss_bf16_forward(activations.losses, activations.max_of_each_row, activations.sum_of_each_row, activations.logits, targets,
-                              config.vocab_size);
+                              config.vocab_size, SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, config.logit_softcap);
 }
 
 /// Adds every parameter's gradient onto param_grads for the mean loss, the products in 8 bits: the forward's
@@ -711,7 +738,7 @@ inline void gpt2_8bit_backward(const GPT2Params& param_grads, const Tensor& toke
     // backward: lnf_output_grad, and its part added onto wte_grad
     float loss_grad_val = (float)(1.0 / ((double)micro_batches * activations.losses.numel()));
     softmax_loss_bf16_backward(activations.logits, activations.logits, targets, activations.max_of_each_row, activations.sum_of_each_row,
-                               config.vocab_size, loss_grad_val);
+                               config.vocab_size, loss_grad_val, SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, config.logit_softcap);
     HeadWeightGrad8bitCopies head_weight_grad_copies =
         weight_grad_copies_8bit(activations.head_input_grad_copies_scratch, activations.head_weight_grad_copies_scratch, activations.logits,
                                 activations.head_history(MODEL_8BIT_HISTORY_HEAD_GRAD), activations.lnf_turned_8bit,
@@ -805,11 +832,23 @@ inline const Tensor& AdamW8bit::master_param(int k) const {
 /// Gives this slice's master params as one flat tensor.
 inline Tensor AdamW8bit::master_slice() const { return buffer_.group(master_group_index_); }
 
-/// Stops: 8-bit m has no float or bfloat16 tensor to give (checkpoints do not save 8-bit m and v yet).
+/// Stops: 8-bit m has no float or bfloat16 tensor to give (checkpoint_8bit.cuh saves m_bytes() and m_scales()).
 inline const Tensor& AdamW8bit::m_slice() const { stop_no_moments_tensor("m_slice()"); }
 
-/// Stops: 8-bit v has no float or bfloat16 tensor to give.
+/// Stops: 8-bit v has no float or bfloat16 tensor to give (checkpoint_8bit.cuh saves sqrt_v_bytes() and sqrt_v_scales()).
 inline const Tensor& AdamW8bit::v_slice() const { stop_no_moments_tensor("v_slice()"); }
+
+/// Gives this slice's m as it is kept, one E4M3 byte a value (m / its scale), for a checkpoint to save and load.
+inline const Tensor& AdamW8bit::m_bytes() const { return m_bytes_; }
+
+/// Gives m's scales, one float per ADAMW_VALUES_PER_SCALE values, for a checkpoint to save and load.
+inline const Tensor& AdamW8bit::m_scales() const { return m_scales_; }
+
+/// Gives this slice's sqrt(v) as it is kept, one E4M3 byte a value, for a checkpoint to save and load.
+inline const Tensor& AdamW8bit::sqrt_v_bytes() const { return sqrt_v_bytes_; }
+
+/// Gives sqrt(v)'s scales, one float per ADAMW_VALUES_PER_SCALE values, for a checkpoint to save and load.
+inline const Tensor& AdamW8bit::sqrt_v_scales() const { return sqrt_v_scales_; }
 
 /// Stops with a message: m and v are bytes and scales here, not a tensor of values.
 ///

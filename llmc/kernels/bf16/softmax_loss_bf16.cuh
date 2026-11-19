@@ -20,6 +20,11 @@
 // one read of the logits from memory instead of two); the backward alone and both at once give the same bits.
 // Columns from vocab_size (50257) on are padding: left out of the softmax, gradient 0. Each exp is one ex2.approx.ftz
 // (about 2 ulp): the loss within float rounding of fp32/classifier.cuh's.
+// A softcap c > 0 (the 8-bit model's: nanochat's 15; 0, not given: none, the same bits as without it) caps each logit
+// as it is read, the logits in memory left raw: capped = c · tanh(logit / c), always within (-c, c); the softmax, loss
+// and gradient are the capped logits', and the gradient goes back through the cap onto the raw logit:
+//     logits_grad = (prob - 1 at the target) · loss_grad · (1 - (capped / c)²)       (tanh' = 1 - tanh²)
+// Each tanh is one tanh.approx.f32 (about 2^-11 relative, under a bfloat16's rounding).
 #ifndef SOFTMAX_LOSS_BF16_CUH
 #define SOFTMAX_LOSS_BF16_CUH
 
@@ -35,26 +40,28 @@
 void softmax_loss_bf16_forward(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                const Tensor& sum_of_each_row_tensor, const Tensor& logits_tensor,
                                const Tensor& targets_tensor, size_t vocab_size_val,
-                               int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK);
+                               int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, float softcap_val = 0.0f);
 void softmax_loss_bf16_backward(const Tensor& logits_grad_tensor, const Tensor& logits_tensor, const Tensor& targets_tensor,
                                 const Tensor& max_of_each_row_tensor, const Tensor& sum_of_each_row_tensor,
                                 size_t vocab_size_val, float loss_grad_val,
-                                int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK);
+                                int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK, float softcap_val = 0.0f);
 void softmax_loss_bf16_forward_backward(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                         const Tensor& sum_of_each_row_tensor, const Tensor& logits_grad_tensor,
                                         const Tensor& logits_tensor, const Tensor& targets_tensor, size_t vocab_size_val,
-                                        float loss_grad_val, int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK);
+                                        float loss_grad_val, int threads_per_block_val = SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK,
+                                        float softcap_val = 0.0f);
 
 // ── for all three ─────────────────────────────────────────────────────────────
 template <bool FORWARD, bool BACKWARD>
 __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_row_ptr, float* sum_of_each_row_ptr,
                                          nv_bfloat16* logits_grad_ptr, const nv_bfloat16* logits_ptr, const int* targets_ptr,
-                                         size_t vocab_size_val, size_t padded_vocab_size_val, float loss_grad_val);
+                                         size_t vocab_size_val, size_t padded_vocab_size_val, float loss_grad_val,
+                                         float softcap_val);
 template <bool FORWARD, bool BACKWARD>
 void softmax_loss_bf16_launch(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                               const Tensor& sum_of_each_row_tensor, const Tensor& logits_grad_tensor,
                               const Tensor& logits_tensor, const Tensor& targets_tensor, size_t vocab_size_val,
-                              float loss_grad_val, int threads_per_block_val);
+                              float loss_grad_val, int threads_per_block_val, float softcap_val);
 void softmax_loss_bf16_check_shapes(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                     const Tensor& sum_of_each_row_tensor, const Tensor& logits_grad_tensor,
                                     const Tensor& logits_tensor, const Tensor& targets_tensor, size_t vocab_size_val,
@@ -76,11 +83,14 @@ void softmax_loss_bf16_check_shapes(const Tensor& losses_tensor, const Tensor& m
 ///   threads_per_block_val    the block size: whole warps, at most HARDWARE_MAX_THREADS_PER_BLOCK; not given:
 ///                            SOFTMAX_LOSS_BF16_THREADS_PER_BLOCK. Another size adds each row in another order, so
 ///                            the last bits can change.
+///   softcap_val              c > 0: each logit capped to c · tanh(logit / c) before the softmax; 0 (not given): none
 inline void softmax_loss_bf16_forward(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                       const Tensor& sum_of_each_row_tensor, const Tensor& logits_tensor,
-                                      const Tensor& targets_tensor, size_t vocab_size_val, int threads_per_block_val) {
+                                      const Tensor& targets_tensor, size_t vocab_size_val, int threads_per_block_val,
+                                      float softcap_val) {
     softmax_loss_bf16_launch<true, false>(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, Tensor(),
-                                          logits_tensor, targets_tensor, vocab_size_val, 0.0f, threads_per_block_val);
+                                          logits_tensor, targets_tensor, vocab_size_val, 0.0f, threads_per_block_val,
+                                          softcap_val);
 }
 
 /// Writes logits_grad (written over, not added) from the forward's row_max and row_sum: pass 2 alone.
@@ -91,12 +101,14 @@ inline void softmax_loss_bf16_forward(const Tensor& losses_tensor, const Tensor&
 ///   vocab_size_val                                   the real words: 50257
 ///   loss_grad_val                                    d(loss) / d(each row's loss): 1 / rows for the mean
 ///   threads_per_block_val                            as in softmax_loss_bf16_forward; here any size gives the same bits
+///   softcap_val                                      the forward's
 inline void softmax_loss_bf16_backward(const Tensor& logits_grad_tensor, const Tensor& logits_tensor,
                                        const Tensor& targets_tensor, const Tensor& max_of_each_row_tensor,
                                        const Tensor& sum_of_each_row_tensor, size_t vocab_size_val, float loss_grad_val,
-                                       int threads_per_block_val) {
+                                       int threads_per_block_val, float softcap_val) {
     softmax_loss_bf16_launch<false, true>(Tensor(), max_of_each_row_tensor, sum_of_each_row_tensor, logits_grad_tensor,
-                                          logits_tensor, targets_tensor, vocab_size_val, loss_grad_val, threads_per_block_val);
+                                          logits_tensor, targets_tensor, vocab_size_val, loss_grad_val, threads_per_block_val,
+                                          softcap_val);
 }
 
 /// Writes each row's loss, row_max and row_sum, and logits_grad, in one kernel: pass 1 and pass 2 together, so the
@@ -104,13 +116,15 @@ inline void softmax_loss_bf16_backward(const Tensor& logits_grad_tensor, const T
 /// same block size.
 ///
 ///   losses_tensor ... targets_tensor, vocab_size_val, loss_grad_val   as in the two above
-///   threads_per_block_val                                              as in softmax_loss_bf16_forward
+///   threads_per_block_val, softcap_val                                 as in softmax_loss_bf16_forward
 inline void softmax_loss_bf16_forward_backward(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                                const Tensor& sum_of_each_row_tensor, const Tensor& logits_grad_tensor,
                                                const Tensor& logits_tensor, const Tensor& targets_tensor,
-                                               size_t vocab_size_val, float loss_grad_val, int threads_per_block_val) {
+                                               size_t vocab_size_val, float loss_grad_val, int threads_per_block_val,
+                                               float softcap_val) {
     softmax_loss_bf16_launch<true, true>(losses_tensor, max_of_each_row_tensor, sum_of_each_row_tensor, logits_grad_tensor,
-                                         logits_tensor, targets_tensor, vocab_size_val, loss_grad_val, threads_per_block_val);
+                                         logits_tensor, targets_tensor, vocab_size_val, loss_grad_val, threads_per_block_val,
+                                         softcap_val);
 }
 
 // ── for all three ─────────────────────────────────────────────────────────────
@@ -134,6 +148,18 @@ __device__ __forceinline__ float softmax_loss_bf16_moved(float sum_val, float ma
     return max_val == -INFINITY ? 0.0f : sum_val * softmax_loss_bf16_exp2(max_val - new_max_val);
 }
 
+/// Gives a logit after the softcap, c · tanh(logit / c), by the special function unit's one tanh.approx.f32 (about
+/// 2^-11 relative); no softcap (c 0): the logit itself, untouched.
+///
+///   logit_val                            the raw logit
+///   softcap_val, one_over_softcap_val    c and 1 / c; 0 and 0: none
+__device__ __forceinline__ float softmax_loss_bf16_capped(float logit_val, float softcap_val, float one_over_softcap_val) {
+    if (softcap_val <= 0.0f) return logit_val;
+    float tanh_val;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(tanh_val) : "f"(logit_val * one_over_softcap_val));
+    return softcap_val * tanh_val;
+}
+
 /// One row per block. FORWARD: pass 1, the row's max and sum in powers of 2 (each thread over its 16-byte loads,
 /// then the warp, then the block), and the loss; BACKWARD: pass 2, each value's gradient, 8 a thread at a time.
 /// Both: pass 2 takes the max and sum pass 1 just worked out; BACKWARD alone: the ones in memory.
@@ -143,10 +169,12 @@ __device__ __forceinline__ float softmax_loss_bf16_moved(float sum_val, float ma
 ///   logits_ptr, targets_ptr                                the scores, the right next words
 ///   vocab_size_val, padded_vocab_size_val                  real words, and the row length (a multiple of 8)
 ///   loss_grad_val                                          BACKWARD: d(loss) / d(each row's loss)
+///   softcap_val                                            c > 0: every logit read is capped first; 0: none
 template <bool FORWARD, bool BACKWARD>
 __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_row_ptr, float* sum_of_each_row_ptr,
                                          nv_bfloat16* logits_grad_ptr, const nv_bfloat16* logits_ptr, const int* targets_ptr,
-                                         size_t vocab_size_val, size_t padded_vocab_size_val, float loss_grad_val) {
+                                         size_t vocab_size_val, size_t padded_vocab_size_val, float loss_grad_val,
+                                         float softcap_val) {
     // one slot per warp; warp 0's HARDWARE_THREADS_PER_WARP lanes must cover them all; then the row's two numbers
     static_assert(HARDWARE_MAX_WARPS_PER_BLOCK <= HARDWARE_THREADS_PER_WARP, "warp 0 must hold one (max, sum) per warp");
     __shared__ float max_of_each_warp_list[HARDWARE_MAX_WARPS_PER_BLOCK];
@@ -159,6 +187,7 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
     const nv_bfloat16* row_logits_ptr = logits_ptr + row_index_val * padded_vocab_size_val;
     float row_max_val = 0.0f;                                   // row_max · log2 e
     float row_sum_val = 0.0f;
+    float one_over_softcap_val = softcap_val > 0.0f ? 1.0f / softcap_val : 0.0f;
 
     if (FORWARD) {
         // 1. this thread's (max, sum) over its loads, in powers of 2; padding counts as -inf, 2^-inf 0. Every load
@@ -174,7 +203,8 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
 #pragma unroll
             for (int value_index_val = 0; value_index_val < SOFTMAX_LOSS_BF16_VALUES_PER_LOAD; value_index_val++) {
                 values_list[value_index_val] = first_column_index_val + value_index_val < vocab_size_val
-                                                   ? values_list[value_index_val] * SOFTMAX_LOSS_BF16_LOG2_E
+                                                   ? softmax_loss_bf16_capped(values_list[value_index_val], softcap_val,
+                                                                              one_over_softcap_val) * SOFTMAX_LOSS_BF16_LOG2_E
                                                    : -INFINITY;
                 load_max_val = fmaxf(load_max_val, values_list[value_index_val]);
             }
@@ -217,7 +247,8 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
             }
             // 4. lane 0: loss = log(row_sum) - (logit[target] - row_max), row_max back in natural units
             if (lane_index_val == 0) {
-                float target_logit_val = to_float(row_logits_ptr[targets_ptr[row_index_val]]);
+                float target_logit_val = softmax_loss_bf16_capped(to_float(row_logits_ptr[targets_ptr[row_index_val]]),
+                                                                  softcap_val, one_over_softcap_val);
                 losses_ptr[row_index_val] = logf(warp_sum_val) - (target_logit_val - warp_max_val * SOFTMAX_LOSS_BF16_LN_2);
                 max_of_each_row_ptr[row_index_val] = warp_max_val;
                 sum_of_each_row_ptr[row_index_val] = warp_sum_val;
@@ -237,8 +268,8 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
     }
 
     if (BACKWARD) {
-        // 5. each value: (prob - 1 at the target) · loss_grad, padding 0; 8 a thread, read then written by the same
-        //    thread (so logits_grad may be logits)
+        // 5. each value: (prob - 1 at the target) · loss_grad, padding 0, with a softcap times 1 - (capped / c)²; 8 a
+        //    thread, read then written by the same thread (so logits_grad may be logits)
         nv_bfloat16* row_grad_ptr = logits_grad_ptr + row_index_val * padded_vocab_size_val;
         float one_over_sum_val = 1.0f / row_sum_val;
         size_t target_val = (size_t)targets_ptr[row_index_val];
@@ -250,10 +281,15 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
 #pragma unroll
             for (int value_index_val = 0; value_index_val < SOFTMAX_LOSS_BF16_VALUES_PER_LOAD; value_index_val++) {
                 size_t column_index_val = first_column_index_val + value_index_val;
-                float prob_val = softmax_loss_bf16_exp2(fmaf(values_list[value_index_val], SOFTMAX_LOSS_BF16_LOG2_E, -row_max_val)) *
-                                 one_over_sum_val;
+                float capped_val = softmax_loss_bf16_capped(values_list[value_index_val], softcap_val, one_over_softcap_val);
+                float prob_val = softmax_loss_bf16_exp2(fmaf(capped_val, SOFTMAX_LOSS_BF16_LOG2_E, -row_max_val)) * one_over_sum_val;
                 float one_at_target_val = column_index_val == target_val ? 1.0f : 0.0f;
-                values_list[value_index_val] = column_index_val < vocab_size_val ? (prob_val - one_at_target_val) * loss_grad_val : 0.0f;
+                float grad_val = (prob_val - one_at_target_val) * loss_grad_val;
+                if (softcap_val > 0.0f) {                       // back through the cap: tanh' = 1 - tanh²
+                    float tanh_val = capped_val * one_over_softcap_val;
+                    grad_val *= 1.0f - tanh_val * tanh_val;
+                }
+                values_list[value_index_val] = column_index_val < vocab_size_val ? grad_val : 0.0f;
             }
             write8_from_float(row_grad_ptr + first_column_index_val, values_list);
         }
@@ -266,11 +302,12 @@ __global__ void softmax_loss_bf16_kernel(float* losses_ptr, float* max_of_each_r
 ///   losses_tensor ... loss_grad_val   as in softmax_loss_bf16_forward_backward; the parts a launch does not use
 ///                                     may be Tensor()
 ///   threads_per_block_val             the block size
+///   softcap_val                       c > 0: the logits capped as they are read; 0: none
 template <bool FORWARD, bool BACKWARD>
 inline void softmax_loss_bf16_launch(const Tensor& losses_tensor, const Tensor& max_of_each_row_tensor,
                                      const Tensor& sum_of_each_row_tensor, const Tensor& logits_grad_tensor,
                                      const Tensor& logits_tensor, const Tensor& targets_tensor, size_t vocab_size_val,
-                                     float loss_grad_val, int threads_per_block_val) {
+                                     float loss_grad_val, int threads_per_block_val, float softcap_val) {
     // 1. check the launch and the tensors; any of them wrong: stop with an error
     check_threads_per_block(threads_per_block_val, "softmax_loss_bf16");
     softmax_loss_bf16_check_shapes(FORWARD ? losses_tensor : max_of_each_row_tensor, max_of_each_row_tensor,
@@ -281,7 +318,7 @@ inline void softmax_loss_bf16_launch(const Tensor& losses_tensor, const Tensor& 
     softmax_loss_bf16_kernel<FORWARD, BACKWARD><<<(unsigned)rows_val, threads_per_block_val>>>(
         FORWARD ? losses_tensor.data() : nullptr, max_of_each_row_tensor.data(), sum_of_each_row_tensor.data(),
         BACKWARD ? logits_grad_tensor.data_ptr<nv_bfloat16>() : nullptr, logits_tensor.data_ptr<nv_bfloat16>(),
-        targets_tensor.data_ptr<int>(), vocab_size_val, logits_tensor.size(2), loss_grad_val);
+        targets_tensor.data_ptr<int>(), vocab_size_val, logits_tensor.size(2), loss_grad_val, softcap_val);
     cudaCheck(cudaGetLastError());
 }
 

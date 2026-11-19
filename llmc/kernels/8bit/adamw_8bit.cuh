@@ -17,6 +17,10 @@
 #define ADAMW_8BIT_THREADS_PER_BLOCK (4 * HARDWARE_THREADS_PER_WARP)             // the default block size: 4 warps; with ADAMW_8BIT_BLOCKS 0.623 ms against 0.652 for one float4 a thread at 8 warps (H100 NVL)
 #define ADAMW_8BIT_BLOCKS 40960                                                  // blocks in the launch, at most: past that each thread takes several float4s
 #define ADAMW_VALUES_PER_SCALE (HARDWARE_THREADS_PER_WARP * VALUES_PER_FLOAT4)   // one scale per warp, a float4 per thread
+#define ADAMW_8BIT_SMALLEST_KEPT 1e-30f   // a group whose largest |m| or sqrt(v) is below this is stored as 0s, scale 0:
+                                          // past ~1.3e-36, 448 / largest overflows float to inf, and a 0 value x inf is NaN
+                                          // (a never-seen token's wte row: g = 0, m shrinks x beta1 a step, NaN at step 1167).
+                                          // An m that small moves its param by less than 1e-22 a step
 
 /// Moves one parameter one AdamW step: clips g, decays p, updates m and v, then steps p against m, scaled by
 /// sqrt(v). Returns the new p; m and v are written back through their pointers.
@@ -136,6 +140,9 @@ __global__ void adamw_8bit_kernel(nv_bfloat16* params_ptr, const nv_bfloat16* gr
         m_largest_val = warp_reduce_max(m_largest_val);
         sqrt_v_largest_val = warp_reduce_max(sqrt_v_largest_val);
         // 3. zoom and store: x 448 / largest, so the largest becomes 448, rounded to the nearest E4M3
+        // a group too small for a finite zoom: all 0s, scale 0
+        if (m_largest_val < ADAMW_8BIT_SMALLEST_KEPT) m_largest_val = 0.0f;
+        if (sqrt_v_largest_val < ADAMW_8BIT_SMALLEST_KEPT) sqrt_v_largest_val = 0.0f;
         if (in_slice_val) {
             // zoom = 448 / largest; 0 if all 0
             float m_to_stored_val = m_largest_val > 0.0f ? HARDWARE_E4M3_LARGEST / m_largest_val : 0.0f;
