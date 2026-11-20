@@ -1,0 +1,73 @@
+log: logs/tests/test_attention_8bit_2026-11-13_130524.log
+
+needs_head_size_64_whole_tiles_and_an_h100
+    input: attention_8bit_fits(1000, FLASH_HEAD_SIZE) expected: false   actual: false   ok  (line 225)
+    input: attention_8bit_fits(GPT2_SEQ_LEN, FLASH_HEAD_SIZE / 2) expected: false   actual: false   ok  (line 226)
+    input: attention_8bit_fits(GPT2_SEQ_LEN, FLASH_HEAD_SIZE) expected: true   actual: true   ok  (line 227)
+
+each_row_s_scale_is_a_power_of_2_that_fits_448
+    input: (log2_tensor != log2_tensor.round()).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 253)
+    input: (nonzero_tensor & ((ratio_tensor <= 224.0) | (ratio_tensor > HARDWARE_E4M3_LARGEST))).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 254)
+    input: (~nonzero_tensor).sum().item<int64_t>() expected: 36   actual: 36   ok  (line 255)
+    input: (~nonzero_tensor & (scales_tensor != 1.0)).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 256)
+
+rounding_matches_pytorch_s_float8
+    input: torch::equal(pytorch_copy_of(mine_val.qkv_rounded_tensor), pytorch_rounded_qkv(mine_val)) expected: true   actual: true   ok  (line 275)
+
+matches_pytorch_on_the_rounded_values
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00279298   ok  (line 295)
+    input: relative_difference_on_gpu(mine_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 2.23761e-05   ok  (line 296)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.00222049   ok  (line 297)
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00245542   ok  (line 295)
+    input: relative_difference_on_gpu(mine_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 4.58304e-05   ok  (line 296)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.00353497   ok  (line 297)
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00234979   ok  (line 295)
+    input: relative_difference_on_gpu(mine_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 4.57419e-05   ok  (line 296)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.00244923   ok  (line 297)
+
+stays_near_pytorch_on_the_values_before_rounding
+    input: relative_difference_on_gpu(mine_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.1   actual: 0.0424668   ok  (line 341)
+    input: relative_difference_on_gpu(mine_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.15   actual: 0.028626   ok  (line 342)
+
+backward_writes_over_qkv_grad_the_same_every_time
+    input: (first_tensor == 7.0f).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 362)
+    input: torch::equal(pytorch_copy_of(mine_val.qkv_grad_tensor), first_tensor) expected: true   actual: true   ok  (line 365)
+
+every_kernel_fits_its_block
+    attention_8bit_round_qkv_kernel: 30 registers per thread, largest block 1024 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 392)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 393)
+    attention_8bit_forward_kernel: 106 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 392)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 393)
+    attention_8bit_turn_back_kernel: 32 registers per thread, largest block 1024 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 392)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 393)
+
+any_block_size_gives_the_same_bits
+    input: bytes_of(tensors_val.query_8bit_tensor) == bytes_of(usual_val.query_8bit_tensor) expected: true   actual: true   ok  (line 421)
+    input: bytes_of(tensors_val.key_8bit_tensor) == bytes_of(usual_val.key_8bit_tensor) expected: true   actual: true   ok  (line 422)
+    input: bytes_of(tensors_val.value_8bit_tensor) == bytes_of(usual_val.value_8bit_tensor) expected: true   actual: true   ok  (line 423)
+    input: bytes_of(tensors_val.query_scales_tensor) == bytes_of(usual_val.query_scales_tensor) expected: true   actual: true   ok  (line 424)
+    input: bytes_of(tensors_val.output_tensor) == bytes_of(usual_val.output_tensor) expected: true   actual: true   ok  (line 425)
+    input: bytes_of(tensors_val.qkv_grad_tensor) == bytes_of(usual_val.qkv_grad_tensor) expected: true   actual: true   ok  (line 426)
+    input: bytes_of(tensors_val.query_8bit_tensor) == bytes_of(usual_val.query_8bit_tensor) expected: true   actual: true   ok  (line 421)
+    input: bytes_of(tensors_val.key_8bit_tensor) == bytes_of(usual_val.key_8bit_tensor) expected: true   actual: true   ok  (line 422)
+    input: bytes_of(tensors_val.value_8bit_tensor) == bytes_of(usual_val.value_8bit_tensor) expected: true   actual: true   ok  (line 423)
+    input: bytes_of(tensors_val.query_scales_tensor) == bytes_of(usual_val.query_scales_tensor) expected: true   actual: true   ok  (line 424)
+    input: bytes_of(tensors_val.output_tensor) == bytes_of(usual_val.output_tensor) expected: true   actual: true   ok  (line 425)
+    input: bytes_of(tensors_val.qkv_grad_tensor) == bytes_of(usual_val.qkv_grad_tensor) expected: true   actual: true   ok  (line 426)
+    input: bytes_of(tensors_val.query_8bit_tensor) == bytes_of(usual_val.query_8bit_tensor) expected: true   actual: true   ok  (line 421)
+    input: bytes_of(tensors_val.key_8bit_tensor) == bytes_of(usual_val.key_8bit_tensor) expected: true   actual: true   ok  (line 422)
+    input: bytes_of(tensors_val.value_8bit_tensor) == bytes_of(usual_val.value_8bit_tensor) expected: true   actual: true   ok  (line 423)
+    input: bytes_of(tensors_val.query_scales_tensor) == bytes_of(usual_val.query_scales_tensor) expected: true   actual: true   ok  (line 424)
+    input: bytes_of(tensors_val.output_tensor) == bytes_of(usual_val.output_tensor) expected: true   actual: true   ok  (line 425)
+    input: bytes_of(tensors_val.qkv_grad_tensor) == bytes_of(usual_val.qkv_grad_tensor) expected: true   actual: true   ok  (line 426)
+    input: bytes_of(tensors_val.query_8bit_tensor) == bytes_of(usual_val.query_8bit_tensor) expected: true   actual: true   ok  (line 421)
+    input: bytes_of(tensors_val.key_8bit_tensor) == bytes_of(usual_val.key_8bit_tensor) expected: true   actual: true   ok  (line 422)
+    input: bytes_of(tensors_val.value_8bit_tensor) == bytes_of(usual_val.value_8bit_tensor) expected: true   actual: true   ok  (line 423)
+    input: bytes_of(tensors_val.query_scales_tensor) == bytes_of(usual_val.query_scales_tensor) expected: true   actual: true   ok  (line 424)
+    input: bytes_of(tensors_val.output_tensor) == bytes_of(usual_val.output_tensor) expected: true   actual: true   ok  (line 425)
+    input: bytes_of(tensors_val.qkv_grad_tensor) == bytes_of(usual_val.qkv_grad_tensor) expected: true   actual: true   ok  (line 426)
+
+all tests passed

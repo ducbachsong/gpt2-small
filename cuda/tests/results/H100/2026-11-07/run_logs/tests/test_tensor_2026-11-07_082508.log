@@ -1,0 +1,180 @@
+log: logs/tests/test_tensor_2026-11-07_082508.log
+
+zeros_makes_a_tensor_of_zeros
+    input: t_tensor.dim()                       expected: 2   actual: 2   ok  (line 17)
+    input: t_tensor.numel()                     expected: 6   actual: 6   ok  (line 18)
+    input: t_tensor.shape()                     expected: {2, 3}   actual: {2, 3}   ok  (line 19)
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0}   ok  (line 20)
+
+strides_follow_row_order
+    input: t_tensor.numel()                     expected: 24   actual: 24   ok  (line 27)
+    input: t_tensor.stride()                    expected: {12, 4, 1}   actual: {12, 4, 1}   ok  (line 28)
+    input: t_tensor.size(0)                     expected: 2   actual: 2   ok  (line 29)
+    input: t_tensor.size(1)                     expected: 3   actual: 3   ok  (line 30)
+    input: t_tensor.size(2)                     expected: 4   actual: 4   ok  (line 31)
+    input: t_tensor.stride(0)                   expected: 12   actual: 12   ok  (line 32)
+    input: t_tensor.stride(1)                   expected: 4   actual: 4   ok  (line 33)
+    input: t_tensor.stride(2)                   expected: 1   actual: 1   ok  (line 34)
+
+an_empty_tensor_has_no_values
+    input: t_tensor.dim()                       expected: 0   actual: 0   ok  (line 42)
+    input: t_tensor.numel()                     expected: 0   actual: 0   ok  (line 43)
+    input: t_tensor.data()                      expected: (nil)   actual: (nil)   ok  (line 44)
+    input: t_tensor.numel()                     expected: 4   actual: 4   ok  (line 47)
+    input: t_tensor.data() != nullptr           expected: true   actual: true   ok  (line 48)
+
+values_come_back_as_they_went_in
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 57)
+
+value_i_j_sits_at_i_times_stride_0_plus_j
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 0   actual: 0   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 1   actual: 1   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 2   actual: 2   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 3   actual: 3   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 4   actual: 4   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 5   actual: 5   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 6   actual: 6   ok  (line 69)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 7   actual: 7   ok  (line 69)
+    input: values_on_cpu_list[1 * t_tensor.stride(0) + 2 * t_tensor.stride(1)] expected: 6   actual: 6   ok  (line 71)
+
+view_changes_the_shape_not_the_values
+    input: view_tensor.shape()                  expected: {4, 2}   actual: {4, 2}   ok  (line 84)
+    input: view_tensor.stride()                 expected: {2, 1}   actual: {2, 1}   ok  (line 85)
+    input: view_tensor.data()                   expected: 0x7de0c0600000   actual: 0x7de0c0600000   ok  (line 86)
+    input: view_tensor.tolist()                 expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 87)
+    input: t_tensor.view({8}).shape()           expected: {8}   actual: {8}   ok  (line 88)
+
+a_view_shares_the_values
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 96)
+
+a_view_keeps_the_memory_alive
+    input: view_tensor.tolist()                 expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 109)
+
+narrow_takes_rows
+    input: rows_tensor.shape()                  expected: {2, 3}   actual: {2, 3}   ok  (line 122)
+    input: rows_tensor.data()                   expected: 0x7de0c060000c   actual: 0x7de0c060000c   ok  (line 123)
+    input: rows_tensor.tolist()                 expected: {3, 4, 5, 6, 7, 8}   actual: {3, 4, 5, 6, 7, 8}   ok  (line 124)
+
+narrow_then_view
+    input: piece_tensor.shape()                 expected: {3, 4}   actual: {3, 4}   ok  (line 135)
+    input: piece_tensor.data()                  expected: 0x7de0c0600020   actual: 0x7de0c0600020   ok  (line 136)
+    input: piece_tensor.tolist()                expected: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   actual: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   ok  (line 137)
+
+writing_a_narrow_leaves_the_rest_alone
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0}   actual: {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0}   ok  (line 144)
+
+from_blob_uses_the_memory_and_does_not_free_it
+    input: t_tensor.data()                      expected: 0x7de0c0600000   actual: 0x7de0c0600000   ok  (line 159)
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 160)
+    input: values_after_list                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 165)
+
+empty_has_the_shape
+    input: t_tensor.shape()                     expected: {3, 4}   actual: {3, 4}   ok  (line 174)
+    input: t_tensor.numel()                     expected: 12   actual: 12   ok  (line 175)
+    input: t_tensor.data() != nullptr           expected: true   actual: true   ok  (line 176)
+
+ones_makes_a_tensor_of_ones
+    input: t_tensor.tolist()                    expected: {1, 1, 1, 1}   actual: {1, 1, 1, 1}   ok  (line 182)
+
+zeros_like_and_empty_like_copy_shape_and_dtype
+    input: zeros_like_t_tensor.shape()          expected: {2, 5}   actual: {2, 5}   ok  (line 193)
+    input: zeros_like_t_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 194)
+    input: empty_like_t_tensor.shape()          expected: {2, 5}   actual: {2, 5}   ok  (line 195)
+    input: empty_like_t_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 196)
+    input: zeros_like_t_tensor.data_ptr<int>() != t_tensor.data_ptr<int>() expected: true   actual: true   ok  (line 197)
+    input: zeros_like_t_tensor.tolist<int>()    expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 198)
+
+int_tensors_hold_ints
+    input: tokens_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 208)
+    input: tokens_tensor.tolist<int>()          expected: {3, 464, 50256, 0}   actual: {3, 464, 50256, 0}   ok  (line 209)
+
+half_tensors_take_2_bytes_a_value
+    input: t_tensor.element_size()              expected: 2   actual: 2   ok  (line 232)
+    input: Tensor::zeros({1}).element_size()    expected: 4   actual: 4   ok  (line 233)
+    input: Tensor::zeros({1}, DType::Int32).element_size() expected: 4   actual: 4   ok  (line 234)
+    input: t_tensor.stride()                    expected: {4, 1}   actual: {4, 1}   ok  (line 235)
+    input: t_tensor[1].data_ptr<half>()         expected: 0x7de0c0600008   actual: 0x7de0c0600008   ok  (line 236)
+    input: (size_t)((char*)t_tensor[1].data_ptr<half>() - (char*)t_tensor.data_ptr<half>()) expected: 8   actual: 8   ok  (line 237)
+    input: as_floats(t_tensor.tolist<half>())   expected: {0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 238)
+
+half_values_come_back_as_they_went_in
+    input: as_floats(t_tensor.tolist<half>())   expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 246)
+
+to_half_rounds_each_value_to_the_nearest_half
+    input: halves_tensor.dtype() == DType::Float16 expected: true   actual: true   ok  (line 266)
+    input: halves_tensor.shape()                expected: {9}   actual: {9}   ok  (line 267)
+    input: as_floats(halves_tensor.tolist<half>()) expected: {1, 0.333252, 0.0999756, -2.5, 2048, 2052, 65504, inf, 0}   actual: {1, 0.333252, 0.0999756, -2.5, 2048, 2052, 65504, inf, 0}   ok  (line 268)
+    input: halves_tensor.to(DType::Float32).tolist() expected: {1, 0.333252, 0.0999756, -2.5, 2048, 2052, 65504, inf, 0}   actual: {1, 0.333252, 0.0999756, -2.5, 2048, 2052, 65504, inf, 0}   ok  (line 269)
+
+copy_converts_between_float_and_half
+    input: as_floats(halves_tensor.tolist<half>()) expected: {0.0999756, 0.5, 3}   actual: {0.0999756, 0.5, 3}   ok  (line 280)
+    input: back_tensor.tolist()                 expected: {0.0999756, 0.5, 3}   actual: {0.0999756, 0.5, 3}   ok  (line 284)
+
+to_its_own_dtype_shares_the_tensor
+    input: floats_tensor.to(DType::Float32).data() expected: 0x7de0c0600000   actual: 0x7de0c0600000   ok  (line 291)
+    input: halves_tensor.to(DType::Float16).data_ptr<half>() expected: 0x7de0c0600200   actual: 0x7de0c0600200   ok  (line 292)
+
+fill_ones_and_zero_for_halves
+    input: as_floats(Tensor::ones({3}, DType::Float16).tolist<half>()) expected: {1, 1, 1}   actual: {1, 1, 1}   ok  (line 299)
+    input: as_floats(t_tensor.tolist<half>())   expected: {0, 0, 0, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0, 0, 0}   actual: {0, 0, 0, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0.0999756, 0, 0, 0}   ok  (line 304)
+    input: as_floats(t_tensor.tolist<half>())   expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 307)
+
+narrow_then_view_on_halves
+    input: piece_tensor.data_ptr<half>()        expected: 0x7de0c0600010   actual: 0x7de0c0600010   ok  (line 316)
+    input: as_floats(piece_tensor.tolist<half>()) expected: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   actual: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   ok  (line 317)
+
+randn_in_half_is_randn_in_float_rounded
+    input: made_as_halves_list                  expected: {0.566895, 1.71387, -1.16992, 0.269531, 0.353516, -0.128662, 0.758301, -1.01758, 0.111572, -0.152222, 0.0796509, -1.19043, 0.884766, 1.10254, -0.814941, 0.897461, ... (1000 values)}   actual: {0.566895, 1.71387, -1.16992, 0.269531, 0.353516, -0.128662, 0.758301, -1.01758, 0.111572, -0.152222, 0.0796509, -1.19043, 0.884766, 1.10254, -0.814941, 0.897461, ... (1000 values)}   ok  (line 327)
+
+item_and_indexing_on_halves
+    input: __half2float(t_tensor[1][2].item<half>()) expected: 6   actual: 6   ok  (line 336)
+    input: __half2float(loss_tensor.item<half>()) expected: 42.5   actual: 42.5   ok  (line 340)
+
+bfloat16_has_float_s_range_and_8_significant_bits
+    input: bfloat16s_tensor.dtype() == DType::BFloat16 expected: true   actual: true   ok  (line 364)
+    input: bfloat16s_tensor.element_size()      expected: 2   actual: 2   ok  (line 365)
+    input: bfloat16s_tensor.to(DType::Float32).tolist() expected: {1, 0.333984, 0.100098, -2.5, 256, 260, 65536, 70144, 1.00117e-08}   actual: {1, 0.333984, 0.100098, -2.5, 256, 260, 65536, 70144, 1.00117e-08}   ok  (line 366)
+    input: read_on_cpu_list                     expected: {1, 0.333984, 0.100098, -2.5, 256, 260, 65536, 70144, 1.00117e-08}   actual: {1, 0.333984, 0.100098, -2.5, 256, 260, 65536, 70144, 1.00117e-08}   ok  (line 369)
+    input: bfloat16s_tensor.to(DType::Float16)[7].to(DType::Float32).item() expected: inf   actual: inf   ok  (line 371)
+    input: filled_tensor.to(DType::Float32).tolist() expected: {0.100098, 0.100098, 0.100098}   actual: {0.100098, 0.100098, 0.100098}   ok  (line 375)
+
+zero_sets_every_value_to_0
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0}   ok  (line 385)
+
+fill_sets_every_value
+    input: t_tensor.tolist()                    expected: {1.5, 1.5, 1.5, 1.5, 1.5, 1.5}   actual: {1.5, 1.5, 1.5, 1.5, 1.5, 1.5}   ok  (line 393)
+    input: ints_tensor.tolist<int>()            expected: {7, 7, 7, 7}   actual: {7, 7, 7, 7}   ok  (line 397)
+
+fill_on_a_narrow_fills_only_those_rows
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 2, 2, 2, 2, 2, 2, 0, 0, 0}   actual: {0, 0, 0, 2, 2, 2, 2, 2, 2, 0, 0, 0}   ok  (line 404)
+
+the_same_seed_gives_the_same_numbers
+    input: seed_7_again_list                    expected: {0.566698, 1.71414, -1.17027, 0.269586, 0.353567, -0.128628, 0.758484, -1.01728, 0.111543, -0.152168, 0.0796314, -1.19063, 0.88482, 1.10221, -0.815093, 0.897476, ... (1000 values)}   actual: {0.566698, 1.71414, -1.17027, 0.269586, 0.353567, -0.128628, 0.758484, -1.01728, 0.111543, -0.152168, 0.0796314, -1.19063, 0.88482, 1.10221, -0.815093, 0.897476, ... (1000 values)}   ok  (line 419)
+    input: seed_8_numbers_list != seed_7_numbers_list expected: true   actual: true   ok  (line 420)
+
+normal_has_the_mean_and_std_asked_for
+    input: mean_val                             expected: 0 +/- 0.0005   actual: -1.16583e-05   ok  (line 439)
+    input: deviation_val                        expected: 0.02 +/- 0.0004   actual: 0.0200331   ok  (line 440)
+
+copy_copies_gpu_to_gpu
+    input: target_tensor.tolist()               expected: {0, 1, 2, 3, 4, 5}   actual: {0, 1, 2, 3, 4, 5}   ok  (line 454)
+    input: target_tensor.shape()                expected: {3, 2}   actual: {3, 2}   ok  (line 455)
+    input: target_tensor.data() != source_tensor.data() expected: true   actual: true   ok  (line 456)
+
+clone_is_a_separate_copy
+    input: copy_tensor.tolist()                 expected: {0, 1, 2, 3}   actual: {0, 1, 2, 3}   ok  (line 467)
+    input: copy_tensor.data() != original_tensor.data() expected: true   actual: true   ok  (line 468)
+
+item_reads_the_one_value
+    input: loss_tensor.item()                   expected: 42.5   actual: 42.5   ok  (line 479)
+    input: token_tensor.item<int>()             expected: 50256   actual: 50256   ok  (line 484)
+
+indexing_picks_rows_and_values
+    input: row_tensor.shape()                   expected: {4}   actual: {4}   ok  (line 494)
+    input: row_tensor.tolist()                  expected: {4, 5, 6, 7}   actual: {4, 5, 6, 7}   ok  (line 495)
+    input: row_tensor.data()                    expected: 0x7de0c0600010   actual: 0x7de0c0600010   ok  (line 496)
+    input: t_tensor[1][2].dim()                 expected: 0   actual: 0   ok  (line 498)
+    input: t_tensor[1][2].numel()               expected: 1   actual: 1   ok  (line 499)
+    input: t_tensor[1][2].item()                expected: 6   actual: 6   ok  (line 500)
+
+all tests passed

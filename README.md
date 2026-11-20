@@ -39,7 +39,7 @@ The charts come from the run's logs by [docs/nanochat-d24/make_charts.py](docs/n
 
 QK-norm costs about 4% (987,000 against 1,030,000 tokens/s on 8× H100 SXM): with it, attention's backward writes `qkv_grad` in bfloat16 for the norm's backward, then rounds it, instead of writing it straight in 8 bits. The rows from 2026-11-16 and 17 are from before 60374f7 and the SXM-tuned products.
 
-Against PyTorch's FP8 training at its fastest, on the same H100 PCIe: torchao's float8 training (`convert_to_float8_training`, its tensorwise recipe), compiled (`torch.compile`), as nanochat trains. One micro-batch as the training loop runs it; ours from `tune_model`, PyTorch's from [tests/tune_model_torchao.py](tests/tune_model_torchao.py) (2026-11-17, bc4bdf1):
+Against PyTorch's FP8 training at its fastest, on the same H100 PCIe: torchao's float8 training (`convert_to_float8_training`, its tensorwise recipe), compiled (`torch.compile`), as nanochat trains. One micro-batch as the training loop runs it; ours from `tune_model`, PyTorch's from [cuda/tests/tune_model_torchao.py](cuda/tests/tune_model_torchao.py) (2026-11-17, bc4bdf1):
 
 | Rows | Ours 8-bit | PyTorch FP8 (torchao) | Ours / PyTorch |
 |---|---|---|---|
@@ -47,7 +47,7 @@ Against PyTorch's FP8 training at its fastest, on the same H100 PCIe: torchao's 
 | 8 | 84,564 | 73,029 | 1.16× |
 | 16 | 86,467 | 75,494 | 1.15× |
 
-At its best our 8-bit step reaches 87,188 tokens/s at 30 rows (MFU 51.0%), torchao's 75,494 at 16 rows. PyTorch's attention has no sliding window, so it does a little more work: in ours, 18 of the 24 layers see only the last 512 tokens. Our 8-bit model computes what PyTorch's FP8 model computes: on the same weights its gradients point the same way (the least alike, cosine 0.978) and the losses agree (10.692 against 10.688). 13 of the 15 8-bit products beat cuBLAS's bfloat16 on their own (1.11× to 1.56×). The two that don't, `mlp_up` and `mlp_down_input_grad`, do GELU inside them and cuBLAS doesn't; `mlp_up` is now 0.97× cuBLAS on an H100 PCIe (b7101a5). Every run's full log is in [tests/results/H100/](tests/results/H100/).
+At its best our 8-bit step reaches 87,188 tokens/s at 30 rows (MFU 51.0%), torchao's 75,494 at 16 rows. PyTorch's attention has no sliding window, so it does a little more work: in ours, 18 of the 24 layers see only the last 512 tokens. Our 8-bit model computes what PyTorch's FP8 model computes: on the same weights its gradients point the same way (the least alike, cosine 0.978) and the losses agree (10.692 against 10.688). 13 of the 15 8-bit products beat cuBLAS's bfloat16 on their own (1.11× to 1.56×). The two that don't, `mlp_up` and `mlp_down_input_grad`, do GELU inside them and cuBLAS doesn't; `mlp_up` is now 0.97× cuBLAS on an H100 PCIe (b7101a5). Every run's full log is in [cuda/tests/results/H100/](cuda/tests/results/H100/).
 
 ## Getting started
 
@@ -66,26 +66,26 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128   #
 The GPUs should never wait for data, so the tokens come first. Tokenize once, on any machine (no GPU needed; about 1.3M tokens a second with 16 threads), and keep the files in a dataset on the Hugging Face Hub. Ours is public, [ducbachsong/climbmix-tokens-32768](https://huggingface.co/datasets/ducbachsong/climbmix-tokens-32768) (CC BY-NC 4.0, as ClimbMix), so you can skip this step and just download it:
 
 ```bash
-python data/climbmix.py --train-tokens 6000M --threads 16
-python data/token_hub.py upload --repo <user>/climbmix-tokens-32768
+python python/climbmix.py --train-tokens 6000M --threads 16
+python python/token_hub.py upload --repo <user>/climbmix-tokens-32768
 ```
 
 Then on each GPU machine download them, a few minutes, and train. `--data-ready 1` starts only when every token of the run is on disk. nanochat-d24's run, on 8 GPUs:
 
 ```bash
-python data/token_hub.py download --repo <user>/climbmix-tokens-32768
-nvcc -ccbin g++ -O3 -std=c++17 -gencode arch=compute_90a,code=sm_90a train_8bit.cu -o train_8bit -lnccl
+python python/token_hub.py download --repo <user>/climbmix-tokens-32768
+nvcc -ccbin g++ -O3 -std=c++17 -gencode arch=compute_90a,code=sm_90a cuda/train_8bit.cu -o train_8bit -lnccl
 torchrun --standalone --nproc_per_node=8 --no-python ./train_8bit --data-ready 1 --steps 10420 \
     --batch-size 32 --max-learning-rate 3e-4 --checkpoint-dir ckpt --checkpoint-every 1000 &
-python data/checkpoint_hub.py watch --repo <user>/d24-checkpoints --dir ckpt --trainer-pid $!   # each checkpoint to the Hub
+python python/checkpoint_hub.py watch --repo <user>/d24-checkpoints --dir ckpt --trainer-pid $!   # each checkpoint to the Hub
 ```
 
-A rented machine can go away mid-run: `checkpoint_hub.py download` brings the newest checkpoint onto a new one (as many GPUs), and `--resume ckpt` goes on from it. At the end, `python data/export_safetensors.py --checkpoint ckpt --out nanochat-d24 --repo <user>/nanochat-d24` makes the model folder and sends it to the Hub.
+A rented machine can go away mid-run: `checkpoint_hub.py download` brings the newest checkpoint onto a new one (as many GPUs), and `--resume ckpt` goes on from it. At the end, `python python/export_safetensors.py --checkpoint ckpt --out nanochat-d24 --repo <user>/nanochat-d24` makes the model folder and sends it to the Hub.
 
 One GPU runs the same steps, just 8× slower: `./train_8bit`. For a quick try you can also train while the files are still being written or downloaded: the trainer waits for a lead of `--data-lead-tokens` (500M) before the first step, each step's line shows its `data` milliseconds, and the loader says so whenever the GPUs had to wait for a file:
 
 ```bash
-python data/climbmix.py --train-tokens 400M --threads 16 &
+python python/climbmix.py --train-tokens 400M --threads 16 &
 ./train_8bit --steps 20 --tokens-per-step 32768 --val-every 10
 ```
 
@@ -95,9 +95,9 @@ Each step is 524,288 tokens, all GPUs together. `--batch-size` sets the rows per
 
 | Trainer | Params, grads, activations | Matrix products | AdamW state |
 |---|---|---|---|
-| `train_fp32.cu` | float | float | float |
-| `train_bf16.cu` | bfloat16 | bfloat16 on WGMMA | float master params |
-| `train_8bit.cu` | bfloat16 | FP8 E4M3 on WGMMA, float sums | float master params, m and √v in 8 bits |
+| `cuda/train_fp32.cu` | float | float | float |
+| `cuda/train_bf16.cu` | bfloat16 | bfloat16 on WGMMA | float master params |
+| `cuda/train_8bit.cu` | bfloat16 | FP8 E4M3 on WGMMA, float sums | float master params, m and √v in 8 bits |
 
 In `train_8bit` each product's two sides are rounded to E4M3 just before it, with one scale per tensor taken from its largest values over the last steps (delayed scaling, as Transformer Engine does). Where it can, the rounding happens inside the kernel that writes the tensor, both the copy the forward reads and the turned copy the backward reads, and no bfloat16 copy is kept: the LayerNorms write their outputs in 8 bits, `mlp_up` writes GELU's output, `mlp_down`'s backward writes the gradient into `mlp_up`, and attention's backward writes the gradient into `qkv`. The scales those kernels use start at 1 (as Transformer Engine's do) for the activations; a gradient's first scale is exact, from its own largest value, since its values are far too small for a scale of 1. The 4 linears have no bias, as in nanochat: the 8-bit model stops if asked for one.
 
@@ -105,7 +105,7 @@ In `train_8bit` each product's two sides are rounded to E4M3 just before it, wit
 
 ## Tests and tunes
 
-Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTorch, passes or fails) and a **tune** (`tune_<kernel>.cu`: times its settings on this GPU and against cuBLAS). They sit side by side in `tests/fp32/`, `tests/bf16/` and `tests/8bit/`; [tests/README.md](tests/README.md) lists them all. Each kernel's settings are `#define`s at the top of its file, set from a tune on the GPU it will train on. The whole model: `tune_model` finds the best `--batch-size`, checks the 8-bit model's gradients and loss against PyTorch's FP8 model (`torch._scaled_mm`); `tune_model_torchao.py` times PyTorch's FP8 training at its fastest for the comparison above (`pip install torchao`).
+Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTorch, passes or fails) and a **tune** (`tune_<kernel>.cu`: times its settings on this GPU and against cuBLAS). They sit side by side in `cuda/tests/fp32/`, `cuda/tests/bf16/` and `cuda/tests/8bit/`; [cuda/tests/README.md](cuda/tests/README.md) lists them all. Each kernel's settings are `#define`s at the top of its file, set from a tune on the GPU it will train on. The whole model: `tune_model` finds the best `--batch-size`, checks the 8-bit model's gradients and loss against PyTorch's FP8 model (`torch._scaled_mm`); `tune_model_torchao.py` times PyTorch's FP8 training at its fastest for the comparison above (`pip install torchao`).
 
 ## File structure
 
@@ -114,40 +114,47 @@ Every kernel has a **test** (`test_<kernel>.cu`: checks its numbers against PyTo
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
-├── train_fp32.cu                   # the trainer in float, any GPU
-├── train_bf16.cu                   # the trainer in bfloat16, an H100
-├── train_8bit.cu                   # the trainer with FP8 products, an H100
 ├── docs/nanochat-d24               # the run's charts and the script that draws them
-├── data
+├── python
 │   ├── climbmix.py                 # ClimbMix into token files, trains nanochat's tokenizer
 │   ├── fineweb.py                  # FineWeb-Edu into llm.c's token files (GPT-2's tokenizer)
 │   ├── token_hub.py                # uploads and downloads the token files: tokenize once, keep them on the Hub
 │   ├── checkpoint_hub.py           # sends each checkpoint to the Hub during a run; brings the newest back
 │   ├── export_safetensors.py       # a checkpoint into a model folder: model.safetensors, config.json, the tokenizer
 │   ├── safetensors_model.py        # that model in plain PyTorch, and its val loss
+│   ├── chat_sft.py                 # the chat fine-tune's data: SmolTalk, MMLU, GSM8K as masked, packed rows
+│   ├── finetune_init.py            # the fine-tune's starting weights, from an exported model folder
 │   ├── parquetpool.py              # downloads the parquet shards into RAM in the background
 │   ├── tokenpool.py                # tokenizes in threads
-│   └── data_common.py              # the token-file and tokenizer-file formats
-├── llmc
-│   ├── model_fp32.cuh              # the model's forward and backward, one per number type
-│   ├── model_bf16.cuh
-│   ├── model_8bit.cuh
-│   ├── common                      # tensors, the model's params, the training settings and flags
-│   ├── helper                      # the dataloader, checkpoints, NCCL across GPUs
-│   └── kernels
-│       ├── cuda_common.h           # warp and block reductions, the GPU's fixed numbers
-│       ├── fp32                    # one file per kernel: attention, layer_norm, gelu, adamw, ...
-│       ├── bf16                    # the same in bfloat16, plus WGMMA products
-│       │   └── prod                # one kernel per model product, each tuned on its own
-│       └── 8bit                    # FP8 rounding, 8-bit AdamW, FP8 products
-│           └── prod                # the 15 FP8 product kernels: qkv, mlp_up, head, their grads, ...
-└── tests
-    ├── test_helpers.h              # ASSERT_EQ, ASSERT_NEAR
-    ├── tune_helpers.h              # GPU timing, GB/s and MBU
-    ├── test_model.cu, tune_model.cu
-    ├── tune_model_torchao.py       # PyTorch's FP8 training at its fastest on the same model: torchao, compiled
-    ├── fp32, bf16, 8bit            # test_<kernel>.cu and tune_<kernel>.cu for every kernel
-    └── results                     # what each tune printed, per GPU and per day
+│   ├── data_common.py              # the token-file and tokenizer-file formats
+│   ├── tokenizer
+│   │   ├── tokenizer.py            # nanochat's tokenizer: its settings, training it, loading it
+│   │   └── data                    # what the python/ scripts make: the tokenizer (tokenizer.pkl), token files, chat rows
+│   └── tests                       # test_parquetpool.py, test_tokenpool.py, test_chat_model.py
+└── cuda
+    ├── train_fp32.cu               # the trainer in float, any GPU
+    ├── train_bf16.cu               # the trainer in bfloat16, an H100
+    ├── train_8bit.cu               # the trainer with FP8 products, an H100
+    ├── finetune_8bit.cu            # the chat fine-tune of the 8-bit model
+    ├── model_fp32.cuh              # the model's forward and backward, one per number type
+    ├── model_bf16.cuh
+    ├── model_8bit.cuh
+    ├── common                      # tensors, the model's params, the training settings and flags
+    ├── helper                      # the dataloader, checkpoints, NCCL across GPUs
+    ├── kernels
+    │   ├── cuda_common.h           # warp and block reductions, the GPU's fixed numbers
+    │   ├── fp32                    # one file per kernel: attention, layer_norm, gelu, adamw, ...
+    │   ├── bf16                    # the same in bfloat16, plus WGMMA products
+    │   │   └── prod                # one kernel per model product, each tuned on its own
+    │   └── 8bit                    # FP8 rounding, 8-bit AdamW, FP8 products
+    │       └── prod                # the 15 FP8 product kernels: qkv, mlp_up, head, their grads, ...
+    └── tests
+        ├── common                  # test_helpers.h (ASSERT_EQ, ASSERT_NEAR); the tensor, buffer and NCCL tests
+        ├── tune_helpers.h          # GPU timing, GB/s and MBU
+        ├── test_model.cu, tune_model.cu
+        ├── tune_model_torchao.py   # PyTorch's FP8 training at its fastest on the same model: torchao, compiled
+        ├── fp32, bf16, 8bit        # test_<kernel>.cu and tune_<kernel>.cu for every kernel
+        └── results                 # what each tune printed, per GPU and per day
 ```
 
 ## Contributing

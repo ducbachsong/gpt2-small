@@ -1,0 +1,30 @@
+GPT-2 small: 124475904 parameters, bf16, on 1 GPU(s)
+train: 1 file(s), 12000000 tokens; val: 3000000 tokens, 1 batches of it on each GPU each time
+20 steps of 1 GPU(s) x 128 x {4, 1024} = 524288 tokens: 10485760 tokens, 0.87 epochs
+learning rate: 0.0006, warmup 700 steps, cosine down to 0; weight decay 0.1, clip at 1
+GPU memory, rank 0: 4.2 GB used of 85.0 GB
+checkpoints: none
+
+step     0 | val loss 10.9915
+step     1/20 | loss 10.9780 | norm  0.4616 | lr 8.57e-07 |   2328 ms |  225251 tokens/s
+step     2/20 | loss 10.9787 | norm  0.4777 | lr 1.71e-06 |   2285 ms |  229491 tokens/s
+step     3/20 | loss 10.9781 | norm  0.4531 | lr 2.57e-06 |   2282 ms |  229790 tokens/s
+step     4/20 | loss 10.9783 | norm  0.4680 | lr 3.43e-06 |   2285 ms |  229475 tokens/s
+step     5/20 | loss 10.9757 | norm  0.4471 | lr 4.29e-06 |   2287 ms |  229271 tokens/s
+step     6/20 | loss 10.9742 | norm  0.4393 | lr 5.14e-06 |   2286 ms |  229314 tokens/s
+step     7/20 | loss 10.9714 | norm  0.4027 | lr 6.00e-06 |   2288 ms |  229153 tokens/s
+step     8/20 | loss 10.9685 | norm  0.3917 | lr 6.86e-06 |   2287 ms |  229227 tokens/s
+step     9/20 | loss 10.9654 | norm  0.3515 | lr 7.71e-06 |   2285 ms |  229409 tokens/s
+step    10/20 | loss 10.9625 | norm  0.3128 | lr 8.57e-06 |   2286 ms |  229357 tokens/s
+step    11/20 | loss 10.9600 | norm  0.2920 | lr 9.43e-06 |   2285 ms |  229455 tokens/s
+step    12/20 | loss 10.9569 | norm  0.2522 | lr 1.03e-05 |   2286 ms |  229333 tokens/s
+step    13/20 | loss 10.9557 | norm  0.2223 | lr 1.11e-05 |   2286 ms |  229323 tokens/s
+step    14/20 | loss 10.9512 | norm  0.2098 | lr 1.20e-05 |   2284 ms |  229513 tokens/s
+step    15/20 | loss 10.9498 | norm  0.1923 | lr 1.29e-05 |   2282 ms |  229724 tokens/s
+step    16/20 | loss 10.9453 | norm  0.1770 | lr 1.37e-05 |   2288 ms |  229163 tokens/s
+step    17/20 | loss 10.9436 | norm  0.1580 | lr 1.46e-05 |   2285 ms |  229399 tokens/s
+step    18/20 | loss 10.9397 | norm  0.1548 | lr 1.54e-05 |   2283 ms |  229651 tokens/s
+step    19/20 | loss 10.9374 | norm  0.1440 | lr 1.63e-05 |   2282 ms |  229786 tokens/s
+step    20/20 | loss 10.9362 | norm  0.1386 | lr 1.71e-05 |   2283 ms |  229657 tokens/s
+step    20 | val loss 10.9499
+done: steps 1 .. 20 in 46 s

@@ -1,0 +1,133 @@
+log: logs/tests/test_attention_bf16_2026-11-13_130522.log
+
+steps_match_pytorch
+    input: mine_val.output_tensor.to(DType::Float32).tolist() expected: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   actual: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   difference: 0.00261324 (at most 0.02)   ok  (line 227)
+    input: mine_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   difference: 0.00305647 (at most 0.02)   ok  (line 228)
+    input: mine_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   difference: 0.00287109 (at most 0.05)   ok  (line 229)
+
+steps_need_whole_wgmmas_and_an_h100
+    input: attention_bf16_fits(1000, GPT2_HEAD_SIZE) expected: false   actual: false   ok  (line 258)
+    input: attention_bf16_fits(GPT2_SEQ_LEN, 40) expected: false   actual: false   ok  (line 259)
+    input: attention_bf16_fits(GPT2_SEQ_LEN, GPT2_HEAD_SIZE) expected: true   actual: true   ok  (line 260)
+    input: attention_bf16_fits(80, 32)          expected: true   actual: true   ok  (line 261)
+
+steps_match_pytorch
+    input: mine_val.output_tensor.to(DType::Float32).tolist() expected: {0.237305, 1.08594, -0.25, -0.498047, -1.14844, 1.40625, 0.910156, -0.0600586, 0.402344, -0.462891, 0.0932617, 1.09375, 0.675781, -0.19043, -0.474609, -1.78906, ... (20480 values)}   actual: {0.237305, 1.08594, -0.25, -0.498047, -1.14844, 1.40625, 0.910156, -0.0600586, 0.402344, -0.462891, 0.0932617, 1.09375, 0.675781, -0.19043, -0.474609, -1.78906, ... (20480 values)}   difference: 0.00357221 (at most 0.02)   ok  (line 227)
+    input: mine_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (51200 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (51200 values)}   difference: 0.00331074 (at most 0.02)   ok  (line 228)
+    input: mine_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (61440 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (61440 values)}   difference: 0.00582627 (at most 0.05)   ok  (line 229)
+    input: mine_val.output_tensor.to(DType::Float32).tolist() expected: {0.292969, 0.292969, -0.470703, -1.82812, 0.065918, 0.5, -1.36719, 0.349609, -0.953125, -0.625, 0.59375, -0.0256348, -1.47656, -0.730469, 0.106934, -0.439453, ... (99840 values)}   actual: {0.292969, 0.292969, -0.470703, -1.82812, 0.065918, 0.5, -1.36719, 0.349609, -0.953125, -0.625, 0.59375, -0.0256348, -1.47656, -0.730469, 0.106934, -0.439453, ... (99840 values)}   difference: 0.00327331 (at most 0.02)   ok  (line 227)
+    input: mine_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (259584 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (259584 values)}   difference: 0.00251687 (at most 0.02)   ok  (line 228)
+    input: mine_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (299520 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (299520 values)}   difference: 0.00305407 (at most 0.05)   ok  (line 229)
+
+steps_backward_writes_over_qkv_grad_the_same_every_time
+    input: (first_tensor == 7.0f).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 303)
+    input: torch::equal(pytorch_copy_of(mine_val.qkv_grad_tensor), first_tensor) expected: true   actual: true   ok  (line 306)
+
+flash_needs_head_size_64_and_whole_tiles
+    input: attention_bf16_flash_fits(1000, FLASH_HEAD_SIZE) expected: false   actual: false   ok  (line 355)
+    input: attention_bf16_flash_fits(GPT2_SEQ_LEN, FLASH_HEAD_SIZE / 2) expected: false   actual: false   ok  (line 356)
+    input: attention_bf16_flash_fits(GPT2_SEQ_LEN, FLASH_HEAD_SIZE) expected: true   actual: true   ok  (line 357)
+
+flash_matches_pytorch_and_the_steps
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00394793   ok  (line 332)
+    input: relative_difference_on_gpu(flash_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 9.56904e-08   ok  (line 333)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.00263267   ok  (line 334)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_copy_of(steps_val.output_tensor)) expected: 0 +/- 0.02   actual: 0.00373134   ok  (line 336)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_copy_of(steps_val.qkv_grad_tensor)) expected: 0 +/- 0.05   actual: 0.00478469   ok  (line 338)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00238997   ok  (line 332)
+    input: relative_difference_on_gpu(flash_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 1.42545e-07   ok  (line 333)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.00305596   ok  (line 334)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_copy_of(steps_val.output_tensor)) expected: 0 +/- 0.02   actual: 0.00469484   ok  (line 336)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_copy_of(steps_val.qkv_grad_tensor)) expected: 0 +/- 0.05   actual: 0.00367647   ok  (line 338)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_val.output_tensor) expected: 0 +/- 0.02   actual: 0.00248599   ok  (line 332)
+    input: relative_difference_on_gpu(flash_val.logsumexp_tensor, pytorch_val.logsumexp_tensor) expected: 0 +/- 0.02   actual: 1.20778e-07   ok  (line 333)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_val.qkv_tensor.grad()) expected: 0 +/- 0.05   actual: 0.0028458   ok  (line 334)
+    input: relative_difference_on_gpu(flash_val.output_tensor, pytorch_copy_of(steps_val.output_tensor)) expected: 0 +/- 0.02   actual: 0.00434783   ok  (line 336)
+    input: relative_difference_on_gpu(flash_val.qkv_grad_tensor, pytorch_copy_of(steps_val.qkv_grad_tensor)) expected: 0 +/- 0.05   actual: 0.00287356   ok  (line 338)
+
+flash_backward_writes_over_qkv_grad_the_same_every_time
+    input: (first_tensor == 7.0f).sum().item<int64_t>() expected: 0   actual: 0   ok  (line 399)
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), first_tensor) expected: true   actual: true   ok  (line 402)
+
+every_stage_count_gives_the_same_bits
+    key_grad 1 sets, query_grad 1 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 1 sets, query_grad 2 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 1 sets, query_grad 3 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 1 sets, query_grad 4 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 2 sets, query_grad 1 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 2 sets, query_grad 2 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 2 sets, query_grad 3 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 2 sets, query_grad 4 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 3 sets, query_grad 1 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 3 sets, query_grad 2 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 3 sets, query_grad 3 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 3 sets, query_grad 4 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 4 sets, query_grad 1 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 4 sets, query_grad 2 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 4 sets, query_grad 3 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+    key_grad 4 sets, query_grad 4 sets:
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), expected_tensor) expected: true   actual: true   ok  (line 455)
+
+every_kernel_fits_its_block
+    attention_product_kernel<false, false>: 58 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_product_kernel<false, true>: 58 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_product_kernel<true, true>: 58 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_softmax_forward_kernel: 32 registers per thread, largest block 1024 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_softmax_backward_kernel: 30 registers per thread, largest block 1024 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_flash_forward_kernel: 90 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_flash_row_dot_kernel: 28 registers per thread, largest block 1024 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_flash_key_grad_kernel: 156 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+    attention_bf16_flash_query_grad_kernel: 122 registers per thread, largest block 128 threads, 0 bytes local memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 505)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 506)
+
+any_block_size_gives_the_same_bits
+    input: tensors_val.output_tensor.to(DType::Float32).tolist() expected: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   actual: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   ok  (line 536)
+    input: tensors_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   ok  (line 537)
+    input: tensors_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   ok  (line 538)
+    input: tensors_val.output_tensor.to(DType::Float32).tolist() expected: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   actual: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   ok  (line 536)
+    input: tensors_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   ok  (line 537)
+    input: tensors_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   ok  (line 538)
+    input: tensors_val.output_tensor.to(DType::Float32).tolist() expected: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   actual: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   ok  (line 536)
+    input: tensors_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   ok  (line 537)
+    input: tensors_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   ok  (line 538)
+    input: tensors_val.output_tensor.to(DType::Float32).tolist() expected: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   actual: {-1.58594, -0.404297, -0.625, 1.26562, -0.550781, -1.3125, -0.0615234, 1.91406, -0.636719, -1.44531, 0.789062, 0.566406, -0.0125122, 0.898438, -1.875, 0.255859, ... (98304 values)}   ok  (line 536)
+    input: tensors_val.attention_probs_tensor.to(DType::Float32).tolist() expected: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   actual: {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (98304 values)}   ok  (line 537)
+    input: tensors_val.qkv_grad_tensor.to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (294912 values)}   ok  (line 538)
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), usual_qkv_grad_tensor) expected: true   actual: true   ok  (line 556)
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), usual_qkv_grad_tensor) expected: true   actual: true   ok  (line 556)
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), usual_qkv_grad_tensor) expected: true   actual: true   ok  (line 556)
+    input: torch::equal(pytorch_copy_of(flash_val.qkv_grad_tensor), usual_qkv_grad_tensor) expected: true   actual: true   ok  (line 556)
+
+all tests passed

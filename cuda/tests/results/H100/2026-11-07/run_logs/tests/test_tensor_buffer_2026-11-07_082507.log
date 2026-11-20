@@ -1,0 +1,251 @@
+log: logs/tests/test_tensor_buffer_2026-11-07_082507.log
+
+add_returns_each_tensors_index
+    input: buffer_val.add({2, 4})               expected: 0   actual: 0   ok  (line 26)
+    input: buffer_val.add({12})                 expected: 1   actual: 1   ok  (line 27)
+    input: buffer_val.num_tensors()             expected: 2   actual: 2   ok  (line 28)
+
+add_many_returns_its_group
+    input: buffer_val.add_many({{2, 4}, {12}})  expected: 0   actual: 0   ok  (line 38)
+    input: buffer_val.add_many({{2, 2, 3}})     expected: 1   actual: 1   ok  (line 39)
+    input: buffer_val.num_groups()              expected: 2   actual: 2   ok  (line 41)
+    input: buffer_val.group_size(0)             expected: 2   actual: 2   ok  (line 42)
+    input: buffer_val.group_size(1)             expected: 1   actual: 1   ok  (line 43)
+    input: buffer_val.num_tensors()             expected: 4   actual: 4   ok  (line 44)
+
+numel_is_known_before_allocate
+    input: buffer_val.numel()                   expected: 32   actual: 32   ok  (line 51)
+
+allocate_makes_one_flat_tensor_of_zeros
+    input: buffer_val.flat().shape()            expected: {32}   actual: {32}   ok  (line 61)
+    input: buffer_val.flat().tolist()           expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   ok  (line 62)
+    input: buffer_val.numel()                   expected: 32   actual: 32   ok  (line 63)
+
+each_tensor_has_its_own_shape
+    input: buffer_val.tensor(0).shape()         expected: {2, 4}   actual: {2, 4}   ok  (line 71)
+    input: buffer_val.tensor(1).shape()         expected: {12}   actual: {12}   ok  (line 72)
+    input: buffer_val.tensor(2).shape()         expected: {2, 2, 3}   actual: {2, 2, 3}   ok  (line 73)
+
+tensors_sit_one_after_another
+    input: buffer_val.tensor(0).data()          expected: 0x77cbb0600000   actual: 0x77cbb0600000   ok  (line 82)
+    input: buffer_val.tensor(1).data()          expected: 0x77cbb0600020   actual: 0x77cbb0600020   ok  (line 83)
+    input: buffer_val.tensor(2).data()          expected: 0x77cbb0600050   actual: 0x77cbb0600050   ok  (line 84)
+
+each_tensor_sees_its_part_of_the_memory
+    input: buffer_val.tensor(0).tolist()        expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 98)
+    input: buffer_val.tensor(1).tolist()        expected: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   actual: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   ok  (line 99)
+    input: buffer_val.tensor(2).tolist()        expected: {20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}   actual: {20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}   ok  (line 100)
+
+writing_a_tensor_writes_only_its_part
+    input: buffer_val.flat().tolist()           expected: {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, ... (32 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, ... (32 values)}   ok  (line 115)
+
+zeroing_all_zeroes_every_tensor
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 128)
+    input: buffer_val.tensor(1).tolist()        expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 129)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 130)
+
+a_tensor_keeps_the_memory_alive
+    input: kept_tensor.tolist()                 expected: {0, 1, 2, 3}   actual: {0, 1, 2, 3}   ok  (line 146)
+
+matrices_are_the_tensors_with_2_or_more_dims
+    input: buffer_val.tensor(0).dim() >= 2      expected: true   actual: true   ok  (line 157)
+    input: buffer_val.tensor(1).dim() >= 2      expected: false   actual: false   ok  (line 158)
+    input: buffer_val.tensor(2).dim() >= 2      expected: true   actual: true   ok  (line 159)
+    input: buffer_val.tensor(3).dim() >= 2      expected: true   actual: true   ok  (line 160)
+
+a_group_is_one_flat_tensor_of_its_values
+    input: buffer_val.group(0).shape()          expected: {32}   actual: {32}   ok  (line 183)
+    input: buffer_val.group(0).data()           expected: 0x77cbb0600000   actual: 0x77cbb0600000   ok  (line 184)
+    input: buffer_val.group(0).tolist()         expected: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (32 values)}   actual: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (32 values)}   ok  (line 185)
+    input: buffer_val.group(1).data()           expected: 0x77cbb0600080   actual: 0x77cbb0600080   ok  (line 189)
+    input: buffer_val.group(1).tolist()         expected: {32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, ... (32 values)}   actual: {32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, ... (32 values)}   ok  (line 190)
+
+tensor_g_k_is_tensor_k_of_group_g
+    input: buffer_val.tensor(0, 1).data()       expected: 0x77cbb0600020   actual: 0x77cbb0600020   ok  (line 197)
+    input: buffer_val.tensor(1, 0).data()       expected: 0x77cbb0600080   actual: 0x77cbb0600080   ok  (line 198)
+    input: buffer_val.tensor(1, 0).shape()      expected: {2, 4}   actual: {2, 4}   ok  (line 199)
+    input: buffer_val.tensor(1, 2).shape()      expected: {2, 2, 3}   actual: {2, 2, 3}   ok  (line 200)
+
+writing_a_group_writes_only_its_part
+    input: buffer_val.flat().tolist()           expected: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (64 values)}   actual: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (64 values)}   ok  (line 212)
+
+zeros_like_copies_the_groups
+    input: copy_val.num_groups()                expected: 2   actual: 2   ok  (line 222)
+    input: copy_val.group_size(0)               expected: 3   actual: 3   ok  (line 223)
+    input: copy_val.group_size(1)               expected: 3   actual: 3   ok  (line 224)
+    input: copy_val.group(1).data()             expected: 0x77cbb0600280   actual: 0x77cbb0600280   ok  (line 225)
+    input: copy_val.group(1).tolist()           expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   ok  (line 226)
+
+zeros_like_copies_the_layout_not_the_memory
+    input: grads_val.num_tensors()              expected: 3   actual: 3   ok  (line 239)
+    input: grads_val.tensor(0).shape()          expected: {2, 4}   actual: {2, 4}   ok  (line 240)
+    input: grads_val.tensor(1).shape()          expected: {12}   actual: {12}   ok  (line 241)
+    input: grads_val.tensor(2).shape()          expected: {2, 2, 3}   actual: {2, 2, 3}   ok  (line 242)
+    input: grads_val.flat().tolist()            expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ... (32 values)}   ok  (line 243)
+    input: grads_val.flat().data() != params_val.flat().data() expected: true   actual: true   ok  (line 244)
+    input: params_val.flat().tolist()           expected: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (32 values)}   actual: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, ... (32 values)}   ok  (line 247)
+
+an_int_buffer_holds_ints
+    input: tokens_val.flat().dtype() == DType::Int32 expected: true   actual: true   ok  (line 258)
+    input: tokens_val.tensor(0).tolist<int>()   expected: {0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 259)
+    input: tokens_val.tensor(1).tolist<int>()   expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 260)
+    input: copy_val.flat().dtype() == DType::Int32 expected: true   actual: true   ok  (line 263)
+
+a_bfloat16_buffer_takes_2_bytes_a_value
+    input: buffer_val.flat().dtype() == DType::BFloat16 expected: true   actual: true   ok  (line 278)
+    input: (size_t)((const char*)buffer_val.tensor(1).data_ptr<nv_bfloat16>() - start_ptr) expected: 16   actual: 16   ok  (line 279)
+    input: (size_t)((const char*)buffer_val.tensor(2).data_ptr<nv_bfloat16>() - start_ptr) expected: 40   actual: 40   ok  (line 280)
+    input: buffer_val.tensor(1).to(DType::Float32).tolist() expected: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}   actual: {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}   ok  (line 285)
+    input: buffer_val.tensor(0).to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 286)
+    input: buffer_val.tensor(2).to(DType::Float32).tolist() expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 287)
+    input: copy_val.flat().dtype() == DType::BFloat16 expected: true   actual: true   ok  (line 290)
+
+buffer_tensor_starts_as_zeros
+    input: t_tensor.dim()                       expected: 2   actual: 2   ok  (line 319)
+    input: t_tensor.numel()                     expected: 6   actual: 6   ok  (line 320)
+    input: t_tensor.shape()                     expected: {2, 3}   actual: {2, 3}   ok  (line 321)
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0}   ok  (line 322)
+    input: t_tensor.data()                      expected: 0x77cbb0600010   actual: 0x77cbb0600010   ok  (line 323)
+
+buffer_tensor_strides_follow_row_order
+    input: t_tensor.numel()                     expected: 24   actual: 24   ok  (line 331)
+    input: t_tensor.stride()                    expected: {12, 4, 1}   actual: {12, 4, 1}   ok  (line 332)
+    input: t_tensor.size(0)                     expected: 2   actual: 2   ok  (line 333)
+    input: t_tensor.size(1)                     expected: 3   actual: 3   ok  (line 334)
+    input: t_tensor.size(2)                     expected: 4   actual: 4   ok  (line 335)
+    input: t_tensor.stride(0)                   expected: 12   actual: 12   ok  (line 336)
+    input: t_tensor.stride(1)                   expected: 4   actual: 4   ok  (line 337)
+    input: t_tensor.stride(2)                   expected: 1   actual: 1   ok  (line 338)
+
+an_empty_tensor_can_take_a_buffer_tensor
+    input: t_tensor.dim()                       expected: 0   actual: 0   ok  (line 347)
+    input: t_tensor.numel()                     expected: 0   actual: 0   ok  (line 348)
+    input: t_tensor.data()                      expected: (nil)   actual: (nil)   ok  (line 349)
+    input: t_tensor.numel()                     expected: 4   actual: 4   ok  (line 352)
+    input: t_tensor.data()                      expected: 0x77cbb0600010   actual: 0x77cbb0600010   ok  (line 353)
+
+buffer_tensor_values_come_back_as_they_went_in
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 363)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 364)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 365)
+
+buffer_tensor_value_i_j_sits_at_i_times_stride_0_plus_j
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 0   actual: 0   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 1   actual: 1   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 2   actual: 2   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 3   actual: 3   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 4   actual: 4   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 5   actual: 5   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 6   actual: 6   ok  (line 379)
+    input: values_on_cpu_list[i_val * t_tensor.stride(0) + j_val * t_tensor.stride(1)] expected: 7   actual: 7   ok  (line 379)
+    input: values_on_cpu_list[1 * t_tensor.stride(0) + 2 * t_tensor.stride(1)] expected: 6   actual: 6   ok  (line 381)
+
+buffer_tensor_view_changes_the_shape_not_the_values
+    input: view_tensor.shape()                  expected: {4, 2}   actual: {4, 2}   ok  (line 395)
+    input: view_tensor.stride()                 expected: {2, 1}   actual: {2, 1}   ok  (line 396)
+    input: view_tensor.data()                   expected: 0x77cbb0600010   actual: 0x77cbb0600010   ok  (line 397)
+    input: view_tensor.tolist()                 expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 398)
+    input: t_tensor.view({8}).shape()           expected: {8}   actual: {8}   ok  (line 399)
+
+buffer_tensor_view_shares_the_values
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 409)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 410)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 411)
+
+buffer_tensor_view_keeps_the_memory_alive
+    input: view_tensor.tolist()                 expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 426)
+
+buffer_tensor_narrow_takes_rows
+    input: rows_tensor.shape()                  expected: {2, 3}   actual: {2, 3}   ok  (line 440)
+    input: rows_tensor.data()                   expected: 0x77cbb060001c   actual: 0x77cbb060001c   ok  (line 441)
+    input: rows_tensor.data()                   expected: 0x77cbb060001c   actual: 0x77cbb060001c   ok  (line 442)
+    input: rows_tensor.tolist()                 expected: {3, 4, 5, 6, 7, 8}   actual: {3, 4, 5, 6, 7, 8}   ok  (line 443)
+
+buffer_tensor_narrow_then_view
+    input: piece_tensor.shape()                 expected: {3, 4}   actual: {3, 4}   ok  (line 455)
+    input: piece_tensor.data()                  expected: 0x77cbb0600030   actual: 0x77cbb0600030   ok  (line 456)
+    input: piece_tensor.tolist()                expected: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   actual: {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}   ok  (line 457)
+
+buffer_tensor_writing_a_narrow_leaves_the_rest_alone
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0}   actual: {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0}   ok  (line 466)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 467)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 468)
+
+from_blob_over_a_buffer_tensor_does_not_free_it
+    input: blob_tensor.data()                   expected: 0x77cbb0600010   actual: 0x77cbb0600010   ok  (line 483)
+    input: blob_tensor.tolist()                 expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 484)
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5, 6, 7}   actual: {0, 1, 2, 3, 4, 5, 6, 7}   ok  (line 487)
+
+buffer_tensor_zeros_like_and_empty_like_copy_shape_and_dtype
+    input: zeros_like_t_tensor.shape()          expected: {2, 5}   actual: {2, 5}   ok  (line 502)
+    input: zeros_like_t_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 503)
+    input: empty_like_t_tensor.shape()          expected: {2, 5}   actual: {2, 5}   ok  (line 504)
+    input: empty_like_t_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 505)
+    input: zeros_like_t_tensor.data_ptr<int>() != t_tensor.data_ptr<int>() expected: true   actual: true   ok  (line 506)
+    input: zeros_like_t_tensor.tolist<int>()    expected: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}   ok  (line 507)
+
+buffer_tensor_fill_1_makes_ones
+    input: t_tensor.tolist()                    expected: {1, 1, 1, 1}   actual: {1, 1, 1, 1}   ok  (line 516)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 517)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 518)
+
+buffer_tensor_holds_ints
+    input: tokens_tensor.dtype() == DType::Int32 expected: true   actual: true   ok  (line 530)
+    input: tokens_tensor.tolist<int>()          expected: {3, 464, 50256, 0}   actual: {3, 464, 50256, 0}   ok  (line 531)
+    input: buffer_val.tensor(0).tolist<int>()   expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 532)
+    input: buffer_val.tensor(2).tolist<int>()   expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 533)
+
+buffer_tensor_zero_leaves_the_neighbours_alone
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 0, 0, 0}   actual: {0, 0, 0, 0, 0, 0}   ok  (line 549)
+    input: buffer_val.tensor(0).tolist()        expected: {9, 9, 9, 9}   actual: {9, 9, 9, 9}   ok  (line 550)
+    input: buffer_val.tensor(2).tolist()        expected: {9, 9, 9, 9}   actual: {9, 9, 9, 9}   ok  (line 551)
+
+buffer_tensor_fill_sets_every_value
+    input: floats_val.tensor(1).tolist()        expected: {1.5, 1.5, 1.5, 1.5, 1.5, 1.5}   actual: {1.5, 1.5, 1.5, 1.5, 1.5, 1.5}   ok  (line 560)
+    input: floats_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 561)
+    input: floats_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 562)
+    input: ints_val.tensor(1).tolist<int>()     expected: {7, 7, 7, 7}   actual: {7, 7, 7, 7}   ok  (line 566)
+    input: ints_val.tensor(0).tolist<int>()     expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 567)
+    input: ints_val.tensor(2).tolist<int>()     expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 568)
+
+buffer_tensor_fill_on_a_narrow_fills_only_those_rows
+    input: t_tensor.tolist()                    expected: {0, 0, 0, 2, 2, 2, 2, 2, 2, 0, 0, 0}   actual: {0, 0, 0, 2, 2, 2, 2, 2, 2, 0, 0, 0}   ok  (line 577)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 578)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 579)
+
+buffer_tensor_the_same_seed_gives_the_same_numbers
+    input: buffer_val.tensor(1).tolist()        expected: {0.566698, 1.71414, -1.17027, 0.269586, 0.353567, -0.128628, 0.758484, -1.01728, 0.111543, -0.152168, 0.0796314, -1.19063, 0.88482, 1.10221, -0.815093, 0.897476, ... (1000 values)}   actual: {0.566698, 1.71414, -1.17027, 0.269586, 0.353567, -0.128628, 0.758484, -1.01728, 0.111543, -0.152168, 0.0796314, -1.19063, 0.88482, 1.10221, -0.815093, 0.897476, ... (1000 values)}   ok  (line 595)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 596)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 597)
+
+buffer_tensor_normal_has_the_mean_and_std_asked_for
+    input: mean_val                             expected: 0 +/- 0.0005   actual: -1.16583e-05   ok  (line 616)
+    input: deviation_val                        expected: 0.02 +/- 0.0004   actual: 0.0200331   ok  (line 617)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 618)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 619)
+
+buffer_tensor_copy_copies_gpu_to_gpu
+    input: t_tensor.tolist()                    expected: {0, 1, 2, 3, 4, 5}   actual: {0, 1, 2, 3, 4, 5}   ok  (line 634)
+    input: t_tensor.shape()                     expected: {3, 2}   actual: {3, 2}   ok  (line 635)
+    input: buffer_val.tensor(0).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 636)
+    input: buffer_val.tensor(2).tolist()        expected: {0, 0, 0, 0}   actual: {0, 0, 0, 0}   ok  (line 637)
+    input: copied_out_tensor.tolist()           expected: {0, 1, 2, 3, 4, 5}   actual: {0, 1, 2, 3, 4, 5}   ok  (line 641)
+
+buffer_tensor_clone_is_outside_the_buffer
+    input: copy_tensor.tolist()                 expected: {0, 1, 2, 3}   actual: {0, 1, 2, 3}   ok  (line 654)
+    input: copy_tensor.data() != t_tensor.data() expected: true   actual: true   ok  (line 655)
+
+buffer_tensor_item_reads_the_one_value
+    input: floats_val.tensor(1).item()          expected: 42.5   actual: 42.5   ok  (line 667)
+    input: ints_val.tensor(1).item<int>()       expected: 50256   actual: 50256   ok  (line 672)
+
+buffer_tensor_indexing_picks_rows_and_values
+    input: row_tensor.shape()                   expected: {4}   actual: {4}   ok  (line 683)
+    input: row_tensor.tolist()                  expected: {4, 5, 6, 7}   actual: {4, 5, 6, 7}   ok  (line 684)
+    input: row_tensor.data()                    expected: 0x77cbb0600020   actual: 0x77cbb0600020   ok  (line 685)
+    input: row_tensor.data()                    expected: 0x77cbb0600020   actual: 0x77cbb0600020   ok  (line 686)
+    input: t_tensor[1][2].dim()                 expected: 0   actual: 0   ok  (line 688)
+    input: t_tensor[1][2].numel()               expected: 1   actual: 1   ok  (line 689)
+    input: t_tensor[1][2].item()                expected: 6   actual: 6   ok  (line 690)
+
+all tests passed

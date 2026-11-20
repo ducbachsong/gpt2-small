@@ -1,0 +1,79 @@
+log: logs/tests/test_grad_norm_2026-11-07_082503.log
+
+whole_model_norm_matches_pytorch
+    input: grad_norm_tensor.item()              expected: 67.5779 +/- 0.000675779   actual: 67.5779   ok  (line 117)
+    input: grad_norm_tensor.item() > 1.0f       expected: true   actual: true   ok  (line 118)
+    input: grad_norm_tensor.item()              expected: 0.0674365 +/- 6.74365e-07   actual: 0.0674365   ok  (line 117)
+    input: grad_norm_tensor.item() > 1.0f       expected: false   actual: false   ok  (line 118)
+
+norm_of_bfloat16_gradients_matches_pytorch
+    input: grad_norm_tensor.item()              expected: 100.914 +/- 0.00100914   actual: 100.914   ok  (line 138)
+
+computes_the_norm_of_all_gradients_together
+    input: grad_norm_tensor.item()              expected: 9.53939 +/- 1e-05   actual: 9.53939   ok  (line 165)
+
+a_3_and_minus_4_give_5
+    input: grad_norm_tensor.item()              expected: 5   actual: 5   ok  (line 178)
+
+zeros_give_0
+    input: grad_norm_tensor.item()              expected: 0   actual: 0   ok  (line 192)
+
+each_block_adds_its_share_of_the_values
+    input: block_sums_tensor[0].tolist()        expected: {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, ... (512 values)}   actual: {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, ... (512 values)}   ok  (line 208)
+    input: grad_norm_tensor.item()              expected: 2048   actual: 2048   ok  (line 209)
+
+a_last_round_that_is_not_full_still_counts
+    input: block_sums_tensor[0][0].item()       expected: 2048   actual: 2048   ok  (line 230)
+    input: block_sums_tensor[0][464].item()     expected: 1600   actual: 1600   ok  (line 231)
+    input: block_sums_tensor[0][511].item()     expected: 1024   actual: 1024   ok  (line 232)
+    input: grad_norm_tensor.item()              expected: 1000   actual: 1000   ok  (line 233)
+
+values_after_the_last_whole_float4_still_count
+    input: block_sums_tensor[0][0].item()       expected: 16   actual: 16   ok  (line 247)
+    input: grad_norm_tensor.item()              expected: 4   actual: 4   ok  (line 248)
+
+the_same_values_give_the_same_norm_every_time
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 268)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 268)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 268)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 268)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 271)
+
+only_the_values_in_the_view_count
+    input: grad_norm_tensor.item()              expected: 5   actual: 5   ok  (line 285)
+
+changes_nothing_but_the_norm
+    input: buffer_val.tensor(grad_norm_index_val).item() expected: 5.47723 +/- 1e-05   actual: 5.47723   ok  (line 313)
+    input: buffer_val.tensor(block_sums_index_val)[0][0].item() expected: 30   actual: 30   ok  (line 314)
+    input: buffer_val.tensor(block_sums_index_val)[0][GRAD_NORM_BLOCKS - 1].item() expected: 0   actual: 0   ok  (line 315)
+    input: buffer_val.tensor(block_sums_index_val)[1][0].item() expected: 0   actual: 0   ok  (line 316)
+    input: buffer_val.tensor(values_index_val).tolist() expected: {1, 2, 3, 4}   actual: {1, 2, 3, 4}   ok  (line 317)
+    input: buffer_val.tensor(after_index_val).tolist() expected: {7, 7, 7, 7}   actual: {7, 7, 7, 7}   ok  (line 318)
+
+any_block_size_gives_the_same_norm_within_tolerance
+    input: norm_val                             expected: 999.94 +/- 0.0099994   actual: 999.94   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.94 +/- 0.0099994   actual: 999.94   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.94 +/- 0.0099994   actual: 999.94   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.94 +/- 0.0099994   actual: 999.94   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.94   actual: 999.94   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.945 +/- 0.00999945   actual: 999.945   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.945   actual: 999.945   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.945 +/- 0.00999945   actual: 999.945   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.945   actual: 999.945   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.945 +/- 0.00999945   actual: 999.945   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.945   actual: 999.945   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+    input: norm_val                             expected: 999.945 +/- 0.00999945   actual: 999.945   ok  (line 346)
+    input: grad_norm_tensor.item()              expected: 999.945   actual: 999.945   ok  (line 348)
+    input: block_sums_tensor[1][0].item()       expected: 0   actual: 0   ok  (line 349)
+
+all tests passed

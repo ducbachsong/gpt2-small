@@ -10,13 +10,15 @@ build/
 runs/
 logs/
 
-# data: the token files (data/), PyTorch's reference numbers (tests/reference/), logs
+# data: the token files (python/tokenizer/data/), PyTorch's reference numbers (cuda/tests/reference/), logs
 *.bin
 *.csv
 *.parquet
 *.safetensors
-data/tinyshakespeare/
-data/fineweb10B/
+python/tokenizer/data/tinyshakespeare/
+python/tokenizer/data/fineweb10B/
+python/tokenizer/data/chat_sft/
+python/tokenizer/data/finetune_init/
 
 # built files that can land outside build/ (MSVC and nvcc on Windows)
 *.exe

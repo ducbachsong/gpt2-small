@@ -1,0 +1,961 @@
+log: logs/tests/test_wgmma_matmul_bf16_2026-11-13_123220.log
+
+matches_pytorch_on_gpt2_qkv
+    rows 4096, columns 2304, sum_length 768, bias
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00323907   ok  (line 107)
+
+matches_pytorch_on_gpt2_attention_output
+    rows 4096, columns 768, sum_length 768, bias
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00291313   ok  (line 107)
+
+matches_pytorch_on_gpt2_mlp_up
+    rows 4096, columns 3072, sum_length 768, bias
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00314648   ok  (line 107)
+
+matches_pytorch_on_gpt2_mlp_down
+    rows 4096, columns 768, sum_length 3072, bias
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00309246   ok  (line 107)
+
+matches_pytorch_on_gpt2_head
+    rows 4096, columns 50304, sum_length 768
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00317506   ok  (line 107)
+
+matches_pytorch_on_gpt2_qkv_input_grad
+    rows 4096, columns 768, sum_length 2304, right turned
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00195942   ok  (line 107)
+
+matches_pytorch_on_gpt2_qkv_weight_grad
+    rows 2304, columns 768, sum_length 4096, left turned, right turned
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00317834   ok  (line 107)
+
+matches_pytorch_with_sizes_no_tile_divides
+    rows 100, columns 200, sum_length 72, bias
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00322859   ok  (line 107)
+
+matches_pytorch_turned_with_sizes_no_tile_divides
+    rows 104, columns 200, sum_length 72, bias, left turned
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00277657   ok  (line 107)
+
+matches_pytorch_turned_with_sizes_no_tile_divides
+    rows 104, columns 200, sum_length 72, bias, right turned
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.0018793   ok  (line 107)
+
+matches_pytorch_turned_with_sizes_no_tile_divides
+    rows 104, columns 200, sum_length 72, bias, left turned, right turned
+
+matmul_matches_pytorch
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00281862   ok  (line 107)
+
+times_the_identity_gives_right_turned_round
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 188)
+
+zero_left_gives_the_bias_in_every_row
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 204)
+
+add_onto_adds_to_what_output_holds
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 222)
+
+turned_tensors_give_the_same_bits
+    left turned, right plain
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 251)
+    left plain, right turned
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 251)
+    left turned, right turned
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 251)
+
+every_setting_gives_the_default_bits_with_sizes_no_tile_divides
+    rows 136, columns 520, sum_length 336: 6 steps of 64 values of k
+    left plain, right plain, 1 warpgroups, 64 columns, 1 sets of tiles:
+
+every_setting_gives_the_default_bits
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+
+every_setting_gives_the_default_bits_with_fewer_steps_than_sets
+    rows 72, columns 200, sum_length 64: 1 steps of 64 values of k
+    left plain, right plain, 1 warpgroups, 64 columns, 1 sets of tiles:
+
+every_setting_gives_the_default_bits
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right plain, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right plain, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left plain, right turned, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 1 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 64 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 128 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 1 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 2 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 3 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+    left turned, right turned, 2 warpgroups, 256 columns, 4 sets of tiles:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 318)
+
+every_setting_matches_pytorch_on_gpt2_qkv_weight_grad
+    1 warpgroups, 64 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 64 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 64 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 64 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 128 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 128 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 128 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 128 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 256 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 256 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 256 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    1 warpgroups, 256 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 64 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 64 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 64 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 64 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 128 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 128 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 128 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 128 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 256 columns, 1 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 256 columns, 2 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 256 columns, 3 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+    2 warpgroups, 256 columns, 4 sets of tiles:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00276456   ok  (line 356)
+
+every_block_order_gives_the_default_bits
+    left plain, right plain, groups of 1 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right plain, groups of 2 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right plain, groups of 3 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right plain, groups of 4 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right plain, groups of 8 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right plain, groups of 64 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 1 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 2 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 3 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 4 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 8 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right plain, groups of 64 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 1 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 2 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 3 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 4 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 8 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left plain, right turned, groups of 64 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 1 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 2 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 3 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 4 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 8 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+    left turned, right turned, groups of 64 rows of squares:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 394)
+
+every_split_count_matches_pytorch_with_bias_and_add_onto
+    left plain, right plain, 1 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right plain, 2 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right plain, 3 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right plain, 4 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right plain, 6 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right plain, 8 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 1 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 2 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 3 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 4 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 6 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right plain, 8 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 1 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 2 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 3 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 4 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 6 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left plain, right turned, 8 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 1 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 2 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 3 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 4 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 6 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+    left turned, right turned, 8 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00290451   ok  (line 459)
+
+every_split_count_matches_pytorch_on_gpt2_attention_output_weight_grad
+    1 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+    2 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+    4 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+    8 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+    16 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+    64 splits:
+    input: relative_difference_on_gpu(output_tensor, expected_tensor) expected: 0 +/- 0.01   actual: 0.00321265   ok  (line 481)
+
+every_split_count_runs_the_epilogue_once_on_each_pair
+    1 splits:
+    input: torch::equal(pytorch_copy_of(doubled_tensor), 2.0f * pytorch_copy_of(plain_tensor)) expected: true   actual: true   ok  (line 506)
+    2 splits:
+    input: torch::equal(pytorch_copy_of(doubled_tensor), 2.0f * pytorch_copy_of(plain_tensor)) expected: true   actual: true   ok  (line 506)
+    3 splits:
+    input: torch::equal(pytorch_copy_of(doubled_tensor), 2.0f * pytorch_copy_of(plain_tensor)) expected: true   actual: true   ok  (line 506)
+    6 splits:
+    input: torch::equal(pytorch_copy_of(doubled_tensor), 2.0f * pytorch_copy_of(plain_tensor)) expected: true   actual: true   ok  (line 506)
+
+every_splits_sum_block_size_gives_the_same_bits
+    32 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+    64 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+    128 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+    256 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+    512 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+    1024 threads a block:
+    input: torch::equal(pytorch_copy_of(output_tensor), expected_tensor) expected: true   actual: true   ok  (line 533)
+
+every_kernel_fits_its_block
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 256 columns, 1 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 256 columns, 1 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 256 columns, 1 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 256 columns, 1 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 256 columns, 2 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 256 columns, 2 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 256 columns, 2 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 256 columns, 2 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 256 columns, 3 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 256 columns, 3 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 256 columns, 3 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 256 columns, 3 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 1 warpgroups, 256 columns, 4 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 1 warpgroups, 256 columns, 4 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 1 warpgroups, 256 columns, 4 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 1 warpgroups, 256 columns, 4 sets>: 166 registers per thread, largest block 128 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 64 columns, 1 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 64 columns, 2 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 64 columns, 3 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 64 columns, 4 sets>: 58 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 128 columns, 1 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 128 columns, 2 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 128 columns, 3 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 128 columns, 4 sets>: 90 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 256 columns, 1 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 256 columns, 1 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 256 columns, 1 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 256 columns, 1 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 256 columns, 2 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 256 columns, 2 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 256 columns, 2 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 256 columns, 2 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 16 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 256 columns, 3 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 256 columns, 3 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 256 columns, 3 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 256 columns, 3 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, false, 2 warpgroups, 256 columns, 4 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<false, true, 2 warpgroups, 256 columns, 4 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, false, 2 warpgroups, 256 columns, 4 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_kernel<true, true, 2 warpgroups, 256 columns, 4 sets>: 167 registers per thread, largest block 256 threads, 0 bytes local memory, 32 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+    wgmma_matmul_bf16_splits_sum_kernel<WgmmaMatmulBf16Store>: 32 registers per thread, largest block 1024 threads, 0 bytes local memory, 0 bytes shared memory
+    input: attributes_val.maxThreadsPerBlock >= threads_list[kernel_index_val] expected: true   actual: true   ok  (line 606)
+    input: attributes_val.localSizeBytes        expected: 0   actual: 0   ok  (line 607)
+
+all tests passed
