@@ -1,2 +1,0 @@
-name, clocks.current.sm [MHz], clocks.max.sm [MHz], power.draw [W], power.limit [W], temperature.gpu
-NVIDIA H100 80GB HBM3, 1965 MHz, 1980 MHz, 534.64 W, 700.00 W, 49

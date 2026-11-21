@@ -1,0 +1,250 @@
+log: cuda/tests/results/H100/encoder_tma_bf16_2026-11-21_055718.txt
+GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
+
+    32800 settings to run; left out: 15600 tiles that do not fit, 16400 kernels that spill, 0 with no room on an SM
+    ... 2000 of 32800 settings, 9 s
+    ... 4000 of 32800 settings, 18 s
+    ... 6000 of 32800 settings, 27 s
+    ... 8000 of 32800 settings, 33 s
+    ... 10000 of 32800 settings, 39 s
+    ... 12000 of 32800 settings, 45 s
+    ... 14000 of 32800 settings, 52 s
+    ... 16000 of 32800 settings, 56 s
+    ... 18000 of 32800 settings, 61 s
+    ... 20000 of 32800 settings, 68 s
+    ... 22000 of 32800 settings, 72 s
+    ... 24000 of 32800 settings, 77 s
+    ... 26000 of 32800 settings, 85 s
+    ... 28000 of 32800 settings, 88 s
+    ... 30000 of 32800 settings, 92 s
+    ... 32000 of 32800 settings, 99 s
+
+time_every_setting
+    nanochat d24: 16 rows of 2048 tokens, embed_dim 1536, vocab 32768: 302.1 MB; this GPU's peak 2039 GB/s
+    registers a thread (S: spills, so left out with every larger value count)
+    warps  swizzle     8 values   16 values   32 values   64 values  128 values
+        1      128         89         108         132         176         255 S
+        1        0         89          99         130         177         255 S
+        2      128         89         108         132         176         255 S
+        2        0         89          95         121         177         255 S
+        4      128         89         108         117         176         255 S
+        4        0         89          95         107         177         255 S
+        8      128         89          86         107         176         255 S
+        8        0         89          74         107         177         255 S
+       16      128         89          86         107         128 S       128 S
+       16        0         89          74         107         128 S       128 S
+       32      128         56          64 S        64 S        64 S        64 S
+       32        0         56          64 S        64 S        64 S        64 S
+    the current kernel: fastest 3648 blocks x 512 threads, 0.1234 ms, 2449 GB/s
+    the tree, first pass: the fastest under each father (ms, GB/s, x the current kernel's best)
+    blocks 114 (1x SMs)   0.1306   2313   0.94x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+        warps 1              0.3825    790   0.32x    1 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 99 registers, 197632 B shared)
+            values 8             0.3920    771   0.31x    1 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.3825    790   0.32x    1 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 99 registers, 197632 B shared)
+            values 32            0.3900    775   0.32x    1 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (130 registers, 197632 B shared)
+            values 64            0.4254    710   0.29x    1 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 2              0.2473   1222   0.50x    2 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (121 registers, 197632 B shared)
+            values 8             0.2483   1217   0.50x    2 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.2546   1187   0.48x    2 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 95 registers, 197632 B shared)
+            values 32            0.2473   1222   0.50x    2 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (121 registers, 197632 B shared)
+            values 64            0.2678   1128   0.46x    2 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 4              0.1746   1730   0.71x    4 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 8             0.1787   1691   0.69x    4 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1806   1673   0.68x    4 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 95 registers, 197632 B shared)
+            values 32            0.1746   1730   0.71x    4 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64            0.1904   1587   0.65x    4 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 8              0.1466   2061   0.84x    8 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 8             0.1472   2052   0.84x    8 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1483   2038   0.83x    8 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1466   2061   0.84x    8 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64            0.1697   1780   0.73x    8 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 16             0.1306   2313   0.94x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 8             0.1306   2313   0.94x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1319   2290   0.94x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1369   2207   0.90x   16 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64          nothing runs
+            values 128         nothing runs
+        warps 32             0.1342   2251   0.92x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 8             0.1342   2251   0.92x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 16          nothing runs
+            values 32          nothing runs
+            values 64          nothing runs
+            values 128         nothing runs
+    blocks 228 (2x SMs)   0.1234   2449   1.00x    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+        warps 1              0.2149   1406   0.57x    1 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 99 registers,  99328 B shared)
+            values 8             0.2197   1375   0.56x    1 warps,   8 values, tile  16 x  768, swizzle   0, 2 sets  ( 89 registers,  99328 B shared)
+            values 16            0.2149   1406   0.57x    1 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 99 registers,  99328 B shared)
+            values 32            0.2177   1388   0.57x    1 warps,  32 values, tile  16 x  768, swizzle   0, 2 sets  (130 registers,  99328 B shared)
+            values 64            0.2385   1267   0.52x    1 warps,  64 values, tile  16 x  768, swizzle   0, 2 sets  (177 registers,  99328 B shared)
+            values 128         nothing runs
+        warps 2              0.1489   2029   0.83x    2 warps,   8 values, tile  16 x  768, swizzle   0, 2 sets  ( 89 registers,  99328 B shared)
+            values 8             0.1489   2029   0.83x    2 warps,   8 values, tile  16 x  768, swizzle   0, 2 sets  ( 89 registers,  99328 B shared)
+            values 16            0.1521   1987   0.81x    2 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 95 registers,  99328 B shared)
+            values 32            0.1493   2024   0.83x    2 warps,  32 values, tile  16 x  768, swizzle   0, 2 sets  (121 registers,  99328 B shared)
+            values 64            0.1644   1838   0.75x    2 warps,  64 values, tile  16 x  768, swizzle   0, 2 sets  (177 registers,  99328 B shared)
+            values 128         nothing runs
+        warps 4              0.1242   2432   0.99x    4 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 95 registers,  99328 B shared)
+            values 8             0.1266   2386   0.97x    4 warps,   8 values, tile   8 x 1536, swizzle   0, 2 sets  ( 89 registers,  99328 B shared)
+            values 16            0.1242   2432   0.99x    4 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 95 registers,  99328 B shared)
+            values 32            0.1260   2398   0.98x    4 warps,  32 values, tile  16 x  768, swizzle   0, 2 sets  (107 registers,  99328 B shared)
+            values 64            0.1438   2101   0.86x    4 warps,  64 values, tile  32 x  256, swizzle   0, 3 sets  (177 registers,  99328 B shared)
+            values 128         nothing runs
+        warps 8              0.1234   2449   1.00x    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+            values 8             0.1254   2410   0.98x    8 warps,   8 values, tile  32 x  256, swizzle   0, 2 sets  ( 89 registers,  66560 B shared)
+            values 16            0.1234   2449   1.00x    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+            values 32            0.1252   2412   0.99x    8 warps,  32 values, tile  32 x  256, swizzle   0, 3 sets  (107 registers,  99328 B shared)
+            values 64            0.1701   1776   0.73x    8 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 16             0.1326   2278   0.93x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 8             0.1330   2272   0.93x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1326   2278   0.93x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1392   2171   0.89x   16 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64          nothing runs
+            values 128         nothing runs
+        warps 32             0.1360   2221   0.91x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 8             0.1360   2221   0.91x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 16          nothing runs
+            values 32          nothing runs
+            values 64          nothing runs
+            values 128         nothing runs
+    blocks 456 (4x SMs)   0.1232   2453   1.00x    4 warps,   8 values, tile   4 x  768, swizzle   0, 2 sets  ( 89 registers,  25600 B shared)
+        warps 1              0.1343   2249   0.92x    1 warps,  16 values, tile   8 x  768, swizzle   0, 2 sets  ( 99 registers,  50176 B shared)
+            values 8             0.1363   2216   0.90x    1 warps,   8 values, tile   8 x  768, swizzle   0, 2 sets  ( 89 registers,  50176 B shared)
+            values 16            0.1343   2249   0.92x    1 warps,  16 values, tile   8 x  768, swizzle   0, 2 sets  ( 99 registers,  50176 B shared)
+            values 32            0.1375   2197   0.90x    1 warps,  32 values, tile   8 x  768, swizzle   0, 2 sets  (130 registers,  50176 B shared)
+            values 64            0.1533   1971   0.80x    1 warps,  64 values, tile   8 x  768, swizzle   0, 2 sets  (177 registers,  50176 B shared)
+            values 128         nothing runs
+        warps 2              0.1244   2429   0.99x    2 warps,  32 values, tile  16 x  256, swizzle   0, 3 sets  (121 registers,  50176 B shared)
+            values 8             0.1247   2424   0.99x    2 warps,   8 values, tile  16 x  256, swizzle   0, 2 sets  ( 89 registers,  33792 B shared)
+            values 16            0.1245   2426   0.99x    2 warps,  16 values, tile  16 x  256, swizzle   0, 3 sets  ( 95 registers,  50176 B shared)
+            values 32            0.1244   2429   0.99x    2 warps,  32 values, tile  16 x  256, swizzle   0, 3 sets  (121 registers,  50176 B shared)
+            values 64            0.1338   2257   0.92x    2 warps,  64 values, tile  16 x  256, swizzle   0, 2 sets  (177 registers,  33792 B shared)
+            values 128         nothing runs
+        warps 4              0.1232   2453   1.00x    4 warps,   8 values, tile   4 x  768, swizzle   0, 2 sets  ( 89 registers,  25600 B shared)
+            values 8             0.1232   2453   1.00x    4 warps,   8 values, tile   4 x  768, swizzle   0, 2 sets  ( 89 registers,  25600 B shared)
+            values 16            0.1246   2424   0.99x    4 warps,  16 values, tile  32 x  128, swizzle   0, 2 sets  ( 95 registers,  33792 B shared)
+            values 32            0.1236   2445   1.00x    4 warps,  32 values, tile  32 x  128, swizzle   0, 3 sets  (107 registers,  50176 B shared)
+            values 64            0.1471   2054   0.84x    4 warps,  64 values, tile  32 x  256, swizzle   0, 2 sets  (177 registers,  66560 B shared)
+            values 128         nothing runs
+        warps 8              0.1259   2400   0.98x    8 warps,  32 values, tile   8 x 1536, swizzle   0, 2 sets  (107 registers,  99328 B shared)
+            values 8             0.1275   2370   0.97x    8 warps,   8 values, tile  32 x  256, swizzle   0, 2 sets  ( 89 registers,  66560 B shared)
+            values 16            0.1262   2393   0.98x    8 warps,  16 values, tile  16 x  768, swizzle   0, 2 sets  ( 74 registers,  99328 B shared)
+            values 32            0.1259   2400   0.98x    8 warps,  32 values, tile   8 x 1536, swizzle   0, 2 sets  (107 registers,  99328 B shared)
+            values 64            0.1750   1726   0.70x    8 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 16             0.1344   2247   0.92x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 8             0.1363   2216   0.90x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1344   2247   0.92x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1437   2102   0.86x   16 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64          nothing runs
+            values 128         nothing runs
+        warps 32             0.1398   2161   0.88x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 8             0.1398   2161   0.88x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 16          nothing runs
+            values 32          nothing runs
+            values 64          nothing runs
+            values 128         nothing runs
+    blocks 912 (8x SMs)   0.1222   2472   1.01x    2 warps,  16 values, tile  32 x   64, swizzle   0, 2 sets  ( 95 registers,  17408 B shared)
+        warps 1              0.1249   2420   0.99x    1 warps,  32 values, tile   4 x  768, swizzle   0, 1 sets  (130 registers,  13312 B shared)
+            values 8             0.1253   2412   0.98x    1 warps,   8 values, tile   4 x  768, swizzle   0, 1 sets  ( 89 registers,  13312 B shared)
+            values 16            0.1250   2418   0.99x    1 warps,  16 values, tile   8 x  384, swizzle 128, 2 sets  (108 registers,  25600 B shared)
+            values 32            0.1249   2420   0.99x    1 warps,  32 values, tile   4 x  768, swizzle   0, 1 sets  (130 registers,  13312 B shared)
+            values 64            0.1250   2417   0.99x    1 warps,  64 values, tile  32 x   64, swizzle 128, 2 sets  (176 registers,  17408 B shared)
+            values 128         nothing runs
+        warps 2              0.1222   2472   1.01x    2 warps,  16 values, tile  32 x   64, swizzle   0, 2 sets  ( 95 registers,  17408 B shared)
+            values 8             0.1239   2439   1.00x    2 warps,   8 values, tile   8 x  384, swizzle 128, 2 sets  ( 89 registers,  25600 B shared)
+            values 16            0.1222   2472   1.01x    2 warps,  16 values, tile  32 x   64, swizzle   0, 2 sets  ( 95 registers,  17408 B shared)
+            values 32            0.1232   2452   1.00x    2 warps,  32 values, tile  32 x   64, swizzle   0, 2 sets  (121 registers,  17408 B shared)
+            values 64            0.1379   2191   0.89x    2 warps,  64 values, tile  16 x  256, swizzle   0, 2 sets  (177 registers,  33792 B shared)
+            values 128         nothing runs
+        warps 4              0.1257   2404   0.98x    4 warps,  16 values, tile   8 x  768, swizzle   0, 3 sets  ( 95 registers,  74752 B shared)
+            values 8             0.1264   2390   0.98x    4 warps,   8 values, tile   8 x  768, swizzle   0, 3 sets  ( 89 registers,  74752 B shared)
+            values 16            0.1257   2404   0.98x    4 warps,  16 values, tile   8 x  768, swizzle   0, 3 sets  ( 95 registers,  74752 B shared)
+            values 32            0.1270   2379   0.97x    4 warps,  32 values, tile   8 x  768, swizzle   0, 1 sets  (107 registers,  25600 B shared)
+            values 64            0.1534   1970   0.80x    4 warps,  64 values, tile  32 x  256, swizzle   0, 2 sets  (177 registers,  66560 B shared)
+            values 128         nothing runs
+        warps 8              0.1250   2418   0.99x    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+            values 8             0.1264   2391   0.98x    8 warps,   8 values, tile  32 x  256, swizzle   0, 3 sets  ( 89 registers,  99328 B shared)
+            values 16            0.1250   2418   0.99x    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+            values 32            0.1279   2363   0.96x    8 warps,  32 values, tile  32 x  256, swizzle   0, 2 sets  (107 registers,  66560 B shared)
+            values 64            0.1865   1620   0.66x    8 warps,  64 values, tile  32 x  768, swizzle   0, 2 sets  (177 registers, 197632 B shared)
+            values 128         nothing runs
+        warps 16             0.1386   2180   0.89x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 8             0.1419   2130   0.87x   16 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1386   2180   0.89x   16 warps,  16 values, tile  32 x  768, swizzle   0, 2 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1481   2039   0.83x   16 warps,  32 values, tile  32 x  768, swizzle   0, 2 sets  (107 registers, 197632 B shared)
+            values 64          nothing runs
+            values 128         nothing runs
+        warps 32             0.1468   2058   0.84x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 8             0.1468   2058   0.84x   32 warps,   8 values, tile  32 x  768, swizzle   0, 2 sets  ( 56 registers, 197632 B shared)
+            values 16          nothing runs
+            values 32          nothing runs
+            values 64          nothing runs
+            values 128         nothing runs
+    blocks 1824 (16x SMs)   0.1226   2465   1.01x    1 warps,   8 values, tile   4 x  256, swizzle   0, 1 sets  ( 89 registers,   5120 B shared)
+        warps 1              0.1226   2465   1.01x    1 warps,   8 values, tile   4 x  256, swizzle   0, 1 sets  ( 89 registers,   5120 B shared)
+            values 8             0.1226   2465   1.01x    1 warps,   8 values, tile   4 x  256, swizzle   0, 1 sets  ( 89 registers,   5120 B shared)
+            values 16            0.1234   2448   1.00x    1 warps,  16 values, tile   8 x  128, swizzle   0, 1 sets  ( 99 registers,   5120 B shared)
+            values 32            0.1277   2366   0.97x    1 warps,  32 values, tile   8 x  384, swizzle 128, 2 sets  (132 registers,  25600 B shared)
+            values 64            0.1281   2358   0.96x    1 warps,  64 values, tile  32 x   64, swizzle 128, 3 sets  (176 registers,  25600 B shared)
+            values 128         nothing runs
+        warps 2              0.1260   2398   0.98x    2 warps,   8 values, tile  16 x  384, swizzle   0, 2 sets  ( 89 registers,  50176 B shared)
+            values 8             0.1260   2398   0.98x    2 warps,   8 values, tile  16 x  384, swizzle   0, 2 sets  ( 89 registers,  50176 B shared)
+            values 16            0.1261   2395   0.98x    2 warps,  16 values, tile  16 x  384, swizzle   0, 2 sets  ( 95 registers,  50176 B shared)
+            values 32            0.1263   2392   0.98x    2 warps,  32 values, tile   4 x  768, swizzle   0, 1 sets  (121 registers,  13312 B shared)
+            values 64            0.1404   2152   0.88x    2 warps,  64 values, tile  16 x  768, swizzle 128, 1 sets  (176 registers,  50176 B shared)
+            values 128         nothing runs
+        warps 4              0.1251   2415   0.99x    4 warps,  16 values, tile  32 x  256, swizzle   0, 2 sets  ( 95 registers,  66560 B shared)
+            values 8             0.1259   2399   0.98x    4 warps,   8 values, tile   8 x  768, swizzle   0, 2 sets  ( 89 registers,  50176 B shared)
+            values 16            0.1251   2415   0.99x    4 warps,  16 values, tile  32 x  256, swizzle   0, 2 sets  ( 95 registers,  66560 B shared)
+            values 32            0.1265   2388   0.98x    4 warps,  32 values, tile  16 x  256, swizzle   0, 2 sets  (107 registers,  33792 B shared)
+            values 64            0.1627   1857   0.76x    4 warps,  64 values, tile  32 x  256, swizzle   0, 2 sets  (177 registers,  66560 B shared)
+            values 128         nothing runs
+        warps 8              0.1240   2436   0.99x    8 warps,  16 values, tile   8 x  768, swizzle   0, 2 sets  ( 74 registers,  50176 B shared)
+            values 8             0.1269   2381   0.97x    8 warps,   8 values, tile  32 x  256, swizzle   0, 3 sets  ( 89 registers,  99328 B shared)
+            values 16            0.1240   2436   0.99x    8 warps,  16 values, tile   8 x  768, swizzle   0, 2 sets  ( 74 registers,  50176 B shared)
+            values 32            0.1292   2339   0.96x    8 warps,  32 values, tile  16 x  768, swizzle   0, 2 sets  (107 registers,  99328 B shared)
+            values 64            0.2116   1428   0.58x    8 warps,  64 values, tile  64 x  256, swizzle   0, 2 sets  (177 registers, 132096 B shared)
+            values 128         nothing runs
+        warps 16             0.1620   1865   0.76x   16 warps,  16 values, tile  32 x 1536, swizzle   0, 1 sets  ( 74 registers, 197632 B shared)
+            values 8             0.1664   1815   0.74x   16 warps,   8 values, tile  64 x  768, swizzle   0, 1 sets  ( 89 registers, 197632 B shared)
+            values 16            0.1620   1865   0.76x   16 warps,  16 values, tile  32 x 1536, swizzle   0, 1 sets  ( 74 registers, 197632 B shared)
+            values 32            0.1748   1728   0.71x   16 warps,  32 values, tile  64 x  256, swizzle   0, 2 sets  (107 registers, 132096 B shared)
+            values 64          nothing runs
+            values 128         nothing runs
+        warps 32             0.1743   1734   0.71x   32 warps,   8 values, tile  32 x 1536, swizzle   0, 1 sets  ( 56 registers, 197632 B shared)
+            values 8             0.1743   1734   0.71x   32 warps,   8 values, tile  32 x 1536, swizzle   0, 1 sets  ( 56 registers, 197632 B shared)
+            values 16          nothing runs
+            values 32          nothing runs
+            values 64          nothing runs
+            values 128         nothing runs
+    the 20 fastest, timed again over 20 rounds with the current kernel (3648 x 512: 0.1246 ms, 2425 GB/s, MBU 119%)
+         ms    GB/s   MBU   x current   blocks   setting
+     0.1241    2434  119%      1.00x      228    8 warps,  16 values, tile  32 x  256, swizzle   0, 3 sets  ( 74 registers,  99328 B shared)
+     0.1246    2424  119%      1.00x      456    4 warps,  32 values, tile  32 x  128, swizzle   0, 3 sets  (107 registers,  50176 B shared)
+     0.1251    2415  118%      1.00x      912    2 warps,   8 values, tile   2 x  768, swizzle   0, 3 sets  ( 89 registers,  19456 B shared)
+     0.1252    2414  118%      1.00x      912    2 warps,   8 values, tile   8 x  384, swizzle 128, 2 sets  ( 89 registers,  25600 B shared)
+     0.1255    2407  118%      0.99x      228    8 warps,  32 values, tile  32 x  256, swizzle   0, 3 sets  (107 registers,  99328 B shared)
+     0.1257    2404  118%      0.99x      912    2 warps,  16 values, tile  16 x  128, swizzle 128, 3 sets  (108 registers,  25600 B shared)
+     0.1257    2404  118%      0.99x      912    2 warps,  16 values, tile  32 x   64, swizzle 128, 3 sets  (108 registers,  25600 B shared)
+     0.1258    2402  118%      0.99x      456    4 warps,   8 values, tile  32 x  128, swizzle   0, 2 sets  ( 89 registers,  33792 B shared)
+     0.1259    2399  118%      0.99x     1824    1 warps,   8 values, tile   8 x  128, swizzle   0, 1 sets  ( 89 registers,   5120 B shared)
+     0.1261    2396  118%      0.99x      912    2 warps,  16 values, tile  32 x   64, swizzle   0, 3 sets  ( 95 registers,  25600 B shared)
+     0.1262    2395  117%      0.99x      456    4 warps,  16 values, tile  32 x  128, swizzle   0, 3 sets  ( 95 registers,  50176 B shared)
+     0.1263    2391  117%      0.99x      228    8 warps,   8 values, tile  32 x  256, swizzle   0, 2 sets  ( 89 registers,  66560 B shared)
+     0.1264    2391  117%      0.99x      912    2 warps,  32 values, tile  32 x   64, swizzle   0, 3 sets  (121 registers,  25600 B shared)
+     0.1265    2389  117%      0.99x      228    8 warps,  16 values, tile  32 x  256, swizzle   0, 2 sets  ( 74 registers,  66560 B shared)
+     0.1265    2388  117%      0.98x      912    2 warps,  16 values, tile  32 x   64, swizzle   0, 2 sets  ( 95 registers,  17408 B shared)
+     0.1267    2384  117%      0.98x      456    4 warps,   8 values, tile   4 x  768, swizzle   0, 4 sets  ( 89 registers,  50176 B shared)
+     0.1270    2379  117%      0.98x      912    2 warps,   8 values, tile  32 x   64, swizzle 128, 3 sets  ( 89 registers,  25600 B shared)
+     0.1270    2379  117%      0.98x      456    4 warps,  16 values, tile  32 x  128, swizzle   0, 2 sets  ( 95 registers,  33792 B shared)
+     0.1271    2377  117%      0.98x      912    2 warps,  32 values, tile   8 x  384, swizzle   0, 1 sets  (121 registers,  13312 B shared)
+     0.1272    2376  117%      0.98x      912    2 warps,  16 values, tile  32 x   64, swizzle 128, 2 sets  (108 registers,  17408 B shared)
+    every setting: cuda/tests/results/H100/encoder_tma_bf16_2026-11-21_055718.csv
+    input: same_count_val                       expected: 32800   actual: 32800   ok  (line 469)
+
+all tunes done

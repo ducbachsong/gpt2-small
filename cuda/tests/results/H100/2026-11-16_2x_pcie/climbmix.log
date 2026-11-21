@@ -1,24 +1,0 @@
-wrote 32,768 tokens to /root/gpt2-small/data/climbmix/climbmix_tokenizer.bin
-[dry-run] Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-[dry-run] Fetching 8 files:  12%|█▎        | 1/8 [00:00<00:00,  7.33it/s][dry-run] Fetching 8 files: 100%|██████████| 8/8 [00:00<00:00, 42.71it/s]
-[parquetpool] 8 file(s), 699.9 MB total, largest 88.0 MB; 3.0 GB RAM limit -> 8 in RAM at a time
-[parquetpool] fetched shard_00003.parquet, 87.5 MB
-[parquetpool] fetched shard_00001.parquet, 87.9 MB
-[parquetpool] fetched shard_00007.parquet, 87.0 MB
-[parquetpool] fetched shard_00006.parquet, 87.2 MB
-[parquetpool] fetched shard_00000.parquet, 88.0 MB
-[parquetpool] fetched shard_00005.parquet, 87.6 MB
-[parquetpool] fetched shard_00002.parquet, 87.6 MB
-[parquetpool] fetched shard_00004.parquet, 87.2 MB
-wrote 10,000,000 tokens to /root/gpt2-small/data/climbmix/climbmix_val_000000.bin
-  7s: 0 train tokens so far
-wrote 100,000,000 tokens to /root/gpt2-small/data/climbmix/climbmix_train_000001.bin
-  29s: 100,000,000 train tokens so far
-wrote 100,000,000 tokens to /root/gpt2-small/data/climbmix/climbmix_train_000002.bin
-  51s: 200,000,000 train tokens so far
-wrote 100,000,000 tokens to /root/gpt2-small/data/climbmix/climbmix_train_000003.bin
-  73s: 300,000,000 train tokens so far
-wrote 100,000,000 tokens to /root/gpt2-small/data/climbmix/climbmix_train_000004.bin
-  95s: 400,000,000 train tokens so far
-check: document 1 (47 tokens) decodes and re-encodes exactly; it starts:
-I think the point to the others is dishes dirty enough INSIDE to support a few plants should also be dirty enough where we can see them. At least the plates, which presumably had food on them, and were never washed.

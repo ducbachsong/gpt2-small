@@ -1,8 +1,0 @@
-log: tests/results/H100/model_2026-11-15_033626.txt
-GPU: NVIDIA H100 PCIe   compute 9.0   114 SMs   85.0 GB   peak memory bandwidth 2039 GB/s   peak bfloat16 819 TFLOPS   CUDA 12.8
-
-
-find_the_micro_batch_with_the_best_mfu
-    bfloat16: 2159350272 parameters, 14.77G flops a token at T = 2048; this GPU's peak 819 TFLOPS in bfloat16
-    rows   activations GB   ms a micro-batch   ms a step of 524288   tokens/s   TFLOPS    MFU   loss
-error: layer_norm_bf16_backward keeps a lane's sums in registers, 4 loads a row at most: embed_dim up to 1024; got 2304

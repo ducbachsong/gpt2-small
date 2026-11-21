@@ -207,6 +207,8 @@ __host__ __device__ constexpr int bits_for_values(unsigned long long count) {
 #define HARDWARE_TMA_SWIZZLE_BYTES_PER_ATOM (HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_ROW * HARDWARE_TMA_SWIZZLE_CELLS_PER_ATOM_COLUMN * HARDWARE_TMA_BYTES_PER_CELL)   // 8 x 8 x 16 = 1024
 #define HARDWARE_TMA_SWIZZLE_MAX_BYTES_PER_BOX_ROW HARDWARE_TMA_SWIZZLE_BYTES_PER_ROW                                  // a box's row, at most: one pattern row, 128 (the kernels use all 128)
 #define HARDWARE_TMA_MAX_ROWS_PER_BOX 256                                                                               // a box's rows, at most (the kernels use 64)
+#define HARDWARE_TMA_MAX_VALUES_PER_BOX_ROW 256                                                                         // a box's row with no swizzle, at most, in values
+#define HARDWARE_TMA_SHARED_ALIGN_BYTES 128                                                                             // a box's start in shared memory: on 128 bytes
 #define HARDWARE_TMA_SWIZZLE_MAX_BYTES_PER_BOX (HARDWARE_TMA_MAX_ROWS_PER_BOX * HARDWARE_TMA_SWIZZLE_MAX_BYTES_PER_BOX_ROW)   // a box, at most: 256 x 128 = 32 KB (32 atoms)
 
 // A WGMMA shared memory descriptor: one 64-bit number telling the tensor cores where a tile starts and how its rows

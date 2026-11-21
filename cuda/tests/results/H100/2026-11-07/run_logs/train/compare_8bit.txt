@@ -1,4 +1,0 @@
-data done: exit 0 after 95 s
-bf16: exit 0 at 09:06:52
-8bit: exit 0 at 09:17:05
-all done 09:17:05
